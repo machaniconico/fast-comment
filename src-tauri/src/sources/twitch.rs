@@ -504,3 +504,212 @@ fn now_ms() -> i64 {
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{ChatMessage, Fragment, MessageKind, Platform};
+    use tokio::sync::broadcast;
+
+    const TAGGED_BITS_PRIVMSG: &str = concat!(
+        "@badge-info=subscriber/12;badges=broadcaster/1,moderator/1,subscriber/12,vip/1;",
+        "client-nonce=0123456789abcdef;color=#1E90FF;display-name=RealUser;",
+        "emotes=25:9-13;first-msg=0;flags=;",
+        "id=9f60f9af-f7d-4bc3-bf55-1c15b310d8fb;mod=1;returning-chatter=0;",
+        "room-id=111111;subscriber=1;tmi-sent-ts=1700000000000;turbo=0;",
+        "user-id=12345;user-type=;bits=100 ",
+        ":realuser!realuser@realuser.tmi.twitch.tv PRIVMSG #fastcomment :cheer100 Kappa hello",
+    );
+
+    const UTF16_EMOTE_PRIVMSG: &str = concat!(
+        "@badge-info=;badges=;client-nonce=abcdef0123456789;color=;display-name=UTF16User;",
+        "emotes=25:2-6/88:13-20;first-msg=0;flags=;",
+        "id=0d7f3fd2-6561-4d70-920f-3c9a6c8a4471;mod=0;returning-chatter=0;",
+        "room-id=111111;subscriber=0;tmi-sent-ts=1700000000001;turbo=0;",
+        "user-id=67890;user-type= ",
+        ":utf16user!utf16user@utf16user.tmi.twitch.tv PRIVMSG #fastcomment :😀Kappa test PogChamp",
+    );
+
+    const NORMAL_PRIVMSG: &str = concat!(
+        "@badge-info=;badges=;client-nonce=fedcba9876543210;color=#FF69B4;display-name=NormalUser;",
+        "emotes=;first-msg=0;flags=;",
+        "id=66b8c9cf-b545-4f8e-8c4b-9c8b17b99418;mod=0;returning-chatter=0;",
+        "room-id=111111;subscriber=0;tmi-sent-ts=1700000000002;turbo=0;",
+        "user-id=22222;user-type= ",
+        ":normaluser!normaluser@normaluser.tmi.twitch.tv PRIVMSG #fastcomment :hello chat",
+    );
+
+    const FOUNDER_PRIVMSG: &str = concat!(
+        "@badge-info=founder/0;badges=founder/0;client-nonce=0011223344556677;color=;",
+        "display-name=FounderUser;emotes=;first-msg=0;flags=;",
+        "id=48183d84-165d-4020-a297-48c1f7f8f1af;mod=0;returning-chatter=0;",
+        "room-id=111111;subscriber=1;tmi-sent-ts=1700000000003;turbo=0;",
+        "user-id=33333;user-type= ",
+        ":founderuser!founderuser@founderuser.tmi.twitch.tv PRIVMSG #fastcomment :founder hello",
+    );
+
+    fn source() -> TwitchSource {
+        TwitchSource::new("fastcomment".to_string())
+    }
+
+    fn tag<'a>(line: &'a IrcLine, key: &str) -> &'a str {
+        line.tags.get(key).map(String::as_str).unwrap()
+    }
+
+    fn chat_from(line: &str) -> ChatMessage {
+        source()
+            .privmsg_to_chat(&parse_irc_line(line))
+            .expect("PRIVMSG should parse into ChatMessage")
+    }
+
+    fn emote_url(id: &str) -> String {
+        format!("https://static-cdn.jtvnw.net/emoticons/v2/{id}/default/dark/2.0")
+    }
+
+    #[test]
+    fn parses_privmsg_tags_into_fields() {
+        // 実際のTwitch PRIVMSG行から主要IRCv3タグを抽出できることを確認する。
+        let parsed = parse_irc_line(TAGGED_BITS_PRIVMSG);
+
+        assert_eq!(parsed.command, "PRIVMSG");
+        assert_eq!(
+            parsed.prefix.as_deref(),
+            Some("realuser!realuser@realuser.tmi.twitch.tv")
+        );
+        assert_eq!(parsed.params, vec!["#fastcomment".to_string()]);
+        assert_eq!(parsed.trailing.as_deref(), Some("cheer100 Kappa hello"));
+        assert_eq!(tag(&parsed, "display-name"), "RealUser");
+        assert_eq!(tag(&parsed, "color"), "#1E90FF");
+        assert_eq!(
+            tag(&parsed, "badges"),
+            "broadcaster/1,moderator/1,subscriber/12,vip/1"
+        );
+        assert_eq!(tag(&parsed, "emotes"), "25:9-13");
+        assert_eq!(tag(&parsed, "bits"), "100");
+        assert_eq!(tag(&parsed, "id"), "9f60f9af-f7d-4bc3-bf55-1c15b310d8fb");
+        assert_eq!(tag(&parsed, "tmi-sent-ts"), "1700000000000");
+
+        let msg = source()
+            .privmsg_to_chat(&parsed)
+            .expect("PRIVMSG should parse into ChatMessage");
+        assert_eq!(msg.platform, Platform::Twitch);
+        assert_eq!(msg.channel, "fastcomment");
+        assert_eq!(msg.id, "9f60f9af-f7d-4bc3-bf55-1c15b310d8fb");
+        assert_eq!(msg.author.id, "12345");
+        assert_eq!(msg.author.name, "RealUser");
+        assert_eq!(msg.author.display_color.as_deref(), Some("#1E90FF"));
+        assert_eq!(msg.timestamp_ms, 1700000000000);
+    }
+
+    #[test]
+    fn badges_tag_sets_roles_and_founder_as_subscriber() {
+        // badgesタグを共通Rolesへ変換し、founderはsubscriber相当として扱う。
+        let msg = chat_from(TAGGED_BITS_PRIVMSG);
+        let roles = &msg.author.roles;
+        let badges = &msg.author.badges;
+
+        assert!(roles.broadcaster);
+        assert!(roles.moderator);
+        assert!(roles.subscriber);
+        assert!(roles.member);
+        assert!(roles.vip);
+        assert_eq!(badges.len(), 4);
+        assert_eq!(badges[0].kind, "broadcaster");
+        assert_eq!(badges[1].kind, "moderator");
+        assert_eq!(badges[2].label, "subscriber/12");
+        assert_eq!(badges[3].label, "vip/1");
+
+        let founder = chat_from(FOUNDER_PRIVMSG);
+        let founder_roles = &founder.author.roles;
+        let founder_badges = &founder.author.badges;
+        assert!(founder_roles.subscriber);
+        assert!(founder_roles.member);
+        assert!(!founder_roles.broadcaster);
+        assert!(!founder_roles.moderator);
+        assert!(!founder_roles.vip);
+        assert_eq!(founder_badges[0].kind, "founder");
+        assert_eq!(founder_badges[0].label, "founder/0");
+    }
+
+    #[test]
+    fn splits_emotes_on_utf16_code_unit_boundaries() {
+        // サロゲートペアを含む本文でもTwitchのUTF-16境界でemote分割する。
+        let parsed = parse_irc_line(UTF16_EMOTE_PRIVMSG);
+        let expected = vec![
+            Fragment::text("😀"),
+            Fragment::Emote {
+                id: "25".to_string(),
+                name: "Kappa".to_string(),
+                url: emote_url("25"),
+            },
+            Fragment::text(" test "),
+            Fragment::Emote {
+                id: "88".to_string(),
+                name: "PogChamp".to_string(),
+                url: emote_url("88"),
+            },
+        ];
+
+        let fragments = split_fragments(
+            parsed.trailing.as_deref().unwrap(),
+            tag(&parsed, "emotes"),
+        );
+        assert_eq!(fragments, expected);
+
+        let msg = source()
+            .privmsg_to_chat(&parsed)
+            .expect("PRIVMSG should parse into ChatMessage");
+        assert_eq!(msg.fragments, expected);
+        assert_eq!(msg.plain_text(), "😀Kappa test PogChamp");
+    }
+
+    #[test]
+    fn bits_tag_creates_bits_message_kind_and_amount() {
+        // bitsタグ付きPRIVMSGはBits種別とAmountへ正規化される。
+        let msg = chat_from(TAGGED_BITS_PRIVMSG);
+
+        assert_eq!(msg.kind, MessageKind::Bits);
+        let amount = msg.amount.expect("bits tag should create Amount");
+        assert_eq!(amount.value, 100.0);
+        assert_eq!(amount.currency, "BITS");
+        assert_eq!(amount.raw_text, "100 bits");
+    }
+
+    #[test]
+    fn ping_returns_pong_reply() {
+        // TwitchのPING行に対して即時返信用のPONG文字列を返す。
+        let (tx, _rx) = broadcast::channel(1);
+        let handled = source().handle_line("PING :tmi.twitch.tv", &tx);
+
+        assert_eq!(handled.reply.as_deref(), Some("PONG :tmi.twitch.tv"));
+        assert!(!handled.emitted_privmsg);
+    }
+
+    #[test]
+    fn handle_line_emits_only_privmsg() {
+        // 通常PRIVMSGのみ送信済み扱いになり、CAP ACKや001 welcomeは無視される。
+        let (tx, mut rx) = broadcast::channel(8);
+        let source = source();
+
+        let privmsg = source.handle_line(NORMAL_PRIVMSG, &tx);
+        assert!(privmsg.emitted_privmsg);
+        assert!(privmsg.reply.is_none());
+
+        let emitted = rx.try_recv().expect("PRIVMSG should be broadcast");
+        assert_eq!(emitted.kind, MessageKind::Normal);
+        assert_eq!(emitted.plain_text(), "hello chat");
+
+        let cap_ack =
+            source.handle_line(":tmi.twitch.tv CAP * ACK :twitch.tv/tags twitch.tv/commands", &tx);
+        assert!(!cap_ack.emitted_privmsg);
+        assert!(cap_ack.reply.is_none());
+
+        let welcome = source.handle_line(":tmi.twitch.tv 001 justinfan123 :Welcome, GLHF!", &tx);
+        assert!(!welcome.emitted_privmsg);
+        assert!(welcome.reply.is_none());
+        assert!(matches!(
+            rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+}

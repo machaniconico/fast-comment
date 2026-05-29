@@ -117,3 +117,119 @@ fn compile_all(patterns: &[String], label: &str) -> Vec<Regex> {
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{Moderator, Verdict};
+    use crate::config::ModerationConfig;
+    use crate::model::{Author, ChatMessage, Fragment, MessageKind, Platform, Roles};
+
+    fn config(
+        ng_words: &[&str],
+        ng_users: &[&str],
+        highlights: &[&str],
+    ) -> ModerationConfig {
+        ModerationConfig {
+            ng_words: ng_words.iter().map(|s| (*s).to_string()).collect(),
+            ng_users: ng_users.iter().map(|s| (*s).to_string()).collect(),
+            highlights: highlights.iter().map(|s| (*s).to_string()).collect(),
+        }
+    }
+
+    fn message(id: &str, author_id: &str, author_name: &str, texts: &[&str]) -> ChatMessage {
+        ChatMessage {
+            id: id.to_string(),
+            platform: Platform::Twitch,
+            channel: "test-channel".to_string(),
+            author: Author {
+                id: author_id.to_string(),
+                name: author_name.to_string(),
+                display_color: None,
+                badges: Vec::new(),
+                roles: Roles::default(),
+            },
+            fragments: texts.iter().map(|text| Fragment::text(*text)).collect(),
+            kind: MessageKind::Normal,
+            amount: None,
+            timestamp_ms: 0,
+            raw: None,
+        }
+    }
+
+    #[test]
+    fn ng_word_regex_match_hides_message() {
+        // NGワードは正規表現として本文Text断片にマッチしたら非表示判定になる。
+        let moderator = Moderator::new(&config(&[r"b[a@]d\s+word", "禁止"], &[], &[]));
+
+        assert_eq!(
+            moderator.judge(&message("m1", "u1", "viewer", &["this is b@d word"])),
+            Verdict::Hide
+        );
+        assert_eq!(
+            moderator.judge(&message("m2", "u2", "viewer", &["これは禁止です"])),
+            Verdict::Hide
+        );
+    }
+
+    #[test]
+    fn ng_user_regex_match_hides_message() {
+        // NGユーザーは著者名または著者IDに正規表現がマッチしたら非表示判定になる。
+        let moderator = Moderator::new(&config(&[], &[r"^bad_(name|id)$"], &[]));
+
+        assert_eq!(
+            moderator.judge(&message("m1", "u1", "bad_name", &["hello"])),
+            Verdict::Hide
+        );
+        assert_eq!(
+            moderator.judge(&message("m2", "bad_id", "viewer", &["hello"])),
+            Verdict::Hide
+        );
+    }
+
+    #[test]
+    fn highlight_rules_for_user_and_keyword_mark_highlight() {
+        // ハイライトルールは本文キーワードまたは著者名にマッチしたらHighlight判定になる。
+        let moderator = Moderator::new(&config(&[], &[], &[r"\burgent\b", r"^featured_user$"]));
+
+        assert_eq!(
+            moderator.judge(&message("m1", "u1", "viewer", &["needs urgent review"])),
+            Verdict::Highlight
+        );
+        assert_eq!(
+            moderator.judge(&message("m2", "u2", "featured_user", &["ordinary text"])),
+            Verdict::Highlight
+        );
+    }
+
+    #[test]
+    fn hidden_id_hides_message_and_unhide_restores_judgement() {
+        // 手動のローカル非表示IDは設定ルールに関係なく最優先で非表示判定になる。
+        let mut moderator = Moderator::new(&ModerationConfig::default());
+        let msg = message("hidden-message", "u1", "viewer", &["hello"]);
+
+        assert_eq!(moderator.judge(&msg), Verdict::Show);
+        moderator.hide_id("hidden-message");
+        assert_eq!(moderator.judge(&msg), Verdict::Hide);
+        moderator.unhide_id("hidden-message");
+        assert_eq!(moderator.judge(&msg), Verdict::Show);
+    }
+
+    #[test]
+    fn invalid_regex_patterns_are_skipped_without_panic() {
+        // 不正な正規表現はコンパイル時にスキップされ、判定実行時もpanicしない。
+        let result = std::panic::catch_unwind(|| {
+            let mut moderator = Moderator::new(&config(&["["], &["("], &["*bad"]));
+            let msg = message("m1", "u1", "viewer", &["plain text"]);
+
+            assert_eq!(moderator.judge(&msg), Verdict::Show);
+
+            moderator.update_config(&config(&["[invalid", r"safe\s+word"], &[], &[]));
+            assert_eq!(
+                moderator.judge(&message("m2", "u2", "viewer", &["safe word"])),
+                Verdict::Hide
+            );
+        });
+
+        assert!(result.is_ok());
+    }
+}

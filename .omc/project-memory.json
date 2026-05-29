@@ -131,8 +131,8 @@
     },
     {
       "path": "src-tauri/src/config.rs",
-      "accessCount": 32,
-      "lastAccessed": 1780074952698,
+      "accessCount": 33,
+      "lastAccessed": 1780075440835,
       "type": "file"
     },
     {
@@ -161,20 +161,20 @@
     },
     {
       "path": "src-tauri/src/sources/twitch.rs",
-      "accessCount": 14,
-      "lastAccessed": 1780074466823,
+      "accessCount": 15,
+      "lastAccessed": 1780075582537,
+      "type": "file"
+    },
+    {
+      "path": "src-tauri/src/model.rs",
+      "accessCount": 15,
+      "lastAccessed": 1780075592271,
       "type": "file"
     },
     {
       "path": "src/lib/components/CommentList.svelte",
       "accessCount": 14,
       "lastAccessed": 1780074634455,
-      "type": "file"
-    },
-    {
-      "path": "src-tauri/src/model.rs",
-      "accessCount": 13,
-      "lastAccessed": 1780074972112,
       "type": "file"
     },
     {
@@ -203,20 +203,20 @@
     },
     {
       "path": "src-tauri/src/moderation.rs",
-      "accessCount": 8,
-      "lastAccessed": 1780072126218,
+      "accessCount": 10,
+      "lastAccessed": 1780075424465,
+      "type": "file"
+    },
+    {
+      "path": "src-tauri/src/sources/youtube/parser.rs",
+      "accessCount": 9,
+      "lastAccessed": 1780075471881,
       "type": "file"
     },
     {
       "path": "src-tauri/src/sources/youtube/innertube.rs",
       "accessCount": 8,
       "lastAccessed": 1780072136999,
-      "type": "file"
-    },
-    {
-      "path": "src-tauri/src/sources/youtube/parser.rs",
-      "accessCount": 8,
-      "lastAccessed": 1780072137429,
       "type": "file"
     },
     {

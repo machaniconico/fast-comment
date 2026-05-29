@@ -1,7 +1,7 @@
 {
-  "tool_name": "Bash",
-  "tool_input_preview": "{\"command\":\"grep -rn \\\"tts-speak\\\\|startTtsSpeakListener\\\\|http://127.0.0.1\\\\|?template=\\\\|?ws=\\\\|ws://127.0.0.1\\\" .claude/SPEC.md SETUP.md README.md src/lib/stores.svelte.ts templates/default/index.h...",
-  "error": "Exit code 2\n.claude/SPEC.md:112:- **OBS向け**: axum WebSocket `/ws`。接続クライアントへ同じ batch を push。`GET /?template=<name>` は `templates/<name>/index.html` を返す（未指定は `default`、`../` 等は拒否）。静的アセットは `/<name>/...` で配信。ポートは設定(既定 11180)で、変更時は新ポートの bind 成功後にサーバを再起動して再 bind する。\n.claude/SPEC.md:121:- **voicevox.rs**: VOICEVOX。`POST /audio_query` → `POST /synthesis` でwav取得 → 再生(UIへ送って再生 or rodio)。既定 `http://127.0.0.1:50021`。\n.claude/SPEC.md:147:- OBS には「ブラウザソース」で `http://127.0.0.1:11180/?template=default&ws=ws://12...",
-  "timestamp": "2026-05-29T17:11:01.788Z",
+  "tool_name": "mcp__plugin_oh-my-claudecode_t__lsp_diagnostics",
+  "tool_input_preview": "{\"file\":\"/mnt/d/workspace/fast-comment/src-tauri/src/sources/twitch.rs\"}",
+  "error": "Language server 'rust-analyzer' not found.\nInstall with: rustup component add rust-analyzer",
+  "timestamp": "2026-05-29T17:26:47.906Z",
   "retry_count": 1
 }

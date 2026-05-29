@@ -627,3 +627,331 @@ fn now_ms() -> i64 {
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use serde_json::json;
+
+    use super::{dig, extract_actions, parse_action, parse_runs, split_currency_value, Seg};
+    use crate::model::{Fragment, MessageKind};
+
+    #[test]
+    fn dig_returns_value_or_none_for_missing_path() {
+        // dig は存在するパスを返し、途中欠落や型違いは None に落とす。
+        let payload = json!({
+            "outer": [
+                { "inner": { "leaf": 42 } }
+            ]
+        });
+
+        let found = dig(
+            &payload,
+            &[
+                Seg::Key("outer"),
+                Seg::Idx(0),
+                Seg::Key("inner"),
+                Seg::Key("leaf"),
+            ],
+        )
+        .and_then(|v| v.as_i64());
+
+        assert_eq!(found, Some(42));
+        assert!(dig(&payload, &[Seg::Key("outer"), Seg::Idx(1)]).is_none());
+        assert!(
+            dig(
+                &payload,
+                &[
+                    Seg::Key("outer"),
+                    Seg::Idx(0),
+                    Seg::Key("missing"),
+                    Seg::Key("leaf"),
+                ],
+            )
+            .is_none()
+        );
+        assert!(dig(&payload, &[Seg::Key("outer"), Seg::Key("inner")]).is_none());
+    }
+
+    #[test]
+    fn parse_runs_converts_text_and_emoji_fragments() {
+        // runs[] の text は Text、画像 URL 付き emoji は Emote、URL 空の emoji は Text にする。
+        let field = json!({
+            "runs": [
+                { "text": "hello " },
+                {
+                    "emoji": {
+                        "emojiId": "emoji-1",
+                        "shortcuts": [":wave:"],
+                        "image": {
+                            "thumbnails": [
+                                { "url": "https://example.test/wave-24.png" },
+                                { "url": "https://example.test/wave-48.png" }
+                            ]
+                        }
+                    }
+                },
+                {
+                    "emoji": {
+                        "emojiId": "emoji-2",
+                        "searchTerms": ["smile"],
+                        "image": { "thumbnails": [] }
+                    }
+                },
+                { "text": "" }
+            ]
+        });
+
+        let fragments = parse_runs(Some(&field));
+
+        assert_eq!(
+            fragments,
+            vec![
+                Fragment::Text {
+                    text: "hello ".to_string(),
+                },
+                Fragment::Emote {
+                    id: "emoji-1".to_string(),
+                    name: ":wave:".to_string(),
+                    url: "https://example.test/wave-48.png".to_string(),
+                },
+                Fragment::Text {
+                    text: "smile".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_action_detects_text_superchat_and_membership_kinds() {
+        // addChatItemAction の代表的 renderer を kind と Amount に正規化する。
+        let payload = json!({
+            "continuationContents": {
+                "liveChatContinuation": {
+                    "actions": [
+                        {
+                            "addChatItemAction": {
+                                "item": {
+                                    "liveChatTextMessageRenderer": {
+                                        "id": "normal-1",
+                                        "timestampUsec": "1000000",
+                                        "authorName": { "simpleText": "Alice" },
+                                        "authorExternalChannelId": "UC_ALICE",
+                                        "message": {
+                                            "runs": [{ "text": "通常コメント" }]
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        {
+                            "addChatItemAction": {
+                                "item": {
+                                    "liveChatPaidMessageRenderer": {
+                                        "id": "superchat-1",
+                                        "timestampUsec": "2000000",
+                                        "authorName": { "simpleText": "Bob" },
+                                        "authorExternalChannelId": "UC_BOB",
+                                        "purchaseAmountText": { "simpleText": "¥1,000" },
+                                        "message": {
+                                            "runs": [{ "text": "ありがとう" }]
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        {
+                            "addChatItemAction": {
+                                "item": {
+                                    "liveChatMembershipItemRenderer": {
+                                        "id": "membership-1",
+                                        "timestampUsec": "3000000",
+                                        "authorName": { "simpleText": "Carol" },
+                                        "authorExternalChannelId": "UC_CAROL",
+                                        "headerSubtext": {
+                                            "runs": [{ "text": "メンバーになりました" }]
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    ]
+                }
+            }
+        });
+        let paths: HashMap<String, String> = HashMap::new();
+        let actions = extract_actions(&payload, &paths);
+
+        let normal = parse_action(&actions[0], "video-1").expect("normal message");
+        let superchat = parse_action(&actions[1], "video-1").expect("superchat message");
+        let membership = parse_action(&actions[2], "video-1").expect("membership message");
+
+        assert_eq!(normal.kind, MessageKind::Normal);
+        assert_eq!(normal.plain_text(), "通常コメント");
+        assert_eq!(normal.timestamp_ms, 1000);
+
+        assert_eq!(superchat.kind, MessageKind::SuperChat);
+        assert_eq!(superchat.plain_text(), "ありがとう");
+        let amount = superchat.amount.as_ref().expect("superchat amount");
+        assert_eq!(amount.raw_text.as_str(), "¥1,000");
+        assert_eq!(amount.currency.as_str(), "¥");
+        assert_eq!(amount.value, 1000.0);
+
+        assert_eq!(membership.kind, MessageKind::Membership);
+        assert_eq!(membership.plain_text(), "メンバーになりました");
+        assert!(membership.amount.is_none());
+    }
+
+    #[test]
+    fn author_badges_map_to_member_moderator_and_owner_roles() {
+        // authorBadges は member/moderator/owner を Roles へ写す(owner は broadcaster)。
+        let action = json!({
+            "addChatItemAction": {
+                "item": {
+                    "liveChatTextMessageRenderer": {
+                        "id": "badge-1",
+                        "timestampUsec": "4000000",
+                        "authorName": { "simpleText": "Dana" },
+                        "authorExternalChannelId": "UC_DANA",
+                        "authorBadges": [
+                            {
+                                "liveChatAuthorBadgeRenderer": {
+                                    "tooltip": "Member",
+                                    "customThumbnail": {
+                                        "thumbnails": [
+                                            { "url": "https://example.test/member.png" }
+                                        ]
+                                    }
+                                }
+                            },
+                            {
+                                "liveChatAuthorBadgeRenderer": {
+                                    "tooltip": "Moderator",
+                                    "icon": { "iconType": "MODERATOR" }
+                                }
+                            },
+                            {
+                                "liveChatAuthorBadgeRenderer": {
+                                    "tooltip": "Owner",
+                                    "icon": { "iconType": "OWNER" }
+                                }
+                            }
+                        ],
+                        "message": {
+                            "runs": [{ "text": "badge check" }]
+                        }
+                    }
+                }
+            }
+        });
+
+        let msg = parse_action(&action, "video-1").expect("badge message");
+
+        assert!(msg.author.roles.member);
+        assert!(msg.author.roles.moderator);
+        assert!(msg.author.roles.broadcaster);
+        assert!(!msg.author.roles.subscriber);
+        assert!(!msg.author.roles.vip);
+        assert_eq!(msg.author.badges[0].kind.as_str(), "member");
+        assert_eq!(
+            msg.author.badges[0].image_url.as_deref(),
+            Some("https://example.test/member.png")
+        );
+        assert_eq!(msg.author.badges[1].kind.as_str(), "moderator");
+        assert_eq!(msg.author.badges[2].kind.as_str(), "broadcaster");
+    }
+
+    #[test]
+    fn split_currency_value_handles_jpy_and_european_amounts() {
+        // 金額文字列は日本円の桁区切りと欧州表記を数値化し、Amount は raw_text を温存する。
+        let (currency, value) = split_currency_value("¥1,000");
+        assert_eq!(currency, "¥");
+        assert_eq!(value, 1000.0);
+
+        let (currency, value) = split_currency_value("1.000,50");
+        assert_eq!(currency, "");
+        assert_eq!(value, 1000.50);
+
+        let action = json!({
+            "addChatItemAction": {
+                "item": {
+                    "liveChatPaidMessageRenderer": {
+                        "id": "amount-1",
+                        "timestampUsec": "5000000",
+                        "authorName": { "simpleText": "Eve" },
+                        "authorExternalChannelId": "UC_EVE",
+                        "purchaseAmountText": { "simpleText": "1.000,50" }
+                    }
+                }
+            }
+        });
+
+        let msg = parse_action(&action, "video-1").expect("paid message");
+        let amount = msg.amount.as_ref().expect("amount");
+        assert_eq!(amount.value, 1000.50);
+        assert_eq!(amount.currency.as_str(), "");
+        assert_eq!(amount.raw_text.as_str(), "1.000,50");
+        assert_eq!(msg.fragments, vec![Fragment::text("1.000,50")]);
+    }
+
+    #[test]
+    fn unknown_or_broken_actions_return_none_and_are_skipped() {
+        // 未知 renderer や壊れた addChatItemAction は panic せず None になり、filter_map でスキップできる。
+        let payload = json!({
+            "continuationContents": {
+                "liveChatContinuation": {
+                    "actions": [
+                        {
+                            "addChatItemAction": {
+                                "item": {
+                                    "liveChatUnknownRenderer": {
+                                        "id": "unknown-1"
+                                    }
+                                }
+                            }
+                        },
+                        {
+                            "addChatItemAction": {}
+                        },
+                        {
+                            "replaceChatItemAction": {
+                                "item": {}
+                            }
+                        },
+                        {
+                            "addChatItemAction": {
+                                "item": {
+                                    "liveChatTextMessageRenderer": {
+                                        "id": "valid-1",
+                                        "timestampUsec": "6000000",
+                                        "authorName": { "simpleText": "Frank" },
+                                        "authorExternalChannelId": "UC_FRANK",
+                                        "message": {
+                                            "runs": [{ "text": "kept" }]
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    ]
+                }
+            }
+        });
+        let paths: HashMap<String, String> = HashMap::new();
+        let actions = extract_actions(&payload, &paths);
+
+        assert!(parse_action(&actions[0], "video-1").is_none());
+        assert!(parse_action(&actions[1], "video-1").is_none());
+        assert!(parse_action(&actions[2], "video-1").is_none());
+
+        let parsed = actions
+            .iter()
+            .filter_map(|action| parse_action(action, "video-1"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].id.as_str(), "valid-1");
+        assert_eq!(parsed[0].plain_text(), "kept");
+    }
+}
