@@ -45,20 +45,27 @@
   let paddingTop = $derived(startIdx * ROW_HEIGHT);
 
   // Scroll to bottom when new messages arrive and the user is at the bottom.
-  // prevCount is tracked via untrack() so it does not become a reactive dep of
-  // this effect (reading/writing a plain reactive would be fragile in Svelte 5).
-  let prevCount = $state(0);
+  // Monitors store.receivedCount (monotonically increasing) instead of
+  // visibleMessages.length so that filter/search changes do not falsely trigger
+  // a scroll, and buffer saturation (maxBuffer cap) does not kill auto-scroll.
+  // prevReceived is tracked via untrack() so it does not become a reactive dep
+  // of this effect (reading/writing a plain reactive would be fragile in Svelte 5).
+  let prevReceived = $state(0);
   $effect(() => {
-    const count = totalCount;
-    const last = untrack(() => prevCount);
-    if (count !== last) {
-      untrack(() => { prevCount = count; });
+    const received = store.receivedCount;
+    const last = untrack(() => prevReceived);
+    if (received > last) {
+      untrack(() => { prevReceived = received; });
       if (isAtBottom && containerEl) {
         // schedule after DOM update
         requestAnimationFrame(() => {
           containerEl.scrollTop = containerEl.scrollHeight;
         });
       }
+    } else if (received !== last) {
+      // received < last should not occur (monotonic), but sync on mismatch
+      // (e.g. store replaced at module level in tests) without scrolling.
+      untrack(() => { prevReceived = received; });
     }
   });
 

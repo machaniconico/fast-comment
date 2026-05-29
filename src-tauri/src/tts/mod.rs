@@ -11,6 +11,13 @@
 pub mod bouyomi;
 pub mod voicevox;
 
+/// max_length == 0(無制限)の場合に適用する安全上限。
+///
+/// ユーザーが finite な max_length(> 0)を指定した場合はその値を完全に尊重し、
+/// この定数は使用しない。長文 SuperChat 連発などで巨大ペイロードが IPC に
+/// 流れるのを防ぐバックストップとしてのみ機能する。
+const TTS_UNLIMITED_HARD_CAP: usize = 500;
+
 use tauri::{AppHandle, Emitter};
 
 use crate::config::{TtsBackendKind, TtsConfig};
@@ -168,11 +175,17 @@ impl TtsDispatcher {
         };
 
         // 長文カット(char 単位)。
-        if opt.max_length > 0 {
-            let chars: Vec<char> = text.chars().collect();
-            if chars.len() > opt.max_length {
-                text = chars[..opt.max_length].iter().collect();
-            }
+        // finite 指定(> 0)はユーザー意図として完全に尊重する。
+        // 0(無制限)の場合も TTS_UNLIMITED_HARD_CAP を上限として適用し、
+        // 巨大 IPC ペイロードを防ぐバックストップとする。
+        let effective_max = if opt.max_length > 0 {
+            opt.max_length
+        } else {
+            TTS_UNLIMITED_HARD_CAP
+        };
+        let chars: Vec<char> = text.chars().collect();
+        if chars.len() > effective_max {
+            text = chars[..effective_max].iter().collect();
         }
 
         text

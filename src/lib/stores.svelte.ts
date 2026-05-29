@@ -35,6 +35,10 @@ class CommentStore {
   // no-filter fast path can return it without re-mapping all entries.
   private _msgs: ChatMessage[] = $state([]);
   private _maxBuffer: number = $state(DEFAULT_MAX_BUFFER);
+  // Monotonically increasing counter — incremented by every pushBatch call,
+  // never reset on clear. Used by CommentList to detect genuinely new messages
+  // regardless of buffer saturation or filter state.
+  private _received: number = $state(0);
 
   // Public filter state
   filterPlatform: Platform | 'all' = $state('all');
@@ -67,9 +71,13 @@ class CommentStore {
   // Derived: total buffered count
   readonly totalCount: number = $derived(this._buf.length);
 
+  // Derived: monotonically increasing received count (never decreases on clear)
+  readonly receivedCount: number = $derived(this._received);
+
   /** Push a batch into the ring buffer, evicting oldest on overflow. */
   pushBatch(messages: ChatMessage[]): void {
     const incoming = messages.map((msg) => ({ msg, search: buildSearch(msg) }));
+    this._received += incoming.length;
     const combined = this._buf.concat(incoming);
     if (combined.length > this._maxBuffer) {
       this._buf = combined.slice(combined.length - this._maxBuffer);
