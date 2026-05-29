@@ -88,10 +88,29 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
 }
 
 // Config
+
+// Mirror of Rust `TtsOptions` (src-tauri/src/config.rs), serde camelCase.
+// All fields optional so partially-written configs deserialize cleanly and the
+// UI can read individual keys without asserting the whole object is present.
+export interface TtsOptions {
+  bouyomiHost?: string;
+  bouyomiPort?: number;
+  bouyomiSpeed?: number;
+  bouyomiVolume?: number;
+  bouyomiTone?: number;
+  bouyomiVoice?: number;
+  voicevoxUrl?: string;
+  voicevoxSpeaker?: number;
+  readName?: boolean;
+  omitUrl?: boolean;
+  stripEmoji?: boolean;
+  maxLength?: number;
+}
+
 export interface AppConfig {
   channels: ChannelConfig[];
   obs: { port: number; template: string };
-  tts: { backend: 'bouyomi' | 'voicevox' | 'webSpeech' | 'none'; options: Record<string, unknown> };
+  tts: { backend: 'bouyomi' | 'voicevox' | 'webSpeech' | 'none'; options: TtsOptions };
   moderation: { ngWords: string[]; ngUsers: string[]; highlights: string[] };
   ui: { maxBuffer: number };
   youtubeOverrides?: { apiKey?: string; clientVersion?: string; paths?: Record<string, string> };
@@ -100,6 +119,7 @@ export interface AppConfig {
 export interface ChannelConfig {
   platform: 'twitch' | 'youtube';
   identifier: string; // Twitch: channel name, YouTube: videoId
+  enabled: boolean; // Rust ChannelConfig.enabled (serde default true)
 }
 
 export async function getConfig(): Promise<AppConfig | null> {

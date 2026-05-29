@@ -84,7 +84,7 @@
     const div = document.createElement('div');
     div.className = 'comment';
     const kind = msg.kind || 'normal';
-    const isSystem = kind === 'system' || kind === 'System';
+    const isSystem = kind === 'system';
 
     // Kind class for CSS highlights
     if (kind === 'superChat')  div.classList.add('superchat');

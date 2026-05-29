@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
-  import type { AppConfig, ChannelConfig } from '../ipc';
+  import type { AppConfig, ChannelConfig, TtsOptions } from '../ipc';
   import {
     getConfig, setConfig, addChannel, removeChannel, getObsUrl
   } from '../ipc';
@@ -29,26 +29,39 @@
   let saveMsgTimer: ReturnType<typeof setTimeout> | null = null;
   let copiedTimer: ReturnType<typeof setTimeout> | null = null;
 
-  // ── TTS options accessors (config.tts.options is a flexible camelCase map) ──
-  function ttsNum(key: string, fallback: number): number {
+  // ── TTS options accessors (config.tts.options mirrors Rust TtsOptions) ──
+  // Keys are partitioned by value type so reads/writes stay type-checked
+  // against the TtsOptions interface.
+  type TtsNumKey = {
+    [K in keyof TtsOptions]-?: NonNullable<TtsOptions[K]> extends number ? K : never;
+  }[keyof TtsOptions];
+  type TtsBoolKey = {
+    [K in keyof TtsOptions]-?: NonNullable<TtsOptions[K]> extends boolean ? K : never;
+  }[keyof TtsOptions];
+
+  function ttsNum(key: TtsNumKey, fallback: number): number {
     const v = config?.tts.options?.[key];
     return typeof v === 'number' && Number.isFinite(v) ? v : fallback;
   }
-  function ttsBool(key: string, fallback: boolean): boolean {
+  function ttsBool(key: TtsBoolKey, fallback: boolean): boolean {
     const v = config?.tts.options?.[key];
     return typeof v === 'boolean' ? v : fallback;
   }
-  function setTtsOption(key: string, value: unknown) {
+  function setTtsNum(key: TtsNumKey, value: number) {
     if (!config) return;
-    if (!config.tts.options || typeof config.tts.options !== 'object') {
-      config.tts.options = {};
-    }
+    config.tts.options[key] = value;
+  }
+  function setTtsBool(key: TtsBoolKey, value: boolean) {
+    if (!config) return;
     config.tts.options[key] = value;
   }
 
   // Bound proxies for TTS option fields
+  // Rust default for tts.options.maxLength is 140 (config.rs default_max_read_len).
+  // Initial/fallback must match so an unedited save does not silently change it.
+  const MAX_LENGTH_DEFAULT = 140;
   let voicevoxSpeaker: number = $state(1);
-  let maxLength: number = $state(80);
+  let maxLength: number = $state(MAX_LENGTH_DEFAULT);
   let stripEmoji: boolean = $state(true);
 
   onMount(async () => {
@@ -58,7 +71,7 @@
       ngUsersText = config.moderation.ngUsers.join('\n');
       highlightsText = config.moderation.highlights.join('\n');
       voicevoxSpeaker = ttsNum('voicevoxSpeaker', 1);
-      maxLength = ttsNum('maxLength', 80);
+      maxLength = ttsNum('maxLength', MAX_LENGTH_DEFAULT);
       stripEmoji = ttsBool('stripEmoji', true);
       // Backward-compat: older config.json may lack obs.template.
       if (!config.obs.template || !config.obs.template.trim()) {
@@ -95,7 +108,8 @@
     const id = newIdentifier.trim();
     if (!id) { addError = 'チャンネル名またはIDを入力してください'; return; }
     const identifier = newPlatform === 'youtube' ? extractYoutubeId(id) : id;
-    const ch: ChannelConfig = { platform: newPlatform, identifier };
+    if (!identifier) { addError = 'YouTube動画IDを取得できませんでした'; return; }
+    const ch: ChannelConfig = { platform: newPlatform, identifier, enabled: true };
     try {
       await addChannel(ch);
       // Update only the channels list to avoid discarding unsaved NG/TTS edits.
@@ -124,7 +138,11 @@
     // Accept full URL or bare videoId
     try {
       const url = new URL(input);
-      return url.searchParams.get('v') ?? url.pathname.split('/').pop() ?? input;
+      // pathname.split('/').pop() yields '' for a trailing slash (e.g.
+      // youtu.be/), which would otherwise slip past `?? input`. Filter out
+      // empty segments and fall back to the raw input.
+      const last = url.pathname.split('/').filter(Boolean).pop();
+      return url.searchParams.get('v') || last || input;
     } catch {
       return input;
     }
@@ -137,9 +155,9 @@
     config.moderation.ngWords = ngWordsText.split('\n').map(s => s.trim()).filter(Boolean);
     config.moderation.ngUsers = ngUsersText.split('\n').map(s => s.trim()).filter(Boolean);
     config.moderation.highlights = highlightsText.split('\n').map(s => s.trim()).filter(Boolean);
-    setTtsOption('voicevoxSpeaker', Number.isFinite(voicevoxSpeaker) ? Math.trunc(voicevoxSpeaker) : 1);
-    setTtsOption('maxLength', Number.isFinite(maxLength) && maxLength >= 0 ? Math.trunc(maxLength) : 80);
-    setTtsOption('stripEmoji', stripEmoji);
+    setTtsNum('voicevoxSpeaker', Number.isFinite(voicevoxSpeaker) ? Math.trunc(voicevoxSpeaker) : 1);
+    setTtsNum('maxLength', Number.isFinite(maxLength) && maxLength >= 0 ? Math.trunc(maxLength) : MAX_LENGTH_DEFAULT);
+    setTtsBool('stripEmoji', stripEmoji);
     // Normalize template before persisting (config is the single source).
     config.obs.template = (config.obs.template || 'default').trim() || 'default';
     try {

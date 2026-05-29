@@ -118,81 +118,87 @@
   },
   "hotPaths": [
     {
+      "path": "src-tauri/src/lib.rs",
+      "accessCount": 36,
+      "lastAccessed": 1780074647088,
+      "type": "file"
+    },
+    {
+      "path": "src/lib/components/Settings.svelte",
+      "accessCount": 34,
+      "lastAccessed": 1780074952789,
+      "type": "file"
+    },
+    {
+      "path": "src-tauri/src/config.rs",
+      "accessCount": 32,
+      "lastAccessed": 1780074952698,
+      "type": "file"
+    },
+    {
       "path": ".claude/SPEC.md",
       "accessCount": 31,
       "lastAccessed": 1780072134361,
       "type": "file"
     },
     {
-      "path": "src-tauri/src/lib.rs",
-      "accessCount": 31,
-      "lastAccessed": 1780072167057,
-      "type": "file"
-    },
-    {
-      "path": "src-tauri/src/config.rs",
-      "accessCount": 28,
-      "lastAccessed": 1780073749199,
-      "type": "file"
-    },
-    {
-      "path": "src/lib/components/Settings.svelte",
-      "accessCount": 23,
-      "lastAccessed": 1780073808104,
-      "type": "file"
-    },
-    {
       "path": "src/lib/stores.svelte.ts",
-      "accessCount": 20,
-      "lastAccessed": 1780073765397,
+      "accessCount": 23,
+      "lastAccessed": 1780074889931,
       "type": "file"
     },
     {
       "path": "src/lib/ipc.ts",
-      "accessCount": 15,
-      "lastAccessed": 1780073755138,
+      "accessCount": 19,
+      "lastAccessed": 1780074815969,
       "type": "file"
     },
     {
       "path": "src-tauri/src/bus.rs",
-      "accessCount": 14,
-      "lastAccessed": 1780072164872,
+      "accessCount": 18,
+      "lastAccessed": 1780074647886,
       "type": "file"
     },
     {
       "path": "src-tauri/src/sources/twitch.rs",
-      "accessCount": 13,
-      "lastAccessed": 1780072127238,
+      "accessCount": 14,
+      "lastAccessed": 1780074466823,
       "type": "file"
     },
     {
       "path": "src/lib/components/CommentList.svelte",
-      "accessCount": 13,
-      "lastAccessed": 1780073760460,
+      "accessCount": 14,
+      "lastAccessed": 1780074634455,
       "type": "file"
     },
     {
       "path": "src-tauri/src/model.rs",
+      "accessCount": 13,
+      "lastAccessed": 1780074972112,
+      "type": "file"
+    },
+    {
+      "path": "templates/default/app.js",
       "accessCount": 11,
-      "lastAccessed": 1780072157044,
-      "type": "file"
-    },
-    {
-      "path": "src-tauri/src/tts/mod.rs",
-      "accessCount": 9,
-      "lastAccessed": 1780072143215,
-      "type": "file"
-    },
-    {
-      "path": "src-tauri/src/tts/bouyomi.rs",
-      "accessCount": 9,
-      "lastAccessed": 1780072143594,
+      "lastAccessed": 1780074870187,
       "type": "file"
     },
     {
       "path": "src-tauri/src/tts/voicevox.rs",
-      "accessCount": 9,
-      "lastAccessed": 1780072144635,
+      "accessCount": 10,
+      "lastAccessed": 1780074439314,
+      "type": "file"
+    },
+    {
+      "path": "src-tauri/src/tts/bouyomi.rs",
+      "accessCount": 10,
+      "lastAccessed": 1780074439793,
+      "type": "file"
+    },
+    {
+      "path": "src-tauri/src/tts/mod.rs",
+      "accessCount": 10,
+      "lastAccessed": 1780074655654,
       "type": "file"
     },
     {
@@ -214,15 +220,27 @@
       "type": "file"
     },
     {
-      "path": "templates/default/app.js",
-      "accessCount": 8,
-      "lastAccessed": 1780072139455,
-      "type": "file"
-    },
-    {
       "path": "src-tauri/src/sources/youtube/mod.rs",
       "accessCount": 7,
       "lastAccessed": 1780072136514,
+      "type": "file"
+    },
+    {
+      "path": "src/lib/types.ts",
+      "accessCount": 7,
+      "lastAccessed": 1780074654298,
+      "type": "file"
+    },
+    {
+      "path": "src/lib/components/CommentItem.svelte",
+      "accessCount": 6,
+      "lastAccessed": 1780074634537,
+      "type": "file"
+    },
+    {
+      "path": "src/App.svelte",
+      "accessCount": 6,
+      "lastAccessed": 1780074655333,
       "type": "file"
     },
     {
@@ -232,39 +250,21 @@
       "type": "file"
     },
     {
-      "path": "src/lib/components/CommentItem.svelte",
-      "accessCount": 5,
-      "lastAccessed": 1780073725443,
-      "type": "file"
-    },
-    {
-      "path": "src/lib/types.ts",
-      "accessCount": 5,
-      "lastAccessed": 1780073737851,
-      "type": "file"
-    },
-    {
-      "path": "src/App.svelte",
-      "accessCount": 4,
-      "lastAccessed": 1780072963778,
-      "type": "file"
-    },
-    {
       "path": "SETUP.md",
       "accessCount": 3,
       "lastAccessed": 1780072142748,
       "type": "file"
     },
     {
-      "path": "src-tauri/src/main.rs",
-      "accessCount": 2,
-      "lastAccessed": 1780072118427,
+      "path": "templates/default/index.html",
+      "accessCount": 3,
+      "lastAccessed": 1780074666954,
       "type": "file"
     },
     {
-      "path": "templates/default/index.html",
+      "path": "src-tauri/src/main.rs",
       "accessCount": 2,
-      "lastAccessed": 1780072139916,
+      "lastAccessed": 1780072118427,
       "type": "file"
     },
     {
