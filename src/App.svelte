@@ -16,6 +16,7 @@
 
   onDestroy(() => {
     unlisten?.();
+    if (searchDebounce) clearTimeout(searchDebounce);
   });
 
   function onFilterClick(p: Platform | 'all') {

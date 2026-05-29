@@ -437,6 +437,9 @@ fn split_fragments(body: &str, emotes_tag: &str) -> Vec<Fragment> {
         if start >= utf16.len() || end >= utf16.len() || start > end {
             continue;
         }
+        if start < cursor {
+            continue;
+        }
         // エモート本体。
         let name = match String::from_utf16(&utf16[start..=end]) {
             Ok(name) => name,

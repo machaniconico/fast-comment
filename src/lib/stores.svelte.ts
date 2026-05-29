@@ -112,7 +112,8 @@ class CommentStore {
   }
 
   setMaxBuffer(n: number): void {
-    this._maxBuffer = n;
+    if (!Number.isFinite(n) || n < 1) return;
+    this._maxBuffer = Math.trunc(n);
     if (this._buf.length > this._maxBuffer) {
       this._buf = this._buf.slice(this._buf.length - this._maxBuffer);
       this.pruneHiddenIds();
