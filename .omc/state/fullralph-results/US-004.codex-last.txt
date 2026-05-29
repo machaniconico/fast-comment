@@ -1,0 +1,26 @@
+US-004 の reviewer feedback 対応を完了しました。
+
+変更内容:
+- [src-tauri/src/lib.rs](/mnt/d/workspace/fast-comment/src-tauri/src/lib.rs:179)
+  - `get_obs_url` が `ws=ws://127.0.0.1:{port}/ws` を必ず付与するよう修正。
+  - OBS ポート変更時、bind 成功後だけ `obs_server.port` を更新するよう修正。
+- [src-tauri/src/bus.rs](/mnt/d/workspace/fast-comment/src-tauri/src/bus.rs:125)
+  - `spawn_obs_server_on_port` を `Result<JoinHandle<()>, String>` に変更し、bind 失敗を呼び出し側へ返すよう修正。
+  - `/`, `/ws`, batch 配列 push、`?template` 解釈、トラバーサル拒否は維持。
+  - `sender()` は削除済み。
+- [src-tauri/tauri.conf.json](/mnt/d/workspace/fast-comment/src-tauri/tauri.conf.json:30)
+  - `bundle.resources` に `../templates -> templates` 登録済み。
+- [.claude/SPEC.md](/mnt/d/workspace/fast-comment/.claude/SPEC.md:112) / [SETUP.md](/mnt/d/workspace/fast-comment/SETUP.md:71)
+  - OBS URL 記述を `template` + explicit `ws` 付きに更新。
+
+検証:
+- `jq empty src-tauri/tauri.conf.json`: pass
+- `python3 -m json.tool src-tauri/tauri.conf.json`: pass
+- `rg` で `sender()` 削除、`ws=` 付与、spawn 呼び出し整合を確認
+- `git status --short -- <allowed files>` は指定5ファイルのみ
+
+未実行:
+- `cargo check`: `cargo: command not found`
+- `rustfmt`: `rustfmt: command not found`
+
+WSL 環境に Rust ツールチェーンが無いため、Rust のビルド検証はできませんでした。

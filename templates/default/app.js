@@ -16,11 +16,12 @@
   // ---- Config from URL params ----
   const params = new URLSearchParams(location.search);
   const CHANNEL_FILTER = params.get('channel') || null;
-  const MAX_ROWS = parseInt(params.get('max') || '8', 10);
-  const TTL_MS   = parseInt(params.get('ttl')  || '12000', 10);
-  const WS_URL   = params.get('ws') || 'ws://127.0.0.1:11180/ws' + location.search;
+  const MAX_ROWS = positiveIntParam('max', 8);
+  const TTL_MS   = positiveIntParam('ttl', 12000);
+  const WS_URL   = buildWsUrl(params.get('ws') || 'ws://127.0.0.1:11180/ws');
 
   const overlay = document.getElementById('overlay');
+  const LEAVE_MS = cssDurationMs('--leave-ms', 400);
 
   // ---- Active row tracking ----
   // Each entry: { el, timerId }
@@ -82,11 +83,14 @@
   function buildRow(msg) {
     const div = document.createElement('div');
     div.className = 'comment';
+    const kind = msg.kind || 'normal';
+    const isSystem = kind === 'system' || kind === 'System';
 
     // Kind class for CSS highlights
-    if (msg.kind === 'superChat')  div.classList.add('superchat');
-    if (msg.kind === 'membership') div.classList.add('membership');
-    if (msg.kind === 'bits')       div.classList.add('bits');
+    if (kind === 'superChat')  div.classList.add('superchat');
+    if (kind === 'membership') div.classList.add('membership');
+    if (kind === 'bits')       div.classList.add('bits');
+    if (isSystem) div.classList.add('system');
 
     // Platform dot
     const dot = document.createElement('span');
@@ -96,7 +100,7 @@
     // Badges
     const badges = (msg.author && msg.author.badges) || [];
     badges.forEach((badge) => {
-      if (badge.imageUrl) {
+      if (isHttpUrl(badge.imageUrl)) {
         const img = document.createElement('img');
         img.className = 'badge-img';
         img.src = badge.imageUrl;
@@ -110,10 +114,10 @@
     const author = document.createElement('span');
     author.className = 'author';
     const color = msg.author && msg.author.displayColor;
-    if (color && msg.kind === 'normal') {
+    if (isSafeHexColor(color) && kind === 'normal') {
       author.style.color = color;
     }
-    author.textContent = (msg.author && msg.author.name) || '';
+    author.textContent = (msg.author && msg.author.name) || (isSystem ? 'System' : '');
     div.appendChild(author);
 
     // Separator
@@ -137,7 +141,7 @@
     fragments.forEach((frag) => {
       if (frag.type === 'text') {
         fragWrap.appendChild(document.createTextNode(frag.text));
-      } else if (frag.type === 'emote') {
+      } else if (frag.type === 'emote' && isHttpUrl(frag.url)) {
         const img = document.createElement('img');
         img.className = 'emote';
         img.src = frag.url;
@@ -182,10 +186,53 @@
 
   function startLeave(el) {
     el.classList.add('leaving');
-    // Remove from DOM after animation (matches CSS 0.4s)
+    // Remove from DOM after the CSS-driven exit animation.
     setTimeout(() => {
       if (el.parentNode) el.parentNode.removeChild(el);
-    }, 420);
+    }, LEAVE_MS);
+  }
+
+  function positiveIntParam(name, fallback) {
+    const raw = params.get(name);
+    if (raw === null) return fallback;
+
+    const value = Number(raw);
+    if (!Number.isFinite(value) || value <= 0) return fallback;
+    const intValue = Math.floor(value);
+    return intValue > 0 ? intValue : fallback;
+  }
+
+  function buildWsUrl(base) {
+    const url = new URL(base, location.href);
+    if (CHANNEL_FILTER) {
+      url.searchParams.set('channel', CHANNEL_FILTER);
+    }
+    return url.toString();
+  }
+
+  function isSafeHexColor(value) {
+    return typeof value === 'string' && /^#[0-9a-fA-F]{3,8}$/.test(value);
+  }
+
+  function isHttpUrl(value) {
+    if (typeof value !== 'string') return false;
+
+    try {
+      const url = new URL(value);
+      return url.protocol === 'http:' || url.protocol === 'https:';
+    } catch {
+      return false;
+    }
+  }
+
+  function cssDurationMs(name, fallback) {
+    const value = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+    const match = value.match(/^([0-9]*\.?[0-9]+)(ms|s)$/);
+    if (!match) return fallback;
+
+    const duration = Number(match[1]);
+    if (!Number.isFinite(duration) || duration < 0) return fallback;
+    return match[2] === 's' ? duration * 1000 : duration;
   }
 
   // ---- Start ----

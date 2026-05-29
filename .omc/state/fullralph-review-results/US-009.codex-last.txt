@@ -1,0 +1,15 @@
+指摘なし。US-009 の受入条件は満たされています。
+
+確認内容:
+- `?ws=` 指定時/未指定時ともに `channel` は `new URL(...).searchParams.set()` で付与されます。
+- `max` / `ttl` は `Number.isFinite` と正数チェックで既定値へフォールバックします。
+- `System` / `system` は `.system` として描画されます。
+- `displayColor` は `#hex` 検証後のみ適用、emote/badge URL は `http:` / `https:` のみ許可されています。
+- batch 配列受信、5秒安定後の再接続バックオフリセット、`error -> close` 集約は維持されています。
+- 提示された対象差分は `templates/default/app.js`, `templates/default/style.css`, `templates/default/index.html` のみです。
+
+検証:
+- `node --check templates/default/app.js`
+- `git diff --check -- templates/default/app.js templates/default/style.css templates/default/index.html`
+
+FULLRALPH-VERDICT: PASS

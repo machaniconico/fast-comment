@@ -1,0 +1,242 @@
+# FULLRALPH REVIEW for story US-009
+
+## Original task
+fast-comment SPEC完成度向上: 3レーン監査で検出したCRITICAL/HIGH/MEDIUM欠陥を修正し、MVP(P1-P5)を機能水準に引き上げる。WSLはビルド不可のため目視レビュー検証のみ。
+
+## Story US-009: OBSテンプレ堅牢化 (URL構築 / NaNガード / System種別 / 色サニタイズ)
+templates/default/ 配下の app.js, style.css, index.html のみを編集。
+1) [HIGH] app.js: WS_URL = params.get('ws') || 'ws://127.0.0.1:11180/ws' + location.search が演算子優先順位で壊れている。?ws= 指定時に channel が付かず、未指定時のみ location.search が付く。修正: const base = params.get('ws') || 'ws://127.0.0.1:11180/ws'; とし、channel は常に new URL + searchParams で base に付与する(ws指定とchannel併用可)。
+2) [MEDIUM] app.js: parseInt の NaN ガード無し。?max=abc で MAX_ROWS=NaN→行無限増殖、?ttl 不正で setTimeout(...,NaN)=即時発火で全消滅。Number.isFinite && >0 チェックで既定値にフォールバック。
+3) [MEDIUM] app.js/style.css: MessageKind::System が来た時 author色も背景クラスも付かず素表示。.system クラス分岐を追加するか System は非表示にするポリシーを決めて実装。
+4) [MEDIUM] app.js: displayColor を author.style.color に無検証で直挿し。/^#[0-9a-fA-F]{3,8}$/ で検証してから適用。frag.url/badge.imageUrl は http(s)スキームチェック。
+5) [LOW] app.js/style.css: 退場アニメ時間がJS(420ms)とCSS(400ms)で分散。CSS変数 --leave-ms を定義しJSから getComputedStyle で読む等で一元化。
+6) [LOW] index.html: OBSブラウザソースで無意味な viewport meta は削除可(任意)。
+batch(配列)受信契約と既存の再接続バックオフ(5秒安定後リセット/error→close集約)は維持すること(これらは既に良実装)。templates/default/ 以外を変更しないこと。
+
+## Acceptance criteria (verify EACH)
+  1. ?ws= 指定時も channel クエリが正しく付与され、未指定時の既定WS URLでも channel が付く
+  2. ?max / ?ttl が不正値でも Number.isFinite ガードで既定値にフォールバックし暴走しない
+  3. System 種別メッセージが適切に描画(または非表示ポリシー)で破綻しない
+  4. displayColor が #hex 検証後にのみ適用され、url系は http(s)スキーム検証される
+  5. batch配列受信契約と既存の再接続バックオフ(5秒安定後リセット/error→close集約)が維持されている
+  6. templates/default/ 以外を変更していない
+
+## Files in scope (touchedFiles)
+  - templates/default/app.js
+  - templates/default/style.css
+  - templates/default/index.html
+
+## Diff under review
+```diff
+diff --git a/templates/default/app.js b/templates/default/app.js
+index b290518..ac16975 100644
+--- a/templates/default/app.js
++++ b/templates/default/app.js
+@@ -16,11 +16,12 @@
+   // ---- Config from URL params ----
+   const params = new URLSearchParams(location.search);
+   const CHANNEL_FILTER = params.get('channel') || null;
+-  const MAX_ROWS = parseInt(params.get('max') || '8', 10);
+-  const TTL_MS   = parseInt(params.get('ttl')  || '12000', 10);
+-  const WS_URL   = params.get('ws') || 'ws://127.0.0.1:11180/ws' + location.search;
++  const MAX_ROWS = positiveIntParam('max', 8);
++  const TTL_MS   = positiveIntParam('ttl', 12000);
++  const WS_URL   = buildWsUrl(params.get('ws') || 'ws://127.0.0.1:11180/ws');
+ 
+   const overlay = document.getElementById('overlay');
++  const LEAVE_MS = cssDurationMs('--leave-ms', 400);
+ 
+   // ---- Active row tracking ----
+   // Each entry: { el, timerId }
+@@ -82,11 +83,14 @@
+   function buildRow(msg) {
+     const div = document.createElement('div');
+     div.className = 'comment';
++    const kind = msg.kind || 'normal';
++    const isSystem = kind === 'system' || kind === 'System';
+ 
+     // Kind class for CSS highlights
+-    if (msg.kind === 'superChat')  div.classList.add('superchat');
+-    if (msg.kind === 'membership') div.classList.add('membership');
+-    if (msg.kind === 'bits')       div.classList.add('bits');
++    if (kind === 'superChat')  div.classList.add('superchat');
++    if (kind === 'membership') div.classList.add('membership');
++    if (kind === 'bits')       div.classList.add('bits');
++    if (isSystem) div.classList.add('system');
+ 
+     // Platform dot
+     const dot = document.createElement('span');
+@@ -96,7 +100,7 @@
+     // Badges
+     const badges = (msg.author && msg.author.badges) || [];
+     badges.forEach((badge) => {
+-      if (badge.imageUrl) {
++      if (isHttpUrl(badge.imageUrl)) {
+         const img = document.createElement('img');
+         img.className = 'badge-img';
+         img.src = badge.imageUrl;
+@@ -110,10 +114,10 @@
+     const author = document.createElement('span');
+     author.className = 'author';
+     const color = msg.author && msg.author.displayColor;
+-    if (color && msg.kind === 'normal') {
++    if (isSafeHexColor(color) && kind === 'normal') {
+       author.style.color = color;
+     }
+-    author.textContent = (msg.author && msg.author.name) || '';
++    author.textContent = (msg.author && msg.author.name) || (isSystem ? 'System' : '');
+     div.appendChild(author);
+ 
+     // Separator
+@@ -137,7 +141,7 @@
+     fragments.forEach((frag) => {
+       if (frag.type === 'text') {
+         fragWrap.appendChild(document.createTextNode(frag.text));
+-      } else if (frag.type === 'emote') {
++      } else if (frag.type === 'emote' && isHttpUrl(frag.url)) {
+         const img = document.createElement('img');
+         img.className = 'emote';
+         img.src = frag.url;
+@@ -182,10 +186,53 @@
+ 
+   function startLeave(el) {
+     el.classList.add('leaving');
+-    // Remove from DOM after animation (matches CSS 0.4s)
++    // Remove from DOM after the CSS-driven exit animation.
+     setTimeout(() => {
+       if (el.parentNode) el.parentNode.removeChild(el);
+-    }, 420);
++    }, LEAVE_MS);
++  }
++
++  function positiveIntParam(name, fallback) {
++    const raw = params.get(name);
++    if (raw === null) return fallback;
++
++    const value = Number(raw);
++    if (!Number.isFinite(value) || value <= 0) return fallback;
++    const intValue = Math.floor(value);
++    return intValue > 0 ? intValue : fallback;
++  }
++
++  function buildWsUrl(base) {
++    const url = new URL(base, location.href);
++    if (CHANNEL_FILTER) {
++      url.searchParams.set('channel', CHANNEL_FILTER);
++    }
++    return url.toString();
++  }
++
++  function isSafeHexColor(value) {
++    return typeof value === 'string' && /^#[0-9a-fA-F]{3,8}$/.test(value);
++  }
++
++  function isHttpUrl(value) {
++    if (typeof value !== 'string') return false;
++
++    try {
++      const url = new URL(value);
++      return url.protocol === 'http:' || url.protocol === 'https:';
++    } catch {
++      return false;
++    }
++  }
++
++  function cssDurationMs(name, fallback) {
++    const value = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
++    const match = value.match(/^([0-9]*\.?[0-9]+)(ms|s)$/);
++    if (!match) return fallback;
++
++    const duration = Number(match[1]);
++    if (!Number.isFinite(duration) || duration < 0) return fallback;
++    return match[2] === 's' ? duration * 1000 : duration;
+   }
+ 
+   // ---- Start ----
+diff --git a/templates/default/index.html b/templates/default/index.html
+index b8f1d11..75d92c7 100644
+--- a/templates/default/index.html
++++ b/templates/default/index.html
+@@ -2,7 +2,6 @@
+ <html lang="ja">
+   <head>
+     <meta charset="UTF-8" />
+-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+     <title>fast-comment overlay</title>
+     <link rel="stylesheet" href="style.css" />
+   </head>
+diff --git a/templates/default/style.css b/templates/default/style.css
+index 05692ed..4c36f4d 100644
+--- a/templates/default/style.css
++++ b/templates/default/style.css
+@@ -1,5 +1,9 @@
+ /* OBS Browser Source overlay — transparent background */
+ 
++:root {
++  --leave-ms: 400ms;
++}
++
+ *, *::before, *::after {
+   box-sizing: border-box;
+   margin: 0;
+@@ -49,7 +53,7 @@ html, body {
+ 
+ /* Exit animation applied via JS */
+ .comment.leaving {
+-  animation: fade-out 0.4s ease-in forwards;
++  animation: fade-out var(--leave-ms) ease-in forwards;
+ }
+ 
+ @keyframes fade-slide-in {
+@@ -136,6 +140,15 @@ html, body {
+   color: #fff;
+ }
+ 
++.comment.system {
++  background: rgba(32, 38, 44, 0.88);
++  color: #d6dde5;
++  font-style: italic;
++}
++.comment.system .author { color: #9fb3c8; }
++.comment.system .fragments { color: #d6dde5; }
++.comment.system .sep { color: rgba(214,221,229,0.45); }
++
+ /* ---- Amount badge ---- */
+ .amount {
+   display: inline-block;
+
+```
+
+## Worker stdout tail (last 4KB)
+```
+実装完了しました。変更は指定範囲の `templates/default/app.js`, `templates/default/style.css`, `templates/default/index.html` のみです。
+
+**変更内容**
+- `?ws=` 指定時/未指定時どちらも `new URL(...).searchParams.set('channel', ...)` で `channel` を付与。
+- `max` / `ttl` を `Number.isFinite && > 0` で検証し、不正値は既定値へフォールバック。
+- `System` / `system` メッセージを `.system` として描画し、CSSを追加。
+- `displayColor` は `#hex` のみ適用、badge/emote URL は `http:` / `https:` のみ許可。
+- 退場アニメ時間を CSS 変数 `--leave-ms` に集約し、JSは `getComputedStyle` から取得。
+- OBS用途で不要な viewport meta を削除。
+- batch配列受信と既存の再接続バックオフ処理は維持。
+
+**検証**
+- `node --check templates/default/app.js`
+- `git diff --check -- templates/default/app.js templates/default/style.css templates/default/index.html`
+- VMスタブで URL構築、NaNフォールバック、System描画、色/URLサニタイズの実行確認済み。
+
+```
+(exit code: 0)
+
+
+## Required output (machine-readable, stdout-last-line)
+Reply with normal review prose, then on the FINAL line print exactly one of:
+
+  FULLRALPH-VERDICT: PASS
+  FULLRALPH-VERDICT: FAIL -- <one-line reason summary>
+
+Reject (FAIL) if ANY of these are true:
+  * any acceptance criterion is not satisfied by the diff
+  * the diff touches files outside the touchedFiles list
+  * tests, types, or builds in the affected area are broken
+  * the implementation is partial or hand-wavy

@@ -1,0 +1,218 @@
+# FULLRALPH REVIEW for story US-002
+
+## Original task
+fast-comment SPEC完成度向上: 3レーン監査で検出したCRITICAL/HIGH/MEDIUM欠陥を修正し、MVP(P1-P5)を機能水準に引き上げる。WSLはビルド不可のため目視レビュー検証のみ。
+
+## Story US-002: YouTube 寛容パース強化 (初期continuation誤抽出 / 未解析ログパス / timeoutMs下限 / 金額)
+src-tauri/src/sources/youtube/ 配下の innertube.rs, mod.rs, parser.rs のみを編集。
+1) [HIGH] innertube.rs: DEFAULT_INITIAL_CONTINUATION_MARKERS の先頭 "continuation":" が貪欲で、live_chatページHTML内の無関係continuation(メニュー/関連動画等)を最初にマッチして誤抽出する。修正: invalidationContinuationData / timedContinuationData / reloadContinuation 系の限定的マーカーを優先順で先に試し、汎用 "continuation":" は最後の保険にする。overrides で指定された initialContinuationMarkers がある場合はそれを優先する既存契約は維持。
+2) [HIGH] parser.rs: yt-unparsed.jsonl の書き込み先が Path::new("logs") で実行時CWD相対のため本番で書き込み先不定。修正: parser.rs 内で完結する形で、std::env::current_exe() の親ディレクトリ配下の logs/ を解決して絶対パスで書く（current_exe 取得失敗時は従来の相対 logs/ にフォールバック）。lib.rs 等 youtube配下以外は変更しないこと。OnceLock<PathBuf> でキャッシュしてよい。
+3) [MEDIUM] mod.rs: ポーリング待機の下限クランプが 200ms と過小で、非公式InnerTubeに対し過剰アグレッシブ→IPブロックリスク。clamp の下限を 1000ms（最低でも500ms）に引き上げ、上限10_000msは維持。YouTube指定の timeoutMs を尊重する方向にする。
+4) [MEDIUM] parser.rs: split_currency_value が欧州表記("1.000,50")で誤値を生む。最低限、桁区切りカンマ除去・小数点ドット固定を明示し、value 抽出のロバスト性を改善（raw_text は常に温存）。
+寛容パース原則（固いstruct deserialize禁止・serde_json::Valueパス探索・欠落はNoneで劣化）を厳守。youtube配下以外を変更しないこと。
+
+## Acceptance criteria (verify EACH)
+  1. 初期 continuation 抽出が限定マーカー優先になり、汎用 "continuation":" は最後のフォールバックに後退している。overrides指定時はそれを優先する契約を維持
+  2. yt-unparsed.jsonl が current_exe ベースの絶対パスに書かれ、CWD非依存。取得失敗時のみ相対フォールバック
+  3. ポーリング待機の下限が >=500ms にクランプされ過剰ポーリングしない、上限10秒は維持
+  4. 通貨パースで桁区切りカンマを除去し raw_text は温存、寛容パース原則を維持
+  5. innertube.rs/mod.rs/parser.rs 以外を変更していない
+
+## Files in scope (touchedFiles)
+  - src-tauri/src/sources/youtube/innertube.rs
+  - src-tauri/src/sources/youtube/mod.rs
+  - src-tauri/src/sources/youtube/parser.rs
+
+## Diff under review
+```diff
+diff --git a/src-tauri/src/sources/youtube/innertube.rs b/src-tauri/src/sources/youtube/innertube.rs
+index a6413df..9295d34 100644
+--- a/src-tauri/src/sources/youtube/innertube.rs
++++ b/src-tauri/src/sources/youtube/innertube.rs
+@@ -45,10 +45,11 @@ const DEFAULT_API_KEY_MARKER_ALT: &str = "\"innertubeApiKey\":\"";
+ const DEFAULT_CLIENT_VERSION_MARKER: &str = "\"INNERTUBE_CONTEXT_CLIENT_VERSION\":\"";
+ const DEFAULT_CLIENT_VERSION_MARKER_ALT: &str = "\"clientVersion\":\"";
+ const DEFAULT_INITIAL_CONTINUATION_MARKERS: &[&str] = &[
+-    "\"continuation\":\"",
+     "\"invalidationContinuationData\":{\"continuation\":\"",
+     "\"timedContinuationData\":{\"continuation\":\"",
+     "\"reloadContinuationData\":{\"continuation\":\"",
++    "\"liveChatReplayContinuationData\":{\"continuation\":\"",
++    "\"continuation\":\"",
+ ];
+ 
+ /// `paths` から指定キーの非空値を取り出す。欠落/空文字なら `default` を返す。
+diff --git a/src-tauri/src/sources/youtube/mod.rs b/src-tauri/src/sources/youtube/mod.rs
+index 7f5faed..ef33ec2 100644
+--- a/src-tauri/src/sources/youtube/mod.rs
++++ b/src-tauri/src/sources/youtube/mod.rs
+@@ -136,7 +136,7 @@ impl YoutubeSource {
+             }
+ 
+             // timeoutMs に従う(欠落時は既定 1000ms、過小なら下限を設ける)。
+-            let wait = timeout_ms.unwrap_or(1000).clamp(200, 10_000);
++            let wait = timeout_ms.unwrap_or(1000).clamp(1000, 10_000);
+             tokio::select! {
+                 _ = cancel.cancelled() => return Ok(()),
+                 _ = tokio::time::sleep(std::time::Duration::from_millis(wait)) => {}
+diff --git a/src-tauri/src/sources/youtube/parser.rs b/src-tauri/src/sources/youtube/parser.rs
+index db6385a..dcb6af6 100644
+--- a/src-tauri/src/sources/youtube/parser.rs
++++ b/src-tauri/src/sources/youtube/parser.rs
+@@ -8,6 +8,8 @@
+ 
+ use std::collections::HashMap;
+ use std::io::Write as _;
++use std::path::{Path, PathBuf};
++use std::sync::OnceLock;
+ 
+ use serde_json::Value;
+ 
+@@ -16,6 +18,8 @@ use crate::model::{Amount, Author, Badge, ChatMessage, Fragment, MessageKind, Pl
+ /// パーサのバージョン。レスポンス構造の解釈が変わったら上げる。
+ pub const PARSER_VERSION: &str = "yt-1";
+ 
++static UNPARSED_LOG_DIR: OnceLock<PathBuf> = OnceLock::new();
++
+ // ─────────────────────────────────────────────────────────────────────────
+ // youtube_overrides.paths のキー名(SPEC §4.2「抽出パスを再ビルド無しで差し替え」)。
+ // いずれも欠落/空のときは下記ハードコード既定にフォールバックし、現行挙動を維持する。
+@@ -504,6 +508,10 @@ fn simple_text(v: &Value) -> Option<String> {
+ }
+ 
+ /// "¥500" / "$5.00" / "￥1,000" 等から通貨記号と数値を分離する(寛容)。
++///
++/// 数値は内部的に小数点ドットへ正規化し、桁区切りカンマは除去する。
++/// 欧州表記のように `.` と `,` が混在し `,` が後ろにある場合は、`,` を小数点と
++/// みなして `.` を桁区切りとして扱う。
+ fn split_currency_value(raw: &str) -> (String, f64) {
+     // 通貨部 = 数字/小数点/桁区切り/空白 以外の連続部分。
+     let currency: String = raw
+@@ -511,10 +519,12 @@ fn split_currency_value(raw: &str) -> (String, f64) {
+         .filter(|c| !c.is_ascii_digit() && *c != '.' && *c != ',' && !c.is_whitespace())
+         .collect();
+ 
+-    let number: String = raw
+-        .chars()
+-        .filter(|c| c.is_ascii_digit() || *c == '.')
+-        .collect();
++    let number: String = normalize_amount_number(
++        &raw
++            .chars()
++            .filter(|c| c.is_ascii_digit() || *c == '.' || *c == ',')
++            .collect::<String>(),
++    );
+ 
+     let value = number.parse::<f64>().unwrap_or(0.0);
+     let currency = if currency.is_empty() {
+@@ -525,6 +535,51 @@ fn split_currency_value(raw: &str) -> (String, f64) {
+     (currency, value)
+ }
+ 
++fn normalize_amount_number(number: &str) -> String {
++    let last_dot = number.rfind('.');
++    let last_comma = number.rfind(',');
++
++    if let (Some(dot), Some(comma)) = (last_dot, last_comma) {
++        if comma > dot {
++            return number
++                .chars()
++                .filter_map(|c| match c {
++                    '.' => None,
++                    ',' => Some('.'),
++                    _ => Some(c),
++                })
++                .collect();
++        }
++
++        return number.chars().filter(|c| *c != ',').collect();
++    }
++
++    if last_comma.is_some() {
++        return normalize_comma_only_number(number);
++    }
++
++    number.to_string()
++}
++
++fn normalize_comma_only_number(number: &str) -> String {
++    let parts: Vec<&str> = number.split(',').collect();
++    if parts.len() > 1
++        && parts[0].len() <= 3
++        && parts[1..].iter().all(|part| part.len() == 3)
++    {
++        return parts.concat();
++    }
++
++    if parts.len() == 2 && matches!(parts[1].len(), 1 | 2) {
++        return format!("{}.{}", parts[0], parts[1]);
++    }
++
++    number
++        .chars()
++        .filter(|c| c.is_ascii_digit() || *c == '.')
++        .collect()
++}
++
+ /// 解析できなかったアクションを `logs/yt-unparsed.jsonl` に1行追記する。
+ ///
+ /// 失敗してもアプリ動作は止めない(best-effort)。
+@@ -535,7 +590,7 @@ pub fn log_unparsed(action: &Value) {
+ }
+ 
+ fn try_log_unparsed(action: &Value) -> std::io::Result<()> {
+-    let dir = std::path::Path::new("logs");
++    let dir = unparsed_log_dir();
+     std::fs::create_dir_all(dir)?;
+     let path = dir.join("yt-unparsed.jsonl");
+     let mut f = std::fs::OpenOptions::new()
+@@ -553,6 +608,17 @@ fn try_log_unparsed(action: &Value) -> std::io::Result<()> {
+     Ok(())
+ }
+ 
++fn unparsed_log_dir() -> &'static Path {
++    UNPARSED_LOG_DIR
++        .get_or_init(|| {
++            std::env::current_exe()
++                .ok()
++                .and_then(|p| p.parent().map(|parent| parent.join("logs")))
++                .unwrap_or_else(|| PathBuf::from("logs"))
++        })
++        .as_path()
++}
++
+ /// 現在時刻(unix ms)。
+ fn now_ms() -> i64 {
+     use std::time::{SystemTime, UNIX_EPOCH};
+
+```
+
+## Worker stdout tail (last 4KB)
+```
+実装完了しました。変更は許可された3ファイルに限定しています。
+
+- [innertube.rs](/mnt/d/workspace/fast-comment/src-tauri/src/sources/youtube/innertube.rs:47): 初期 continuation 抽出を `invalidationContinuationData` / `timedContinuationData` / `reloadContinuationData` / `liveChatReplayContinuationData` 優先にし、汎用 `"continuation":"` は最後のフォールバックへ移動。override 指定時の優先契約は維持。
+- [mod.rs](/mnt/d/workspace/fast-comment/src-tauri/src/sources/youtube/mod.rs:139): `timeoutMs` 待機クランプを `1000..=10000ms` に変更。
+- [parser.rs](/mnt/d/workspace/fast-comment/src-tauri/src/sources/youtube/parser.rs:592): `yt-unparsed.jsonl` の出力先を `current_exe()` 親ディレクトリ配下の `logs/` に変更し、取得失敗時のみ相対 `logs/` にフォールバック。
+- [parser.rs](/mnt/d/workspace/fast-comment/src-tauri/src/sources/youtube/parser.rs:515): 金額パースで桁区切りカンマ除去、ドット小数正規化、`1.000,50` 系の欧州表記補正を追加。`raw_text` は従来通り温存。
+
+検証:
+- `git diff --check` passed
+- `git diff --name-only -- src-tauri/src/sources/youtube/...` は対象3ファイルのみ
+- `cargo check` は `cargo: command not found`、`rustfmt` は `rustfmt: command not found` のため実行不可でした。
+
+```
+(exit code: 0)
+
+
+## Required output (machine-readable, stdout-last-line)
+Reply with normal review prose, then on the FINAL line print exactly one of:
+
+  FULLRALPH-VERDICT: PASS
+  FULLRALPH-VERDICT: FAIL -- <one-line reason summary>
+
+Reject (FAIL) if ANY of these are true:
+  * any acceptance criterion is not satisfied by the diff
+  * the diff touches files outside the touchedFiles list
+  * tests, types, or builds in the affected area are broken
+  * the implementation is partial or hand-wavy

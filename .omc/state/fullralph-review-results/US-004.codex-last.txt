@@ -1,0 +1,13 @@
+No blocking findings in the US-004 diff under review.
+
+Verified by inspection:
+- `/` now resolves `?template=<name>` to `templates/<name>/index.html`, defaults to `default`, and rejects traversal-style names via a strict allowlist.
+- `/ws` and JSON batch push behavior remain in place.
+- OBS port changes now bind the new port first, then cancel the old server and update `get_obs_url` state.
+- `sender()` was removed.
+- `bundle.resources` includes `../templates -> templates`.
+- SPEC/SETUP URLs match the implemented explicit `ws=` URL form.
+
+Could not run Rust verification because `cargo`, `rustc`, and `rustfmt` are not installed in this WSL environment. `jq empty src-tauri/tauri.conf.json` passed.
+
+FULLRALPH-VERDICT: PASS

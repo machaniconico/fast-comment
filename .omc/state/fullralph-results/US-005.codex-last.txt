@@ -1,0 +1,17 @@
+Implemented US-005 under `src-tauri/icons/` only.
+
+Created:
+- `32x32.png`
+- `128x128.png`
+- `128x128@2x.png`
+- `icon.ico`
+- `icon.icns`
+
+Verified:
+- PNG signatures and dimensions are valid: `32x32`, `128x128`, `256x256`
+- `icon.ico` has a valid ICO header with 3 entries
+- `icon.icns` has a valid ICNS header and matching byte length
+- Temporary generation script was removed
+- No files were created in `src-tauri/icons/` beyond the required icon assets
+
+Note: `git status` already shows unrelated pre-existing changes outside `src-tauri/icons/`; I did not modify them.

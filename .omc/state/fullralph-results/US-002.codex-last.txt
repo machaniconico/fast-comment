@@ -1,0 +1,11 @@
+実装完了しました。変更は許可された3ファイルに限定しています。
+
+- [innertube.rs](/mnt/d/workspace/fast-comment/src-tauri/src/sources/youtube/innertube.rs:47): 初期 continuation 抽出を `invalidationContinuationData` / `timedContinuationData` / `reloadContinuationData` / `liveChatReplayContinuationData` 優先にし、汎用 `"continuation":"` は最後のフォールバックへ移動。override 指定時の優先契約は維持。
+- [mod.rs](/mnt/d/workspace/fast-comment/src-tauri/src/sources/youtube/mod.rs:139): `timeoutMs` 待機クランプを `1000..=10000ms` に変更。
+- [parser.rs](/mnt/d/workspace/fast-comment/src-tauri/src/sources/youtube/parser.rs:592): `yt-unparsed.jsonl` の出力先を `current_exe()` 親ディレクトリ配下の `logs/` に変更し、取得失敗時のみ相対 `logs/` にフォールバック。
+- [parser.rs](/mnt/d/workspace/fast-comment/src-tauri/src/sources/youtube/parser.rs:515): 金額パースで桁区切りカンマ除去、ドット小数正規化、`1.000,50` 系の欧州表記補正を追加。`raw_text` は従来通り温存。
+
+検証:
+- `git diff --check` passed
+- `git diff --name-only -- src-tauri/src/sources/youtube/...` は対象3ファイルのみ
+- `cargo check` は `cargo: command not found`、`rustfmt` は `rustfmt: command not found` のため実行不可でした。

@@ -5,8 +5,8 @@
 //! - webspeech: 実再生は UI 側(`speechSynthesis`)。Rust は読み上げ対象テキストを
 //!   イベントで UI に渡すだけ。
 //!
-//! ルーティング: 設定の優先バックエンドが `available()==false` なら Web Speech へ
-//! フォールバックする。読み上げ整形(名前/URL/絵文字/長文)もここで行う。
+//! ルーティング: 読み上げ時は優先バックエンドへ直接 `speak()` し、失敗したら
+//! Web Speech へフォールバックする。読み上げ整形(名前/URL/絵文字/長文)もここで行う。
 
 pub mod bouyomi;
 pub mod voicevox;
@@ -22,6 +22,10 @@ pub trait TtsBackend {
     /// 整形済みテキストを読み上げる。
     async fn speak(&self, text: String) -> anyhow::Result<()>;
     /// バックエンドが現在利用可能か(接続可否の簡易判定)。
+    ///
+    /// speak パスでは TOCTOU と二重往復を避けるため呼ばない。設定 UI からの
+    /// 疎通テスト用途として残す。
+    #[allow(dead_code)]
     async fn available(&self) -> bool;
 }
 
@@ -31,16 +35,73 @@ pub trait TtsBackend {
 pub struct TtsDispatcher {
     config: TtsConfig,
     app: AppHandle,
+    bouyomi: bouyomi::BouyomiBackend,
+    voicevox: voicevox::VoicevoxBackend,
 }
 
 impl TtsDispatcher {
     pub fn new(config: TtsConfig, app: AppHandle) -> Self {
-        TtsDispatcher { config, app }
+        let bouyomi = Self::build_bouyomi(&config);
+        let voicevox = Self::build_voicevox(&config, &app);
+        TtsDispatcher {
+            config,
+            app,
+            bouyomi,
+            voicevox,
+        }
     }
 
     /// 設定を差し替える(設定更新コマンドから呼ぶ)。
     pub fn update_config(&mut self, config: TtsConfig) {
+        if self.config == config {
+            return;
+        }
+
+        if !Self::same_bouyomi_config(&self.config, &config) {
+            self.bouyomi = Self::build_bouyomi(&config);
+        }
+        if !Self::same_voicevox_config(&self.config, &config) {
+            self.voicevox = Self::build_voicevox(&config, &self.app);
+        }
         self.config = config;
+    }
+
+    fn same_bouyomi_config(a: &TtsConfig, b: &TtsConfig) -> bool {
+        let a = &a.options;
+        let b = &b.options;
+        a.bouyomi_host == b.bouyomi_host
+            && a.bouyomi_port == b.bouyomi_port
+            && a.bouyomi_speed == b.bouyomi_speed
+            && a.bouyomi_tone == b.bouyomi_tone
+            && a.bouyomi_volume == b.bouyomi_volume
+            && a.bouyomi_voice == b.bouyomi_voice
+    }
+
+    fn same_voicevox_config(a: &TtsConfig, b: &TtsConfig) -> bool {
+        let a = &a.options;
+        let b = &b.options;
+        a.voicevox_url == b.voicevox_url && a.voicevox_speaker == b.voicevox_speaker
+    }
+
+    fn build_bouyomi(config: &TtsConfig) -> bouyomi::BouyomiBackend {
+        let opt = &config.options;
+        bouyomi::BouyomiBackend::new(
+            opt.bouyomi_host.clone(),
+            opt.bouyomi_port,
+            opt.bouyomi_speed,
+            opt.bouyomi_tone,
+            opt.bouyomi_volume,
+            opt.bouyomi_voice,
+        )
+    }
+
+    fn build_voicevox(config: &TtsConfig, app: &AppHandle) -> voicevox::VoicevoxBackend {
+        let opt = &config.options;
+        voicevox::VoicevoxBackend::new(
+            opt.voicevox_url.clone(),
+            opt.voicevox_speaker,
+            app.clone(),
+        )
     }
 
     /// 1メッセージを読み上げる。整形 → 優先バックエンド → 失敗時フォールバック。
@@ -56,28 +117,13 @@ impl TtsDispatcher {
             TtsBackendKind::None => {}
             TtsBackendKind::WebSpeech => self.emit_webspeech(&text),
             TtsBackendKind::Bouyomi => {
-                let opt = &self.config.options;
-                let backend = bouyomi::BouyomiBackend::new(
-                    opt.bouyomi_host.clone(),
-                    opt.bouyomi_port,
-                    opt.bouyomi_speed,
-                    opt.bouyomi_tone,
-                    opt.bouyomi_volume,
-                    opt.bouyomi_voice,
-                );
-                if let Err(e) = backend.speak(text.clone()).await {
+                if let Err(e) = self.bouyomi.speak(text.clone()).await {
                     tracing::warn!("bouyomi 読み上げ失敗→Web Speech へ: {e}");
                     self.emit_webspeech(&text);
                 }
             }
             TtsBackendKind::Voicevox => {
-                let opt = &self.config.options;
-                let backend = voicevox::VoicevoxBackend::new(
-                    opt.voicevox_url.clone(),
-                    opt.voicevox_speaker,
-                    self.app.clone(),
-                );
-                if let Err(e) = backend.speak(text.clone()).await {
+                if let Err(e) = self.voicevox.speak(text.clone()).await {
                     tracing::warn!("voicevox 読み上げ失敗→Web Speech へ: {e}");
                     self.emit_webspeech(&text);
                 }

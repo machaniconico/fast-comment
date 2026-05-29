@@ -1,0 +1,7 @@
+指摘事項はありません。
+
+受け入れ条件は満たしています。初期 continuation は限定マーカー優先で汎用 `"continuation":"` が最後、override 指定時の優先契約も維持されています。ログ出力先は `current_exe()` 親の `logs/` に固定され、失敗時だけ相対 `logs/` に戻ります。ポーリング下限は `1000ms`、上限は `10_000ms` のままです。通貨パースもカンマ桁区切り除去と `1.000,50` 系の正規化を追加し、`raw_text` は温存されています。
+
+検証は `git diff --check` のみ成功確認済みです。`cargo check` と `rustfmt --check` は環境に `cargo` / `rustfmt` がなく実行不可でした。
+
+FULLRALPH-VERDICT: PASS

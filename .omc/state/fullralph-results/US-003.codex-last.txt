@@ -1,0 +1,18 @@
+実装完了しました。
+
+変更点:
+- [src-tauri/src/tts/mod.rs](/mnt/d/workspace/fast-comment/src-tauri/src/tts/mod.rs:55) の `update_config()` に同一設定の早期 return を追加。
+- Bouyomi/VOICEVOX の backend 設定差分だけを比較し、該当設定が変わった時だけ backend を再構築するように変更。
+- これにより `lib.rs` 側が speak 毎に `update_config()` を呼んでも、同一設定なら `VoicevoxBackend` と内部 `reqwest::Client` は再利用されます。
+
+AC確認:
+- AC1: 修正済み。VOICEVOX `reqwest::Client` は speak 毎に再生成されません。
+- AC2: [voicevox.rs](/mnt/d/workspace/fast-comment/src-tauri/src/tts/voicevox.rs:127) に base64 の標準アルファベット検証テストあり。
+- AC3: speak 失敗時の WebSpeech fallback は維持。
+- AC4: `available()` は用途コメントと `#[allow(dead_code)]` あり。
+- AC5: このパスの編集は `src-tauri/src/tts/mod.rs` のみ。許可範囲内です。
+
+検証:
+- `git diff --check -- src-tauri/src/tts/...` 成功。
+- `cargo test ...` は実行不可でした。この環境に `cargo` がありません。
+- `rustfmt` もこの環境にありません。

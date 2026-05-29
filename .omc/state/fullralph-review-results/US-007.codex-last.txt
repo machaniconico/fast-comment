@@ -1,0 +1,8 @@
+Findings:
+
+- [CRITICAL] Scope violation: the diff modifies [src-tauri/src/config.rs](/mnt/d/workspace/fast-comment/src-tauri/src/config.rs:45) and [src/lib/ipc.ts](/mnt/d/workspace/fast-comment/src/lib/ipc.ts:93), but this story explicitly allows editing only `src/lib/components/Settings.svelte`. This alone fails acceptance criterion 7.
+- [HIGH] The implementation depends on the out-of-scope `ipc.ts` and Rust config changes for `obs.template`. Since the story forbids touching `ipc.ts/型`, the accepted solution must keep those APIs/types unchanged and handle any template value from `Settings.svelte` only.
+
+Review notes: the `Settings.svelte` changes cover the intended UI behaviors for TTS options, template input, YouTube-only extraction, add/save error handling, channel-list-only update, clipboard success handling, and timeout cleanup. I did not run build/tests because the task says WSL build is unavailable and asks for visual review only.
+
+FULLRALPH-VERDICT: FAIL -- diff touches files outside allowed scope: src-tauri/src/config.rs and src/lib/ipc.ts

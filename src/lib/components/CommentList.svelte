@@ -6,7 +6,7 @@
    * Only rows in the visible window [startIdx, endIdx) are rendered.
    * Auto-scroll to bottom when new messages arrive, unless the user has scrolled up.
    */
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import type { ChatMessage } from '../types';
   import CommentItem from './CommentItem.svelte';
   import { store } from '../stores.svelte';
@@ -18,7 +18,11 @@
 
   let containerEl: HTMLDivElement;
   let scrollTop = $state(0);
-  let clientHeight = $state(600);
+  // Real value is measured onMount/onScroll. We do not render the virtual
+  // window until `measured` is true, so there is never a one-frame mis-size
+  // from a guessed height before layout.
+  let clientHeight = $state(0);
+  let measured = $state(false);
   let isAtBottom = $state(true);
 
   let messages: ChatMessage[] = $derived(store.visibleMessages);
@@ -28,18 +32,27 @@
   let startIdx = $derived(
     Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - OVERSCAN)
   );
+  // Until the container is measured (post-mount), do NOT guess a viewport
+  // height — gate the visible window on `measured` so the first paint never
+  // mis-sizes from a hardcoded default. The total-height spacer still renders,
+  // so the scrollbar/layout is correct; only the row window waits for measure.
   let endIdx = $derived(
-    Math.min(totalCount, Math.ceil((scrollTop + clientHeight) / ROW_HEIGHT) + OVERSCAN)
+    !measured
+      ? 0
+      : Math.min(totalCount, Math.ceil((scrollTop + clientHeight) / ROW_HEIGHT) + OVERSCAN)
   );
   let visibleSlice = $derived(messages.slice(startIdx, endIdx));
   let paddingTop = $derived(startIdx * ROW_HEIGHT);
 
-  // Scroll to bottom when new messages arrive and user is at bottom
-  let prevCount = 0;
+  // Scroll to bottom when new messages arrive and the user is at the bottom.
+  // prevCount is tracked via untrack() so it does not become a reactive dep of
+  // this effect (reading/writing a plain reactive would be fragile in Svelte 5).
+  let prevCount = $state(0);
   $effect(() => {
     const count = totalCount;
-    if (count !== prevCount) {
-      prevCount = count;
+    const last = untrack(() => prevCount);
+    if (count !== last) {
+      untrack(() => { prevCount = count; });
       if (isAtBottom && containerEl) {
         // schedule after DOM update
         requestAnimationFrame(() => {
@@ -59,6 +72,7 @@
 
   onMount(() => {
     clientHeight = containerEl.clientHeight;
+    measured = true;
     const ro = new ResizeObserver(() => {
       clientHeight = containerEl.clientHeight;
     });

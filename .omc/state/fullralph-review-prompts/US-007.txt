@@ -1,0 +1,394 @@
+# FULLRALPH REVIEW for story US-007
+
+## Original task
+fast-comment SPEC完成度向上: 3レーン監査で検出したCRITICAL/HIGH/MEDIUM欠陥を修正し、MVP(P1-P5)を機能水準に引き上げる。WSLはビルド不可のため目視レビュー検証のみ。
+
+## Story US-007: 設定画面 完成: TTSオプション・テンプレ選択・エラー表示・編集消失防止
+src/lib/components/Settings.svelte のみを編集（ipc.ts/型は触らない。既存の getConfig/setConfig/addChannel等のAPIをそのまま使う）。
+1) [HIGH] TTS設定が backend選択のみ。config.tts.options(既存の型)を編集できるフィールドを追加: 最低限 voicevox の speaker id、長文カット最大文字数、絵文字除去トグル。options が無ければ安全に初期化。
+2) [HIGH] テンプレ選択UIが無い(SPEC §8要求)。テンプレ選択(最低限 'default' を含むドロップダウン or 入力)を追加し、選択値を config に保存。OBS URLコピー時にその template を反映する。
+3) [HIGH] extractYoutubeId が platform に関わらず適用され、Twitchチャンネル名を壊す恐れ。youtube の時だけ id 抽出し、twitch はそのまま渡す。
+4) [HIGH] 変更系invoke(addChannel/setConfig)に try/catch を付け、失敗をユーザーに表示(addError/saveMsg等)。saving は finally で必ず解除。
+5) [MEDIUM] onAddChannel が config = await getConfig() で全体を再取得し、未保存のNG/TTS編集を破棄してしまう。修正: 追加後に config 全体を再取得せず channels 配列だけ更新する等、未保存編集を失わない。
+6) [LOW] clipboard: writeText().catch(()=>{}) なのに copied=true を立てて誤成功表示。.then でのみ copied=true。
+7) [LOW] saveMsg等の setTimeout を onDestroy でクリア。
+Svelte5 runesを正しく使う。日本語UIラベルを自然に。Settings.svelte 以外を変更しないこと。
+
+## Acceptance criteria (verify EACH)
+  1. config.tts.options を編集するフィールド(voicevox speaker / 長文カット / 絵文字除去)が追加され保存できる
+  2. テンプレ選択UIが存在し選択値が保存され、OBS URLに反映される
+  3. extractYoutubeId は youtube 選択時のみ適用され twitch 名は加工されない
+  4. addChannel/setConfig が try/catch で保護されエラーがユーザーに表示、saving は finally で解除
+  5. チャンネル追加時に未保存のNG/TTS編集が破棄されない
+  6. clipboardコピーは成功時のみ copied=true、setTimeoutはonDestroyでクリア
+  7. Settings.svelte 以外を変更していない
+
+## Files in scope (touchedFiles)
+  - src/lib/components/Settings.svelte
+
+## Diff under review
+```diff
+diff --git a/src-tauri/src/config.rs b/src-tauri/src/config.rs
+index ebce798..41632f7 100644
+--- a/src-tauri/src/config.rs
++++ b/src-tauri/src/config.rs
+@@ -42,12 +42,17 @@ pub struct ObsConfig {
+     /// axum サーバの待受ポート。既定 11180。
+     #[serde(default = "default_obs_port")]
+     pub port: u16,
++    /// OBS オーバーレイで使うテンプレート名。既定 "default"。
++    /// SPEC §10 に従い config を唯一の永続化先とする(localStorage 非使用)。
++    #[serde(default = "default_obs_template")]
++    pub template: String,
+ }
+ 
+ impl Default for ObsConfig {
+     fn default() -> Self {
+         ObsConfig {
+             port: default_obs_port(),
++            template: default_obs_template(),
+         }
+     }
+ }
+@@ -287,6 +292,9 @@ fn default_minus_one() -> i16 {
+ fn default_obs_port() -> u16 {
+     11180
+ }
++fn default_obs_template() -> String {
++    "default".to_string()
++}
+ fn default_bouyomi_host() -> String {
+     "127.0.0.1".to_string()
+ }
+diff --git a/src/lib/components/Settings.svelte b/src/lib/components/Settings.svelte
+index 452ccf3..84a0208 100644
+--- a/src/lib/components/Settings.svelte
++++ b/src/lib/components/Settings.svelte
+@@ -1,12 +1,12 @@
+ <script lang="ts">
+-  import { onMount } from 'svelte';
++  import { onMount, onDestroy } from 'svelte';
+   import type { AppConfig, ChannelConfig } from '../ipc';
+   import {
+     getConfig, setConfig, addChannel, removeChannel, getObsUrl
+   } from '../ipc';
+ 
+   let config: AppConfig | null = $state(null);
+-  let obsUrl: string = $state('');
++  let obsBaseUrl: string = $state('');
+   let copied: boolean = $state(false);
+ 
+   // New channel form
+@@ -19,33 +19,105 @@
+   let ngUsersText: string = $state('');
+   let highlightsText: string = $state('');
+ 
++  // Template selection is persisted in config (config.obs.template); SPEC §10
++  // mandates config as the single persistence source (no localStorage).
++
+   let saving: boolean = $state(false);
+   let saveMsg: string = $state('');
+ 
++  // setTimeout handles (cleared on destroy)
++  let saveMsgTimer: ReturnType<typeof setTimeout> | null = null;
++  let copiedTimer: ReturnType<typeof setTimeout> | null = null;
++
++  // ── TTS options accessors (config.tts.options is a flexible camelCase map) ──
++  function ttsNum(key: string, fallback: number): number {
++    const v = config?.tts.options?.[key];
++    return typeof v === 'number' && Number.isFinite(v) ? v : fallback;
++  }
++  function ttsBool(key: string, fallback: boolean): boolean {
++    const v = config?.tts.options?.[key];
++    return typeof v === 'boolean' ? v : fallback;
++  }
++  function setTtsOption(key: string, value: unknown) {
++    if (!config) return;
++    if (!config.tts.options || typeof config.tts.options !== 'object') {
++      config.tts.options = {};
++    }
++    config.tts.options[key] = value;
++  }
++
++  // Bound proxies for TTS option fields
++  let voicevoxSpeaker: number = $state(1);
++  let maxLength: number = $state(80);
++  let stripEmoji: boolean = $state(true);
++
+   onMount(async () => {
+     config = await getConfig();
+     if (config) {
+       ngWordsText = config.moderation.ngWords.join('\n');
+       ngUsersText = config.moderation.ngUsers.join('\n');
+       highlightsText = config.moderation.highlights.join('\n');
++      voicevoxSpeaker = ttsNum('voicevoxSpeaker', 1);
++      maxLength = ttsNum('maxLength', 80);
++      stripEmoji = ttsBool('stripEmoji', true);
++      // Backward-compat: older config.json may lack obs.template.
++      if (!config.obs.template || !config.obs.template.trim()) {
++        config.obs.template = 'default';
++      }
+     }
++
+     const url = await getObsUrl();
+-    obsUrl = url ?? 'http://127.0.0.1:11180/?template=default';
++    obsBaseUrl = url ?? 'http://127.0.0.1:11180/?template=default';
++  });
++
++  onDestroy(() => {
++    if (saveMsgTimer !== null) clearTimeout(saveMsgTimer);
++    if (copiedTimer !== null) clearTimeout(copiedTimer);
+   });
+ 
++  // Displayed OBS URL: base URL with the config template reflected in.
++  const obsUrl = $derived(withTemplate(obsBaseUrl, config?.obs.template ?? 'default'));
++
++  function withTemplate(url: string, tmpl: string): string {
++    const name = (tmpl || 'default').trim() || 'default';
++    try {
++      const u = new URL(url);
++      u.searchParams.set('template', name);
++      return u.toString();
++    } catch {
++      return url;
++    }
++  }
++
+   async function onAddChannel() {
+     addError = '';
++    if (!config) return;
+     const id = newIdentifier.trim();
+     if (!id) { addError = 'チャンネル名またはIDを入力してください'; return; }
+-    const ch: ChannelConfig = { platform: newPlatform, identifier: extractYoutubeId(id) };
+-    await addChannel(ch);
+-    config = await getConfig();
+-    newIdentifier = '';
++    const identifier = newPlatform === 'youtube' ? extractYoutubeId(id) : id;
++    const ch: ChannelConfig = { platform: newPlatform, identifier };
++    try {
++      await addChannel(ch);
++      // Update only the channels list to avoid discarding unsaved NG/TTS edits.
++      if (!config.channels.some(c => c.platform === ch.platform && c.identifier === ch.identifier)) {
++        config.channels = [...config.channels, ch];
++      }
++      newIdentifier = '';
++    } catch (e) {
++      addError = `追加に失敗しました: ${e instanceof Error ? e.message : String(e)}`;
++    }
+   }
+ 
+   async function onRemoveChannel(ch: ChannelConfig) {
+-    await removeChannel(`${ch.platform}:${ch.identifier}`);
+-    config = await getConfig();
++    if (!config) return;
++    try {
++      await removeChannel(`${ch.platform}:${ch.identifier}`);
++      config.channels = config.channels.filter(
++        c => !(c.platform === ch.platform && c.identifier === ch.identifier)
++      );
++    } catch (e) {
++      addError = `削除に失敗しました: ${e instanceof Error ? e.message : String(e)}`;
++    }
+   }
+ 
+   function extractYoutubeId(input: string): string {
+@@ -61,19 +133,35 @@
+   async function onSave() {
+     if (!config) return;
+     saving = true;
++    saveMsg = '';
+     config.moderation.ngWords = ngWordsText.split('\n').map(s => s.trim()).filter(Boolean);
+     config.moderation.ngUsers = ngUsersText.split('\n').map(s => s.trim()).filter(Boolean);
+     config.moderation.highlights = highlightsText.split('\n').map(s => s.trim()).filter(Boolean);
+-    await setConfig(config);
+-    saving = false;
+-    saveMsg = '保存しました';
+-    setTimeout(() => saveMsg = '', 2000);
++    setTtsOption('voicevoxSpeaker', Number.isFinite(voicevoxSpeaker) ? Math.trunc(voicevoxSpeaker) : 1);
++    setTtsOption('maxLength', Number.isFinite(maxLength) && maxLength >= 0 ? Math.trunc(maxLength) : 80);
++    setTtsOption('stripEmoji', stripEmoji);
++    // Normalize template before persisting (config is the single source).
++    config.obs.template = (config.obs.template || 'default').trim() || 'default';
++    try {
++      await setConfig(config);
++      saveMsg = '保存しました';
++    } catch (e) {
++      saveMsg = `保存に失敗しました: ${e instanceof Error ? e.message : String(e)}`;
++    } finally {
++      saving = false;
++    }
++    if (saveMsgTimer !== null) clearTimeout(saveMsgTimer);
++    saveMsgTimer = setTimeout(() => { saveMsg = ''; saveMsgTimer = null; }, 3000);
+   }
+ 
+-  async function onCopyObs() {
+-    await navigator.clipboard.writeText(obsUrl).catch(() => {});
+-    copied = true;
+-    setTimeout(() => copied = false, 1500);
++  function onCopyObs() {
++    navigator.clipboard.writeText(obsUrl)
++      .then(() => {
++        copied = true;
++        if (copiedTimer !== null) clearTimeout(copiedTimer);
++        copiedTimer = setTimeout(() => { copied = false; copiedTimer = null; }, 1500);
++      })
++      .catch(() => { /* clipboard denied — do not show success */ });
+   }
+ </script>
+ 
+@@ -129,11 +217,55 @@
+         <option value="voicevox">VOICEVOX</option>
+       </select>
+     </div>
++
++    {#if config.tts.backend === 'voicevox'}
++    <div class="field-row">
++      <label>VOICEVOX 話者ID</label>
++      <input
++        type="number"
++        min="0"
++        step="1"
++        bind:value={voicevoxSpeaker}
++        class="num-input"
++      />
++    </div>
++    {/if}
++
++    <div class="field-row">
++      <label>最大読み上げ文字数</label>
++      <input
++        type="number"
++        min="0"
++        step="1"
++        bind:value={maxLength}
++        class="num-input"
++      />
++      <span class="hint-inline">（0で無制限）</span>
++    </div>
++
++    <div class="field-row">
++      <label for="strip-emoji">絵文字を除去</label>
++      <input id="strip-emoji" type="checkbox" bind:checked={stripEmoji} class="chk" />
++    </div>
+   </section>
+ 
+   <!-- ── OBS URL ── -->
+   <section>
+     <h3>OBSオーバーレイ URL</h3>
++    <div class="field-row">
++      <label for="obs-template">テンプレート</label>
++      <input
++        id="obs-template"
++        type="text"
++        list="obs-template-list"
++        bind:value={config.obs.template}
++        class="id-input"
++        placeholder="default"
++      />
++      <datalist id="obs-template-list">
++        <option value="default"></option>
++      </datalist>
++    </div>
+     <div class="obs-row">
+       <input type="text" value={obsUrl} readonly class="obs-input" />
+       <button class="copy-btn" class:copied onclick={onCopyObs}>
+@@ -239,7 +371,7 @@
+     align-items: center;
+   }
+ 
+-  .platform-select, .id-input, .obs-input {
++  .platform-select, .id-input, .obs-input, .num-input {
+     background: rgba(255,255,255,0.07);
+     border: 1px solid rgba(255,255,255,0.12);
+     border-radius: 4px;
+@@ -251,6 +383,8 @@
+   .platform-select { flex-shrink: 0; }
+   .id-input { flex: 1; }
+   .obs-input { flex: 1; font-size: 12px; }
++  .num-input { width: 90px; }
++  .chk { width: 16px; height: 16px; accent-color: #1976d2; }
+ 
+   .add-btn, .remove-btn, .copy-btn, .save-btn {
+     border: none;
+@@ -292,6 +426,7 @@
+     display: flex;
+     align-items: center;
+     gap: 10px;
++    margin-top: 6px;
+   }
+ 
+   .field-row label {
+diff --git a/src/lib/ipc.ts b/src/lib/ipc.ts
+index 882b6bb..402883b 100644
+--- a/src/lib/ipc.ts
++++ b/src/lib/ipc.ts
+@@ -57,6 +57,28 @@ export async function startChatListener(): Promise<() => void> {
+   return unlisten;
+ }
+ 
++/**
++ * Start listening to the 'tts-speak' event from Tauri and speak the payload
++ * via the browser SpeechSynthesis API (WebSpeech backend).
++ * Returns an unlisten function; call it on component destroy.
++ * No-op when Tauri or speechSynthesis is unavailable.
++ */
++export async function startTtsSpeakListener(): Promise<() => void> {
++  if (!isTauri()) return () => {};
++  if (typeof window === 'undefined' || !('speechSynthesis' in window)) return () => {};
++  const { listen } = await import('@tauri-apps/api/event');
++  const unlisten = await listen<string>('tts-speak', (event) => {
++    const text = event.payload;
++    if (!text) return;
++    try {
++      window.speechSynthesis.speak(new SpeechSynthesisUtterance(text));
++    } catch (e) {
++      console.warn('[ipc] speechSynthesis.speak failed', e);
++    }
++  });
++  return unlisten;
++}
++
+ // ---- Tauri invoke helpers ----
+ 
+ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T | null> {
+@@ -68,7 +90,7 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
+ // Config
+ export interface AppConfig {
+   channels: ChannelConfig[];
+-  obs: { port: number };
++  obs: { port: number; template: string };
+   tts: { backend: 'bouyomi' | 'voicevox' | 'webSpeech' | 'none'; options: Record<string, unknown> };
+   moderation: { ngWords: string[]; ngUsers: string[]; highlights: string[] };
+   ui: { maxBuffer: number };
+@@ -85,7 +107,9 @@ export async function getConfig(): Promise<AppConfig | null> {
+ }
+ 
+ export async function setConfig(config: AppConfig): Promise<void> {
+-  await invoke<void>('set_config', { config });
++  // Rust command is `update_config(new_config)`; Tauri maps the snake_case
++  // param `new_config` to the JS key `newConfig`.
++  await invoke<void>('update_config', { newConfig: config });
+ }
+ 
+ export async function addChannel(channel: ChannelConfig): Promise<void> {
+
+```
+
+## Worker stdout tail (last 4KB)
+```
+
+```
+(exit code: 0)
+
+
+## Required output (machine-readable, stdout-last-line)
+Reply with normal review prose, then on the FINAL line print exactly one of:
+
+  FULLRALPH-VERDICT: PASS
+  FULLRALPH-VERDICT: FAIL -- <one-line reason summary>
+
+Reject (FAIL) if ANY of these are true:
+  * any acceptance criterion is not satisfied by the diff
+  * the diff touches files outside the touchedFiles list
+  * tests, types, or builds in the affected area are broken
+  * the implementation is partial or hand-wavy

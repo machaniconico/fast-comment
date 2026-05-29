@@ -7,17 +7,33 @@
  *
  * - Ring buffer: keeps at most `maxBuffer` messages; oldest are evicted.
  * - Platform filter, text search, and individual hide state.
- * - Wired to ipc.ts via onChatBatch + startChatListener.
+ * - Wired to ipc.ts via onChatBatch + startChatListener (+ startTtsSpeakListener).
  */
 
 import type { ChatMessage, Platform } from './types';
-import { onChatBatch, startChatListener, getConfig } from './ipc';
+import { onChatBatch, startChatListener, startTtsSpeakListener, getConfig } from './ipc';
 
 const DEFAULT_MAX_BUFFER = 2000;
 
+/** Buffer entry: the message plus a once-computed lowercase search haystack. */
+interface BufEntry {
+  msg: ChatMessage;
+  /** Lowercased "author name + fragment text" used for substring search. */
+  search: string;
+}
+
+/** Precompute the lowercase search haystack for a message (author + body). */
+function buildSearch(m: ChatMessage): string {
+  const body = m.fragments.map((f) => (f.type === 'text' ? f.text : f.name)).join('');
+  return (m.author.name + ' ' + body).toLowerCase();
+}
+
 class CommentStore {
-  // Private backing state
-  private _buf: ChatMessage[] = $state([]);
+  // Private backing state — entries carry a precomputed search string.
+  private _buf: BufEntry[] = $state([]);
+  // msg-only projection of _buf, rebuilt only on push/eviction/clear so the
+  // no-filter fast path can return it without re-mapping all entries.
+  private _msgs: ChatMessage[] = $state([]);
   private _maxBuffer: number = $state(DEFAULT_MAX_BUFFER);
 
   // Public filter state
@@ -26,32 +42,61 @@ class CommentStore {
   hiddenIds: Set<string> = $state(new Set());
 
   // Derived: filtered list
-  readonly visibleMessages: ChatMessage[] = $derived(
-    this._buf.filter((m) => {
-      if (this.hiddenIds.has(m.id)) return false;
-      if (this.filterPlatform !== 'all' && m.platform !== this.filterPlatform) return false;
-      if (this.searchQuery.trim()) {
-        const q = this.searchQuery.trim().toLowerCase();
-        const text = m.fragments
-          .map((f) => (f.type === 'text' ? f.text : f.name))
-          .join('')
-          .toLowerCase();
-        if (!text.includes(q) && !m.author.name.toLowerCase().includes(q)) return false;
-      }
-      return true;
-    })
-  );
+  readonly visibleMessages: ChatMessage[] = $derived.by(() => {
+    const hidden = this.hiddenIds;
+    const platform = this.filterPlatform;
+    const q = this.searchQuery.trim().toLowerCase();
+
+    // Fast path: no platform filter and no search — only strip hidden.
+    if (platform === 'all' && q === '') {
+      // No hidden either: return the prebuilt msg-only array as-is (no re-scan).
+      if (hidden.size === 0) return this._msgs;
+      return this._buf.filter((e) => !hidden.has(e.msg.id)).map((e) => e.msg);
+    }
+
+    const out: ChatMessage[] = [];
+    for (const e of this._buf) {
+      if (hidden.has(e.msg.id)) continue;
+      if (platform !== 'all' && e.msg.platform !== platform) continue;
+      if (q !== '' && !e.search.includes(q)) continue;
+      out.push(e.msg);
+    }
+    return out;
+  });
 
   // Derived: total buffered count
   readonly totalCount: number = $derived(this._buf.length);
 
   /** Push a batch into the ring buffer, evicting oldest on overflow. */
   pushBatch(messages: ChatMessage[]): void {
-    const combined = this._buf.concat(messages);
-    this._buf =
-      combined.length > this._maxBuffer
-        ? combined.slice(combined.length - this._maxBuffer)
-        : combined;
+    const incoming = messages.map((msg) => ({ msg, search: buildSearch(msg) }));
+    const combined = this._buf.concat(incoming);
+    if (combined.length > this._maxBuffer) {
+      this._buf = combined.slice(combined.length - this._maxBuffer);
+      this.pruneHiddenIds();
+    } else {
+      this._buf = combined;
+    }
+    this._msgs = this._buf.map((e) => e.msg);
+  }
+
+  /** Drop hiddenIds that no longer reference any buffered message. */
+  private pruneHiddenIds(): void {
+    if (this.hiddenIds.size === 0) return;
+    const present = new Set(this._buf.map((e) => e.msg.id));
+    let changed = false;
+    for (const id of this.hiddenIds) {
+      if (!present.has(id)) {
+        changed = true;
+        break;
+      }
+    }
+    if (!changed) return;
+    const next = new Set<string>();
+    for (const id of this.hiddenIds) {
+      if (present.has(id)) next.add(id);
+    }
+    this.hiddenIds = next;
   }
 
   hideMessage(id: string): void {
@@ -70,20 +115,30 @@ class CommentStore {
     this._maxBuffer = n;
     if (this._buf.length > this._maxBuffer) {
       this._buf = this._buf.slice(this._buf.length - this._maxBuffer);
+      this.pruneHiddenIds();
+      this._msgs = this._buf.map((e) => e.msg);
     }
   }
 
   clearMessages(): void {
     this._buf = [];
+    this._msgs = [];
   }
 
-  /** Call once from App.svelte onMount to start Tauri IPC listener. */
+  /** Call once from App.svelte onMount to start Tauri IPC listeners. */
   async init(): Promise<() => void> {
     const config = await getConfig();
     if (config && config.ui.maxBuffer > 0) {
       this.setMaxBuffer(config.ui.maxBuffer);
     }
-    return startChatListener();
+    const [unlistenChat, unlistenTts] = await Promise.all([
+      startChatListener(),
+      startTtsSpeakListener(),
+    ]);
+    return () => {
+      unlistenChat();
+      unlistenTts();
+    };
   }
 }
 
@@ -94,9 +149,6 @@ export const store = new CommentStore();
 onChatBatch((batch) => store.pushBatch(batch));
 
 // Convenience re-exports so call sites stay terse
-export const visibleMessages = $derived(store.visibleMessages);
-export const totalCount = $derived(store.totalCount);
-
 export function hideMessage(id: string): void { store.hideMessage(id); }
 export function setFilterPlatform(p: Platform | 'all'): void { store.setFilterPlatform(p); }
 export function setSearchQuery(q: string): void { store.setSearchQuery(q); }

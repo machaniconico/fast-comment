@@ -4,10 +4,11 @@
 //! 設計上の要点:
 //! - 内部は `tokio::sync::broadcast`(容量上限あり)。lag は drop 容認=最新優先。
 //! - UI 向けは個別 emit せず、~16ms(1フレーム)単位で配列にまとめて `emit("chat", batch)`。
-//! - OBS 向けは axum の `/ws` で push、`/` 配下で `templates/<name>/` を静的配信。
+//! - OBS 向けは axum の `/ws` で push、`/` は `?template=<name>` を
+//!   `templates/<name>/index.html` に解決し、静的アセットは `/<name>/...` で配信。
 //! - クライアント(WS)ごとに bounded queue を持ち、溢れたら古いものから捨てる。
 
-use std::net::SocketAddr;
+use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,7 +18,8 @@ use axum::{
         ws::{Message as WsMessage, WebSocket, WebSocketUpgrade},
         Query, State,
     },
-    response::IntoResponse,
+    http::StatusCode,
+    response::{Html, IntoResponse},
     routing::get,
     Router,
 };
@@ -38,7 +40,7 @@ const UI_BATCH_INTERVAL_MS: u64 = 16;
 /// WS クライアントごとの送信キュー上限(溢れたら古いものから drop)。
 const WS_CLIENT_QUEUE: usize = 256;
 
-/// Bus のハンドル。Source からの送信と、UI/OBS への配信起動を担う。
+/// Bus のハンドル。正規化済みメッセージの投入と、UI/OBS への配信起動を担う。
 #[derive(Clone)]
 pub struct Bus {
     tx: broadcast::Sender<ChatMessage>,
@@ -50,11 +52,6 @@ impl Bus {
     pub fn new(obs_port: u16) -> Self {
         let (tx, _rx) = broadcast::channel(BROADCAST_CAPACITY);
         Bus { tx, obs_port }
-    }
-
-    /// Source 層が正規化済みメッセージを投入するための送信端。
-    pub fn sender(&self) -> broadcast::Sender<ChatMessage> {
-        self.tx.clone()
     }
 
     /// 新規購読者を得る。
@@ -109,39 +106,70 @@ impl Bus {
     ///
     /// - `GET /ws` : WebSocket。UI と同じ ~16ms バッチ(JSON 配列)で push。
     ///   クエリ `?channel=...` 指定時はそのチャンネルのみに絞り込む。
-    /// - `GET /` 以下: `templates_dir/<...>` を静的配信(ServeDir)。
+    /// - `GET /?template=<name>`: `templates_dir/<name>/index.html` を返す。
+    ///   `template` 未指定時は `default`。`../` 等のトラバーサルは拒否する。
+    /// - `GET /<name>/...`: テンプレの静的アセットを配信(ServeDir)。
     ///
     /// `cancel` 発火でサーバを graceful shutdown する。
     pub fn spawn_obs_server(
         &self,
         templates_dir: PathBuf,
         cancel: CancellationToken,
-    ) -> tokio::task::JoinHandle<()> {
+    ) -> Result<tokio::task::JoinHandle<()>, String> {
+        self.spawn_obs_server_on_port(templates_dir, self.obs_port, cancel)
+    }
+
+    /// 指定ポートで OBS overlay サーバ(axum)を起動する。
+    ///
+    /// `update_config` によるポート変更時の再 bind で使う。
+    pub fn spawn_obs_server_on_port(
+        &self,
+        templates_dir: PathBuf,
+        port: u16,
+        cancel: CancellationToken,
+    ) -> Result<tokio::task::JoinHandle<()>, String> {
         let tx = self.tx.clone();
-        let port = self.obs_port;
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let std_listener = StdTcpListener::bind(addr).map_err(|e| {
+            let msg = format!("OBS サーバの bind に失敗 {addr}: {e}");
+            tracing::error!("{msg}");
+            msg
+        })?;
+        std_listener.set_nonblocking(true).map_err(|e| {
+            let msg = format!("OBS サーバ listener の nonblocking 設定に失敗 {addr}: {e}");
+            tracing::error!("{msg}");
+            msg
+        })?;
 
-        let state = ObsState { tx: Arc::new(tx) };
+        let state = ObsState {
+            tx: Arc::new(tx),
+            templates_dir: Arc::new(templates_dir.clone()),
+        };
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
+            let listener = match tokio::net::TcpListener::from_std(std_listener) {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::error!("OBS サーバ listener 初期化に失敗 {addr}: {e}");
+                    return;
+                }
+            };
+
             // テンプレ静的配信。ディレクトリ直アクセス時は index.html を返す。
             let serve_dir =
                 ServeDir::new(&templates_dir).append_index_html_on_directories(true);
 
             let app = Router::new()
                 .route("/ws", get(ws_handler))
+                .route("/", get(template_index_handler))
                 .fallback_service(serve_dir)
                 .layer(CorsLayer::permissive())
                 .with_state(state);
 
-            let addr = SocketAddr::from(([127, 0, 0, 1], port));
-            let listener = match tokio::net::TcpListener::bind(addr).await {
-                Ok(l) => l,
-                Err(e) => {
-                    tracing::error!("OBS サーバの bind に失敗 {addr}: {e}");
-                    return;
-                }
-            };
-            tracing::info!("OBS overlay サーバ起動: http://{addr}/  (templates: {})", templates_dir.display());
+            tracing::info!(
+                "OBS overlay サーバ起動: http://{addr}/  (templates: {})",
+                templates_dir.display()
+            );
 
             let shutdown = async move {
                 cancel.cancelled().await;
@@ -154,7 +182,9 @@ impl Bus {
             {
                 tracing::error!("OBS サーバ異常終了: {e}");
             }
-        })
+        });
+
+        Ok(handle)
     }
 }
 
@@ -162,12 +192,79 @@ impl Bus {
 #[derive(Clone)]
 struct ObsState {
     tx: Arc<broadcast::Sender<ChatMessage>>,
+    templates_dir: Arc<PathBuf>,
 }
 
 /// `/ws` のクエリ。`channel` 指定時は当該チャンネルのみに絞り込む(任意)。
 #[derive(Debug, Deserialize)]
 struct WsQuery {
     channel: Option<String>,
+}
+
+/// `/` のクエリ。`template` 未指定時は default を使う。
+#[derive(Debug, Deserialize)]
+struct TemplateQuery {
+    template: Option<String>,
+}
+
+/// OBS テンプレート名として許可する文字種。
+///
+/// 1階層のディレクトリ名だけを許し、`../` や `%2e%2e` のようなパストラバーサルを拒否する。
+pub fn is_valid_template_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+}
+
+/// `GET /?template=<name>` を `templates/<name>/index.html` に解決する。
+async fn template_index_handler(
+    State(state): State<ObsState>,
+    Query(query): Query<TemplateQuery>,
+) -> impl IntoResponse {
+    let template = query.template.as_deref().unwrap_or("default");
+    if !is_valid_template_name(template) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "invalid template name: use only ASCII letters, digits, '-' or '_'",
+        )
+            .into_response();
+    }
+
+    let index_path = state.templates_dir.join(template).join("index.html");
+    match tokio::fs::read_to_string(&index_path).await {
+        Ok(html) => Html(inject_template_base(html, template)).into_response(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (
+            StatusCode::NOT_FOUND,
+            format!("template not found: {template}"),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::warn!(
+                "OBS テンプレ index.html 読み込み失敗 {}: {e}",
+                index_path.display()
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to read template index.html",
+            )
+                .into_response()
+        }
+    }
+}
+
+/// ルート URL から返した index.html 内の相対 CSS/JS を `/<template>/...` へ向ける。
+fn inject_template_base(mut html: String, template: &str) -> String {
+    if html.contains("<base ") || html.contains("<base>") {
+        return html;
+    }
+
+    let base = format!(r#"<base href="/{template}/">"#);
+    if let Some(pos) = html.find("<head>") {
+        html.insert_str(pos + "<head>".len(), &base);
+    }
+    html
 }
 
 /// `/ws` のアップグレードハンドラ。

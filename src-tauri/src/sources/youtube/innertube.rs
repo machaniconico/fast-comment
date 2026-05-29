@@ -45,10 +45,11 @@ const DEFAULT_API_KEY_MARKER_ALT: &str = "\"innertubeApiKey\":\"";
 const DEFAULT_CLIENT_VERSION_MARKER: &str = "\"INNERTUBE_CONTEXT_CLIENT_VERSION\":\"";
 const DEFAULT_CLIENT_VERSION_MARKER_ALT: &str = "\"clientVersion\":\"";
 const DEFAULT_INITIAL_CONTINUATION_MARKERS: &[&str] = &[
-    "\"continuation\":\"",
     "\"invalidationContinuationData\":{\"continuation\":\"",
     "\"timedContinuationData\":{\"continuation\":\"",
     "\"reloadContinuationData\":{\"continuation\":\"",
+    "\"liveChatReplayContinuationData\":{\"continuation\":\"",
+    "\"continuation\":\"",
 ];
 
 /// `paths` から指定キーの非空値を取り出す。欠落/空文字なら `default` を返す。

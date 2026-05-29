@@ -8,6 +8,8 @@
 
 use std::collections::HashMap;
 use std::io::Write as _;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use serde_json::Value;
 
@@ -15,6 +17,8 @@ use crate::model::{Amount, Author, Badge, ChatMessage, Fragment, MessageKind, Pl
 
 /// パーサのバージョン。レスポンス構造の解釈が変わったら上げる。
 pub const PARSER_VERSION: &str = "yt-1";
+
+static UNPARSED_LOG_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 // ─────────────────────────────────────────────────────────────────────────
 // youtube_overrides.paths のキー名(SPEC §4.2「抽出パスを再ビルド無しで差し替え」)。
@@ -504,6 +508,10 @@ fn simple_text(v: &Value) -> Option<String> {
 }
 
 /// "¥500" / "$5.00" / "￥1,000" 等から通貨記号と数値を分離する(寛容)。
+///
+/// 数値は内部的に小数点ドットへ正規化し、桁区切りカンマは除去する。
+/// 欧州表記のように `.` と `,` が混在し `,` が後ろにある場合は、`,` を小数点と
+/// みなして `.` を桁区切りとして扱う。
 fn split_currency_value(raw: &str) -> (String, f64) {
     // 通貨部 = 数字/小数点/桁区切り/空白 以外の連続部分。
     let currency: String = raw
@@ -511,10 +519,12 @@ fn split_currency_value(raw: &str) -> (String, f64) {
         .filter(|c| !c.is_ascii_digit() && *c != '.' && *c != ',' && !c.is_whitespace())
         .collect();
 
-    let number: String = raw
-        .chars()
-        .filter(|c| c.is_ascii_digit() || *c == '.')
-        .collect();
+    let number: String = normalize_amount_number(
+        &raw
+            .chars()
+            .filter(|c| c.is_ascii_digit() || *c == '.' || *c == ',')
+            .collect::<String>(),
+    );
 
     let value = number.parse::<f64>().unwrap_or(0.0);
     let currency = if currency.is_empty() {
@@ -523,6 +533,51 @@ fn split_currency_value(raw: &str) -> (String, f64) {
         currency
     };
     (currency, value)
+}
+
+fn normalize_amount_number(number: &str) -> String {
+    let last_dot = number.rfind('.');
+    let last_comma = number.rfind(',');
+
+    if let (Some(dot), Some(comma)) = (last_dot, last_comma) {
+        if comma > dot {
+            return number
+                .chars()
+                .filter_map(|c| match c {
+                    '.' => None,
+                    ',' => Some('.'),
+                    _ => Some(c),
+                })
+                .collect();
+        }
+
+        return number.chars().filter(|c| *c != ',').collect();
+    }
+
+    if last_comma.is_some() {
+        return normalize_comma_only_number(number);
+    }
+
+    number.to_string()
+}
+
+fn normalize_comma_only_number(number: &str) -> String {
+    let parts: Vec<&str> = number.split(',').collect();
+    if parts.len() > 1
+        && parts[0].len() <= 3
+        && parts[1..].iter().all(|part| part.len() == 3)
+    {
+        return parts.concat();
+    }
+
+    if parts.len() == 2 && matches!(parts[1].len(), 1 | 2) {
+        return format!("{}.{}", parts[0], parts[1]);
+    }
+
+    number
+        .chars()
+        .filter(|c| c.is_ascii_digit() || *c == '.')
+        .collect()
 }
 
 /// 解析できなかったアクションを `logs/yt-unparsed.jsonl` に1行追記する。
@@ -535,7 +590,7 @@ pub fn log_unparsed(action: &Value) {
 }
 
 fn try_log_unparsed(action: &Value) -> std::io::Result<()> {
-    let dir = std::path::Path::new("logs");
+    let dir = unparsed_log_dir();
     std::fs::create_dir_all(dir)?;
     let path = dir.join("yt-unparsed.jsonl");
     let mut f = std::fs::OpenOptions::new()
@@ -551,6 +606,17 @@ fn try_log_unparsed(action: &Value) -> std::io::Result<()> {
     });
     writeln!(f, "{}", line)?;
     Ok(())
+}
+
+fn unparsed_log_dir() -> &'static Path {
+    UNPARSED_LOG_DIR
+        .get_or_init(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|parent| parent.join("logs")))
+                .unwrap_or_else(|| PathBuf::from("logs"))
+        })
+        .as_path()
 }
 
 /// 現在時刻(unix ms)。

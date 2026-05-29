@@ -7,6 +7,7 @@
 //! 重要: サーバからの `PING` には必ず `PONG` を返す(返さないと切断される)。
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use futures_util::{SinkExt, StreamExt};
@@ -18,6 +19,7 @@ use super::{Backoff, Source};
 use crate::model::{Amount, Author, Badge, ChatMessage, Fragment, MessageKind, Platform, Roles};
 
 const TWITCH_WS_URL: &str = "wss://irc-ws.chat.twitch.tv:443";
+static NICK_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 /// Twitch チャンネル1件を購読する Source。
 pub struct TwitchSource {
@@ -91,7 +93,7 @@ impl TwitchSource {
         let (ws_stream, _resp) = tokio_tungstenite::connect_async(TWITCH_WS_URL).await?;
         let (mut write, mut read) = ws_stream.split();
 
-        // 匿名ログイン。justinfan + ランダム数値の NICK。
+        // 匿名ログイン。justinfan + 数値サフィックスの NICK。
         let nick = format!("justinfan{}", fastrand_suffix());
         write
             .send(irc_text("CAP REQ :twitch.tv/tags twitch.tv/commands"))
@@ -131,15 +133,15 @@ impl TwitchSource {
                         WsMessage::Text(text) => {
                             // 1フレームに複数IRC行が来ることがある(CRLF区切り)。
                             for line in text.split("\r\n").filter(|l| !l.is_empty()) {
-                                if let Some(reply) = self.handle_line(line, tx) {
+                                let handled = self.handle_line(line, tx);
+                                if handled.emitted_privmsg {
+                                    received_data = true;
+                                }
+                                if let Some(reply) = handled.reply {
                                     // PING への PONG など、即返信が必要なもの。
                                     write.send(irc_text(&reply)).await?;
                                 }
                             }
-                            // PRIVMSG 受信とみなしてデータフラグを立てる。
-                            // (handle_line 内で tx.send が成功した場合のみにしたいが、
-                            //  シグネチャ変更を避けるため Text フレーム受信を近似とする。)
-                            received_data = true;
                         }
                         WsMessage::Ping(payload) => {
                             // WS レベルの ping にも応答。
@@ -157,9 +159,10 @@ impl TwitchSource {
         }
     }
 
-    /// IRC 1行を処理する。返り値 `Some(s)` は即時に送り返すべき文字列(PONG)。
-    fn handle_line(&self, line: &str, tx: &broadcast::Sender<ChatMessage>) -> Option<String> {
+    /// IRC 1行を処理する。
+    fn handle_line(&self, line: &str, tx: &broadcast::Sender<ChatMessage>) -> HandleLineResult {
         let parsed = parse_irc_line(line);
+        let mut result = HandleLineResult::default();
 
         match parsed.command.as_str() {
             // サーバ ping → 必ず pong(切断防止)。
@@ -170,18 +173,18 @@ impl TwitchSource {
                     let j = parsed.params.join(" ");
                     if j.is_empty() { None } else { Some(j) }
                 }).unwrap_or_default();
-                return Some(format!("PONG :{}", token));
+                result.reply = Some(format!("PONG :{}", token));
             }
             "PRIVMSG" => {
                 if let Some(msg) = self.privmsg_to_chat(&parsed) {
-                    let _ = tx.send(msg);
+                    result.emitted_privmsg = tx.send(msg).is_ok();
                 }
             }
             _ => {
                 // JOIN/PART/USERSTATE/ROOMSTATE/NOTICE 等は今は無視。
             }
         }
-        None
+        result
     }
 
     /// PRIVMSG を `ChatMessage` に正規化する。
@@ -271,6 +274,14 @@ struct IrcLine {
     params: Vec<String>,
     /// `:` 以降の trailing パラメータ(本文)。
     trailing: Option<String>,
+}
+
+#[derive(Default)]
+struct HandleLineResult {
+    /// 即時に送り返すべきIRC文字列(PONGなど)。
+    reply: Option<String>,
+    /// PRIVMSG を ChatMessage に正規化し、broadcast 送信に成功したか。
+    emitted_privmsg: bool,
 }
 
 /// IRCv3 1行をパースする。
@@ -382,14 +393,13 @@ fn parse_badges(badges_tag: &str) -> (Roles, Vec<Badge>) {
 /// `emotes` タグと本文から Fragment 列を作る。
 ///
 /// emotes タグ形式: `id:start-end,start-end/id2:start-end`
-/// インデックスは Unicode コードポイント単位(UTF-16 ではない、Twitch は code point)。
+/// インデックスは Twitch 仕様の UTF-16 コードユニット単位。
 fn split_fragments(body: &str, emotes_tag: &str) -> Vec<Fragment> {
     if body.is_empty() {
         return Vec::new();
     }
 
-    // 本文を char(コードポイント)単位で扱う。
-    let chars: Vec<char> = body.chars().collect();
+    let utf16: Vec<u16> = body.encode_utf16().collect();
 
     if emotes_tag.is_empty() {
         return vec![Fragment::text(body.to_string())];
@@ -424,18 +434,24 @@ fn split_fragments(body: &str, emotes_tag: &str) -> Vec<Fragment> {
     let mut cursor = 0usize;
 
     for (start, end, id) in ranges {
-        if start >= chars.len() || end >= chars.len() || start > end {
+        if start >= utf16.len() || end >= utf16.len() || start > end {
             continue;
         }
+        // エモート本体。
+        let name = match String::from_utf16(&utf16[start..=end]) {
+            Ok(name) => name,
+            Err(_) => continue,
+        };
         // エモート前のテキスト。
         if start > cursor {
-            let text: String = chars[cursor..start].iter().collect();
+            let text = match String::from_utf16(&utf16[cursor..start]) {
+                Ok(text) => text,
+                Err(_) => continue,
+            };
             if !text.is_empty() {
                 fragments.push(Fragment::text(text));
             }
         }
-        // エモート本体。
-        let name: String = chars[start..=end].iter().collect();
         let url = format!(
             "https://static-cdn.jtvnw.net/emoticons/v2/{id}/default/dark/2.0"
         );
@@ -444,8 +460,11 @@ fn split_fragments(body: &str, emotes_tag: &str) -> Vec<Fragment> {
     }
 
     // 末尾の残りテキスト。
-    if cursor < chars.len() {
-        let text: String = chars[cursor..].iter().collect();
+    if cursor < utf16.len() {
+        let text = match String::from_utf16(&utf16[cursor..]) {
+            Ok(text) => text,
+            Err(_) => body.to_string(),
+        };
         if !text.is_empty() {
             fragments.push(Fragment::text(text));
         }
@@ -466,15 +485,15 @@ fn irc_text(s: &str) -> WsMessage {
     WsMessage::Text(s.to_string().into())
 }
 
-/// 匿名 NICK 用のランダム数値サフィックス(crate 追加なしで簡易に)。
-fn fastrand_suffix() -> u32 {
+/// 匿名 NICK 用の数値サフィックス(crate 追加なしで時刻と単調カウンタを混ぜる)。
+fn fastrand_suffix() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
+    let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
+        .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    // justinfan は 1〜99999 程度で十分。
-    10_000 + (nanos % 80_000)
+    let counter = (NICK_COUNTER.fetch_add(1, Ordering::Relaxed) as u64) & 0xffff;
+    ((millis & 0x0fffffff) << 16) | counter
 }
 
 /// 現在時刻(unix ms)。

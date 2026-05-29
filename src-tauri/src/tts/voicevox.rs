@@ -123,4 +123,27 @@ mod base64_encode {
         }
         out
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::encode;
+
+        #[test]
+        fn encodes_rfc4648_vectors_with_standard_alphabet() {
+            let cases = [
+                (b"".as_slice(), ""),
+                (b"f".as_slice(), "Zg=="),
+                (b"fo".as_slice(), "Zm8="),
+                (b"foo".as_slice(), "Zm9v"),
+                (b"foob".as_slice(), "Zm9vYg=="),
+                (b"fooba".as_slice(), "Zm9vYmE="),
+                (b"foobar".as_slice(), "Zm9vYmFy"),
+                (&[0xfb, 0xff, 0xff], "+///"),
+            ];
+
+            for (input, expected) in cases {
+                assert_eq!(encode(input), expected);
+            }
+        }
+    }
 }

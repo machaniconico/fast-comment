@@ -109,7 +109,7 @@ trait Source {
 
 - 内部: `tokio::sync::broadcast`（容量上限あり、lag は drop 容認=最新優先）。
 - **UI向け**: Tauri の `app_handle.emit("chat", batch)`。**個別送出せず ~16ms(1フレーム) でまとめて配列送出**(IPC往復削減)。
-- **OBS向け**: axum WebSocket `/ws`。接続クライアントへ同じ batch を push。`GET /` 以下で `templates/<name>/` を静的配信。ポートは設定(既定 11180)。
+- **OBS向け**: axum WebSocket `/ws`。接続クライアントへ同じ batch を push。`GET /?template=<name>` は `templates/<name>/index.html` を返す（未指定は `default`、`../` 等は拒否）。静的アセットは `/<name>/...` で配信。ポートは設定(既定 11180)で、変更時は新ポートの bind 成功後にサーバを再起動して再 bind する。
 - バックプレッシャ: 各クライアントごとに bounded queue、溢れたら古いものから捨てる。
 
 ## 6. TTS 層 (`tts/`) — 3バックエンドをアダプタ化
@@ -144,7 +144,7 @@ trait TtsBackend { async fn speak(&self, text: String) -> Result<()>; fn availab
 
 - `default/`: index.html + style.css + app.js。`/ws` に接続し、届いたコメントを下から積む。フェードアウト等はCSS。
 - テンプレは独立した静的サイト。ユーザーが CSS を差し替えて見た目をカスタム。
-- OBS には「ブラウザソース」で `http://127.0.0.1:11180/?template=default&channel=...` を指定。
+- OBS には「ブラウザソース」で `http://127.0.0.1:11180/?template=default&ws=ws://127.0.0.1:11180/ws&channel=...` を指定。`template` 未指定時は `default`。OBS ポート変更時は `ws` も同じポートを指す。
 
 ## 10. 設定永続化 (`config.rs`)
 

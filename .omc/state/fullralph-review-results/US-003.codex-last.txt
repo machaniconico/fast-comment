@@ -1,0 +1,12 @@
+ブロッキングな指摘はありません。
+
+`TtsDispatcher` が `BouyomiBackend` と `VoicevoxBackend` を保持する形になっており、`VoicevoxBackend` 内の `reqwest::Client` は `speak()` ごとの生成ではなく再利用されます。`update_config()` も VOICEVOX の URL / speaker が変わった場合だけ再構築するため、AC1 は満たしています。
+
+base64 の RFC4648 ベクタと `+///` による標準アルファベット確認テストも追加済みです。`speak()` 失敗時の WebSpeech fallback は既存の `Err => emit_webspeech()` 経路が維持されています。`available()` も speak パスでは使わない用途コメントと `#[allow(dead_code)]` が入っています。
+
+確認:
+- `git diff --name-only -- src-tauri/src/tts` は `mod.rs` と `voicevox.rs` のみ
+- `git diff --check -- src-tauri/src/tts/...` は成功
+- `cargo test` は環境に `cargo` が無く実行不可でしたが、目視上この差分に型破綻は見当たりません
+
+FULLRALPH-VERDICT: PASS

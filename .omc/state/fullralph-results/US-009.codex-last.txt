@@ -1,0 +1,15 @@
+実装完了しました。変更は指定範囲の `templates/default/app.js`, `templates/default/style.css`, `templates/default/index.html` のみです。
+
+**変更内容**
+- `?ws=` 指定時/未指定時どちらも `new URL(...).searchParams.set('channel', ...)` で `channel` を付与。
+- `max` / `ttl` を `Number.isFinite && > 0` で検証し、不正値は既定値へフォールバック。
+- `System` / `system` メッセージを `.system` として描画し、CSSを追加。
+- `displayColor` は `#hex` のみ適用、badge/emote URL は `http:` / `https:` のみ許可。
+- 退場アニメ時間を CSS 変数 `--leave-ms` に集約し、JSは `getComputedStyle` から取得。
+- OBS用途で不要な viewport meta を削除。
+- batch配列受信と既存の再接続バックオフ処理は維持。
+
+**検証**
+- `node --check templates/default/app.js`
+- `git diff --check -- templates/default/app.js templates/default/style.css templates/default/index.html`
+- VMスタブで URL構築、NaNフォールバック、System描画、色/URLサニタイズの実行確認済み。

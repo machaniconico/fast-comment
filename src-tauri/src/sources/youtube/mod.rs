@@ -136,7 +136,7 @@ impl YoutubeSource {
             }
 
             // timeoutMs に従う(欠落時は既定 1000ms、過小なら下限を設ける)。
-            let wait = timeout_ms.unwrap_or(1000).clamp(200, 10_000);
+            let wait = timeout_ms.unwrap_or(1000).clamp(1000, 10_000);
             tokio::select! {
                 _ = cancel.cancelled() => return Ok(()),
                 _ = tokio::time::sleep(std::time::Duration::from_millis(wait)) => {}

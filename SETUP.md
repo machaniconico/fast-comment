@@ -68,7 +68,7 @@ pnpm tauri build
 ## 6. OBS での使い方
 
 1. fast-comment を起動し、Twitch チャンネル名 / YouTube の videoId（または配信URL）を登録。
-2. アプリ内に表示される OBS 用 URL（既定 `http://127.0.0.1:11180/?template=default`）をコピー。
+2. アプリ内に表示される OBS 用 URL（既定 `http://127.0.0.1:11180/?template=default&ws=ws://127.0.0.1:11180/ws`、チャンネル指定時は `http://127.0.0.1:11180/?template=default&ws=ws://127.0.0.1:11180/ws&channel=...`）をコピー。
 3. OBS の「ソース追加 → ブラウザ」にそのURLを貼る。
 
 ## トラブルシュート

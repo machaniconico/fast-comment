@@ -118,165 +118,219 @@
   },
   "hotPaths": [
     {
-      "path": "src-tauri/src/lib.rs",
-      "accessCount": 28,
-      "lastAccessed": 1780057838119,
+      "path": ".claude/SPEC.md",
+      "accessCount": 31,
+      "lastAccessed": 1780072134361,
       "type": "file"
     },
     {
-      "path": ".claude/SPEC.md",
-      "accessCount": 28,
-      "lastAccessed": 1780058093645,
+      "path": "src-tauri/src/lib.rs",
+      "accessCount": 31,
+      "lastAccessed": 1780072167057,
       "type": "file"
     },
     {
       "path": "src-tauri/src/config.rs",
-      "accessCount": 22,
-      "lastAccessed": 1780057846009,
-      "type": "file"
-    },
-    {
-      "path": "src-tauri/src/sources/twitch.rs",
-      "accessCount": 12,
-      "lastAccessed": 1780057845626,
-      "type": "file"
-    },
-    {
-      "path": "src-tauri/src/bus.rs",
-      "accessCount": 11,
-      "lastAccessed": 1780057838666,
+      "accessCount": 28,
+      "lastAccessed": 1780073749199,
       "type": "file"
     },
     {
       "path": "src/lib/components/Settings.svelte",
-      "accessCount": 9,
-      "lastAccessed": 1780057735265,
-      "type": "file"
-    },
-    {
-      "path": "src/lib/ipc.ts",
-      "accessCount": 8,
-      "lastAccessed": 1780057734035,
-      "type": "file"
-    },
-    {
-      "path": "src-tauri/src/tts/mod.rs",
-      "accessCount": 8,
-      "lastAccessed": 1780057838866,
-      "type": "file"
-    },
-    {
-      "path": "src-tauri/src/tts/bouyomi.rs",
-      "accessCount": 8,
-      "lastAccessed": 1780057844429,
-      "type": "file"
-    },
-    {
-      "path": "src-tauri/src/tts/voicevox.rs",
-      "accessCount": 8,
-      "lastAccessed": 1780057844990,
-      "type": "file"
-    },
-    {
-      "path": "src-tauri/src/model.rs",
-      "accessCount": 8,
-      "lastAccessed": 1780057858857,
-      "type": "file"
-    },
-    {
-      "path": "templates/default/app.js",
-      "accessCount": 7,
-      "lastAccessed": 1780057613876,
-      "type": "file"
-    },
-    {
-      "path": "src-tauri/src/sources/youtube/innertube.rs",
-      "accessCount": 7,
-      "lastAccessed": 1780057852740,
-      "type": "file"
-    },
-    {
-      "path": "src-tauri/src/sources/youtube/parser.rs",
-      "accessCount": 7,
-      "lastAccessed": 1780057853413,
-      "type": "file"
-    },
-    {
-      "path": "src-tauri/src/moderation.rs",
-      "accessCount": 7,
-      "lastAccessed": 1780057859387,
+      "accessCount": 23,
+      "lastAccessed": 1780073808104,
       "type": "file"
     },
     {
       "path": "src/lib/stores.svelte.ts",
-      "accessCount": 6,
-      "lastAccessed": 1780057734804,
+      "accessCount": 20,
+      "lastAccessed": 1780073765397,
       "type": "file"
     },
     {
-      "path": "src-tauri/src/sources/youtube/mod.rs",
-      "accessCount": 6,
-      "lastAccessed": 1780057853852,
+      "path": "src/lib/ipc.ts",
+      "accessCount": 15,
+      "lastAccessed": 1780073755138,
       "type": "file"
     },
     {
-      "path": "src-tauri/src/sources/mod.rs",
-      "accessCount": 4,
-      "lastAccessed": 1780057859749,
+      "path": "src-tauri/src/bus.rs",
+      "accessCount": 14,
+      "lastAccessed": 1780072164872,
       "type": "file"
     },
     {
-      "path": "SETUP.md",
-      "accessCount": 2,
-      "lastAccessed": 1780057301605,
-      "type": "file"
-    },
-    {
-      "path": "src/App.svelte",
-      "accessCount": 2,
-      "lastAccessed": 1780057353416,
-      "type": "file"
-    },
-    {
-      "path": "src/lib/types.ts",
-      "accessCount": 2,
-      "lastAccessed": 1780057595084,
-      "type": "file"
-    },
-    {
-      "path": "templates/default/index.html",
-      "accessCount": 1,
-      "lastAccessed": 1780057240158,
-      "type": "file"
-    },
-    {
-      "path": "templates/default/style.css",
-      "accessCount": 1,
-      "lastAccessed": 1780057241476,
+      "path": "src-tauri/src/sources/twitch.rs",
+      "accessCount": 13,
+      "lastAccessed": 1780072127238,
       "type": "file"
     },
     {
       "path": "src/lib/components/CommentList.svelte",
-      "accessCount": 1,
-      "lastAccessed": 1780057242541,
+      "accessCount": 13,
+      "lastAccessed": 1780073760460,
       "type": "file"
     },
     {
-      "path": "src-tauri/src/main.rs",
-      "accessCount": 1,
-      "lastAccessed": 1780057242977,
+      "path": "src-tauri/src/model.rs",
+      "accessCount": 11,
+      "lastAccessed": 1780072157044,
+      "type": "file"
+    },
+    {
+      "path": "src-tauri/src/tts/mod.rs",
+      "accessCount": 9,
+      "lastAccessed": 1780072143215,
+      "type": "file"
+    },
+    {
+      "path": "src-tauri/src/tts/bouyomi.rs",
+      "accessCount": 9,
+      "lastAccessed": 1780072143594,
+      "type": "file"
+    },
+    {
+      "path": "src-tauri/src/tts/voicevox.rs",
+      "accessCount": 9,
+      "lastAccessed": 1780072144635,
+      "type": "file"
+    },
+    {
+      "path": "src-tauri/src/moderation.rs",
+      "accessCount": 8,
+      "lastAccessed": 1780072126218,
+      "type": "file"
+    },
+    {
+      "path": "src-tauri/src/sources/youtube/innertube.rs",
+      "accessCount": 8,
+      "lastAccessed": 1780072136999,
+      "type": "file"
+    },
+    {
+      "path": "src-tauri/src/sources/youtube/parser.rs",
+      "accessCount": 8,
+      "lastAccessed": 1780072137429,
+      "type": "file"
+    },
+    {
+      "path": "templates/default/app.js",
+      "accessCount": 8,
+      "lastAccessed": 1780072139455,
+      "type": "file"
+    },
+    {
+      "path": "src-tauri/src/sources/youtube/mod.rs",
+      "accessCount": 7,
+      "lastAccessed": 1780072136514,
+      "type": "file"
+    },
+    {
+      "path": "src-tauri/src/sources/mod.rs",
+      "accessCount": 5,
+      "lastAccessed": 1780072126803,
       "type": "file"
     },
     {
       "path": "src/lib/components/CommentItem.svelte",
-      "accessCount": 1,
-      "lastAccessed": 1780057243331,
+      "accessCount": 5,
+      "lastAccessed": 1780073725443,
+      "type": "file"
+    },
+    {
+      "path": "src/lib/types.ts",
+      "accessCount": 5,
+      "lastAccessed": 1780073737851,
+      "type": "file"
+    },
+    {
+      "path": "src/App.svelte",
+      "accessCount": 4,
+      "lastAccessed": 1780072963778,
+      "type": "file"
+    },
+    {
+      "path": "SETUP.md",
+      "accessCount": 3,
+      "lastAccessed": 1780072142748,
+      "type": "file"
+    },
+    {
+      "path": "src-tauri/src/main.rs",
+      "accessCount": 2,
+      "lastAccessed": 1780072118427,
+      "type": "file"
+    },
+    {
+      "path": "templates/default/index.html",
+      "accessCount": 2,
+      "lastAccessed": 1780072139916,
+      "type": "file"
+    },
+    {
+      "path": "templates/default/style.css",
+      "accessCount": 2,
+      "lastAccessed": 1780072140418,
+      "type": "file"
+    },
+    {
+      "path": "package.json",
+      "accessCount": 2,
+      "lastAccessed": 1780072142844,
+      "type": "file"
+    },
+    {
+      "path": "src-tauri/Cargo.toml",
+      "accessCount": 2,
+      "lastAccessed": 1780072145082,
+      "type": "file"
+    },
+    {
+      "path": "src-tauri/tauri.conf.json",
+      "accessCount": 2,
+      "lastAccessed": 1780072145599,
       "type": "file"
     },
     {
       "path": "src-tauri/app-icon.png",
       "accessCount": 1,
       "lastAccessed": 1780057285128,
+      "type": "file"
+    },
+    {
+      "path": "src/main.ts",
+      "accessCount": 1,
+      "lastAccessed": 1780072126692,
+      "type": "file"
+    },
+    {
+      "path": "index.html",
+      "accessCount": 1,
+      "lastAccessed": 1780072131229,
+      "type": "file"
+    },
+    {
+      "path": "vite.config.ts",
+      "accessCount": 1,
+      "lastAccessed": 1780072132079,
+      "type": "file"
+    },
+    {
+      "path": "tsconfig.json",
+      "accessCount": 1,
+      "lastAccessed": 1780072132424,
+      "type": "file"
+    },
+    {
+      "path": "svelte.config.js",
+      "accessCount": 1,
+      "lastAccessed": 1780072132489,
+      "type": "file"
+    },
+    {
+      "path": "src-tauri/capabilities/default.json",
+      "accessCount": 1,
+      "lastAccessed": 1780072145760,
       "type": "file"
     }
   ],

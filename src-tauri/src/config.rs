@@ -42,12 +42,17 @@ pub struct ObsConfig {
     /// axum サーバの待受ポート。既定 11180。
     #[serde(default = "default_obs_port")]
     pub port: u16,
+    /// OBS オーバーレイで使うテンプレート名。既定 "default"。
+    /// SPEC §10 に従い config を唯一の永続化先とする(localStorage 非使用)。
+    #[serde(default = "default_obs_template")]
+    pub template: String,
 }
 
 impl Default for ObsConfig {
     fn default() -> Self {
         ObsConfig {
             port: default_obs_port(),
+            template: default_obs_template(),
         }
     }
 }
@@ -286,6 +291,9 @@ fn default_minus_one() -> i16 {
 }
 fn default_obs_port() -> u16 {
     11180
+}
+fn default_obs_template() -> String {
+    "default".to_string()
 }
 fn default_bouyomi_host() -> String {
     "127.0.0.1".to_string()

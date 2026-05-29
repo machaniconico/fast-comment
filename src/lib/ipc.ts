@@ -57,6 +57,28 @@ export async function startChatListener(): Promise<() => void> {
   return unlisten;
 }
 
+/**
+ * Start listening to the 'tts-speak' event from Tauri and speak the payload
+ * via the browser SpeechSynthesis API (WebSpeech backend).
+ * Returns an unlisten function; call it on component destroy.
+ * No-op when Tauri or speechSynthesis is unavailable.
+ */
+export async function startTtsSpeakListener(): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  if (typeof window === 'undefined' || !('speechSynthesis' in window)) return () => {};
+  const { listen } = await import('@tauri-apps/api/event');
+  const unlisten = await listen<string>('tts-speak', (event) => {
+    const text = event.payload;
+    if (!text) return;
+    try {
+      window.speechSynthesis.speak(new SpeechSynthesisUtterance(text));
+    } catch (e) {
+      console.warn('[ipc] speechSynthesis.speak failed', e);
+    }
+  });
+  return unlisten;
+}
+
 // ---- Tauri invoke helpers ----
 
 async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T | null> {
@@ -68,7 +90,7 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
 // Config
 export interface AppConfig {
   channels: ChannelConfig[];
-  obs: { port: number };
+  obs: { port: number; template: string };
   tts: { backend: 'bouyomi' | 'voicevox' | 'webSpeech' | 'none'; options: Record<string, unknown> };
   moderation: { ngWords: string[]; ngUsers: string[]; highlights: string[] };
   ui: { maxBuffer: number };
@@ -85,7 +107,9 @@ export async function getConfig(): Promise<AppConfig | null> {
 }
 
 export async function setConfig(config: AppConfig): Promise<void> {
-  await invoke<void>('set_config', { config });
+  // Rust command is `update_config(new_config)`; Tauri maps the snake_case
+  // param `new_config` to the JS key `newConfig`.
+  await invoke<void>('update_config', { newConfig: config });
 }
 
 export async function addChannel(channel: ChannelConfig): Promise<void> {

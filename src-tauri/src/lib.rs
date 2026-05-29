@@ -26,7 +26,7 @@ use tauri::{AppHandle, Manager, State};
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
-use crate::bus::Bus;
+use crate::bus::{is_valid_template_name, Bus};
 use crate::config::{AppConfig, ChannelConfig};
 use crate::model::{Badge, ChatMessage};
 use crate::moderation::{Moderator, Verdict};
@@ -43,14 +43,24 @@ pub struct AppState {
     source_tx: broadcast::Sender<ChatMessage>,
     /// UI/OBS へ流す下流 Bus。
     bus: Bus,
+    /// OBS テンプレートの配信元ディレクトリ。
+    templates_dir: PathBuf,
+    /// アプリ全体の停止トークン。
+    app_cancel: CancellationToken,
+    /// OBS サーバの現在の待受状態。
+    obs_server: Mutex<ObsServerControl>,
     /// チャンネル識別キー → そのチャンネルの停止トークン。
     channels: Mutex<HashMap<String, CancellationToken>>,
     /// モデレータ(手動非表示状態も保持)。
     moderator: Mutex<Moderator>,
-    /// OBS サーバのポート(URL 生成用)。
-    obs_port: Mutex<u16>,
     /// 長命 TTS ワーカーへの bounded 送信端(溢れたら drop)。
     tts_tx: mpsc::Sender<ChatMessage>,
+}
+
+/// OBS サーバの再起動に必要な実行時ハンドル。
+struct ObsServerControl {
+    port: u16,
+    cancel: CancellationToken,
 }
 
 impl AppState {
@@ -93,8 +103,8 @@ fn update_config(
         .unwrap()
         .update_config(&new_config.moderation);
 
-    // OBS ポート反映(サーバ再起動は将来。今は URL 生成のために保持)。
-    *state.obs_port.lock().unwrap() = new_config.obs.port;
+    // OBS ポート反映。ポートが変わった場合は旧サーバを停止し、新ポートで再 bind する。
+    restart_obs_server_if_needed(&state, new_config.obs.port)?;
 
     // 差分計算用にチャンネル一覧を退避しておく。
     let desired_channels = new_config.channels.clone();
@@ -171,9 +181,13 @@ fn get_obs_url(
     template: Option<String>,
     channel: Option<String>,
 ) -> Result<String, String> {
-    let port = *state.obs_port.lock().unwrap();
     let template = template.unwrap_or_else(|| "default".to_string());
-    let mut url = format!("http://127.0.0.1:{port}/?template={template}");
+    if !is_valid_template_name(&template) {
+        return Err("テンプレート名は半角英数字、'-'、'_' のみ使用できます".to_string());
+    }
+    let port = state.obs_server.lock().unwrap().port;
+    let mut url =
+        format!("http://127.0.0.1:{port}/?template={template}&ws=ws://127.0.0.1:{port}/ws");
     if let Some(ch) = channel {
         url.push_str(&format!("&channel={ch}"));
     }
@@ -181,6 +195,30 @@ fn get_obs_url(
 }
 
 // ============ 内部ヘルパ ============
+
+/// OBS サーバの待受ポートが変わったら、旧サーバを止めて新ポートで起動する。
+fn restart_obs_server_if_needed(state: &AppState, new_port: u16) -> Result<(), String> {
+    let mut server = state.obs_server.lock().unwrap();
+    if server.port == new_port {
+        return Ok(());
+    }
+
+    tracing::info!("OBS サーバを再起動: {} -> {}", server.port, new_port);
+
+    let cancel = state.app_cancel.child_token();
+    let _obs_task = state.bus.spawn_obs_server_on_port(
+        state.templates_dir.clone(),
+        new_port,
+        cancel.clone(),
+    )?;
+
+    server.cancel.cancel();
+    *server = ObsServerControl {
+        port: new_port,
+        cancel,
+    };
+    Ok(())
+}
 
 /// 新しい設定のチャンネル一覧と現在の起動状態を突き合わせ、追加/削除を適用する。
 fn apply_channel_diff(app: &AppHandle, state: &AppState, desired: &[ChannelConfig]) {
@@ -390,25 +428,33 @@ pub fn run() {
             // モデレータ。
             let moderator = Moderator::new(&config.moderation);
 
+            // アプリ全体の停止トークン(将来 on_window_event 等から cancel 可能)。
+            let app_cancel = CancellationToken::new();
+            let obs_cancel = app_cancel.child_token();
+            let templates_dir = resolve_templates_dir(&handle);
+
             let state = AppState {
                 config: Mutex::new(config.clone()),
                 config_dir,
                 source_tx: source_tx.clone(),
                 bus: bus.clone(),
+                templates_dir: templates_dir.clone(),
+                app_cancel: app_cancel.clone(),
+                obs_server: Mutex::new(ObsServerControl {
+                    port: obs_port,
+                    cancel: obs_cancel.clone(),
+                }),
                 channels: Mutex::new(HashMap::new()),
                 moderator: Mutex::new(moderator),
-                obs_port: Mutex::new(obs_port),
                 tts_tx,
             };
             app.manage(state);
 
-            // アプリ全体の停止トークン(将来 on_window_event 等から cancel 可能)。
-            let app_cancel = CancellationToken::new();
-
             // Bus の UI forwarder と OBS サーバを起動。
             bus.spawn_ui_forwarder(handle.clone(), app_cancel.clone());
-            let templates_dir = resolve_templates_dir(&handle);
-            bus.spawn_obs_server(templates_dir, app_cancel.clone());
+            if let Err(e) = bus.spawn_obs_server(templates_dir, obs_cancel) {
+                tracing::error!("{e}");
+            }
 
             // moderation + TTS パイプライン起動。
             spawn_pipeline(handle.clone(), app_cancel.clone());

@@ -1,12 +1,12 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, onDestroy } from 'svelte';
   import type { AppConfig, ChannelConfig } from '../ipc';
   import {
     getConfig, setConfig, addChannel, removeChannel, getObsUrl
   } from '../ipc';
 
   let config: AppConfig | null = $state(null);
-  let obsUrl: string = $state('');
+  let obsBaseUrl: string = $state('');
   let copied: boolean = $state(false);
 
   // New channel form
@@ -19,8 +19,37 @@
   let ngUsersText: string = $state('');
   let highlightsText: string = $state('');
 
+  // Template selection is persisted in config (config.obs.template); SPEC §10
+  // mandates config as the single persistence source (no localStorage).
+
   let saving: boolean = $state(false);
   let saveMsg: string = $state('');
+
+  // setTimeout handles (cleared on destroy)
+  let saveMsgTimer: ReturnType<typeof setTimeout> | null = null;
+  let copiedTimer: ReturnType<typeof setTimeout> | null = null;
+
+  // ── TTS options accessors (config.tts.options is a flexible camelCase map) ──
+  function ttsNum(key: string, fallback: number): number {
+    const v = config?.tts.options?.[key];
+    return typeof v === 'number' && Number.isFinite(v) ? v : fallback;
+  }
+  function ttsBool(key: string, fallback: boolean): boolean {
+    const v = config?.tts.options?.[key];
+    return typeof v === 'boolean' ? v : fallback;
+  }
+  function setTtsOption(key: string, value: unknown) {
+    if (!config) return;
+    if (!config.tts.options || typeof config.tts.options !== 'object') {
+      config.tts.options = {};
+    }
+    config.tts.options[key] = value;
+  }
+
+  // Bound proxies for TTS option fields
+  let voicevoxSpeaker: number = $state(1);
+  let maxLength: number = $state(80);
+  let stripEmoji: boolean = $state(true);
 
   onMount(async () => {
     config = await getConfig();
@@ -28,24 +57,67 @@
       ngWordsText = config.moderation.ngWords.join('\n');
       ngUsersText = config.moderation.ngUsers.join('\n');
       highlightsText = config.moderation.highlights.join('\n');
+      voicevoxSpeaker = ttsNum('voicevoxSpeaker', 1);
+      maxLength = ttsNum('maxLength', 80);
+      stripEmoji = ttsBool('stripEmoji', true);
+      // Backward-compat: older config.json may lack obs.template.
+      if (!config.obs.template || !config.obs.template.trim()) {
+        config.obs.template = 'default';
+      }
     }
+
     const url = await getObsUrl();
-    obsUrl = url ?? 'http://127.0.0.1:11180/?template=default';
+    obsBaseUrl = url ?? 'http://127.0.0.1:11180/?template=default';
   });
+
+  onDestroy(() => {
+    if (saveMsgTimer !== null) clearTimeout(saveMsgTimer);
+    if (copiedTimer !== null) clearTimeout(copiedTimer);
+  });
+
+  // Displayed OBS URL: base URL with the config template reflected in.
+  const obsUrl = $derived(withTemplate(obsBaseUrl, config?.obs.template ?? 'default'));
+
+  function withTemplate(url: string, tmpl: string): string {
+    const name = (tmpl || 'default').trim() || 'default';
+    try {
+      const u = new URL(url);
+      u.searchParams.set('template', name);
+      return u.toString();
+    } catch {
+      return url;
+    }
+  }
 
   async function onAddChannel() {
     addError = '';
+    if (!config) return;
     const id = newIdentifier.trim();
     if (!id) { addError = 'チャンネル名またはIDを入力してください'; return; }
-    const ch: ChannelConfig = { platform: newPlatform, identifier: extractYoutubeId(id) };
-    await addChannel(ch);
-    config = await getConfig();
-    newIdentifier = '';
+    const identifier = newPlatform === 'youtube' ? extractYoutubeId(id) : id;
+    const ch: ChannelConfig = { platform: newPlatform, identifier };
+    try {
+      await addChannel(ch);
+      // Update only the channels list to avoid discarding unsaved NG/TTS edits.
+      if (!config.channels.some(c => c.platform === ch.platform && c.identifier === ch.identifier)) {
+        config.channels = [...config.channels, ch];
+      }
+      newIdentifier = '';
+    } catch (e) {
+      addError = `追加に失敗しました: ${e instanceof Error ? e.message : String(e)}`;
+    }
   }
 
   async function onRemoveChannel(ch: ChannelConfig) {
-    await removeChannel(`${ch.platform}:${ch.identifier}`);
-    config = await getConfig();
+    if (!config) return;
+    try {
+      await removeChannel(`${ch.platform}:${ch.identifier}`);
+      config.channels = config.channels.filter(
+        c => !(c.platform === ch.platform && c.identifier === ch.identifier)
+      );
+    } catch (e) {
+      addError = `削除に失敗しました: ${e instanceof Error ? e.message : String(e)}`;
+    }
   }
 
   function extractYoutubeId(input: string): string {
@@ -61,19 +133,35 @@
   async function onSave() {
     if (!config) return;
     saving = true;
+    saveMsg = '';
     config.moderation.ngWords = ngWordsText.split('\n').map(s => s.trim()).filter(Boolean);
     config.moderation.ngUsers = ngUsersText.split('\n').map(s => s.trim()).filter(Boolean);
     config.moderation.highlights = highlightsText.split('\n').map(s => s.trim()).filter(Boolean);
-    await setConfig(config);
-    saving = false;
-    saveMsg = '保存しました';
-    setTimeout(() => saveMsg = '', 2000);
+    setTtsOption('voicevoxSpeaker', Number.isFinite(voicevoxSpeaker) ? Math.trunc(voicevoxSpeaker) : 1);
+    setTtsOption('maxLength', Number.isFinite(maxLength) && maxLength >= 0 ? Math.trunc(maxLength) : 80);
+    setTtsOption('stripEmoji', stripEmoji);
+    // Normalize template before persisting (config is the single source).
+    config.obs.template = (config.obs.template || 'default').trim() || 'default';
+    try {
+      await setConfig(config);
+      saveMsg = '保存しました';
+    } catch (e) {
+      saveMsg = `保存に失敗しました: ${e instanceof Error ? e.message : String(e)}`;
+    } finally {
+      saving = false;
+    }
+    if (saveMsgTimer !== null) clearTimeout(saveMsgTimer);
+    saveMsgTimer = setTimeout(() => { saveMsg = ''; saveMsgTimer = null; }, 3000);
   }
 
-  async function onCopyObs() {
-    await navigator.clipboard.writeText(obsUrl).catch(() => {});
-    copied = true;
-    setTimeout(() => copied = false, 1500);
+  function onCopyObs() {
+    navigator.clipboard.writeText(obsUrl)
+      .then(() => {
+        copied = true;
+        if (copiedTimer !== null) clearTimeout(copiedTimer);
+        copiedTimer = setTimeout(() => { copied = false; copiedTimer = null; }, 1500);
+      })
+      .catch(() => { /* clipboard denied — do not show success */ });
   }
 </script>
 
@@ -129,11 +217,55 @@
         <option value="voicevox">VOICEVOX</option>
       </select>
     </div>
+
+    {#if config.tts.backend === 'voicevox'}
+    <div class="field-row">
+      <label>VOICEVOX 話者ID</label>
+      <input
+        type="number"
+        min="0"
+        step="1"
+        bind:value={voicevoxSpeaker}
+        class="num-input"
+      />
+    </div>
+    {/if}
+
+    <div class="field-row">
+      <label>最大読み上げ文字数</label>
+      <input
+        type="number"
+        min="0"
+        step="1"
+        bind:value={maxLength}
+        class="num-input"
+      />
+      <span class="hint-inline">（0で無制限）</span>
+    </div>
+
+    <div class="field-row">
+      <label for="strip-emoji">絵文字を除去</label>
+      <input id="strip-emoji" type="checkbox" bind:checked={stripEmoji} class="chk" />
+    </div>
   </section>
 
   <!-- ── OBS URL ── -->
   <section>
     <h3>OBSオーバーレイ URL</h3>
+    <div class="field-row">
+      <label for="obs-template">テンプレート</label>
+      <input
+        id="obs-template"
+        type="text"
+        list="obs-template-list"
+        bind:value={config.obs.template}
+        class="id-input"
+        placeholder="default"
+      />
+      <datalist id="obs-template-list">
+        <option value="default"></option>
+      </datalist>
+    </div>
     <div class="obs-row">
       <input type="text" value={obsUrl} readonly class="obs-input" />
       <button class="copy-btn" class:copied onclick={onCopyObs}>
@@ -239,7 +371,7 @@
     align-items: center;
   }
 
-  .platform-select, .id-input, .obs-input {
+  .platform-select, .id-input, .obs-input, .num-input {
     background: rgba(255,255,255,0.07);
     border: 1px solid rgba(255,255,255,0.12);
     border-radius: 4px;
@@ -251,6 +383,8 @@
   .platform-select { flex-shrink: 0; }
   .id-input { flex: 1; }
   .obs-input { flex: 1; font-size: 12px; }
+  .num-input { width: 90px; }
+  .chk { width: 16px; height: 16px; accent-color: #1976d2; }
 
   .add-btn, .remove-btn, .copy-btn, .save-btn {
     border: none;
@@ -292,6 +426,7 @@
     display: flex;
     align-items: center;
     gap: 10px;
+    margin-top: 6px;
   }
 
   .field-row label {

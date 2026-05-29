@@ -105,15 +105,21 @@
 </div>
 
 <style>
+  /* Every row is exactly ROW_HEIGHT (28px) tall so the virtual-scroll
+     translateY math never drifts. Highlight styles must NOT change the box
+     height: no extra padding/margin, only background + left border. */
   .comment-item {
     display: flex;
     align-items: center;
     gap: 4px;
-    padding: 3px 6px;
+    padding: 0 6px;
     font-size: 13px;
     line-height: 1.4;
     border-bottom: 1px solid rgba(255, 255, 255, 0.05);
-    min-height: 26px;
+    /* Reserve space for the highlight left border on every row so the
+       content does not shift horizontally when a row becomes highlighted. */
+    border-left: 3px solid transparent;
+    height: 28px;
     box-sizing: border-box;
     position: relative;
   }
@@ -122,10 +128,9 @@
     opacity: 1;
   }
 
+  /* Highlight stays within the 28px row: only color/border, no size change. */
   .comment-item.highlighted {
-    border-radius: 3px;
-    padding: 5px 6px;
-    margin: 2px 4px;
+    border-left-color: rgba(0, 0, 0, 0.35);
     font-weight: 500;
   }
 

@@ -1,5 +1,9 @@
 /* OBS Browser Source overlay — transparent background */
 
+:root {
+  --leave-ms: 400ms;
+}
+
 *, *::before, *::after {
   box-sizing: border-box;
   margin: 0;
@@ -49,7 +53,7 @@ html, body {
 
 /* Exit animation applied via JS */
 .comment.leaving {
-  animation: fade-out 0.4s ease-in forwards;
+  animation: fade-out var(--leave-ms) ease-in forwards;
 }
 
 @keyframes fade-slide-in {
@@ -135,6 +139,15 @@ html, body {
   background: rgba(145, 70, 255, 0.85);
   color: #fff;
 }
+
+.comment.system {
+  background: rgba(32, 38, 44, 0.88);
+  color: #d6dde5;
+  font-style: italic;
+}
+.comment.system .author { color: #9fb3c8; }
+.comment.system .fragments { color: #d6dde5; }
+.comment.system .sep { color: rgba(214,221,229,0.45); }
 
 /* ---- Amount badge ---- */
 .amount {

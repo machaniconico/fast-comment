@@ -1,0 +1,10 @@
+実装完了。変更は `src-tauri/src/sources/twitch.rs` のみです。
+
+- `handle_line` の戻り値を拡張し、`PRIVMSG` を `ChatMessage` に正規化して `tx.send(...)` が成功した場合だけ `received_data = true` にしました。`CAP ACK` / welcome numeric / その他制御行では立ちません。
+- `emotes` の切り出しを `body.encode_utf16()` ベースに変更し、Twitch の UTF-16 コードユニット index に合わせました。
+- `justinfan` NICK 生成に `static AtomicUsize` カウンタを混ぜ、同時起動時の衝突リスクを潰しました。
+- `PING -> PONG` 応答ロジックは維持しています。
+
+検証:
+- `git diff --check -- src-tauri/src/sources/twitch.rs`: passed
+- `cargo check --manifest-path src-tauri/Cargo.toml`: 実行試行しましたが、この環境では `cargo: command not found` でした。静的レビューで借用・所有権・呼び出し整合を確認済みです。

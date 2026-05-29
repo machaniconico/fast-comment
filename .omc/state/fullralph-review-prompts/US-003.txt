@@ -1,0 +1,231 @@
+# FULLRALPH REVIEW for story US-003
+
+## Original task
+fast-comment SPEC完成度向上: 3レーン監査で検出したCRITICAL/HIGH/MEDIUM欠陥を修正し、MVP(P1-P5)を機能水準に引き上げる。WSLはビルド不可のため目視レビュー検証のみ。
+
+## Story US-003: TTS バックエンド再利用とフォールバック整備
+src-tauri/src/tts/ 配下の mod.rs, voicevox.rs, bouyomi.rs のみを編集。
+1) [効果大] mod.rs/voicevox.rs: speak 毎に Voicevox backend (reqwest::Client) を new していてコネクションプール(keep-alive)が効かず低遅延目標(SPEC §0)に反する。修正: TtsDispatcher 側で backend インスタンス（または reqwest::Client）を保持して再利用し、設定変更時のみ再構築する。bouyomi も backend 構造体は再利用する。
+2) voicevox.rs の自前base64実装に最低限の単体テスト(#[cfg(test)])を追加し、標準アルファベットでのエンコード正当性を保証（依存追加はしない）。
+3) available() がどこからも呼ばれずデッドコードになっている件: speak失敗時フォールバックの現挙動(TOCTOU回避)は維持しつつ、available() の用途（設定UIからの疎通テスト用）をコメント明記し #[allow(dead_code)] 等で警告抑制するか Tauri command から呼べるよう薄く公開する。実挙動(speak失敗→WebSpeechフォールバック)は壊さないこと。
+tts配下以外を変更しないこと。
+
+## Acceptance criteria (verify EACH)
+  1. Voicevox の reqwest::Client が speak 毎ではなく Dispatcher 保持で再利用され、設定変更時のみ再構築される
+  2. 自前base64に単体テストが追加され標準アルファベットのエンコードが検証されている
+  3. speak失敗時のWebSpeechフォールバック挙動が維持されている（回帰なし）
+  4. available() のデッドコード警告が解消されている（用途明記 or 公開）
+  5. tts/ 配下以外を変更していない
+
+## Files in scope (touchedFiles)
+  - src-tauri/src/tts/mod.rs
+  - src-tauri/src/tts/voicevox.rs
+  - src-tauri/src/tts/bouyomi.rs
+
+## Diff under review
+```diff
+diff --git a/src-tauri/src/tts/mod.rs b/src-tauri/src/tts/mod.rs
+index 2b27f1b..5cc12a5 100644
+--- a/src-tauri/src/tts/mod.rs
++++ b/src-tauri/src/tts/mod.rs
+@@ -5,8 +5,8 @@
+ //! - webspeech: 実再生は UI 側(`speechSynthesis`)。Rust は読み上げ対象テキストを
+ //!   イベントで UI に渡すだけ。
+ //!
+-//! ルーティング: 設定の優先バックエンドが `available()==false` なら Web Speech へ
+-//! フォールバックする。読み上げ整形(名前/URL/絵文字/長文)もここで行う。
++//! ルーティング: 読み上げ時は優先バックエンドへ直接 `speak()` し、失敗したら
++//! Web Speech へフォールバックする。読み上げ整形(名前/URL/絵文字/長文)もここで行う。
+ 
+ pub mod bouyomi;
+ pub mod voicevox;
+@@ -22,6 +22,10 @@ pub trait TtsBackend {
+     /// 整形済みテキストを読み上げる。
+     async fn speak(&self, text: String) -> anyhow::Result<()>;
+     /// バックエンドが現在利用可能か(接続可否の簡易判定)。
++    ///
++    /// speak パスでは TOCTOU と二重往復を避けるため呼ばない。設定 UI からの
++    /// 疎通テスト用途として残す。
++    #[allow(dead_code)]
+     async fn available(&self) -> bool;
+ }
+ 
+@@ -31,18 +35,75 @@ pub trait TtsBackend {
+ pub struct TtsDispatcher {
+     config: TtsConfig,
+     app: AppHandle,
++    bouyomi: bouyomi::BouyomiBackend,
++    voicevox: voicevox::VoicevoxBackend,
+ }
+ 
+ impl TtsDispatcher {
+     pub fn new(config: TtsConfig, app: AppHandle) -> Self {
+-        TtsDispatcher { config, app }
++        let bouyomi = Self::build_bouyomi(&config);
++        let voicevox = Self::build_voicevox(&config, &app);
++        TtsDispatcher {
++            config,
++            app,
++            bouyomi,
++            voicevox,
++        }
+     }
+ 
+     /// 設定を差し替える(設定更新コマンドから呼ぶ)。
+     pub fn update_config(&mut self, config: TtsConfig) {
++        if self.config == config {
++            return;
++        }
++
++        if !Self::same_bouyomi_config(&self.config, &config) {
++            self.bouyomi = Self::build_bouyomi(&config);
++        }
++        if !Self::same_voicevox_config(&self.config, &config) {
++            self.voicevox = Self::build_voicevox(&config, &self.app);
++        }
+         self.config = config;
+     }
+ 
++    fn same_bouyomi_config(a: &TtsConfig, b: &TtsConfig) -> bool {
++        let a = &a.options;
++        let b = &b.options;
++        a.bouyomi_host == b.bouyomi_host
++            && a.bouyomi_port == b.bouyomi_port
++            && a.bouyomi_speed == b.bouyomi_speed
++            && a.bouyomi_tone == b.bouyomi_tone
++            && a.bouyomi_volume == b.bouyomi_volume
++            && a.bouyomi_voice == b.bouyomi_voice
++    }
++
++    fn same_voicevox_config(a: &TtsConfig, b: &TtsConfig) -> bool {
++        let a = &a.options;
++        let b = &b.options;
++        a.voicevox_url == b.voicevox_url && a.voicevox_speaker == b.voicevox_speaker
++    }
++
++    fn build_bouyomi(config: &TtsConfig) -> bouyomi::BouyomiBackend {
++        let opt = &config.options;
++        bouyomi::BouyomiBackend::new(
++            opt.bouyomi_host.clone(),
++            opt.bouyomi_port,
++            opt.bouyomi_speed,
++            opt.bouyomi_tone,
++            opt.bouyomi_volume,
++            opt.bouyomi_voice,
++        )
++    }
++
++    fn build_voicevox(config: &TtsConfig, app: &AppHandle) -> voicevox::VoicevoxBackend {
++        let opt = &config.options;
++        voicevox::VoicevoxBackend::new(
++            opt.voicevox_url.clone(),
++            opt.voicevox_speaker,
++            app.clone(),
++        )
++    }
++
+     /// 1メッセージを読み上げる。整形 → 優先バックエンド → 失敗時フォールバック。
+     pub async fn speak_message(&self, msg: &ChatMessage) {
+         let text = self.format_for_speech(msg);
+@@ -56,28 +117,13 @@ impl TtsDispatcher {
+             TtsBackendKind::None => {}
+             TtsBackendKind::WebSpeech => self.emit_webspeech(&text),
+             TtsBackendKind::Bouyomi => {
+-                let opt = &self.config.options;
+-                let backend = bouyomi::BouyomiBackend::new(
+-                    opt.bouyomi_host.clone(),
+-                    opt.bouyomi_port,
+-                    opt.bouyomi_speed,
+-                    opt.bouyomi_tone,
+-                    opt.bouyomi_volume,
+-                    opt.bouyomi_voice,
+-                );
+-                if let Err(e) = backend.speak(text.clone()).await {
++                if let Err(e) = self.bouyomi.speak(text.clone()).await {
+                     tracing::warn!("bouyomi 読み上げ失敗→Web Speech へ: {e}");
+                     self.emit_webspeech(&text);
+                 }
+             }
+             TtsBackendKind::Voicevox => {
+-                let opt = &self.config.options;
+-                let backend = voicevox::VoicevoxBackend::new(
+-                    opt.voicevox_url.clone(),
+-                    opt.voicevox_speaker,
+-                    self.app.clone(),
+-                );
+-                if let Err(e) = backend.speak(text.clone()).await {
++                if let Err(e) = self.voicevox.speak(text.clone()).await {
+                     tracing::warn!("voicevox 読み上げ失敗→Web Speech へ: {e}");
+                     self.emit_webspeech(&text);
+                 }
+diff --git a/src-tauri/src/tts/voicevox.rs b/src-tauri/src/tts/voicevox.rs
+index 83a981e..40c7b6d 100644
+--- a/src-tauri/src/tts/voicevox.rs
++++ b/src-tauri/src/tts/voicevox.rs
+@@ -123,4 +123,27 @@ mod base64_encode {
+         }
+         out
+     }
++
++    #[cfg(test)]
++    mod tests {
++        use super::encode;
++
++        #[test]
++        fn encodes_rfc4648_vectors_with_standard_alphabet() {
++            let cases = [
++                (b"".as_slice(), ""),
++                (b"f".as_slice(), "Zg=="),
++                (b"fo".as_slice(), "Zm8="),
++                (b"foo".as_slice(), "Zm9v"),
++                (b"foob".as_slice(), "Zm9vYg=="),
++                (b"fooba".as_slice(), "Zm9vYmE="),
++                (b"foobar".as_slice(), "Zm9vYmFy"),
++                (&[0xfb, 0xff, 0xff], "+///"),
++            ];
++
++            for (input, expected) in cases {
++                assert_eq!(encode(input), expected);
++            }
++        }
++    }
+ }
+
+```
+
+## Worker stdout tail (last 4KB)
+```
+実装完了しました。
+
+変更点:
+- [src-tauri/src/tts/mod.rs](/mnt/d/workspace/fast-comment/src-tauri/src/tts/mod.rs:55) の `update_config()` に同一設定の早期 return を追加。
+- Bouyomi/VOICEVOX の backend 設定差分だけを比較し、該当設定が変わった時だけ backend を再構築するように変更。
+- これにより `lib.rs` 側が speak 毎に `update_config()` を呼んでも、同一設定なら `VoicevoxBackend` と内部 `reqwest::Client` は再利用されます。
+
+AC確認:
+- AC1: 修正済み。VOICEVOX `reqwest::Client` は speak 毎に再生成されません。
+- AC2: [voicevox.rs](/mnt/d/workspace/fast-comment/src-tauri/src/tts/voicevox.rs:127) に base64 の標準アルファベット検証テストあり。
+- AC3: speak 失敗時の WebSpeech fallback は維持。
+- AC4: `available()` は用途コメントと `#[allow(dead_code)]` あり。
+- AC5: このパスの編集は `src-tauri/src/tts/mod.rs` のみ。許可範囲内です。
+
+検証:
+- `git diff --check -- src-tauri/src/tts/...` 成功。
+- `cargo test ...` は実行不可でした。この環境に `cargo` がありません。
+- `rustfmt` もこの環境にありません。
+
+```
+(exit code: 0)
+
+
+## Required output (machine-readable, stdout-last-line)
+Reply with normal review prose, then on the FINAL line print exactly one of:
+
+  FULLRALPH-VERDICT: PASS
+  FULLRALPH-VERDICT: FAIL -- <one-line reason summary>
+
+Reject (FAIL) if ANY of these are true:
+  * any acceptance criterion is not satisfied by the diff
+  * the diff touches files outside the touchedFiles list
+  * tests, types, or builds in the affected area are broken
+  * the implementation is partial or hand-wavy
