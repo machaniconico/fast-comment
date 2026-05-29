@@ -341,3 +341,135 @@ async fn handle_ws_client(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- is_valid_template_name ---
+
+    #[test]
+    fn valid_template_name_default() {
+        // 最も基本的な正常系: "default" は常に許可される
+        assert!(is_valid_template_name("default"));
+    }
+
+    #[test]
+    fn valid_template_name_with_hyphen_underscore_and_digits() {
+        // ハイフン・アンダースコア・数字を含む名前は許可される
+        assert!(is_valid_template_name("my-template_1"));
+    }
+
+    #[test]
+    fn valid_template_name_uppercase() {
+        // 大文字 ASCII も許可される
+        assert!(is_valid_template_name("ABC123"));
+    }
+
+    #[test]
+    fn valid_template_name_exactly_64_chars() {
+        // 境界値: ちょうど 64 文字は許可される
+        let name = "a".repeat(64);
+        assert!(is_valid_template_name(&name));
+    }
+
+    #[test]
+    fn invalid_template_name_65_chars() {
+        // 境界値: 65 文字は拒否される
+        let name = "a".repeat(65);
+        assert!(!is_valid_template_name(&name));
+    }
+
+    #[test]
+    fn invalid_template_name_empty() {
+        // 空文字列は拒否される
+        assert!(!is_valid_template_name(""));
+    }
+
+    #[test]
+    fn invalid_template_name_dotdot() {
+        // パストラバーサル ".." は拒否される
+        assert!(!is_valid_template_name(".."));
+    }
+
+    #[test]
+    fn invalid_template_name_dotdot_slash() {
+        // パストラバーサル "../foo" は拒否される
+        assert!(!is_valid_template_name("../foo"));
+    }
+
+    #[test]
+    fn invalid_template_name_slash() {
+        // スラッシュ区切り "a/b" は拒否される(1階層のみ許可)
+        assert!(!is_valid_template_name("a/b"));
+    }
+
+    #[test]
+    fn invalid_template_name_dot() {
+        // ドットを含む "a.b" は拒否される
+        assert!(!is_valid_template_name("a.b"));
+    }
+
+    #[test]
+    fn invalid_template_name_percent_encoded_dotdot() {
+        // URL エンコードされたトラバーサル "%2e%2e" は拒否される
+        assert!(!is_valid_template_name("%2e%2e"));
+    }
+
+    #[test]
+    fn invalid_template_name_backslash() {
+        // バックスラッシュ "a\\b" は拒否される(Windows パス区切り対策)
+        assert!(!is_valid_template_name("a\\b"));
+    }
+
+    #[test]
+    fn invalid_template_name_space() {
+        // 空白を含む名前は拒否される
+        assert!(!is_valid_template_name("a b"));
+    }
+
+    // --- inject_template_base ---
+
+    #[test]
+    fn inject_base_inserts_after_head_tag() {
+        // <head> がある html には <base href="/obs-skin/"> が <head> 直後に挿入される
+        let html = "<html><head><title>Test</title></head><body></body></html>".to_string();
+        let result = inject_template_base(html, "obs-skin");
+        assert!(result.contains(r#"<head><base href="/obs-skin/">"#));
+    }
+
+    #[test]
+    fn inject_base_reflects_template_name_in_href() {
+        // template 名がそのまま base href のパスに反映される
+        let html = "<html><head></head><body></body></html>".to_string();
+        let result = inject_template_base(html, "my-overlay");
+        assert!(result.contains(r#"<base href="/my-overlay/">"#));
+    }
+
+    #[test]
+    fn inject_base_idempotent_when_base_tag_already_present() {
+        // 既に <base ...> が存在する場合は変更されずに返る(冪等)
+        let html = r#"<html><head><base href="/other/"><title>X</title></head></html>"#.to_string();
+        let expected = html.clone();
+        let result = inject_template_base(html, "default");
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn inject_base_idempotent_when_bare_base_tag_present() {
+        // <base> (属性なし) が存在する場合も変更されずに返る
+        let html = "<html><head><base><title>X</title></head></html>".to_string();
+        let expected = html.clone();
+        let result = inject_template_base(html, "default");
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn inject_base_no_change_when_no_head_tag() {
+        // <head> タグが無い html は変更されずに返る
+        let html = "<html><body>no head</body></html>".to_string();
+        let expected = html.clone();
+        let result = inject_template_base(html, "default");
+        assert_eq!(result, expected);
+    }
+}
