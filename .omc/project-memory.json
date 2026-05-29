@@ -131,8 +131,8 @@
     },
     {
       "path": "src-tauri/src/config.rs",
-      "accessCount": 33,
-      "lastAccessed": 1780075440835,
+      "accessCount": 34,
+      "lastAccessed": 1780075999317,
       "type": "file"
     },
     {
@@ -215,8 +215,8 @@
     },
     {
       "path": "src-tauri/src/sources/youtube/innertube.rs",
-      "accessCount": 8,
-      "lastAccessed": 1780072136999,
+      "accessCount": 9,
+      "lastAccessed": 1780076010616,
       "type": "file"
     },
     {

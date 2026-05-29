@@ -240,3 +240,168 @@ fn extract_json_string_field(html: &str, marker: &str) -> Option<String> {
     let end = tail.find('"')?;
     Some(tail[..end].to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_paths(entries: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+        entries
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn extracts_json_string_field_after_marker() {
+        // 指定マーカー直後の文字列値だけを取り出す。
+        let html = r#"prefix {"target":"expected-value","other":"ignored"} suffix"#;
+
+        assert_eq!(
+            extract_json_string_field(html, r#""target":""#).as_deref(),
+            Some("expected-value")
+        );
+    }
+
+    #[test]
+    fn json_string_field_returns_none_when_marker_is_absent() {
+        // マーカーが見つからない場合は抽出しない。
+        let html = r#"{"other":"value"}"#;
+
+        assert_eq!(extract_json_string_field(html, r#""target":""#), None);
+    }
+
+    #[test]
+    fn extracts_api_key_and_client_version_with_default_markers() {
+        // 既定マーカーで API_KEY と clientVersion を抽出する。
+        let html = r#"
+            <script>
+            ytcfg.set({
+                "INNERTUBE_API_KEY":"default-api-key",
+                "INNERTUBE_CONTEXT_CLIENT_VERSION":"2.20240529.01.00"
+            });
+            </script>
+        "#;
+        let paths = make_paths(&[]);
+
+        assert_eq!(extract_api_key(html, &paths).as_deref(), Some("default-api-key"));
+        assert_eq!(
+            extract_client_version(html, &paths).as_deref(),
+            Some("2.20240529.01.00")
+        );
+    }
+
+    #[test]
+    fn override_markers_take_precedence_for_api_key_and_client_version() {
+        // overrides.paths の代替マーカーを既定マーカーより優先する。
+        let html = r#"
+            {
+                "INNERTUBE_API_KEY":"default-api-key",
+                "customApiKey":"override-api-key",
+                "INNERTUBE_CONTEXT_CLIENT_VERSION":"default-client-version",
+                "customClientVersion":"override-client-version"
+            }
+        "#;
+        let paths = make_paths(&[
+            (KEY_API_KEY_MARKER, r#""customApiKey":""#),
+            (KEY_CLIENT_VERSION_MARKER, r#""customClientVersion":""#),
+        ]);
+
+        assert_eq!(extract_api_key(html, &paths).as_deref(), Some("override-api-key"));
+        assert_eq!(
+            extract_client_version(html, &paths).as_deref(),
+            Some("override-client-version")
+        );
+    }
+
+    #[test]
+    fn initial_continuation_prefers_specific_markers_before_generic() {
+        // 汎用 continuation が先に現れても、限定マーカーを優先する。
+        let paths = make_paths(&[]);
+        let html = r#"
+            {
+                "continuation":"generic-token",
+                "invalidationContinuationData":{"continuation":"invalidation-token"},
+                "timedContinuationData":{"continuation":"timed-token"},
+                "reloadContinuationData":{"continuation":"reload-token"},
+                "liveChatReplayContinuationData":{"continuation":"replay-token"}
+            }
+        "#;
+
+        assert_eq!(
+            extract_initial_continuation(html, &paths).as_deref(),
+            Some("invalidation-token")
+        );
+    }
+
+    #[test]
+    fn initial_continuation_uses_generic_marker_as_last_fallback() {
+        // 限定マーカーが無い場合だけ汎用 continuation にフォールバックする。
+        let paths = make_paths(&[]);
+        let html = r#"
+            {
+                "metadata":"no specific continuation container",
+                "continuation":"generic-token"
+            }
+        "#;
+
+        assert_eq!(
+            extract_initial_continuation(html, &paths).as_deref(),
+            Some("generic-token")
+        );
+    }
+
+    #[test]
+    fn initial_continuation_specific_marker_order_is_stable() {
+        // invalidation が無い場合も timed -> reload -> replay -> 汎用の順序を守る。
+        let paths = make_paths(&[]);
+        let html = r#"
+            {
+                "continuation":"generic-token",
+                "reloadContinuationData":{"continuation":"reload-token"},
+                "liveChatReplayContinuationData":{"continuation":"replay-token"},
+                "timedContinuationData":{"continuation":"timed-token"}
+            }
+        "#;
+
+        assert_eq!(
+            extract_initial_continuation(html, &paths).as_deref(),
+            Some("timed-token")
+        );
+    }
+
+    #[test]
+    fn empty_or_missing_override_paths_match_default_behavior() {
+        // 空/未指定の paths は現行の既定マーカー挙動と完全一致する。
+        let html = r#"
+            {
+                "INNERTUBE_API_KEY":"default-api-key",
+                "innertubeApiKey":"alt-api-key",
+                "INNERTUBE_CONTEXT_CLIENT_VERSION":"2.20240529.01.00",
+                "clientVersion":"alt-client-version",
+                "invalidationContinuationData":{"continuation":"invalidation-token"}
+            }
+        "#;
+        let missing_paths = make_paths(&[]);
+        let empty_paths = make_paths(&[
+            (KEY_API_KEY_MARKER, ""),
+            (KEY_API_KEY_MARKER_ALT, ""),
+            (KEY_CLIENT_VERSION_MARKER, ""),
+            (KEY_CLIENT_VERSION_MARKER_ALT, ""),
+            (KEY_INITIAL_CONTINUATION_MARKERS, ""),
+        ]);
+
+        assert_eq!(
+            extract_api_key(html, &empty_paths),
+            extract_api_key(html, &missing_paths)
+        );
+        assert_eq!(
+            extract_client_version(html, &empty_paths),
+            extract_client_version(html, &missing_paths)
+        );
+        assert_eq!(
+            extract_initial_continuation(html, &empty_paths),
+            extract_initial_continuation(html, &missing_paths)
+        );
+    }
+}

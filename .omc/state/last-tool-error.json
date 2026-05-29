@@ -1,7 +1,7 @@
 {
   "tool_name": "mcp__plugin_oh-my-claudecode_t__lsp_diagnostics",
-  "tool_input_preview": "{\"file\":\"/mnt/d/workspace/fast-comment/src-tauri/src/sources/twitch.rs\"}",
+  "tool_input_preview": "{\"file\":\"/mnt/d/workspace/fast-comment/src-tauri/src/sources/youtube/innertube.rs\"}",
   "error": "Language server 'rust-analyzer' not found.\nInstall with: rustup component add rust-analyzer",
-  "timestamp": "2026-05-29T17:26:47.906Z",
+  "timestamp": "2026-05-29T17:34:05.355Z",
   "retry_count": 1
 }

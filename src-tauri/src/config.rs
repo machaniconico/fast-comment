@@ -313,3 +313,233 @@ fn default_max_buffer() -> usize {
 fn default_max_read_len() -> usize {
     140
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn serde_roundtrip_keeps_camel_case_keys_and_values() {
+        // camelCase の永続化キーと、各フィールド値の serde 往復を確認する。
+        let mut paths = HashMap::new();
+        paths.insert(
+            "continuationPath".to_string(),
+            "contents.twoColumnWatchNextResults.conversationBar".to_string(),
+        );
+
+        let cfg = AppConfig {
+            channels: vec![ChannelConfig {
+                platform: ChannelPlatform::Youtube,
+                identifier: "https://www.youtube.com/watch?v=abc123".to_string(),
+                enabled: false,
+            }],
+            obs: ObsConfig {
+                port: 12000,
+                template: "compact".to_string(),
+            },
+            tts: TtsConfig {
+                backend: TtsBackendKind::Voicevox,
+                options: TtsOptions {
+                    bouyomi_host: "192.0.2.10".to_string(),
+                    bouyomi_port: 50002,
+                    bouyomi_speed: 90,
+                    bouyomi_volume: 80,
+                    bouyomi_tone: 70,
+                    bouyomi_voice: 2,
+                    voicevox_url: "http://127.0.0.1:50022".to_string(),
+                    voicevox_speaker: 3,
+                    read_name: false,
+                    omit_url: false,
+                    strip_emoji: false,
+                    max_length: 280,
+                },
+            },
+            moderation: ModerationConfig {
+                ng_words: vec!["spam".to_string()],
+                ng_users: vec!["bot".to_string()],
+                highlights: vec!["important".to_string()],
+            },
+            ui: UiConfig { max_buffer: 1234 },
+            youtube_overrides: YoutubeOverrides {
+                api_key: Some("test-api-key".to_string()),
+                client_version: Some("1.20240501.00.00".to_string()),
+                paths,
+            },
+        };
+
+        let text = serde_json::to_string(&cfg).expect("serialize AppConfig");
+        let json: serde_json::Value = serde_json::from_str(&text).expect("parse serialized JSON");
+
+        assert_eq!(json["obs"]["template"].as_str(), Some("compact"));
+        assert_eq!(json["ui"]["maxBuffer"].as_u64(), Some(1234));
+        assert_eq!(
+            json["tts"]["options"]["bouyomiHost"].as_str(),
+            Some("192.0.2.10")
+        );
+        assert_eq!(json["tts"]["options"]["bouyomiPort"].as_u64(), Some(50002));
+        assert_eq!(json["tts"]["options"]["bouyomiSpeed"].as_i64(), Some(90));
+        assert_eq!(
+            json["tts"]["options"]["bouyomiVolume"].as_i64(),
+            Some(80)
+        );
+        assert_eq!(json["tts"]["options"]["bouyomiTone"].as_i64(), Some(70));
+        assert_eq!(json["tts"]["options"]["bouyomiVoice"].as_i64(), Some(2));
+        assert_eq!(
+            json["tts"]["options"]["voicevoxUrl"].as_str(),
+            Some("http://127.0.0.1:50022")
+        );
+        assert_eq!(
+            json["tts"]["options"]["voicevoxSpeaker"].as_u64(),
+            Some(3)
+        );
+        assert_eq!(json["tts"]["options"]["readName"].as_bool(), Some(false));
+        assert_eq!(json["tts"]["options"]["omitUrl"].as_bool(), Some(false));
+        assert_eq!(json["tts"]["options"]["stripEmoji"].as_bool(), Some(false));
+        assert_eq!(json["tts"]["options"]["maxLength"].as_u64(), Some(280));
+        assert_eq!(
+            json["youtubeOverrides"]["apiKey"].as_str(),
+            Some("test-api-key")
+        );
+        assert_eq!(
+            json["youtubeOverrides"]["clientVersion"].as_str(),
+            Some("1.20240501.00.00")
+        );
+        assert_eq!(
+            json["youtubeOverrides"]["paths"]["continuationPath"].as_str(),
+            Some("contents.twoColumnWatchNextResults.conversationBar")
+        );
+
+        let decoded: AppConfig = serde_json::from_str(&text).expect("deserialize AppConfig");
+        assert_eq!(decoded, cfg);
+    }
+
+    #[test]
+    fn default_helpers_are_reflected_in_default_config() {
+        // private な default helper の値が Default 実装へ反映されることを確認する。
+        let cfg = AppConfig::default();
+
+        assert!(cfg.channels.is_empty());
+        assert_eq!(cfg.obs.port, default_obs_port());
+        assert_eq!(cfg.obs.port, 11180);
+        assert_eq!(cfg.obs.template, default_obs_template());
+        assert_eq!(cfg.obs.template, "default");
+        assert_eq!(cfg.tts.backend, TtsBackendKind::WebSpeech);
+        assert_eq!(cfg.tts.options.bouyomi_host, default_bouyomi_host());
+        assert_eq!(cfg.tts.options.bouyomi_host, "127.0.0.1");
+        assert_eq!(cfg.tts.options.bouyomi_port, default_bouyomi_port());
+        assert_eq!(cfg.tts.options.bouyomi_port, 50001);
+        assert_eq!(cfg.tts.options.bouyomi_speed, default_minus_one());
+        assert_eq!(cfg.tts.options.bouyomi_volume, default_minus_one());
+        assert_eq!(cfg.tts.options.bouyomi_tone, default_minus_one());
+        assert_eq!(cfg.tts.options.bouyomi_voice, 0);
+        assert_eq!(cfg.tts.options.voicevox_url, default_voicevox_url());
+        assert_eq!(cfg.tts.options.voicevox_url, "http://127.0.0.1:50021");
+        assert_eq!(cfg.tts.options.voicevox_speaker, default_voicevox_speaker());
+        assert_eq!(cfg.tts.options.voicevox_speaker, 1);
+        assert_eq!(cfg.tts.options.read_name, default_true());
+        assert_eq!(cfg.tts.options.omit_url, default_true());
+        assert_eq!(cfg.tts.options.strip_emoji, default_true());
+        assert_eq!(cfg.tts.options.max_length, default_max_read_len());
+        assert_eq!(cfg.tts.options.max_length, 140);
+        assert!(cfg.moderation.ng_words.is_empty());
+        assert!(cfg.moderation.ng_users.is_empty());
+        assert!(cfg.moderation.highlights.is_empty());
+        assert_eq!(cfg.ui.max_buffer, default_max_buffer());
+        assert_eq!(cfg.ui.max_buffer, 2000);
+        assert_eq!(cfg.youtube_overrides, YoutubeOverrides::default());
+    }
+
+    #[test]
+    fn partial_legacy_config_is_backfilled_by_serde_defaults() {
+        // 古い/部分的な config.json でも serde default で後方互換の既定値を補完する。
+        let text = r#"{
+            "channels": [
+                {
+                    "platform": "twitch",
+                    "identifier": "example_channel"
+                }
+            ],
+            "obs": {
+                "port": 12345
+            },
+            "tts": {
+                "backend": "bouyomi",
+                "options": {
+                    "bouyomiPort": 50003,
+                    "readName": false
+                }
+            },
+            "ui": {
+                "maxBuffer": 321
+            }
+        }"#;
+
+        let cfg: AppConfig = serde_json::from_str(text).expect("partial legacy config");
+
+        assert_eq!(cfg.channels.len(), 1);
+        assert_eq!(cfg.channels[0].platform, ChannelPlatform::Twitch);
+        assert_eq!(cfg.channels[0].identifier, "example_channel");
+        assert_eq!(cfg.channels[0].enabled, default_true());
+        assert_eq!(cfg.obs.port, 12345);
+        assert_eq!(cfg.obs.template, default_obs_template());
+        assert_eq!(cfg.tts.backend, TtsBackendKind::Bouyomi);
+        assert_eq!(cfg.tts.options.bouyomi_host, default_bouyomi_host());
+        assert_eq!(cfg.tts.options.bouyomi_port, 50003);
+        assert_eq!(cfg.tts.options.bouyomi_speed, default_minus_one());
+        assert_eq!(cfg.tts.options.bouyomi_volume, default_minus_one());
+        assert_eq!(cfg.tts.options.bouyomi_tone, default_minus_one());
+        assert_eq!(cfg.tts.options.bouyomi_voice, 0);
+        assert_eq!(cfg.tts.options.voicevox_url, default_voicevox_url());
+        assert_eq!(cfg.tts.options.voicevox_speaker, default_voicevox_speaker());
+        assert!(!cfg.tts.options.read_name);
+        assert_eq!(cfg.tts.options.omit_url, default_true());
+        assert_eq!(cfg.tts.options.strip_emoji, default_true());
+        assert_eq!(cfg.tts.options.max_length, default_max_read_len());
+        assert_eq!(cfg.ui.max_buffer, 321);
+        assert_eq!(cfg.youtube_overrides, YoutubeOverrides::default());
+    }
+
+    #[test]
+    fn youtube_override_paths_accept_empty_and_preserve_values() {
+        // paths が空でも壊れず、指定したキー名と文字列値は往復で保持される。
+        let empty_text = r#"{
+            "youtubeOverrides": {
+                "paths": {}
+            }
+        }"#;
+        let empty_cfg: AppConfig = serde_json::from_str(empty_text).expect("empty override paths");
+        assert!(empty_cfg.youtube_overrides.paths.is_empty());
+
+        let specified_text = r#"{
+            "youtubeOverrides": {
+                "paths": {
+                    "apiKey": "ytInitialPlayerResponse.args.innertubeApiKey",
+                    "continuation": "contents.liveChatRenderer.continuations.0"
+                }
+            }
+        }"#;
+        let specified_cfg: AppConfig =
+            serde_json::from_str(specified_text).expect("specified override paths");
+        assert_eq!(
+            specified_cfg
+                .youtube_overrides
+                .paths
+                .get("apiKey")
+                .map(String::as_str),
+            Some("ytInitialPlayerResponse.args.innertubeApiKey")
+        );
+        assert_eq!(
+            specified_cfg
+                .youtube_overrides
+                .paths
+                .get("continuation")
+                .map(String::as_str),
+            Some("contents.liveChatRenderer.continuations.0")
+        );
+
+        let text = serde_json::to_string(&specified_cfg).expect("serialize override paths");
+        let decoded: AppConfig = serde_json::from_str(&text).expect("deserialize override paths");
+        assert_eq!(decoded.youtube_overrides.paths, specified_cfg.youtube_overrides.paths);
+    }
+}
