@@ -1,7 +1,7 @@
 {
   "task": "fast-comment SPEC完成度向上: 3レーン監査で検出したCRITICAL/HIGH/MEDIUM欠陥を修正し、MVP(P1-P5)を機能水準に引き上げる。WSLはビルド不可のため目視レビュー検証のみ。",
   "createdAt": "2026-05-29T16:32:57.919Z",
-  "updatedAt": "2026-05-29T17:05:09.243Z",
+  "updatedAt": "2026-05-29T17:05:26.932Z",
   "model": {
     "codex": null,
     "codexEffort": "high",
@@ -95,12 +95,12 @@
       "engine": "codex",
       "kind": "implement",
       "implemented": true,
-      "reviewed": false,
-      "passes": false,
+      "reviewed": true,
+      "passes": true,
       "retryCount": 1,
       "maxRetries": 3,
       "lastResultPath": ".omc/state/fullralph-results/US-003.json",
-      "lastFeedback": "AC1未達: tts/mod.rs update_config()が無条件で毎回build_bouyomi/build_voicevoxを呼び両backendを再構築する。lib.rsがspeak毎にupdate_configを呼ぶためClientが事実上speak毎に再生成されkeep-aliveが効かない。修正: TtsConfigはPartialEq derive済なので update_config 内で self.config==config なら早期return、または関連backend設定が変わった時のみ再構築するガードを追加。他AC(base64テスト/フォールバック/available警告抑制/スコープ)は充足済。tts/配下のみ変更。"
+      "lastFeedback": ""
     },
     {
       "id": "US-004",
@@ -127,12 +127,12 @@
       "engine": "codex",
       "kind": "implement",
       "implemented": true,
-      "reviewed": false,
-      "passes": false,
+      "reviewed": true,
+      "passes": true,
       "retryCount": 1,
       "maxRetries": 3,
       "lastResultPath": ".omc/state/fullralph-results/US-004.json",
-      "lastFeedback": "AC3未達(2点)。(1)get_obs_url(lib.rs:188)が返すURLに ws=ws://127.0.0.1:{port}/ws を付与せよ。テンプレapp.jsの既定WSは11180固定のため、ポート変更後はget_obs_urlがws=で正しいポートを明示しないとコメントWSが旧ポートに繋ぎ続ける。(2)spawn_obs_server_on_port(bus.rs:151)はbind失敗時にログ出力してreturnするだけなので、obs_server.portは再bind成功後にのみ更新せよ(lib.rs:208)。bind失敗時はポート状態を更新せず、get_obs_urlが待受していないURLを返さないようにする。他AC充足済。lib.rs/bus.rs/tauri.conf.json/SPEC.md/SETUP.md以外変更不可。"
+      "lastFeedback": ""
     },
     {
       "id": "US-005",
@@ -237,12 +237,12 @@
       "engine": "claude",
       "kind": "implement",
       "implemented": true,
-      "reviewed": false,
-      "passes": false,
+      "reviewed": true,
+      "passes": true,
       "retryCount": 1,
       "maxRetries": 3,
       "lastResultPath": ".omc/state/fullralph-results/US-008.json",
-      "lastFeedback": "AC3のみ未達: clientHeight初期化を600→0にしたが viewportHeight = clientHeight>0 ? clientHeight : 600 で即600にフォールバックしmount前ミスサイズが残存している。修正: 計測前(mount前)は推測高さで仮想ウィンドウ計算をしない。onMount後にのみ描画する、または measured フラグを立てて endIdx をゲートする。AC1(28px固定高/強調は背景+左ボーダー)/AC2/AC4(untrackで自動スクロール維持)は充足済。CommentList.svelte/CommentItem.svelte以外変更不可。"
+      "lastFeedback": ""
     },
     {
       "id": "US-009",
