@@ -29,13 +29,18 @@
   };
 
   let platformColor = $derived(PLATFORM_COLORS[message.platform] ?? '#888');
-  let isHighlighted = $derived(
-    message.kind === 'superChat' ||
-    message.kind === 'membership' ||
-    message.kind === 'bits'
+  let hasHighlightBadge = $derived(
+    message.author.badges.some(b => b.kind === 'highlight')
   );
-  let highlightBg = $derived(KIND_BG[message.kind] ?? 'transparent');
-  let highlightFg = $derived(KIND_TEXT[message.kind] ?? 'inherit');
+  // kind 由来のベタ塗りを持つ種別。従来 isHighlighted に含めていた集合と一致させ、
+  // system は従来どおり塗らない(KIND_BG['system'] は定義済みだが旧実装でも未適用だった)。
+  const FILLED_KINDS = new Set(['superChat', 'membership', 'bits']);
+  // kind 由来の塗りがある行 = 名前がベタ塗り背景に乗る行。
+  let hasKindStyle = $derived(FILLED_KINDS.has(message.kind));
+  let kindBg = $derived(hasKindStyle ? KIND_BG[message.kind] : undefined);
+  let kindFg = $derived(hasKindStyle ? KIND_TEXT[message.kind] : undefined);
+  // 行強調(太字 + 左枠): kind 塗り or highlight バッジのどちらかで点灯。
+  let isHighlighted = $derived(hasKindStyle || hasHighlightBadge);
 
   function onHide() {
     store.hideMessage(message.id);
@@ -54,8 +59,9 @@
 <div
   class="comment-item"
   class:highlighted={isHighlighted}
-  style:background={isHighlighted ? highlightBg : undefined}
-  style:color={isHighlighted ? highlightFg : undefined}
+  class:highlight-badge={hasHighlightBadge}
+  style:background={kindBg}
+  style:color={kindFg}
   role="listitem"
 >
   <!-- Platform indicator -->
@@ -73,7 +79,7 @@
   <!-- Author name -->
   <span
     class="author-name"
-    style:color={!isHighlighted && message.author.displayColor ? message.author.displayColor : undefined}
+    style:color={!hasKindStyle && message.author.displayColor ? message.author.displayColor : undefined}
   >
     {message.author.name}
   </span>
@@ -132,6 +138,16 @@
   .comment-item.highlighted {
     border-left-color: rgba(0, 0, 0, 0.35);
     font-weight: 500;
+  }
+
+  /* highlight badge (moderation.highlights 由来): 左枠オレンジ + 薄い背景tint。
+     normal kind の行には kind 由来の inline background が出ない(kindBg=undefined)ため
+     この tint が実描画される。kind 塗りのある行では inline background が優先され tint は隠れる。
+     後段ルールなので .highlighted の dark 枠色より #ff9800 が勝つ。
+     border-left は既に3px確保済みなのでレイアウトシフト無し。 */
+  .comment-item.highlight-badge {
+    border-left-color: #ff9800;
+    background: rgba(255, 152, 0, 0.08);
   }
 
   .platform-dot {
