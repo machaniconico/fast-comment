@@ -1,0 +1,316 @@
+<script lang="ts">
+  import { onMount } from 'svelte';
+  import type { AppConfig, ChannelConfig } from '../ipc';
+  import {
+    getConfig, setConfig, addChannel, removeChannel, getObsUrl
+  } from '../ipc';
+
+  let config: AppConfig | null = $state(null);
+  let obsUrl: string = $state('');
+  let copied: boolean = $state(false);
+
+  // New channel form
+  let newPlatform: 'twitch' | 'youtube' = $state('twitch');
+  let newIdentifier: string = $state('');
+  let addError: string = $state('');
+
+  // NG / highlight edit buffers
+  let ngWordsText: string = $state('');
+  let ngUsersText: string = $state('');
+  let highlightsText: string = $state('');
+
+  let saving: boolean = $state(false);
+  let saveMsg: string = $state('');
+
+  onMount(async () => {
+    config = await getConfig();
+    if (config) {
+      ngWordsText = config.moderation.ngWords.join('\n');
+      ngUsersText = config.moderation.ngUsers.join('\n');
+      highlightsText = config.moderation.highlights.join('\n');
+    }
+    const url = await getObsUrl();
+    obsUrl = url ?? 'http://127.0.0.1:11180/?template=default';
+  });
+
+  async function onAddChannel() {
+    addError = '';
+    const id = newIdentifier.trim();
+    if (!id) { addError = 'チャンネル名またはIDを入力してください'; return; }
+    const ch: ChannelConfig = { platform: newPlatform, identifier: extractYoutubeId(id) };
+    await addChannel(ch);
+    config = await getConfig();
+    newIdentifier = '';
+  }
+
+  async function onRemoveChannel(ch: ChannelConfig) {
+    await removeChannel(`${ch.platform}:${ch.identifier}`);
+    config = await getConfig();
+  }
+
+  function extractYoutubeId(input: string): string {
+    // Accept full URL or bare videoId
+    try {
+      const url = new URL(input);
+      return url.searchParams.get('v') ?? url.pathname.split('/').pop() ?? input;
+    } catch {
+      return input;
+    }
+  }
+
+  async function onSave() {
+    if (!config) return;
+    saving = true;
+    config.moderation.ngWords = ngWordsText.split('\n').map(s => s.trim()).filter(Boolean);
+    config.moderation.ngUsers = ngUsersText.split('\n').map(s => s.trim()).filter(Boolean);
+    config.moderation.highlights = highlightsText.split('\n').map(s => s.trim()).filter(Boolean);
+    await setConfig(config);
+    saving = false;
+    saveMsg = '保存しました';
+    setTimeout(() => saveMsg = '', 2000);
+  }
+
+  async function onCopyObs() {
+    await navigator.clipboard.writeText(obsUrl).catch(() => {});
+    copied = true;
+    setTimeout(() => copied = false, 1500);
+  }
+</script>
+
+<div class="settings">
+  <h2>設定</h2>
+
+  <!-- ── Channels ── -->
+  <section>
+    <h3>チャンネル</h3>
+    {#if config && config.channels.length > 0}
+      <ul class="channel-list">
+        {#each config.channels as ch}
+          <li>
+            <span class="platform-badge" class:twitch={ch.platform === 'twitch'} class:youtube={ch.platform === 'youtube'}>
+              {ch.platform}
+            </span>
+            <span class="ch-id">{ch.identifier}</span>
+            <button class="remove-btn" onclick={() => onRemoveChannel(ch)}>削除</button>
+          </li>
+        {/each}
+      </ul>
+    {:else}
+      <p class="empty">チャンネルなし</p>
+    {/if}
+
+    <div class="add-channel-row">
+      <select bind:value={newPlatform} class="platform-select">
+        <option value="twitch">Twitch</option>
+        <option value="youtube">YouTube</option>
+      </select>
+      <input
+        type="text"
+        bind:value={newIdentifier}
+        placeholder={newPlatform === 'twitch' ? 'チャンネル名' : 'videoId または URL'}
+        class="id-input"
+        onkeydown={(e) => e.key === 'Enter' && onAddChannel()}
+      />
+      <button class="add-btn" onclick={onAddChannel}>追加</button>
+    </div>
+    {#if addError}<p class="error">{addError}</p>{/if}
+  </section>
+
+  <!-- ── TTS ── -->
+  {#if config}
+  <section>
+    <h3>TTS（読み上げ）</h3>
+    <div class="field-row">
+      <label>バックエンド</label>
+      <select bind:value={config.tts.backend} class="platform-select">
+        <option value="none">読み上げOFF</option>
+        <option value="webSpeech">Web Speech（内蔵）</option>
+        <option value="bouyomi">棒読みちゃん</option>
+        <option value="voicevox">VOICEVOX</option>
+      </select>
+    </div>
+  </section>
+
+  <!-- ── OBS URL ── -->
+  <section>
+    <h3>OBSオーバーレイ URL</h3>
+    <div class="obs-row">
+      <input type="text" value={obsUrl} readonly class="obs-input" />
+      <button class="copy-btn" class:copied onclick={onCopyObs}>
+        {copied ? 'コピー済' : 'コピー'}
+      </button>
+    </div>
+    <p class="hint">OBSのブラウザソースにこのURLを貼り付けてください。</p>
+  </section>
+
+  <!-- ── Moderation ── -->
+  <section>
+    <h3>NGワード <span class="hint-inline">（1行1語、正規表現可）</span></h3>
+    <textarea bind:value={ngWordsText} rows={4} class="mod-area" placeholder="NG word&#10;bad_word"></textarea>
+
+    <h3>NGユーザー <span class="hint-inline">（1行1ID）</span></h3>
+    <textarea bind:value={ngUsersText} rows={3} class="mod-area" placeholder="username123"></textarea>
+
+    <h3>ハイライト <span class="hint-inline">（ユーザー名またはキーワード）</span></h3>
+    <textarea bind:value={highlightsText} rows={3} class="mod-area" placeholder="!command&#10;favorite_user"></textarea>
+  </section>
+
+  <!-- ── Save ── -->
+  <div class="save-row">
+    <button class="save-btn" onclick={onSave} disabled={saving}>
+      {saving ? '保存中...' : '設定を保存'}
+    </button>
+    {#if saveMsg}<span class="save-ok">{saveMsg}</span>{/if}
+  </div>
+  {/if}
+</div>
+
+<style>
+  .settings {
+    padding: 12px 16px;
+    overflow-y: auto;
+    height: 100%;
+    box-sizing: border-box;
+  }
+
+  h2 {
+    font-size: 15px;
+    font-weight: 700;
+    margin: 0 0 12px;
+    color: #e0e0e0;
+  }
+
+  h3 {
+    font-size: 12px;
+    font-weight: 600;
+    color: #9e9e9e;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin: 14px 0 6px;
+  }
+
+  section {
+    border-bottom: 1px solid rgba(255,255,255,0.07);
+    padding-bottom: 12px;
+    margin-bottom: 4px;
+  }
+
+  .channel-list {
+    list-style: none;
+    margin: 0 0 8px;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .channel-list li {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    background: rgba(255,255,255,0.05);
+    border-radius: 4px;
+    padding: 4px 8px;
+  }
+
+  .platform-badge {
+    font-size: 10px;
+    font-weight: 700;
+    padding: 1px 6px;
+    border-radius: 10px;
+    text-transform: uppercase;
+  }
+
+  .platform-badge.twitch { background: #9146ff; color: #fff; }
+  .platform-badge.youtube { background: #ff0000; color: #fff; }
+
+  .ch-id {
+    flex: 1;
+    font-size: 12px;
+    color: #ccc;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .add-channel-row {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+  }
+
+  .platform-select, .id-input, .obs-input {
+    background: rgba(255,255,255,0.07);
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 4px;
+    color: #e0e0e0;
+    padding: 5px 8px;
+    font-size: 13px;
+  }
+
+  .platform-select { flex-shrink: 0; }
+  .id-input { flex: 1; }
+  .obs-input { flex: 1; font-size: 12px; }
+
+  .add-btn, .remove-btn, .copy-btn, .save-btn {
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 12px;
+    padding: 5px 10px;
+    font-weight: 600;
+    transition: opacity 0.15s;
+  }
+
+  .add-btn { background: #1976d2; color: #fff; }
+  .remove-btn { background: rgba(244,67,54,0.15); color: #f44336; }
+  .copy-btn { background: #37474f; color: #fff; min-width: 60px; }
+  .copy-btn.copied { background: #2e7d32; }
+  .save-btn { background: #1976d2; color: #fff; padding: 7px 18px; }
+  .save-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  .obs-row {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+  }
+
+  .mod-area {
+    width: 100%;
+    background: rgba(255,255,255,0.05);
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 4px;
+    color: #e0e0e0;
+    font-size: 12px;
+    padding: 6px 8px;
+    resize: vertical;
+    box-sizing: border-box;
+    font-family: monospace;
+  }
+
+  .field-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .field-row label {
+    font-size: 13px;
+    color: #ccc;
+    min-width: 90px;
+  }
+
+  .hint { font-size: 11px; color: #757575; margin: 4px 0 0; }
+  .hint-inline { font-size: 11px; color: #757575; font-weight: 400; text-transform: none; letter-spacing: 0; }
+  .error { color: #f44336; font-size: 11px; margin: 4px 0 0; }
+  .empty { color: #757575; font-size: 12px; }
+
+  .save-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding-top: 12px;
+  }
+
+  .save-ok { color: #66bb6a; font-size: 12px; }
+</style>

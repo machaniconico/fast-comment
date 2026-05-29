@@ -1,0 +1,148 @@
+/* OBS Browser Source overlay — transparent background */
+
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body {
+  width: 100%;
+  height: 100%;
+  background: transparent;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Hiragino Sans', 'Yu Gothic UI', sans-serif;
+  font-size: 14px;
+  overflow: hidden;
+}
+
+#overlay {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  /* max visible rows — adjust via URL param max (default 8) */
+  max-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  gap: 4px;
+  padding: 8px;
+  pointer-events: none;
+}
+
+/* ---- Comment row ---- */
+.comment {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 5px 10px;
+  border-radius: 6px;
+  background: rgba(14, 14, 14, 0.82);
+  backdrop-filter: blur(4px);
+  max-width: 520px;
+  word-break: break-word;
+  line-height: 1.45;
+
+  /* Entrance animation */
+  animation: fade-slide-in 0.25s ease-out both;
+}
+
+/* Exit animation applied via JS */
+.comment.leaving {
+  animation: fade-out 0.4s ease-in forwards;
+}
+
+@keyframes fade-slide-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes fade-out {
+  from { opacity: 1; transform: scale(1); }
+  to   { opacity: 0; transform: scale(0.96); }
+}
+
+/* ---- Platform dot ---- */
+.platform-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  margin-top: 5px;
+}
+
+.platform-dot.twitch  { background: #9146ff; }
+.platform-dot.youtube { background: #ff0000; }
+
+/* ---- Badge images ---- */
+.badge-img {
+  width: 18px;
+  height: 18px;
+  vertical-align: middle;
+  flex-shrink: 0;
+}
+
+/* ---- Author ---- */
+.author {
+  font-weight: 700;
+  font-size: 13px;
+  color: #e0e0e0;
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+.sep {
+  color: rgba(255,255,255,0.35);
+  flex-shrink: 0;
+}
+
+/* ---- Text fragments ---- */
+.fragments {
+  color: #f5f5f5;
+  font-size: 14px;
+}
+
+/* ---- Emote images ---- */
+.emote {
+  height: 22px;
+  width: auto;
+  vertical-align: middle;
+}
+
+/* ---- SuperChat / Bits highlight ---- */
+.comment.superchat {
+  background: rgba(255, 214, 0, 0.92);
+  color: #000;
+}
+.comment.superchat .author { color: #000; }
+.comment.superchat .fragments { color: #000; }
+.comment.superchat .sep { color: rgba(0,0,0,0.4); }
+
+.comment.membership {
+  background: rgba(0, 200, 83, 0.88);
+  color: #fff;
+}
+.comment.membership .author { color: #fff; }
+
+.comment.bits {
+  background: rgba(145, 70, 255, 0.85);
+  color: #fff;
+}
+
+/* ---- Amount badge ---- */
+.amount {
+  display: inline-block;
+  background: rgba(0,0,0,0.25);
+  border-radius: 10px;
+  padding: 1px 7px;
+  font-size: 12px;
+  font-weight: 700;
+  flex-shrink: 0;
+}

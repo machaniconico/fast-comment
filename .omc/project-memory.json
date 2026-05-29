@@ -1,0 +1,284 @@
+{
+  "version": "1.0.0",
+  "lastScanned": 1780057080314,
+  "projectRoot": "/mnt/d/workspace/fast-comment",
+  "techStack": {
+    "languages": [
+      {
+        "name": "JavaScript/TypeScript",
+        "version": null,
+        "confidence": "high",
+        "markers": [
+          "package.json"
+        ]
+      },
+      {
+        "name": "TypeScript",
+        "version": null,
+        "confidence": "high",
+        "markers": [
+          "tsconfig.json"
+        ]
+      }
+    ],
+    "frameworks": [
+      {
+        "name": "svelte",
+        "version": "5.19.0",
+        "category": "frontend"
+      },
+      {
+        "name": "vite",
+        "version": "6.0.7",
+        "category": "build"
+      }
+    ],
+    "packageManager": "npm",
+    "runtime": null
+  },
+  "build": {
+    "buildCommand": "npm run build",
+    "testCommand": null,
+    "lintCommand": null,
+    "devCommand": "npm run dev",
+    "scripts": {
+      "dev": "vite",
+      "build": "vite build",
+      "preview": "vite preview",
+      "check": "svelte-check --tsconfig ./tsconfig.json",
+      "tauri": "tauri"
+    }
+  },
+  "conventions": {
+    "namingStyle": null,
+    "importStyle": "ES modules",
+    "testPattern": null,
+    "fileOrganization": null
+  },
+  "structure": {
+    "isMonorepo": false,
+    "workspaces": [],
+    "mainDirectories": [
+      "src"
+    ],
+    "gitBranches": null
+  },
+  "customNotes": [],
+  "directoryMap": {
+    "src": {
+      "path": "src",
+      "purpose": "Source code",
+      "fileCount": 2,
+      "lastAccessed": 1780057080298,
+      "keyFiles": [
+        "App.svelte",
+        "main.ts"
+      ]
+    },
+    "src-tauri": {
+      "path": "src-tauri",
+      "purpose": null,
+      "fileCount": 3,
+      "lastAccessed": 1780057080301,
+      "keyFiles": [
+        "Cargo.toml",
+        "build.rs",
+        "tauri.conf.json"
+      ]
+    },
+    "templates": {
+      "path": "templates",
+      "purpose": null,
+      "fileCount": 0,
+      "lastAccessed": 1780057080303,
+      "keyFiles": []
+    },
+    "src/lib": {
+      "path": "src/lib",
+      "purpose": "Library code",
+      "fileCount": 3,
+      "lastAccessed": 1780057080308,
+      "keyFiles": [
+        "ipc.ts",
+        "stores.svelte.ts",
+        "types.ts"
+      ]
+    },
+    "src-tauri/src": {
+      "path": "src-tauri/src",
+      "purpose": "Source code",
+      "fileCount": 6,
+      "lastAccessed": 1780057080313,
+      "keyFiles": [
+        "bus.rs",
+        "config.rs",
+        "lib.rs"
+      ]
+    }
+  },
+  "hotPaths": [
+    {
+      "path": "src-tauri/src/lib.rs",
+      "accessCount": 28,
+      "lastAccessed": 1780057838119,
+      "type": "file"
+    },
+    {
+      "path": ".claude/SPEC.md",
+      "accessCount": 28,
+      "lastAccessed": 1780058093645,
+      "type": "file"
+    },
+    {
+      "path": "src-tauri/src/config.rs",
+      "accessCount": 22,
+      "lastAccessed": 1780057846009,
+      "type": "file"
+    },
+    {
+      "path": "src-tauri/src/sources/twitch.rs",
+      "accessCount": 12,
+      "lastAccessed": 1780057845626,
+      "type": "file"
+    },
+    {
+      "path": "src-tauri/src/bus.rs",
+      "accessCount": 11,
+      "lastAccessed": 1780057838666,
+      "type": "file"
+    },
+    {
+      "path": "src/lib/components/Settings.svelte",
+      "accessCount": 9,
+      "lastAccessed": 1780057735265,
+      "type": "file"
+    },
+    {
+      "path": "src/lib/ipc.ts",
+      "accessCount": 8,
+      "lastAccessed": 1780057734035,
+      "type": "file"
+    },
+    {
+      "path": "src-tauri/src/tts/mod.rs",
+      "accessCount": 8,
+      "lastAccessed": 1780057838866,
+      "type": "file"
+    },
+    {
+      "path": "src-tauri/src/tts/bouyomi.rs",
+      "accessCount": 8,
+      "lastAccessed": 1780057844429,
+      "type": "file"
+    },
+    {
+      "path": "src-tauri/src/tts/voicevox.rs",
+      "accessCount": 8,
+      "lastAccessed": 1780057844990,
+      "type": "file"
+    },
+    {
+      "path": "src-tauri/src/model.rs",
+      "accessCount": 8,
+      "lastAccessed": 1780057858857,
+      "type": "file"
+    },
+    {
+      "path": "templates/default/app.js",
+      "accessCount": 7,
+      "lastAccessed": 1780057613876,
+      "type": "file"
+    },
+    {
+      "path": "src-tauri/src/sources/youtube/innertube.rs",
+      "accessCount": 7,
+      "lastAccessed": 1780057852740,
+      "type": "file"
+    },
+    {
+      "path": "src-tauri/src/sources/youtube/parser.rs",
+      "accessCount": 7,
+      "lastAccessed": 1780057853413,
+      "type": "file"
+    },
+    {
+      "path": "src-tauri/src/moderation.rs",
+      "accessCount": 7,
+      "lastAccessed": 1780057859387,
+      "type": "file"
+    },
+    {
+      "path": "src/lib/stores.svelte.ts",
+      "accessCount": 6,
+      "lastAccessed": 1780057734804,
+      "type": "file"
+    },
+    {
+      "path": "src-tauri/src/sources/youtube/mod.rs",
+      "accessCount": 6,
+      "lastAccessed": 1780057853852,
+      "type": "file"
+    },
+    {
+      "path": "src-tauri/src/sources/mod.rs",
+      "accessCount": 4,
+      "lastAccessed": 1780057859749,
+      "type": "file"
+    },
+    {
+      "path": "SETUP.md",
+      "accessCount": 2,
+      "lastAccessed": 1780057301605,
+      "type": "file"
+    },
+    {
+      "path": "src/App.svelte",
+      "accessCount": 2,
+      "lastAccessed": 1780057353416,
+      "type": "file"
+    },
+    {
+      "path": "src/lib/types.ts",
+      "accessCount": 2,
+      "lastAccessed": 1780057595084,
+      "type": "file"
+    },
+    {
+      "path": "templates/default/index.html",
+      "accessCount": 1,
+      "lastAccessed": 1780057240158,
+      "type": "file"
+    },
+    {
+      "path": "templates/default/style.css",
+      "accessCount": 1,
+      "lastAccessed": 1780057241476,
+      "type": "file"
+    },
+    {
+      "path": "src/lib/components/CommentList.svelte",
+      "accessCount": 1,
+      "lastAccessed": 1780057242541,
+      "type": "file"
+    },
+    {
+      "path": "src-tauri/src/main.rs",
+      "accessCount": 1,
+      "lastAccessed": 1780057242977,
+      "type": "file"
+    },
+    {
+      "path": "src/lib/components/CommentItem.svelte",
+      "accessCount": 1,
+      "lastAccessed": 1780057243331,
+      "type": "file"
+    },
+    {
+      "path": "src-tauri/app-icon.png",
+      "accessCount": 1,
+      "lastAccessed": 1780057285128,
+      "type": "file"
+    }
+  ],
+  "userDirectives": []
+}
