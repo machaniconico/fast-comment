@@ -4,6 +4,7 @@
   import {
     getConfig, setConfig, addChannel, removeChannel, getObsUrl
   } from '../ipc';
+  import { ui, SETTINGS_ANCHOR_IDS } from '../ui.svelte';
 
   let config: AppConfig | null = $state(null);
   let obsBaseUrl: string = $state('');
@@ -24,6 +25,23 @@
 
   let saving: boolean = $state(false);
   let saveMsg: string = $state('');
+
+  // Scroll to settings section when the command palette sets a settingsAnchor.
+  // Gate on `config`: the tts/obs/moderation sections live inside {#if config},
+  // so a cold navigation from the comments tab mounts Settings while config is
+  // still loading (null) and the target section is not yet in the DOM. We read
+  // `config` (so it is tracked as a dependency) and bail without clearing the
+  // anchor until config resolves; the effect then re-fires and the scroll lands.
+  $effect(() => {
+    const a = ui.settingsAnchor;
+    if (!a) return;
+    if (!config) return;
+    const id = SETTINGS_ANCHOR_IDS[a];
+    requestAnimationFrame(() => {
+      document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
+    ui.clearSettingsAnchor();
+  });
 
   // setTimeout handles (cleared on destroy)
   let saveMsgTimer: ReturnType<typeof setTimeout> | null = null;
@@ -187,7 +205,7 @@
   <h2>設定</h2>
 
   <!-- ── Channels ── -->
-  <section>
+  <section id="settings-channels">
     <h3>チャンネル</h3>
     {#if config && config.channels.length > 0}
       <ul class="channel-list">
@@ -224,7 +242,7 @@
 
   <!-- ── TTS ── -->
   {#if config}
-  <section>
+  <section id="settings-tts">
     <h3>TTS（読み上げ）</h3>
     <div class="field-row">
       <label>バックエンド</label>
@@ -268,7 +286,7 @@
   </section>
 
   <!-- ── OBS URL ── -->
-  <section>
+  <section id="settings-obs">
     <h3>OBSオーバーレイ URL</h3>
     <div class="field-row">
       <label for="obs-template">テンプレート</label>
@@ -294,7 +312,7 @@
   </section>
 
   <!-- ── Moderation ── -->
-  <section>
+  <section id="settings-moderation">
     <h3>NGワード <span class="hint-inline">（1行1語、正規表現可）</span></h3>
     <textarea bind:value={ngWordsText} rows={4} class="mod-area" placeholder="NG word&#10;bad_word"></textarea>
 

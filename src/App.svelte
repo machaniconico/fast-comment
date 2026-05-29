@@ -3,10 +3,9 @@
   import type { Platform } from './lib/types';
   import CommentList from './lib/components/CommentList.svelte';
   import Settings from './lib/components/Settings.svelte';
+  import CommandPalette from './lib/components/CommandPalette.svelte';
   import { store, initStore, clearMessages } from './lib/stores.svelte';
-
-  type Tab = 'comments' | 'settings';
-  let activeTab: Tab = $state('comments');
+  import { ui } from './lib/ui.svelte';
 
   let unlisten: (() => void) | null = null;
 
@@ -31,7 +30,16 @@
     if (searchDebounce) clearTimeout(searchDebounce);
     searchDebounce = setTimeout(() => store.setSearchQuery(val), 120);
   }
+
+  function onWindowKey(e: KeyboardEvent) {
+    if (e.key === 'k' && (e.ctrlKey || e.metaKey)) {
+      e.preventDefault();
+      ui.togglePalette();
+    }
+  }
 </script>
+
+<svelte:window onkeydown={onWindowKey} />
 
 <div class="app">
   <!-- ── Header ── -->
@@ -46,22 +54,22 @@
       <button
         role="tab"
         class="tab-btn"
-        class:active={activeTab === 'comments'}
-        aria-selected={activeTab === 'comments'}
-        onclick={() => activeTab = 'comments'}
+        class:active={ui.activeTab === 'comments'}
+        aria-selected={ui.activeTab === 'comments'}
+        onclick={() => ui.setTab('comments')}
       >コメント</button>
       <button
         role="tab"
         class="tab-btn"
-        class:active={activeTab === 'settings'}
-        aria-selected={activeTab === 'settings'}
-        onclick={() => activeTab = 'settings'}
+        class:active={ui.activeTab === 'settings'}
+        aria-selected={ui.activeTab === 'settings'}
+        onclick={() => ui.setTab('settings')}
       >設定</button>
     </nav>
   </header>
 
   <!-- ── Comment tab toolbar ── -->
-  {#if activeTab === 'comments'}
+  {#if ui.activeTab === 'comments'}
     <div class="toolbar">
       <!-- Platform filter -->
       <div class="filter-group" role="group" aria-label="プラットフォームフィルタ">
@@ -91,6 +99,9 @@
         oninput={onSearchInput}
         aria-label="コメント検索"
       />
+      {#if store.searchQuery.trim() !== ''}
+        <span class="search-count" aria-live="polite">{store.visibleMessages.length}件</span>
+      {/if}
 
       <!-- Clear -->
       <button class="clear-btn" onclick={clearMessages} title="一覧をクリア" aria-label="コメントをクリア">
@@ -101,12 +112,14 @@
 
   <!-- ── Main content ── -->
   <main class="main-content" role="tabpanel">
-    {#if activeTab === 'comments'}
+    {#if ui.activeTab === 'comments'}
       <CommentList />
     {:else}
       <Settings />
     {/if}
   </main>
+
+  <CommandPalette />
 </div>
 
 <style>
@@ -252,6 +265,16 @@
 
   .search-input::placeholder { color: #555; }
   .search-input:focus { outline: none; border-color: rgba(255,255,255,0.25); }
+
+  .search-count {
+    background: rgba(255,255,255,0.12);
+    color: #9e9e9e;
+    font-size: 11px;
+    padding: 1px 6px;
+    border-radius: 10px;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
 
   .clear-btn {
     background: none;
