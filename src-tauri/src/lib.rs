@@ -276,7 +276,7 @@ fn spawn_one_channel(_app: &AppHandle, state: &AppState, ch: &ChannelConfig) {
 /// - Highlight: ハイライトバッジを付けて bus へ流す + TTS
 /// - Show   : そのまま bus へ流す + TTS
 fn spawn_pipeline(app: AppHandle, cancel: CancellationToken) {
-    tokio::spawn(async move {
+    tauri::async_runtime::spawn(async move {
         let state = app.state::<AppState>();
         let mut rx = state.source_tx.subscribe();
         let bus = state.bus.clone();
@@ -334,7 +334,7 @@ fn spawn_pipeline(app: AppHandle, cancel: CancellationToken) {
 /// 各 speak 内で行うが、毎メッセージのタスク spawn / 再プローブは行わない)。
 /// `speak_message` は内部で speak→Err 時に Web Speech フォールバックする(#15 と整合)。
 fn spawn_tts_worker(app: AppHandle, mut rx: mpsc::Receiver<ChatMessage>, cancel: CancellationToken) {
-    tokio::spawn(async move {
+    tauri::async_runtime::spawn(async move {
         let initial_cfg = {
             let state = app.state::<AppState>();
             // MutexGuard 一時値をブロック末尾まで生かさず束縛して即 drop させる

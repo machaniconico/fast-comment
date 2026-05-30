@@ -71,7 +71,7 @@ impl Bus {
     /// `cancel` 発火で終了。
     pub fn spawn_ui_forwarder(&self, app: AppHandle, cancel: CancellationToken) {
         let mut rx = self.tx.subscribe();
-        tokio::spawn(async move {
+        tauri::async_runtime::spawn(async move {
             let mut ticker = interval(Duration::from_millis(UI_BATCH_INTERVAL_MS));
             let mut batch: Vec<ChatMessage> = Vec::with_capacity(64);
             loop {
@@ -115,7 +115,7 @@ impl Bus {
         &self,
         templates_dir: PathBuf,
         cancel: CancellationToken,
-    ) -> Result<tokio::task::JoinHandle<()>, String> {
+    ) -> Result<tauri::async_runtime::JoinHandle<()>, String> {
         self.spawn_obs_server_on_port(templates_dir, self.obs_port, cancel)
     }
 
@@ -127,7 +127,7 @@ impl Bus {
         templates_dir: PathBuf,
         port: u16,
         cancel: CancellationToken,
-    ) -> Result<tokio::task::JoinHandle<()>, String> {
+    ) -> Result<tauri::async_runtime::JoinHandle<()>, String> {
         let tx = self.tx.clone();
         let addr = SocketAddr::from(([127, 0, 0, 1], port));
         let std_listener = StdTcpListener::bind(addr).map_err(|e| {
@@ -146,7 +146,7 @@ impl Bus {
             templates_dir: Arc::new(templates_dir.clone()),
         };
 
-        let handle = tokio::spawn(async move {
+        let handle = tauri::async_runtime::spawn(async move {
             let listener = match tokio::net::TcpListener::from_std(std_listener) {
                 Ok(l) => l,
                 Err(e) => {

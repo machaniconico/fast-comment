@@ -105,13 +105,13 @@ impl SourceManager {
         match ch.platform {
             ChannelPlatform::Twitch => {
                 let src = twitch::TwitchSource::new(identifier);
-                tokio::spawn(async move {
+                tauri::async_runtime::spawn(async move {
                     run_with_logging(&src, tx, child).await;
                 });
             }
             ChannelPlatform::Youtube => {
                 let src = youtube::YoutubeSource::new(identifier, overrides);
-                tokio::spawn(async move {
+                tauri::async_runtime::spawn(async move {
                     run_with_logging(&src, tx, child).await;
                 });
             }
