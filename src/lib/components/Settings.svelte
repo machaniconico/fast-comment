@@ -4,7 +4,6 @@
   import {
     getConfig, setConfig, removeChannel, getObsUrl
   } from '../ipc';
-  import ChannelAdd from './ChannelAdd.svelte';
   import { ui, SETTINGS_ANCHOR_IDS } from '../ui.svelte';
   import { setNotify } from '../stores.svelte';
 
@@ -196,7 +195,7 @@
       <p class="empty">チャンネルなし</p>
     {/if}
 
-    <ChannelAdd onAdded={(ch) => { if (config && !config.channels.some(c => c.platform === ch.platform && c.identifier === ch.identifier)) config.channels = [...config.channels, ch]; }} />
+    <p class="hint">チャンネルの追加はトップ画面上部の入力欄から行えます。</p>
     {#if removeError}<p class="error">{removeError}</p>{/if}
   </section>
 
