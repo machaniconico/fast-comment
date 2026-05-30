@@ -125,60 +125,171 @@
   }
 
   // 入力(配信URL or 生ID/名)から配信プラットフォームと識別子を判別する。
-  // URL から判別できない場合(生のチャンネル名など)は null を返し、手動選択へフォールバック。
-  type DetectedChannel = { platform: 'twitch' | 'youtube'; identifier: string };
+  // URL でない生入力は manual として扱い、手動選択へフォールバックする。
+  type ChannelPlatform = ChannelConfig['platform'];
+  type DetectedChannel = { kind: 'detected'; platform: ChannelPlatform; identifier: string };
+  type ChannelDetection =
+    | DetectedChannel
+    | { kind: 'manual' }
+    | { kind: 'known-url'; platform: ChannelPlatform; message: string }
+    | { kind: 'unsupported-url'; host: string; message: string };
+  type DetectHint = { tone: 'ok' | 'warn'; message: string; identifier?: string };
+
+  const TWITCH_HOSTS = new Set(['twitch.tv', 'm.twitch.tv']);
+  const YOUTUBE_HOSTS = new Set(['youtube.com', 'm.youtube.com', 'music.youtube.com', 'youtu.be']);
+  const YOUTUBE_PATH_ID_PREFIXES = new Set(['live', 'embed', 'shorts', 'v']);
+  const YOUTUBE_VIDEO_ID_RE = /^[A-Za-z0-9_-]{11}$/;
+  const TWITCH_LOGIN_RE = /^[a-z0-9_]{2,25}$/;
+  const TWITCH_RESERVED_PATHS = new Set([
+    'about',
+    'admin',
+    'bits',
+    'broadcast',
+    'clip',
+    'clips',
+    'creatorcamp',
+    'creator-dashboard',
+    'dashboard',
+    'directory',
+    'downloads',
+    'drops',
+    'embed',
+    'event',
+    'events',
+    'following',
+    'friends',
+    'inventory',
+    'jobs',
+    'login',
+    'logout',
+    'messages',
+    'moderator',
+    'p',
+    'payments',
+    'popout',
+    'prime',
+    'search',
+    'settings',
+    'signup',
+    'store',
+    'subscriptions',
+    'team',
+    'teams',
+    'turbo',
+    'user',
+    'videos',
+    'wallet',
+    'whispers'
+  ]);
+  const SUPPORTED_SCHEMELESS_URL_RE =
+    /^(?:(?:www|m)\.twitch\.tv|twitch\.tv|(?:www|m|music)\.youtube\.com|youtube\.com|youtu\.be)(?::\d{1,5})?(?:[/?#].*)?$/i;
 
   // スキーム無しの "twitch.tv/foo" / "youtu.be/xxx" 等も URL として拾う。
   function parseUrlLoose(input: string): URL | null {
+    const trimmed = input.trim();
+    if (!trimmed) return null;
     try {
-      return new URL(input);
+      const url = new URL(trimmed);
+      return (url.protocol === 'http:' || url.protocol === 'https:') && url.hostname
+        ? url
+        : null;
     } catch {
-      if (/^[\w-]+(\.[\w-]+)+(\/|$)/.test(input)) {
-        try { return new URL('https://' + input); } catch { return null; }
+      if (SUPPORTED_SCHEMELESS_URL_RE.test(trimmed)) {
+        try { return new URL('https://' + trimmed); } catch { return null; }
       }
       return null;
     }
+  }
+
+  function normalizedHost(url: URL): string {
+    return url.hostname.replace(/^www\./i, '').toLowerCase();
+  }
+
+  function extractTwitchLogin(url: URL): string | null {
+    const segments = url.pathname.split('/').filter(Boolean);
+    if (segments.length !== 1) return null;
+
+    const login = segments[0].toLowerCase();
+    if (TWITCH_RESERVED_PATHS.has(login)) return null;
+    return TWITCH_LOGIN_RE.test(login) ? login : null;
+  }
+
+  function validYoutubeVideoId(id: string | null): string | null {
+    if (!id) return null;
+    const trimmed = id.trim();
+    return YOUTUBE_VIDEO_ID_RE.test(trimmed) ? trimmed : null;
   }
 
   // YouTube URL から videoId を抽出する(watch?v= / youtu.be / live / embed / shorts)。
-  function youtubeVideoId(url: URL): string | null {
-    const host = url.hostname.replace(/^www\./, '').toLowerCase();
+  function extractYoutubeId(url: URL): string | null {
+    const host = normalizedHost(url);
+    let candidate: string | null = null;
+
     if (host === 'youtu.be') {
-      return url.pathname.split('/').filter(Boolean)[0] ?? null;
+      candidate = url.pathname.split('/').filter(Boolean)[0] ?? null;
+    } else {
+      candidate = url.searchParams.get('v');
+      if (!candidate) {
+        const segments = url.pathname.split('/').filter(Boolean);
+        const prefix = segments[0]?.toLowerCase();
+        if (prefix && segments[1] && YOUTUBE_PATH_ID_PREFIXES.has(prefix)) {
+          candidate = segments[1];
+        }
+      }
     }
-    const v = url.searchParams.get('v');
-    if (v) return v;
-    const seg = url.pathname.split('/').filter(Boolean);
-    if (seg.length >= 2 && ['live', 'embed', 'shorts', 'v'].includes(seg[0])) {
-      return seg[1];
-    }
-    return null;
+
+    return validYoutubeVideoId(candidate);
   }
 
-  function detectChannel(input: string): DetectedChannel | null {
+  function detectChannel(input: string): ChannelDetection {
     const url = parseUrlLoose(input.trim());
-    if (!url) return null;
-    const host = url.hostname.replace(/^www\./, '').toLowerCase();
-    if (host === 'twitch.tv' || host === 'm.twitch.tv') {
-      const login = url.pathname.split('/').filter(Boolean)[0];
-      if (login && /^[a-zA-Z0-9_]{2,25}$/.test(login)) {
-        return { platform: 'twitch', identifier: login.toLowerCase() };
+    if (!url) return { kind: 'manual' };
+
+    const host = normalizedHost(url);
+    if (TWITCH_HOSTS.has(host)) {
+      const login = extractTwitchLogin(url);
+      if (login) {
+        return { kind: 'detected', platform: 'twitch', identifier: login };
       }
-      return null;
+      return {
+        kind: 'known-url',
+        platform: 'twitch',
+        message: 'Twitchチャンネル名が見つかりません。チャンネル名を手動入力してください。'
+      };
     }
-    if (['youtube.com', 'm.youtube.com', 'music.youtube.com', 'youtu.be'].includes(host)) {
-      const id = youtubeVideoId(url);
-      return id ? { platform: 'youtube', identifier: id } : null;
+
+    if (YOUTUBE_HOSTS.has(host)) {
+      const id = extractYoutubeId(url);
+      if (id) {
+        return { kind: 'detected', platform: 'youtube', identifier: id };
+      }
+      return {
+        kind: 'known-url',
+        platform: 'youtube',
+        message: 'YouTubeのライブ配信IDが見つかりません。動画IDを手動入力してください。'
+      };
     }
-    return null;
+
+    return {
+      kind: 'unsupported-url',
+      host,
+      message: `未対応のURLです (${host})。Twitch/YouTubeの配信URLか識別子を入力してください。`
+    };
   }
 
   // URL を貼ったときの自動判別結果(プレビュー表示と追加処理に使う)。
-  const detected = $derived(detectChannel(newIdentifier));
-
-  // URL から判別できたら、プラットフォーム選択も自動で追従させる。
-  $effect(() => {
-    if (detected && detected.platform !== newPlatform) newPlatform = detected.platform;
+  const detection = $derived(detectChannel(newIdentifier));
+  const detected = $derived(detection.kind === 'detected' ? detection : null);
+  const effectivePlatform = $derived(detected?.platform ?? newPlatform);
+  const detectHint = $derived.by((): DetectHint | null => {
+    if (detection.kind === 'detected') {
+      const label = detection.platform === 'twitch' ? 'Twitch' : 'YouTube';
+      return { tone: 'ok', message: `${label} として自動判別:`, identifier: detection.identifier };
+    }
+    if (detection.kind === 'known-url' || detection.kind === 'unsupported-url') {
+      return { tone: 'warn', message: detection.message };
+    }
+    return null;
   });
 
   async function onAddChannel() {
@@ -187,13 +298,15 @@
     const raw = newIdentifier.trim();
     if (!raw) { addError = 'URL か Twitchチャンネル名 / YouTube動画ID を入力してください'; return; }
 
-    // URL から判別できればそれを優先。生入力は手動選択 + 既存抽出へフォールバック。
+    // URL から判別できればそれを優先。生入力は手動選択 + 生ID/名として追加する。
     const det = detectChannel(raw);
-    const platform = det ? det.platform : newPlatform;
-    const identifier = det
-      ? det.identifier
-      : (newPlatform === 'youtube' ? extractYoutubeId(raw) : raw);
-    if (!identifier) { addError = '識別子を取得できませんでした'; return; }
+    if (det.kind === 'known-url' || det.kind === 'unsupported-url') {
+      addError = det.message;
+      return;
+    }
+
+    const platform = det.kind === 'detected' ? det.platform : newPlatform;
+    const identifier = det.kind === 'detected' ? det.identifier : raw;
 
     const ch: ChannelConfig = { platform, identifier, enabled: true };
     try {
@@ -217,20 +330,6 @@
       );
     } catch (e) {
       addError = `削除に失敗しました: ${e instanceof Error ? e.message : String(e)}`;
-    }
-  }
-
-  function extractYoutubeId(input: string): string {
-    // Accept full URL or bare videoId
-    try {
-      const url = new URL(input);
-      // pathname.split('/').pop() yields '' for a trailing slash (e.g.
-      // youtu.be/), which would otherwise slip past `?? input`. Filter out
-      // empty segments and fall back to the raw input.
-      const last = url.pathname.split('/').filter(Boolean).pop();
-      return url.searchParams.get('v') || last || input;
-    } catch {
-      return input;
     }
   }
 
@@ -293,7 +392,14 @@
     {/if}
 
     <div class="add-channel-row">
-      <select bind:value={newPlatform} class="platform-select">
+      <select
+        value={effectivePlatform}
+        class="platform-select"
+        onchange={(e) => {
+          const value = (e.currentTarget as HTMLSelectElement).value;
+          if (value === 'twitch' || value === 'youtube') newPlatform = value;
+        }}
+      >
         <option value="twitch">Twitch</option>
         <option value="youtube">YouTube</option>
       </select>
@@ -306,10 +412,10 @@
       />
       <button class="add-btn" onclick={onAddChannel}>追加</button>
     </div>
-    {#if detected}
-      <p class="detect-hint">
-        → {detected.platform === 'twitch' ? 'Twitch' : 'YouTube'} として自動判別:
-        <code>{detected.identifier}</code>
+    {#if detectHint}
+      <p class="detect-hint" class:warn={detectHint.tone === 'warn'}>
+        {detectHint.message}
+        {#if detectHint.identifier}<code>{detectHint.identifier}</code>{/if}
       </p>
     {/if}
     {#if addError}<p class="error">{addError}</p>{/if}
@@ -585,6 +691,7 @@
   .error { color: #f44336; font-size: 11px; margin: 4px 0 0; }
   .empty { color: #757575; font-size: 12px; }
   .detect-hint { color: #4caf50; font-size: 11px; margin: 4px 0 0; }
+  .detect-hint.warn { color: #ffb74d; }
   .detect-hint code {
     background: rgba(255, 255, 255, 0.08);
     padding: 0 4px;
