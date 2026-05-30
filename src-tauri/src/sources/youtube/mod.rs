@@ -135,8 +135,11 @@ impl YoutubeSource {
                 }
             }
 
-            // timeoutMs に従う(欠落時は既定 1000ms、過小なら下限を設ける)。
-            let wait = timeout_ms.unwrap_or(1000).clamp(1000, 10_000);
+            // YouTube の timeoutMs はライブチャットだと数秒〜10秒と長めで、その間に届いた
+            // コメントが次ポールまでバッファされ「まとめてドサッと表示」=遅延に感じる。
+            // 低遅延重視(SPEC: わんコメより低遅延)のため上限を短く抑えてこまめに取得する。
+            // 下限はレート制限/空ポール回避のため 700ms。欠落時の既定も 1000ms。
+            let wait = timeout_ms.unwrap_or(1000).clamp(700, 1500);
             tokio::select! {
                 _ = cancel.cancelled() => return Ok(()),
                 _ = tokio::time::sleep(std::time::Duration::from_millis(wait)) => {}
