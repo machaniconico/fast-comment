@@ -100,6 +100,7 @@ impl YoutubeSource {
             !session.continuation.is_empty()
         );
 
+        let mut first_poll = true;
         loop {
             if cancel.is_cancelled() {
                 return Ok(());
@@ -116,6 +117,7 @@ impl YoutubeSource {
             let actions = parser::extract_actions(&resp, &self.overrides.paths);
             for action in &actions {
                 if let Some(mut msg) = parser::parse_action(action, video_id) {
+                    msg.skip_tts = first_poll;
                     // raw は通常 None。デバッグ目的で残したい場合のみ付与する。
                     msg.raw = None;
                     let _ = tx.send(msg);
@@ -134,6 +136,7 @@ impl YoutubeSource {
                     return Ok(());
                 }
             }
+            first_poll = false;
 
             // YouTube の timeoutMs はライブチャットだと数秒〜10秒と長めで、その間に届いた
             // コメントが次ポールまでバッファされ「まとめてドサッと表示」=遅延に感じる。

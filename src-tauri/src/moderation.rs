@@ -153,6 +153,7 @@ mod tests {
             amount: None,
             timestamp_ms: 0,
             raw: None,
+            skip_tts: false,
         }
     }
 

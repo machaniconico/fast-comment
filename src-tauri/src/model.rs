@@ -106,6 +106,9 @@ pub struct ChatMessage {
     /// デバッグ用の原データ(任意・通常は None)。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw: Option<serde_json::Value>,
+    /// 内部制御用: 表示はするが TTS には流さない。
+    #[serde(skip)]
+    pub skip_tts: bool,
 }
 
 impl ChatMessage {

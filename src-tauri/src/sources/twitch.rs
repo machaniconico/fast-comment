@@ -262,6 +262,7 @@ impl TwitchSource {
             amount,
             timestamp_ms,
             raw: None,
+            skip_tts: false,
         })
     }
 }

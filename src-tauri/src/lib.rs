@@ -312,10 +312,12 @@ fn spawn_pipeline(app: AppHandle, cancel: CancellationToken) {
                     // 読み上げは単一の長命ワーカーへ bounded channel で渡す。
                     // バースト時は try_send が Full を返すので drop し、UI/OBS 配信は止めない
                     // (背圧/有界・SPEC 設計原則2)。
-                    if let Err(mpsc::error::TrySendError::Full(_)) =
-                        state.tts_tx.try_send(msg.clone())
-                    {
-                        tracing::debug!("TTS キュー満杯につき読み上げを drop");
+                    if !msg.skip_tts {
+                        if let Err(mpsc::error::TrySendError::Full(_)) =
+                            state.tts_tx.try_send(msg.clone())
+                        {
+                            tracing::debug!("TTS キュー満杯につき読み上げを drop");
+                        }
                     }
 
                     // 下流(UI/OBS)へ。

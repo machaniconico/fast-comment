@@ -301,6 +301,7 @@ fn build_message(
         amount,
         timestamp_ms,
         raw: None,
+        skip_tts: false,
     }
 }
 
