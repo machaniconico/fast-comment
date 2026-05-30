@@ -1,8 +1,8 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
-  import type { AppConfig, ChannelConfig, TtsOptions } from '../ipc';
+  import type { AppConfig, TtsOptions } from '../ipc';
   import {
-    getConfig, setConfig, removeChannel, getObsUrl
+    getConfig, setConfig, getObsUrl
   } from '../ipc';
   import { ui, SETTINGS_ANCHOR_IDS } from '../ui.svelte';
   import { setNotify } from '../stores.svelte';
@@ -10,8 +10,6 @@
   let config: AppConfig | null = $state(null);
   let obsBaseUrl: string = $state('');
   let copied: boolean = $state(false);
-
-  let removeError: string = $state('');
 
   // NG / highlight edit buffers
   let ngWordsText: string = $state('');
@@ -125,19 +123,6 @@
     }
   }
 
-  async function onRemoveChannel(ch: ChannelConfig) {
-    if (!config) return;
-    removeError = '';
-    try {
-      await removeChannel(`${ch.platform}:${ch.identifier}`);
-      config.channels = config.channels.filter(
-        c => !(c.platform === ch.platform && c.identifier === ch.identifier)
-      );
-    } catch (e) {
-      removeError = `削除に失敗しました: ${e instanceof Error ? e.message : String(e)}`;
-    }
-  }
-
   async function onSave() {
     if (!config) return;
     saving = true;
@@ -178,29 +163,6 @@
 
 <div class="settings">
   <h2>設定</h2>
-
-  <!-- ── Channels ── -->
-  <section id="settings-channels">
-    <h3>チャンネル</h3>
-    {#if config && config.channels.length > 0}
-      <ul class="channel-list">
-        {#each config.channels as ch}
-          <li>
-            <span class="platform-badge" class:twitch={ch.platform === 'twitch'} class:youtube={ch.platform === 'youtube'}>
-              {ch.platform}
-            </span>
-            <span class="ch-id">{ch.identifier}</span>
-            <button class="remove-btn" onclick={() => onRemoveChannel(ch)}>削除</button>
-          </li>
-        {/each}
-      </ul>
-    {:else}
-      <p class="empty">チャンネルなし</p>
-    {/if}
-
-    <p class="hint">チャンネルの追加はトップ画面上部の入力欄から行えます。</p>
-    {#if removeError}<p class="error">{removeError}</p>{/if}
-  </section>
 
   <!-- ── TTS ── -->
   {#if config}
@@ -375,44 +337,6 @@
     margin-bottom: 4px;
   }
 
-  .channel-list {
-    list-style: none;
-    margin: 0 0 8px;
-    padding: 0;
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-  }
-
-  .channel-list li {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    background: rgba(255,255,255,0.05);
-    border-radius: 4px;
-    padding: 4px 8px;
-  }
-
-  .platform-badge {
-    font-size: 10px;
-    font-weight: 700;
-    padding: 1px 6px;
-    border-radius: 10px;
-    text-transform: uppercase;
-  }
-
-  .platform-badge.twitch { background: #9146ff; color: #fff; }
-  .platform-badge.youtube { background: #ff0000; color: #fff; }
-
-  .ch-id {
-    flex: 1;
-    font-size: 12px;
-    color: #ccc;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
   .platform-select, .id-input, .obs-input, .num-input {
     background: rgba(255,255,255,0.07);
     border: 1px solid rgba(255,255,255,0.12);
@@ -431,7 +355,7 @@
   .vol-slider { flex: 1; max-width: 160px; accent-color: #1976d2; }
   .vol-slider:disabled { opacity: 0.4; }
 
-  .remove-btn, .copy-btn, .save-btn {
+  .copy-btn, .save-btn {
     border: none;
     border-radius: 4px;
     cursor: pointer;
@@ -441,7 +365,6 @@
     transition: opacity 0.15s;
   }
 
-  .remove-btn { background: rgba(244,67,54,0.15); color: #f44336; }
   .copy-btn { background: #37474f; color: #fff; min-width: 60px; }
   .copy-btn.copied { background: #2e7d32; }
   .save-btn { background: #1976d2; color: #fff; padding: 7px 18px; }
@@ -490,8 +413,6 @@
 
   .hint { font-size: 11px; color: #757575; margin: 4px 0 0; }
   .hint-inline { font-size: 11px; color: #757575; font-weight: 400; text-transform: none; letter-spacing: 0; }
-  .error { color: #f44336; font-size: 11px; margin: 4px 0 0; }
-  .empty { color: #757575; font-size: 12px; }
 
   .save-row {
     display: flex;

@@ -56,13 +56,6 @@
       run: () => { ui.setTab('settings'); },
     },
     {
-      id: 'goto-channels',
-      title: 'チャンネル設定へ',
-      keywords: ['channel', 'チャンネル', 'setting', '設定', 'channels'],
-      icon: '⚙️',
-      run: () => { ui.gotoSetting('channels'); },
-    },
-    {
       id: 'goto-tts',
       title: 'TTS(読み上げ)設定へ',
       keywords: ['tts', '読み上げ', 'voicevox', 'voice', 'speech', 'setting', '設定'],

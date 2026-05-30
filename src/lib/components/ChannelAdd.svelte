@@ -1,9 +1,32 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
   import type { ChannelConfig } from '../ipc';
-  import { addChannel } from '../ipc';
+  import { addChannel, removeChannel, getConfig } from '../ipc';
 
-  // 追加成功時に親へ通知(設定画面の一覧をライブ更新するため)。
+  // 追加成功時に親へ通知(任意)。
   let { onAdded }: { onAdded?: (ch: ChannelConfig) => void } = $props();
+
+  // 接続中チャンネル一覧(このコンポーネントがチャンネル管理を一手に担う)。
+  let channels: ChannelConfig[] = $state([]);
+
+  onMount(async () => {
+    const cfg = await getConfig();
+    if (cfg) channels = cfg.channels;
+  });
+
+  function sameChannel(a: ChannelConfig, b: ChannelConfig): boolean {
+    return a.platform === b.platform && a.identifier === b.identifier;
+  }
+
+  async function onRemove(ch: ChannelConfig) {
+    addError = '';
+    try {
+      await removeChannel(`${ch.platform}:${ch.identifier}`);
+      channels = channels.filter((c) => !sameChannel(c, ch));
+    } catch (e) {
+      addError = `削除に失敗しました: ${e instanceof Error ? e.message : String(e)}`;
+    }
+  }
 
   // 入力(配信URL or 生ID/名)から配信プラットフォームと識別子を判別する。
   // URL でない生入力は manual として扱い、手動選択へフォールバックする。
@@ -159,6 +182,9 @@
     const ch: ChannelConfig = { platform, identifier, enabled: true };
     try {
       await addChannel(ch);
+      if (!channels.some((c) => sameChannel(c, ch))) {
+        channels = [...channels, ch];
+      }
       onAdded?.(ch);
       newIdentifier = '';
     } catch (e) {
@@ -198,6 +224,16 @@
     </p>
   {/if}
   {#if addError}<p class="error">{addError}</p>{/if}
+  {#if channels.length > 0}
+    <div class="channel-chips" role="list" aria-label="接続中チャンネル">
+      {#each channels as ch (ch.platform + ':' + ch.identifier)}
+        <span class="chip" class:twitch={ch.platform === 'twitch'} class:youtube={ch.platform === 'youtube'} role="listitem">
+          <span class="chip-id">{ch.identifier}</span>
+          <button class="chip-x" title="削除" aria-label="{ch.identifier} を削除" onclick={() => onRemove(ch)}>×</button>
+        </span>
+      {/each}
+    </div>
+  {/if}
 </div>
 
 <style>
@@ -249,4 +285,44 @@
     border-radius: 3px;
     font-family: ui-monospace, monospace;
   }
+
+  .channel-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    margin-top: 6px;
+  }
+
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    background: rgba(255,255,255,0.08);
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 12px;
+    padding: 1px 4px 1px 8px;
+    font-size: 11px;
+    color: #ccc;
+    max-width: 220px;
+  }
+  .chip.twitch { border-color: rgba(145,70,255,0.5); }
+  .chip.youtube { border-color: rgba(255,0,0,0.4); }
+
+  .chip-id {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .chip-x {
+    border: none;
+    background: none;
+    color: #888;
+    cursor: pointer;
+    font-size: 13px;
+    line-height: 1;
+    padding: 0 2px;
+    border-radius: 50%;
+  }
+  .chip-x:hover { color: #f44336; }
 </style>
