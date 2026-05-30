@@ -80,6 +80,7 @@
   let voicevoxSpeaker: number = $state(1);
   let maxLength: number = $state(MAX_LENGTH_DEFAULT);
   let stripEmoji: boolean = $state(true);
+  let readName: boolean = $state(true);
 
   onMount(async () => {
     config = await getConfig();
@@ -90,6 +91,7 @@
       voicevoxSpeaker = ttsNum('voicevoxSpeaker', 1);
       maxLength = ttsNum('maxLength', MAX_LENGTH_DEFAULT);
       stripEmoji = ttsBool('stripEmoji', true);
+      readName = ttsBool('readName', true);
       // Backward-compat: older config.json may lack obs.template.
       if (!config.obs.template || !config.obs.template.trim()) {
         config.obs.template = 'default';
@@ -145,6 +147,7 @@
     setTtsNum('voicevoxSpeaker', Number.isFinite(voicevoxSpeaker) ? Math.trunc(voicevoxSpeaker) : 1);
     setTtsNum('maxLength', Number.isFinite(maxLength) && maxLength >= 0 ? Math.trunc(maxLength) : MAX_LENGTH_DEFAULT);
     setTtsBool('stripEmoji', stripEmoji);
+    setTtsBool('readName', readName);
     // Normalize template before persisting (config is the single source).
     config.obs.template = (config.obs.template || 'default').trim() || 'default';
     try {
@@ -238,6 +241,11 @@
       <span class="hint-inline">（0で無制限）</span>
     </div>
 
+    <div class="field-row">
+      <label for="read-name">ユーザー名も読み上げる</label>
+      <input id="read-name" type="checkbox" bind:checked={readName} class="chk" />
+      <span class="hint-inline">OFFでコメント本文のみ読み上げ</span>
+    </div>
     <div class="field-row">
       <label for="strip-emoji">絵文字を除去</label>
       <input id="strip-emoji" type="checkbox" bind:checked={stripEmoji} class="chk" />
