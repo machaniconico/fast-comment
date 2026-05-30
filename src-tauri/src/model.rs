@@ -87,6 +87,16 @@ pub struct Amount {
     pub raw_text: String,
 }
 
+/// 参加型配信の参加者。
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct Participant {
+    pub platform: String,
+    pub user_id: String,
+    pub name: String,
+    pub picked: bool,
+}
+
 /// 正規化済みコメント。Source → Bus → UI/OBS を一貫して流れる単一型。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

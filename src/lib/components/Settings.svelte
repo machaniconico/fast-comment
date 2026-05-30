@@ -103,6 +103,7 @@
       webSpeechVolume = ttsNum('webSpeechVolume', 1);
       webSpeechVoice = config.tts.options.webSpeechVoice ?? '';
       normalizeObsConfig(true);
+      normalizeParticipationConfig();
     }
 
     const url = await getObsUrl();
@@ -188,6 +189,11 @@
     if (syncSeconds) obsTtlSeconds = config.obs.ttlMs / 1000;
   }
 
+  function normalizeParticipationConfig() {
+    if (!config) return;
+    config.participation.max = clampInt(config.participation.max, 0, 0, 4294967295);
+  }
+
   function normalizeWebSpeechSettings() {
     webSpeechRate = clampNumber(webSpeechRate, 1, 0.5, 2);
     webSpeechPitch = clampNumber(webSpeechPitch, 1, 0, 2);
@@ -214,6 +220,7 @@
     config.tts.options.webSpeechVoice = webSpeechVoice;
     config.obs.ttlMs = ttlMsFromSeconds(obsTtlSeconds);
     normalizeObsConfig(false);
+    normalizeParticipationConfig();
     try {
       await setConfig(config);
       setNotify(config.ui.notifySound, config.ui.notifyVolume);
@@ -440,6 +447,43 @@
       </button>
     </div>
     <p class="hint">OBSのブラウザソースにこのURLを貼り付けてください。</p>
+  </section>
+
+  <!-- ── Participation ── -->
+  <section id="settings-participation">
+    <h3>参加型</h3>
+    <div class="field-row">
+      <label for="participation-enabled">参加管理を有効化</label>
+      <input
+        id="participation-enabled"
+        type="checkbox"
+        bind:checked={config.participation.enabled}
+        class="chk"
+      />
+    </div>
+    <div class="field-row">
+      <label for="participation-keyword">キーワード</label>
+      <input
+        id="participation-keyword"
+        type="text"
+        bind:value={config.participation.keyword}
+        class="id-input"
+        placeholder="参加"
+      />
+    </div>
+    <div class="field-row">
+      <label for="participation-max">最大人数</label>
+      <input
+        id="participation-max"
+        type="number"
+        min="0"
+        max="4294967295"
+        step="1"
+        bind:value={config.participation.max}
+        class="num-input"
+      />
+      <span class="hint-inline">（0で無制限）</span>
+    </div>
   </section>
 
   <!-- ── Moderation ── -->

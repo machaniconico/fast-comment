@@ -242,6 +242,28 @@ impl Default for UiConfig {
     }
 }
 
+/// 参加型配信の参加管理設定。
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ParticipationConfig {
+    /// 参加管理を有効にするか。既定 false。
+    pub enabled: bool,
+    /// 参加登録に使うキーワード。既定 "参加"。
+    pub keyword: String,
+    /// 最大参加者数。0 は無制限。
+    pub max: u32,
+}
+
+impl Default for ParticipationConfig {
+    fn default() -> Self {
+        ParticipationConfig {
+            enabled: false,
+            keyword: default_participation_keyword(),
+            max: 0,
+        }
+    }
+}
+
 /// YouTube InnerTube の仕様変更を再ビルド無しで吸収するための上書き設定。
 ///
 /// いずれも `None`/空のときは parser/innertube 側の既定挙動を使う。
@@ -274,6 +296,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub ui: UiConfig,
     #[serde(default)]
+    pub participation: ParticipationConfig,
+    #[serde(default)]
     pub youtube_overrides: YoutubeOverrides,
 }
 
@@ -285,6 +309,7 @@ impl Default for AppConfig {
             tts: TtsConfig::default(),
             moderation: ModerationConfig::default(),
             ui: UiConfig::default(),
+            participation: ParticipationConfig::default(),
             youtube_overrides: YoutubeOverrides::default(),
         }
     }
@@ -398,6 +423,9 @@ fn default_max_buffer() -> usize {
 fn default_max_read_len() -> usize {
     140
 }
+fn default_participation_keyword() -> String {
+    "参加".to_string()
+}
 
 #[cfg(test)]
 mod tests {
@@ -461,6 +489,11 @@ mod tests {
                 notify_sound: true,
                 notify_volume: 0.8,
             },
+            participation: ParticipationConfig {
+                enabled: true,
+                keyword: "join".to_string(),
+                max: 32,
+            },
             youtube_overrides: YoutubeOverrides {
                 api_key: Some("test-api-key".to_string()),
                 client_version: Some("1.20240501.00.00".to_string()),
@@ -482,6 +515,9 @@ mod tests {
         assert_eq!(json["ui"]["notifySound"].as_bool(), Some(true));
         // f32→JSON→f64 はビット表現が変わるので近似比較する。
         assert!((json["ui"]["notifyVolume"].as_f64().expect("notifyVolume") - 0.8).abs() < 1e-6);
+        assert_eq!(json["participation"]["enabled"].as_bool(), Some(true));
+        assert_eq!(json["participation"]["keyword"].as_str(), Some("join"));
+        assert_eq!(json["participation"]["max"].as_u64(), Some(32));
         assert_eq!(
             json["tts"]["options"]["bouyomiHost"].as_str(),
             Some("192.0.2.10")
@@ -611,6 +647,10 @@ mod tests {
         // 通知設定は旧 config(キー欠落)でも default に劣化する(後方互換)。
         assert!(!cfg.ui.notify_sound);
         assert_eq!(cfg.ui.notify_volume, default_notify_volume());
+        assert_eq!(cfg.participation, ParticipationConfig::default());
+        assert!(!cfg.participation.enabled);
+        assert_eq!(cfg.participation.keyword, default_participation_keyword());
+        assert_eq!(cfg.participation.max, 0);
         assert_eq!(cfg.youtube_overrides, YoutubeOverrides::default());
     }
 
@@ -672,6 +712,7 @@ mod tests {
         assert_eq!(cfg.tts.options.strip_emoji, default_true());
         assert_eq!(cfg.tts.options.max_length, default_max_read_len());
         assert_eq!(cfg.ui.max_buffer, 321);
+        assert_eq!(cfg.participation, ParticipationConfig::default());
         assert_eq!(cfg.youtube_overrides, YoutubeOverrides::default());
     }
 

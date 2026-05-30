@@ -3,6 +3,7 @@
   import type { Platform } from './lib/types';
   import CommentList from './lib/components/CommentList.svelte';
   import PinnedStrip from './lib/components/PinnedStrip.svelte';
+  import Participation from './lib/components/Participation.svelte';
   import Settings from './lib/components/Settings.svelte';
   import ChannelAdd from './lib/components/ChannelAdd.svelte';
   import CommandPalette from './lib/components/CommandPalette.svelte';
@@ -146,6 +147,13 @@
       <button
         role="tab"
         class="tab-btn"
+        class:active={ui.activeTab === 'participation'}
+        aria-selected={ui.activeTab === 'participation'}
+        onclick={() => ui.setTab('participation')}
+      >参加</button>
+      <button
+        role="tab"
+        class="tab-btn"
         class:active={ui.activeTab === 'settings'}
         aria-selected={ui.activeTab === 'settings'}
         onclick={() => ui.setTab('settings')}
@@ -207,6 +215,8 @@
     {#if ui.activeTab === 'comments'}
       <PinnedStrip />
       <CommentList />
+    {:else if ui.activeTab === 'participation'}
+      <Participation />
     {:else}
       <Settings />
     {/if}

@@ -22,14 +22,15 @@ mod update;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::bus::{is_valid_template_name, Bus};
 use crate::config::{AppConfig, ChannelConfig};
-use crate::model::{Badge, ChatMessage};
+use crate::model::{Badge, ChatMessage, Participant, Platform};
 use crate::moderation::{Moderator, Verdict};
 use crate::sources::SourceManager;
 use crate::tts::{bouyomi, TtsDispatcher};
@@ -57,6 +58,8 @@ pub struct AppState {
     moderator: Mutex<Moderator>,
     /// 長命 TTS ワーカーへの bounded 送信端(溢れたら drop)。
     tts_tx: mpsc::Sender<ChatMessage>,
+    /// 参加型配信の参加者一覧。
+    participants: Mutex<Vec<Participant>>,
 }
 
 /// OBS サーバの再起動に必要な実行時ハンドル。
@@ -196,7 +199,133 @@ fn get_obs_url(
     Ok(url)
 }
 
+/// 参加者一覧を取得する。
+#[tauri::command]
+fn get_participants(state: State<'_, AppState>) -> Vec<Participant> {
+    state.participants.lock().unwrap().clone()
+}
+
+/// 未選出の先頭参加者を選出する。
+#[tauri::command]
+fn pick_next_participant(app: AppHandle, state: State<'_, AppState>) -> Option<Participant> {
+    let (picked, snapshot) = {
+        let mut participants = state.participants.lock().unwrap();
+        let Some(index) = participants.iter().position(|p| !p.picked) else {
+            return None;
+        };
+        participants[index].picked = true;
+        let picked = participants[index].clone();
+        (picked, participants.clone())
+    };
+    emit_participants(&app, &snapshot);
+    Some(picked)
+}
+
+/// 未選出の参加者から疑似ランダムに1人を選出する。
+#[tauri::command]
+fn pick_random_participant(app: AppHandle, state: State<'_, AppState>) -> Option<Participant> {
+    let (picked, snapshot) = {
+        let mut participants = state.participants.lock().unwrap();
+        let unpicked: Vec<usize> = participants
+            .iter()
+            .enumerate()
+            .filter_map(|(index, p)| (!p.picked).then_some(index))
+            .collect();
+        if unpicked.is_empty() {
+            return None;
+        }
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let index = unpicked[(nanos % (unpicked.len() as u128)) as usize];
+        participants[index].picked = true;
+        let picked = participants[index].clone();
+        (picked, participants.clone())
+    };
+    emit_participants(&app, &snapshot);
+    Some(picked)
+}
+
+/// 指定した参加者を削除する。
+#[tauri::command]
+fn remove_participant(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    platform: String,
+    user_id: String,
+) {
+    let snapshot = {
+        let mut participants = state.participants.lock().unwrap();
+        participants.retain(|p| !(p.platform == platform && p.user_id == user_id));
+        participants.clone()
+    };
+    emit_participants(&app, &snapshot);
+}
+
+/// 参加者一覧を全消去する。
+#[tauri::command]
+fn clear_participants(app: AppHandle, state: State<'_, AppState>) {
+    let snapshot = {
+        let mut participants = state.participants.lock().unwrap();
+        participants.clear();
+        participants.clone()
+    };
+    emit_participants(&app, &snapshot);
+}
+
 // ============ 内部ヘルパ ============
+
+fn participant_platform(platform: Platform) -> &'static str {
+    match platform {
+        Platform::Twitch => "twitch",
+        Platform::Youtube => "youtube",
+    }
+}
+
+fn emit_participants(app: &AppHandle, participants: &[Participant]) {
+    if let Err(e) = app.emit("participants-updated", participants) {
+        tracing::warn!("参加者一覧の emit に失敗: {e}");
+    }
+}
+
+fn register_participant_if_needed(app: &AppHandle, state: &AppState, msg: &ChatMessage) {
+    let participation = {
+        let cfg = state.config.lock().unwrap();
+        cfg.participation.clone()
+    };
+    if !participation.enabled {
+        return;
+    }
+    if !msg.plain_text().contains(&participation.keyword) {
+        return;
+    }
+
+    let platform = participant_platform(msg.platform).to_string();
+    let user_id = msg.author.id.clone();
+    let name = msg.author.name.clone();
+
+    let snapshot = {
+        let mut participants = state.participants.lock().unwrap();
+        if participants
+            .iter()
+            .any(|p| p.platform == platform && p.user_id == user_id)
+        {
+            return;
+        }
+        if participation.max != 0 && participants.len() >= participation.max as usize {
+            return;
+        }
+        participants.push(Participant {
+            platform,
+            user_id,
+            name,
+            picked: false,
+        });
+        participants.clone()
+    };
+    emit_participants(app, &snapshot);
+}
 
 /// OBS サーバの待受ポートが変わったら、旧サーバを止めて新ポートで起動する。
 fn restart_obs_server_if_needed(state: &AppState, new_port: u16) -> Result<(), String> {
@@ -310,6 +439,8 @@ fn spawn_pipeline(app: AppHandle, cancel: CancellationToken) {
                         }
                         Verdict::Show => {}
                     }
+
+                    register_participant_if_needed(&app, &state, &msg);
 
                     // 読み上げは単一の長命ワーカーへ bounded channel で渡す。
                     // バースト時は try_send が Full を返すので drop し、UI/OBS 配信は止めない
@@ -456,6 +587,7 @@ pub fn run() {
                 channels: Mutex::new(HashMap::new()),
                 moderator: Mutex::new(moderator),
                 tts_tx,
+                participants: Mutex::new(Vec::new()),
             };
             app.manage(state);
 
@@ -500,6 +632,11 @@ pub fn run() {
             hide_message,
             unhide_message,
             get_obs_url,
+            get_participants,
+            pick_next_participant,
+            pick_random_participant,
+            remove_participant,
+            clear_participants,
             check_for_update,
             open_url,
         ])

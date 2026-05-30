@@ -151,7 +151,21 @@ export interface AppConfig {
   tts: { backend: 'bouyomi' | 'voicevox' | 'webSpeech' | 'none'; options: TtsOptions };
   moderation: { ngWords: string[]; ngUsers: string[]; highlights: string[] };
   ui: { maxBuffer: number; notifySound: boolean; notifyVolume: number };
+  participation: ParticipationConfig;
   youtubeOverrides?: { apiKey?: string; clientVersion?: string; paths?: Record<string, string> };
+}
+
+export interface ParticipationConfig {
+  enabled: boolean;
+  keyword: string;
+  max: number;
+}
+
+export interface Participant {
+  platform: string;
+  userId: string;
+  name: string;
+  picked: boolean;
 }
 
 export interface ChannelConfig {
@@ -191,6 +205,26 @@ export async function hideMessage(id: string): Promise<void> {
 
 export async function getObsUrl(): Promise<string | null> {
   return invoke<string>('get_obs_url');
+}
+
+export async function getParticipants(): Promise<Participant[] | null> {
+  return invoke<Participant[]>('get_participants');
+}
+
+export async function pickNextParticipant(): Promise<Participant | null> {
+  return invoke<Participant>('pick_next_participant');
+}
+
+export async function pickRandomParticipant(): Promise<Participant | null> {
+  return invoke<Participant>('pick_random_participant');
+}
+
+export async function removeParticipant(platform: string, userId: string): Promise<void> {
+  await invoke<void>('remove_participant', { platform, userId });
+}
+
+export async function clearParticipants(): Promise<void> {
+  await invoke<void>('clear_participants');
 }
 
 export async function checkForUpdate(): Promise<UpdateStatus | null> {

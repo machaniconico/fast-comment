@@ -10,7 +10,7 @@
  * singleton so any component can import `ui` and read/write reactively.
  */
 
-export type Tab = 'comments' | 'settings';
+export type Tab = 'comments' | 'participation' | 'settings';
 
 /** Settings sections that the command palette can jump to. */
 export type SettingsAnchor = 'tts' | 'obs' | 'moderation' | 'notify';
