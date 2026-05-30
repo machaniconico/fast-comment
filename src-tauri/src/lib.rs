@@ -337,7 +337,10 @@ fn spawn_tts_worker(app: AppHandle, mut rx: mpsc::Receiver<ChatMessage>, cancel:
     tokio::spawn(async move {
         let initial_cfg = {
             let state = app.state::<AppState>();
-            state.config.lock().unwrap().tts.clone()
+            // MutexGuard 一時値をブロック末尾まで生かさず束縛して即 drop させる
+            // (末尾式のままだと guard が state より後に落ちて E0597 になる)。
+            let cfg = state.config.lock().unwrap().tts.clone();
+            cfg
         };
         let mut dispatcher = TtsDispatcher::new(initial_cfg, app.clone());
 
@@ -352,7 +355,9 @@ fn spawn_tts_worker(app: AppHandle, mut rx: mpsc::Receiver<ChatMessage>, cancel:
                     // 最新設定を反映してから読み上げる。
                     let cfg = {
                         let state = app.state::<AppState>();
-                        state.config.lock().unwrap().tts.clone()
+                        // 同上: MutexGuard 一時値を束縛して即 drop(E0597 回避)。
+                        let snapshot = state.config.lock().unwrap().tts.clone();
+                        snapshot
                     };
                     dispatcher.update_config(cfg);
                     dispatcher.speak_message(&msg).await;
