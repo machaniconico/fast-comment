@@ -2,6 +2,10 @@
 
 このドキュメントは、WSL での開発完了後、Windows 側での最終ビルド・検証・デプロイメント向けの手順書です。WSL 環境では `cargo` と `svelte-check` が利用できないため、**すべての最終検証は Windows 側で実施してください**。
 
+> **ワンクリックビルド**: リポジトリ直下の **`build-windows.bat`** をダブルクリックすると、前提ツール確認 → `pnpm install` → `pnpm tauri build` を自動実行します。手動で進めたい場合は以下の手順を参照。
+>
+> **パッケージマネージャは pnpm を使用**: `tauri.conf.json` の `beforeBuildCommand` が `pnpm build` のため、`tauri build` は内部で pnpm を呼びます。pnpm 未導入なら `corepack enable pnpm`(Node同梱) または `npm i -g pnpm` で用意してください。
+
 ---
 
 ## 前提条件
