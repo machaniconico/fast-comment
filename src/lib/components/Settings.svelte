@@ -5,6 +5,7 @@
     getConfig, setConfig, addChannel, removeChannel, getObsUrl
   } from '../ipc';
   import { ui, SETTINGS_ANCHOR_IDS } from '../ui.svelte';
+  import { setNotify } from '../stores.svelte';
 
   let config: AppConfig | null = $state(null);
   let obsBaseUrl: string = $state('');
@@ -180,6 +181,7 @@
     config.obs.template = (config.obs.template || 'default').trim() || 'default';
     try {
       await setConfig(config);
+      setNotify(config.ui.notifySound, config.ui.notifyVolume);
       saveMsg = '保存しました';
     } catch (e) {
       saveMsg = `保存に失敗しました: ${e instanceof Error ? e.message : String(e)}`;
@@ -323,6 +325,36 @@
     <textarea bind:value={highlightsText} rows={3} class="mod-area" placeholder="!command&#10;favorite_user"></textarea>
   </section>
 
+  <!-- ── Notification ── -->
+  <section id="settings-notify">
+    <h3>通知</h3>
+    <div class="field-row">
+      <label for="notify-sound">ハイライトを効果音で通知</label>
+      <input
+        id="notify-sound"
+        type="checkbox"
+        bind:checked={config.ui.notifySound}
+        class="chk"
+        onchange={() => setNotify(config!.ui.notifySound, config!.ui.notifyVolume)}
+      />
+    </div>
+    <div class="field-row">
+      <label for="notify-volume">音量</label>
+      <input
+        id="notify-volume"
+        type="range"
+        min="0"
+        max="1"
+        step="0.05"
+        bind:value={config.ui.notifyVolume}
+        class="vol-slider"
+        disabled={!config.ui.notifySound}
+        onchange={() => setNotify(config!.ui.notifySound, config!.ui.notifyVolume)}
+      />
+      <span class="hint-inline">{Math.round(config.ui.notifyVolume * 100)}%</span>
+    </div>
+  </section>
+
   <!-- ── Save ── -->
   <div class="save-row">
     <button class="save-btn" onclick={onSave} disabled={saving}>
@@ -421,6 +453,8 @@
   .obs-input { flex: 1; font-size: 12px; }
   .num-input { width: 90px; }
   .chk { width: 16px; height: 16px; accent-color: #1976d2; }
+  .vol-slider { flex: 1; max-width: 160px; accent-color: #1976d2; }
+  .vol-slider:disabled { opacity: 0.4; }
 
   .add-btn, .remove-btn, .copy-btn, .save-btn {
     border: none;

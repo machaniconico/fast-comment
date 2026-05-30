@@ -83,6 +83,13 @@
       icon: '🛡',
       run: () => { ui.gotoSetting('moderation'); },
     },
+    {
+      id: 'goto-notify',
+      title: '通知(効果音)設定へ',
+      keywords: ['notify', 'notification', '通知', 'sound', '効果音', 'audio', '音', 'setting', '設定'],
+      icon: '🔔',
+      run: () => { ui.gotoSetting('notify'); },
+    },
   ];
 
   // ── Local state ──────────────────────────────────────────────────────────

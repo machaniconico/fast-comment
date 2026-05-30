@@ -13,7 +13,7 @@
 export type Tab = 'comments' | 'settings';
 
 /** Settings sections that the command palette can jump to. */
-export type SettingsAnchor = 'channels' | 'tts' | 'obs' | 'moderation';
+export type SettingsAnchor = 'channels' | 'tts' | 'obs' | 'moderation' | 'notify';
 
 /** Maps a SettingsAnchor to the DOM id rendered on the matching <section>. */
 export const SETTINGS_ANCHOR_IDS: Record<SettingsAnchor, string> = {
@@ -21,6 +21,7 @@ export const SETTINGS_ANCHOR_IDS: Record<SettingsAnchor, string> = {
   tts: 'settings-tts',
   obs: 'settings-obs',
   moderation: 'settings-moderation',
+  notify: 'settings-notify',
 };
 
 class UiStore {

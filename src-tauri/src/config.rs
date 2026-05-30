@@ -178,12 +178,20 @@ pub struct UiConfig {
     /// リングバッファの保持上限件数。既定 2000。
     #[serde(default = "default_max_buffer")]
     pub max_buffer: usize,
+    /// ハイライト一致コメント到着時に効果音で通知するか。既定 false。
+    #[serde(default)]
+    pub notify_sound: bool,
+    /// 通知音の音量(0.0〜1.0)。既定 0.5。
+    #[serde(default = "default_notify_volume")]
+    pub notify_volume: f32,
 }
 
 impl Default for UiConfig {
     fn default() -> Self {
         UiConfig {
             max_buffer: default_max_buffer(),
+            notify_sound: false,
+            notify_volume: default_notify_volume(),
         }
     }
 }
@@ -307,6 +315,10 @@ fn default_voicevox_url() -> String {
 fn default_voicevox_speaker() -> u32 {
     1
 }
+fn default_notify_volume() -> f32 {
+    0.5
+}
+
 fn default_max_buffer() -> usize {
     2000
 }
@@ -360,7 +372,11 @@ mod tests {
                 ng_users: vec!["bot".to_string()],
                 highlights: vec!["important".to_string()],
             },
-            ui: UiConfig { max_buffer: 1234 },
+            ui: UiConfig {
+                max_buffer: 1234,
+                notify_sound: true,
+                notify_volume: 0.8,
+            },
             youtube_overrides: YoutubeOverrides {
                 api_key: Some("test-api-key".to_string()),
                 client_version: Some("1.20240501.00.00".to_string()),
@@ -373,6 +389,9 @@ mod tests {
 
         assert_eq!(json["obs"]["template"].as_str(), Some("compact"));
         assert_eq!(json["ui"]["maxBuffer"].as_u64(), Some(1234));
+        assert_eq!(json["ui"]["notifySound"].as_bool(), Some(true));
+        // f32→JSON→f64 はビット表現が変わるので近似比較する。
+        assert!((json["ui"]["notifyVolume"].as_f64().expect("notifyVolume") - 0.8).abs() < 1e-6);
         assert_eq!(
             json["tts"]["options"]["bouyomiHost"].as_str(),
             Some("192.0.2.10")
@@ -447,6 +466,9 @@ mod tests {
         assert!(cfg.moderation.highlights.is_empty());
         assert_eq!(cfg.ui.max_buffer, default_max_buffer());
         assert_eq!(cfg.ui.max_buffer, 2000);
+        // 通知設定は旧 config(キー欠落)でも default に劣化する(後方互換)。
+        assert!(!cfg.ui.notify_sound);
+        assert_eq!(cfg.ui.notify_volume, default_notify_volume());
         assert_eq!(cfg.youtube_overrides, YoutubeOverrides::default());
     }
 

@@ -112,7 +112,7 @@ export interface AppConfig {
   obs: { port: number; template: string };
   tts: { backend: 'bouyomi' | 'voicevox' | 'webSpeech' | 'none'; options: TtsOptions };
   moderation: { ngWords: string[]; ngUsers: string[]; highlights: string[] };
-  ui: { maxBuffer: number };
+  ui: { maxBuffer: number; notifySound: boolean; notifyVolume: number };
   youtubeOverrides?: { apiKey?: string; clientVersion?: string; paths?: Record<string, string> };
 }
 

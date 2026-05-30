@@ -67,6 +67,13 @@ class CommentStore {
   // Intentionally a session total (not buffer-bounded): evicted donations stay
   // counted, same rationale as _received.
   private _donations: DonationSummary = $state(emptyDonationSummary());
+  // Monotonically increasing count of highlight-badge messages received — drives
+  // the keyword notification (sound/flash). Never reset, like _received.
+  private _highlightSeq: number = $state(0);
+
+  // Notification prefs, loaded from config.ui at init and updated live by Settings.
+  notifySound: boolean = $state(false);
+  notifyVolume: number = $state(0.5);
 
   // Public filter state
   filterPlatform: Platform | 'all' = $state('all');
@@ -112,6 +119,9 @@ class CommentStore {
   // Derived: pinned comments (oldest first)
   readonly pinnedMessages: ChatMessage[] = $derived(this._pinned);
 
+  // Derived: monotonically increasing highlight-message count (notification trigger)
+  readonly highlightCount: number = $derived(this._highlightSeq);
+
   /** Push a batch into the ring buffer, evicting oldest on overflow. */
   pushBatch(messages: ChatMessage[]): void {
     const incoming = messages.map((msg) => ({ msg, search: buildSearch(msg) }));
@@ -123,7 +133,11 @@ class CommentStore {
     let byCurrency = don.byCurrency;
     let memberships = don.memberships;
     let donChanged = false;
+    let highlightDelta = 0;
     for (const msg of messages) {
+      // Highlight detection is independent of kind (a SuperChat can also be a
+      // highlight), so check it separately from the donation tally below.
+      if (msg.author.badges.some((b) => b.kind === 'highlight')) highlightDelta += 1;
       if (msg.kind === 'membership') {
         memberships += 1;
         donChanged = true;
@@ -143,6 +157,7 @@ class CommentStore {
       }
     }
     if (donChanged) this._donations = { byCurrency, memberships };
+    if (highlightDelta) this._highlightSeq += highlightDelta;
 
     const combined = this._buf.concat(incoming);
     if (combined.length > this._maxBuffer) {
@@ -218,6 +233,12 @@ class CommentStore {
     }
   }
 
+  /** Update notification prefs live (called by Settings after save). */
+  setNotify(sound: boolean, volume: number): void {
+    this.notifySound = sound;
+    if (Number.isFinite(volume)) this.notifyVolume = Math.min(1, Math.max(0, volume));
+  }
+
   clearMessages(): void {
     this._buf = [];
     this._msgs = [];
@@ -231,6 +252,9 @@ class CommentStore {
     const config = await getConfig();
     if (config && config.ui.maxBuffer > 0) {
       this.setMaxBuffer(config.ui.maxBuffer);
+    }
+    if (config) {
+      this.setNotify(config.ui.notifySound ?? false, config.ui.notifyVolume ?? 0.5);
     }
     const [unlistenChat, unlistenTts] = await Promise.all([
       startChatListener(),
@@ -254,6 +278,7 @@ export function hideMessage(id: string): void { store.hideMessage(id); }
 export function pinMessage(msg: ChatMessage): void { store.pinMessage(msg); }
 export function unpinMessage(id: string): void { store.unpinMessage(id); }
 export function togglePin(msg: ChatMessage): void { store.togglePin(msg); }
+export function setNotify(sound: boolean, volume: number): void { store.setNotify(sound, volume); }
 export function setFilterPlatform(p: Platform | 'all'): void { store.setFilterPlatform(p); }
 export function setSearchQuery(q: string): void { store.setSearchQuery(q); }
 export function setMaxBuffer(n: number): void { store.setMaxBuffer(n); }

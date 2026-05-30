@@ -5,6 +5,7 @@
   import PinnedStrip from './lib/components/PinnedStrip.svelte';
   import Settings from './lib/components/Settings.svelte';
   import CommandPalette from './lib/components/CommandPalette.svelte';
+  import Notifier from './lib/components/Notifier.svelte';
   import { store, initStore, clearMessages } from './lib/stores.svelte';
   import { ui } from './lib/ui.svelte';
 
@@ -159,6 +160,7 @@
   </main>
 
   <CommandPalette />
+  <Notifier />
 </div>
 
 <style>
