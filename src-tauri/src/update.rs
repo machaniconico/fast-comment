@@ -130,18 +130,15 @@ pub fn open_url(url: String) -> Result<(), String> {
 }
 
 fn parse_version(input: &str) -> Option<[u64; 3]> {
-    let s = input.trim().strip_prefix('v').unwrap_or(input.trim());
+    let s = input.trim();
+    let s = s.strip_prefix('v').unwrap_or(s);
     let (major, rest) = parse_u64_prefix(s)?;
     let rest = rest.strip_prefix('.')?;
     let (minor, rest) = parse_u64_prefix(rest)?;
     let rest = rest.strip_prefix('.')?;
-    let (patch, suffix) = parse_u64_prefix(rest)?;
+    let (patch, _suffix) = parse_u64_prefix(rest)?;
 
-    if suffix.is_empty() || suffix.starts_with('-') || suffix.starts_with('+') {
-        Some([major, minor, patch])
-    } else {
-        None
-    }
+    Some([major, minor, patch])
 }
 
 fn parse_u64_prefix(input: &str) -> Option<(u64, &str)> {
