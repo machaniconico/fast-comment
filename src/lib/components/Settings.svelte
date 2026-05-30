@@ -108,7 +108,10 @@
   });
 
   // Displayed OBS URL: base URL with the config template reflected in.
-  const obsUrl = $derived(withTemplate(obsBaseUrl, config?.obs.template ?? 'default'));
+  const obsUrl = $derived.by(() => {
+    const tmpl = config?.obs.template ?? 'default';
+    return withTemplate(obsBaseUrl, tmpl);
+  });
 
   function withTemplate(url: string, tmpl: string): string {
     const name = (tmpl || 'default').trim() || 'default';
@@ -247,8 +250,8 @@
   <section id="settings-tts">
     <h3>TTS（読み上げ）</h3>
     <div class="field-row">
-      <label>バックエンド</label>
-      <select bind:value={config.tts.backend} class="platform-select">
+      <label for="tts-backend">バックエンド</label>
+      <select id="tts-backend" bind:value={config.tts.backend} class="platform-select">
         <option value="none">読み上げOFF</option>
         <option value="webSpeech">Web Speech（内蔵）</option>
         <option value="bouyomi">棒読みちゃん</option>
@@ -258,8 +261,9 @@
 
     {#if config.tts.backend === 'voicevox'}
     <div class="field-row">
-      <label>VOICEVOX 話者ID</label>
+      <label for="tts-voicevox-speaker">VOICEVOX 話者ID</label>
       <input
+        id="tts-voicevox-speaker"
         type="number"
         min="0"
         step="1"
@@ -270,8 +274,9 @@
     {/if}
 
     <div class="field-row">
-      <label>最大読み上げ文字数</label>
+      <label for="tts-max-length">最大読み上げ文字数</label>
       <input
+        id="tts-max-length"
         type="number"
         min="0"
         step="1"

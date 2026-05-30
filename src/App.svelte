@@ -89,7 +89,7 @@
     </div>
 
     <!-- Tab switcher -->
-    <nav class="tabs" role="tablist">
+    <div class="tabs" role="tablist">
       <button
         role="tab"
         class="tab-btn"
@@ -104,7 +104,7 @@
         aria-selected={ui.activeTab === 'settings'}
         onclick={() => ui.setTab('settings')}
       >設定</button>
-    </nav>
+    </div>
   </header>
 
   <!-- ── Comment tab toolbar ── -->
@@ -150,14 +150,14 @@
   {/if}
 
   <!-- ── Main content ── -->
-  <main class="main-content" role="tabpanel">
+  <div class="main-content" role="tabpanel">
     {#if ui.activeTab === 'comments'}
       <PinnedStrip />
       <CommentList />
     {:else}
       <Settings />
     {/if}
-  </main>
+  </div>
 
   <CommandPalette />
   <Notifier />

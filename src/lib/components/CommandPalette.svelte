@@ -184,6 +184,7 @@
       role="dialog"
       aria-modal="true"
       aria-label="コマンドパレット"
+      tabindex="-1"
       onclick={(e) => e.stopPropagation()}
     >
       <input
