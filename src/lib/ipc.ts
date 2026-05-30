@@ -123,6 +123,13 @@ export interface ChannelConfig {
   enabled: boolean; // Rust ChannelConfig.enabled (serde default true)
 }
 
+export interface UpdateStatus {
+  updateAvailable: boolean;
+  currentVersion: string;
+  latestVersion: string;
+  releaseUrl: string;
+}
+
 export async function getConfig(): Promise<AppConfig | null> {
   return invoke<AppConfig>('get_config');
 }
@@ -147,4 +154,13 @@ export async function hideMessage(id: string): Promise<void> {
 
 export async function getObsUrl(): Promise<string | null> {
   return invoke<string>('get_obs_url');
+}
+
+export async function checkForUpdate(): Promise<UpdateStatus | null> {
+  return invoke<UpdateStatus>('check_for_update');
+}
+
+export async function openReleaseUrl(url: string): Promise<void> {
+  if (!url) return;
+  await invoke<void>('open_url', { url });
 }

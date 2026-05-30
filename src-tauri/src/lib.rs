@@ -17,6 +17,7 @@ pub mod model;
 pub mod moderation;
 pub mod sources;
 pub mod tts;
+mod update;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -32,6 +33,7 @@ use crate::model::{Badge, ChatMessage};
 use crate::moderation::{Moderator, Verdict};
 use crate::sources::SourceManager;
 use crate::tts::{bouyomi, TtsDispatcher};
+use crate::update::{check_for_update, open_url};
 
 /// アプリ全体で共有する実行時状態。
 pub struct AppState {
@@ -498,6 +500,8 @@ pub fn run() {
             hide_message,
             unhide_message,
             get_obs_url,
+            check_for_update,
+            open_url,
         ])
         .run(tauri::generate_context!())
         .expect("Tauri アプリの起動に失敗しました");

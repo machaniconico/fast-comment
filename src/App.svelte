@@ -9,8 +9,12 @@
   import Notifier from './lib/components/Notifier.svelte';
   import { store, initStore, clearMessages } from './lib/stores.svelte';
   import { ui } from './lib/ui.svelte';
+  import { checkForUpdate, openReleaseUrl } from './lib/ipc';
+  import type { UpdateStatus } from './lib/ipc';
 
   let unlisten: (() => void) | null = null;
+  let updateStatus = $state<UpdateStatus | null>(null);
+  let updateDismissed = $state(false);
 
   // ── Donation summary helpers ──────────────────────────────────────────────
 
@@ -36,6 +40,7 @@
   );
 
   onMount(async () => {
+    void loadUpdateStatus();
     unlisten = await initStore();
   });
 
@@ -63,11 +68,51 @@
       ui.togglePalette();
     }
   }
+
+  async function loadUpdateStatus() {
+    try {
+      const status = await checkForUpdate();
+      if (status?.updateAvailable) {
+        updateStatus = status;
+        updateDismissed = false;
+      }
+    } catch (e) {
+      console.warn('[update] update check failed', e);
+    }
+  }
+
+  async function onUpdateDownloadClick(e: MouseEvent) {
+    e.preventDefault();
+    const url = updateStatus?.releaseUrl;
+    if (!url) return;
+    try {
+      await openReleaseUrl(url);
+    } catch (err) {
+      console.warn('[update] failed to open release URL', err);
+    }
+  }
 </script>
 
 <svelte:window onkeydown={onWindowKey} />
 
 <div class="app">
+  {#if updateStatus?.updateAvailable && !updateDismissed}
+    <div class="update-banner" role="status" aria-live="polite">
+      <span class="update-banner__text">
+        新しいバージョン v{updateStatus.latestVersion} があります（現在 v{updateStatus.currentVersion}）
+      </span>
+      <a class="update-download" href={updateStatus.releaseUrl || '#'} onclick={onUpdateDownloadClick}>
+        ダウンロード
+      </a>
+      <button
+        class="update-dismiss"
+        onclick={() => (updateDismissed = true)}
+        title="閉じる"
+        aria-label="更新通知を閉じる"
+      >×</button>
+    </div>
+  {/if}
+
   <!-- ── Header ── -->
   <header class="app-header">
     <div class="header-left">
@@ -198,6 +243,56 @@
     flex-direction: column;
     height: 100vh;
     overflow: hidden;
+  }
+
+  .update-banner {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-height: 32px;
+    padding: 5px 10px;
+    background: #123524;
+    border-bottom: 1px solid rgba(74,222,128,0.32);
+    color: #d8f7e3;
+    font-size: 12px;
+    flex-shrink: 0;
+  }
+
+  .update-banner__text {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .update-download {
+    color: #86efac;
+    font-weight: 700;
+    text-decoration: none;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+
+  .update-download:hover {
+    text-decoration: underline;
+  }
+
+  .update-dismiss {
+    width: 22px;
+    height: 22px;
+    border: none;
+    border-radius: 4px;
+    background: rgba(255,255,255,0.08);
+    color: #b8e7c7;
+    cursor: pointer;
+    flex-shrink: 0;
+    line-height: 1;
+  }
+
+  .update-dismiss:hover {
+    background: rgba(255,255,255,0.14);
+    color: #fff;
   }
 
   /* Header */
