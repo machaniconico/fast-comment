@@ -237,8 +237,19 @@ echo  Portable exe   : src-tauri\target\release\fast-comment.exe
 echo.
 echo  The NSIS installer creates a desktop shortcut on install.
 echo.
-choice /c YN /n /m "Open the output folder ^(bundle^)? [Y/N] "
-if not errorlevel 2 start "" "explorer.exe" "src-tauri\target\release\bundle"
+
+REM --- Auto-launch the NSIS installer (newest *-setup.exe) -------------
+set "NSIS_DIR=src-tauri\target\release\bundle\nsis"
+set "SETUP_EXE="
+for %%F in ("%NSIS_DIR%\*-setup.exe") do set "SETUP_EXE=%%F"
+if defined SETUP_EXE (
+  echo  Launching installer: %SETUP_EXE%
+  start "" "%SETUP_EXE%"
+) else (
+  echo [WARN] NSIS setup exe not found under %NSIS_DIR%.
+  echo        Opening the bundle output folder instead.
+  start "" "explorer.exe" "src-tauri\target\release\bundle"
+)
 echo.
 pause
 exit /b 0
