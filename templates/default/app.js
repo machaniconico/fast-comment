@@ -11,6 +11,7 @@
  *   ?bg=0                overlay background opacity percent (default 0)
  *   ?pos=bottom          top or bottom (default bottom)
  *   ?icon=1              show platform dot: 1/0 (default 1)
+ *   ?only=gift           show SuperChat/Bits/membership only
  *   ?ws=ws://127.0.0.1:11180/ws  override WS endpoint
  */
 
@@ -26,6 +27,7 @@
   const BG_OPACITY = boundedNumberParam('bg', 0, 0, 100) / 100;
   const POSITION = params.get('pos') === 'top' ? 'top' : 'bottom';
   const SHOW_PLATFORM = params.get('icon') !== '0';
+  const ONLY_GIFT = params.get('only') === 'gift';
   const WS_URL   = buildWsUrl(params.get('ws') || 'ws://127.0.0.1:11180/ws');
 
   const overlay = document.getElementById('overlay');
@@ -83,6 +85,7 @@
   function handleMessage(msg) {
     // Channel filter
     if (CHANNEL_FILTER && msg.channel !== CHANNEL_FILTER) return;
+    if (ONLY_GIFT && !isGiftMessage(msg)) return;
 
     const el = buildRow(msg);
     addRow(el);
@@ -249,6 +252,11 @@
     } catch {
       return false;
     }
+  }
+
+  function isGiftMessage(msg) {
+    const kind = msg && msg.kind;
+    return kind === 'superChat' || kind === 'membership' || kind === 'bits';
   }
 
   function cssDurationMs(name, fallback) {

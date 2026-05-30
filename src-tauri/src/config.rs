@@ -224,6 +224,9 @@ pub struct UiConfig {
     /// リングバッファの保持上限件数。既定 2000。
     #[serde(default = "default_max_buffer")]
     pub max_buffer: usize,
+    /// 投げ銭を別タブで表示するか。既定 false。
+    #[serde(default)]
+    pub show_donation_panel: bool,
     /// ハイライト一致コメント到着時に効果音で通知するか。既定 false。
     #[serde(default)]
     pub notify_sound: bool,
@@ -236,6 +239,7 @@ impl Default for UiConfig {
     fn default() -> Self {
         UiConfig {
             max_buffer: default_max_buffer(),
+            show_donation_panel: false,
             notify_sound: false,
             notify_volume: default_notify_volume(),
         }
@@ -486,6 +490,7 @@ mod tests {
             },
             ui: UiConfig {
                 max_buffer: 1234,
+                show_donation_panel: true,
                 notify_sound: true,
                 notify_volume: 0.8,
             },
@@ -512,6 +517,7 @@ mod tests {
         assert_eq!(json["obs"]["position"].as_str(), Some("top"));
         assert_eq!(json["obs"]["showPlatform"].as_bool(), Some(false));
         assert_eq!(json["ui"]["maxBuffer"].as_u64(), Some(1234));
+        assert_eq!(json["ui"]["showDonationPanel"].as_bool(), Some(true));
         assert_eq!(json["ui"]["notifySound"].as_bool(), Some(true));
         // f32→JSON→f64 はビット表現が変わるので近似比較する。
         assert!((json["ui"]["notifyVolume"].as_f64().expect("notifyVolume") - 0.8).abs() < 1e-6);
@@ -644,6 +650,7 @@ mod tests {
         assert!(cfg.moderation.highlights.is_empty());
         assert_eq!(cfg.ui.max_buffer, default_max_buffer());
         assert_eq!(cfg.ui.max_buffer, 2000);
+        assert!(!cfg.ui.show_donation_panel);
         // 通知設定は旧 config(キー欠落)でも default に劣化する(後方互換)。
         assert!(!cfg.ui.notify_sound);
         assert_eq!(cfg.ui.notify_volume, default_notify_volume());
@@ -712,6 +719,7 @@ mod tests {
         assert_eq!(cfg.tts.options.strip_emoji, default_true());
         assert_eq!(cfg.tts.options.max_length, default_max_read_len());
         assert_eq!(cfg.ui.max_buffer, 321);
+        assert!(!cfg.ui.show_donation_panel);
         assert_eq!(cfg.participation, ParticipationConfig::default());
         assert_eq!(cfg.youtube_overrides, YoutubeOverrides::default());
     }

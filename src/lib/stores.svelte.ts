@@ -48,8 +48,28 @@ export interface DonationSummary {
   memberships: number;
 }
 
+export type DonationKind = 'superchat' | 'bits' | 'membership';
+
+export interface DonationMessage {
+  message: ChatMessage;
+  donationKind: DonationKind;
+}
+
 function emptyDonationSummary(): DonationSummary {
   return { byCurrency: {}, memberships: 0 };
+}
+
+export function getDonationKind(msg: ChatMessage): DonationKind | null {
+  if (msg.kind === 'membership') return 'membership';
+  if (
+    (msg.kind === 'superChat' || msg.kind === 'bits') &&
+    msg.amount &&
+    Number.isFinite(msg.amount.value) &&
+    msg.amount.value > 0
+  ) {
+    return msg.kind === 'bits' ? 'bits' : 'superchat';
+  }
+  return null;
 }
 
 class CommentStore {
@@ -116,6 +136,20 @@ class CommentStore {
   // Derived: session donation summary (SuperChat/Bits totals + membership count)
   readonly donationSummary: DonationSummary = $derived(this._donations);
 
+  // Derived: buffered donation messages, newest first. Not affected by the
+  // main comment tab's platform/text filters.
+  readonly donationMessages: DonationMessage[] = $derived.by(() => {
+    const out: DonationMessage[] = [];
+    for (let i = this._buf.length - 1; i >= 0; i -= 1) {
+      const entry = this._buf[i];
+      if (!entry) continue;
+      const msg = entry.msg;
+      const donationKind = getDonationKind(msg);
+      if (donationKind) out.push({ message: msg, donationKind });
+    }
+    return out;
+  });
+
   // Derived: pinned comments (oldest first)
   readonly pinnedMessages: ChatMessage[] = $derived(this._pinned);
 
@@ -138,18 +172,17 @@ class CommentStore {
       // Highlight detection is independent of kind (a SuperChat can also be a
       // highlight), so check it separately from the donation tally below.
       if (msg.author.badges.some((b) => b.kind === 'highlight')) highlightDelta += 1;
-      if (msg.kind === 'membership') {
+      const donationKind = getDonationKind(msg);
+      if (donationKind === 'membership') {
         memberships += 1;
         donChanged = true;
       } else if (
-        (msg.kind === 'superChat' || msg.kind === 'bits') &&
-        msg.amount &&
-        Number.isFinite(msg.amount.value) &&
-        msg.amount.value > 0
+        (donationKind === 'superchat' || donationKind === 'bits') &&
+        msg.amount
       ) {
         // Bits は Rust 側が currency="BITS" を送るが、表示キーは casing に依存しない
         // 正準値 'bits' に寄せる(SuperChat は通貨コード/記号をそのまま使う)。
-        const cur = msg.kind === 'bits' ? 'bits' : (msg.amount.currency || '?');
+        const cur = donationKind === 'bits' ? 'bits' : (msg.amount.currency || '?');
         if (byCurrency === don.byCurrency) byCurrency = { ...don.byCurrency };
         const prev = byCurrency[cur] ?? { total: 0, count: 0 };
         byCurrency[cur] = { total: prev.total + msg.amount.value, count: prev.count + 1 };

@@ -7,9 +7,16 @@
   import { ui, SETTINGS_ANCHOR_IDS } from '../ui.svelte';
   import { setNotify } from '../stores.svelte';
 
+  interface Props {
+    onConfigSaved?: (config: AppConfig) => void;
+  }
+
+  let { onConfigSaved }: Props = $props();
+
   let config: AppConfig | null = $state(null);
   let obsBaseUrl: string = $state('');
-  let copied: boolean = $state(false);
+  let copiedObs: boolean = $state(false);
+  let copiedGiftObs: boolean = $state(false);
 
   // NG / highlight edit buffers
   let ngWordsText: string = $state('');
@@ -41,7 +48,8 @@
 
   // setTimeout handles (cleared on destroy)
   let saveMsgTimer: ReturnType<typeof setTimeout> | null = null;
-  let copiedTimer: ReturnType<typeof setTimeout> | null = null;
+  let copiedObsTimer: ReturnType<typeof setTimeout> | null = null;
+  let copiedGiftObsTimer: ReturnType<typeof setTimeout> | null = null;
 
   // ── TTS options accessors (config.tts.options mirrors Rust TtsOptions) ──
   // Keys are partitioned by value type so reads/writes stay type-checked
@@ -118,7 +126,8 @@
 
   onDestroy(() => {
     if (saveMsgTimer !== null) clearTimeout(saveMsgTimer);
-    if (copiedTimer !== null) clearTimeout(copiedTimer);
+    if (copiedObsTimer !== null) clearTimeout(copiedObsTimer);
+    if (copiedGiftObsTimer !== null) clearTimeout(copiedGiftObsTimer);
     if (speechVoicesListenerAttached && typeof window !== 'undefined' && 'speechSynthesis' in window) {
       window.speechSynthesis.removeEventListener('voiceschanged', refreshSpeechVoices);
       speechVoicesListenerAttached = false;
@@ -128,6 +137,10 @@
   // Displayed OBS URL: base URL with the config template and appearance reflected in.
   const obsUrl = $derived.by(() => {
     return withTemplate(obsBaseUrl, config?.obs ?? null);
+  });
+
+  const giftObsUrl = $derived.by(() => {
+    return withOnlyGift(obsUrl);
   });
 
   function withTemplate(url: string, obs: AppConfig['obs'] | null): string {
@@ -141,6 +154,16 @@
       u.searchParams.set('bg', String(clampInt(obs?.bgOpacityPct, 0, 0, 100)));
       u.searchParams.set('pos', obs?.position === 'top' ? 'top' : 'bottom');
       u.searchParams.set('icon', obs?.showPlatform === false ? '0' : '1');
+      return u.toString();
+    } catch {
+      return url;
+    }
+  }
+
+  function withOnlyGift(url: string): string {
+    try {
+      const u = new URL(url);
+      u.searchParams.set('only', 'gift');
       return u.toString();
     } catch {
       return url;
@@ -224,6 +247,7 @@
     try {
       await setConfig(config);
       setNotify(config.ui.notifySound, config.ui.notifyVolume);
+      onConfigSaved?.(config);
       saveMsg = '保存しました';
     } catch (e) {
       saveMsg = `保存に失敗しました: ${e instanceof Error ? e.message : String(e)}`;
@@ -234,14 +258,28 @@
     saveMsgTimer = setTimeout(() => { saveMsg = ''; saveMsgTimer = null; }, 3000);
   }
 
-  function onCopyObs() {
-    navigator.clipboard.writeText(obsUrl)
+  function copyText(text: string, markCopied: () => void) {
+    navigator.clipboard.writeText(text)
       .then(() => {
-        copied = true;
-        if (copiedTimer !== null) clearTimeout(copiedTimer);
-        copiedTimer = setTimeout(() => { copied = false; copiedTimer = null; }, 1500);
+        markCopied();
       })
       .catch(() => { /* clipboard denied — do not show success */ });
+  }
+
+  function onCopyObs() {
+    copyText(obsUrl, () => {
+      copiedObs = true;
+      if (copiedObsTimer !== null) clearTimeout(copiedObsTimer);
+      copiedObsTimer = setTimeout(() => { copiedObs = false; copiedObsTimer = null; }, 1500);
+    });
+  }
+
+  function onCopyGiftObs() {
+    copyText(giftObsUrl, () => {
+      copiedGiftObs = true;
+      if (copiedGiftObsTimer !== null) clearTimeout(copiedGiftObsTimer);
+      copiedGiftObsTimer = setTimeout(() => { copiedGiftObs = false; copiedGiftObsTimer = null; }, 1500);
+    });
   }
 </script>
 
@@ -440,10 +478,18 @@
       <label for="obs-show-platform">プラットフォーム表示</label>
       <input id="obs-show-platform" type="checkbox" bind:checked={config.obs.showPlatform} class="chk" />
     </div>
+    <div class="obs-label">通常オーバーレイURL</div>
     <div class="obs-row">
       <input type="text" value={obsUrl} readonly class="obs-input" />
-      <button class="copy-btn" class:copied onclick={onCopyObs}>
-        {copied ? 'コピー済' : 'コピー'}
+      <button class="copy-btn" class:copied={copiedObs} onclick={onCopyObs}>
+        {copiedObs ? 'コピー済' : 'コピー'}
+      </button>
+    </div>
+    <div class="obs-label">投げ銭専用オーバーレイURL</div>
+    <div class="obs-row">
+      <input type="text" value={giftObsUrl} readonly class="obs-input" />
+      <button class="copy-btn" class:copied={copiedGiftObs} onclick={onCopyGiftObs}>
+        {copiedGiftObs ? 'コピー済' : 'コピー'}
       </button>
     </div>
     <p class="hint">OBSのブラウザソースにこのURLを貼り付けてください。</p>
@@ -501,6 +547,15 @@
   <!-- ── Notification ── -->
   <section id="settings-notify">
     <h3>通知</h3>
+    <div class="field-row">
+      <label for="show-donation-panel">投げ銭を別タブで表示</label>
+      <input
+        id="show-donation-panel"
+        type="checkbox"
+        bind:checked={config.ui.showDonationPanel}
+        class="chk"
+      />
+    </div>
     <div class="field-row">
       <label for="notify-sound">ハイライトを効果音で通知</label>
       <input
@@ -601,6 +656,13 @@
   .copy-btn.copied { background: #2e7d32; }
   .save-btn { background: #1976d2; color: #fff; padding: 7px 18px; }
   .save-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  .obs-label {
+    margin-top: 8px;
+    color: #bdbdbd;
+    font-size: 12px;
+    font-weight: 600;
+  }
 
   .obs-row {
     display: flex;

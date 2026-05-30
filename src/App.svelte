@@ -2,6 +2,7 @@
   import { onMount, onDestroy } from 'svelte';
   import type { Platform } from './lib/types';
   import CommentList from './lib/components/CommentList.svelte';
+  import DonationPanel from './lib/components/DonationPanel.svelte';
   import PinnedStrip from './lib/components/PinnedStrip.svelte';
   import Participation from './lib/components/Participation.svelte';
   import Settings from './lib/components/Settings.svelte';
@@ -10,10 +11,11 @@
   import Notifier from './lib/components/Notifier.svelte';
   import { store, initStore, clearMessages } from './lib/stores.svelte';
   import { ui } from './lib/ui.svelte';
-  import { checkForUpdate, openReleaseUrl } from './lib/ipc';
-  import type { UpdateStatus } from './lib/ipc';
+  import { checkForUpdate, openReleaseUrl, getConfig } from './lib/ipc';
+  import type { AppConfig, UpdateStatus } from './lib/ipc';
 
   let unlisten: (() => void) | null = null;
+  let config: AppConfig | null = $state(null);
   let updateStatus = $state<UpdateStatus | null>(null);
   let updateDismissed = $state(false);
 
@@ -40,8 +42,19 @@
     donationEntries.length > 0 || store.donationSummary.memberships > 0
   );
 
+  function isDonationPanelEnabled(cfg: AppConfig | null): boolean {
+    return cfg?.ui.showDonationPanel === true;
+  }
+
+  const showDonationPanel = $derived(isDonationPanelEnabled(config));
+
+  $effect(() => {
+    if (!showDonationPanel && ui.activeTab === 'donations') ui.setTab('comments');
+  });
+
   onMount(async () => {
     void loadUpdateStatus();
+    void loadConfig();
     unlisten = await initStore();
   });
 
@@ -80,6 +93,19 @@
     } catch (e) {
       console.warn('[update] update check failed', e);
     }
+  }
+
+  async function loadConfig() {
+    try {
+      const loaded = await getConfig();
+      if (loaded) config = loaded;
+    } catch (e) {
+      console.warn('[config] load failed', e);
+    }
+  }
+
+  function onSettingsSaved(nextConfig: AppConfig) {
+    config = { ...nextConfig, ui: { ...nextConfig.ui } };
   }
 
   async function onUpdateDownloadClick(e: MouseEvent) {
@@ -144,6 +170,15 @@
         aria-selected={ui.activeTab === 'comments'}
         onclick={() => ui.setTab('comments')}
       >コメント</button>
+      {#if showDonationPanel}
+        <button
+          role="tab"
+          class="tab-btn"
+          class:active={ui.activeTab === 'donations'}
+          aria-selected={ui.activeTab === 'donations'}
+          onclick={() => ui.setTab('donations')}
+        >投げ銭</button>
+      {/if}
       <button
         role="tab"
         class="tab-btn"
@@ -215,10 +250,12 @@
     {#if ui.activeTab === 'comments'}
       <PinnedStrip />
       <CommentList />
+    {:else if ui.activeTab === 'donations' && showDonationPanel}
+      <DonationPanel />
     {:else if ui.activeTab === 'participation'}
       <Participation />
     {:else}
-      <Settings />
+      <Settings onConfigSaved={onSettingsSaved} />
     {/if}
   </div>
 

@@ -11,6 +11,7 @@
  *   ?bg=0
  *   ?pos=bottom
  *   ?icon=1
+ *   ?only=gift
  *   ?ws=ws://127.0.0.1:11180/ws
  */
 
@@ -25,6 +26,7 @@
   const BG_OPACITY = boundedNumberParam('bg', 0, 0, 100) / 100;
   const POSITION = params.get('pos') === 'top' ? 'top' : 'bottom';
   const SHOW_PLATFORM = params.get('icon') !== '0';
+  const ONLY_GIFT = params.get('only') === 'gift';
   const WS_URL = buildWsUrl(params.get('ws') || 'ws://127.0.0.1:11180/ws');
 
   const overlay = document.getElementById('overlay');
@@ -71,6 +73,7 @@
 
   function handleMessage(msg) {
     if (CHANNEL_FILTER && msg.channel !== CHANNEL_FILTER) return;
+    if (ONLY_GIFT && !isGiftMessage(msg)) return;
 
     const el = buildRow(msg);
     addRow(el);
@@ -214,6 +217,11 @@
     } catch {
       return false;
     }
+  }
+
+  function isGiftMessage(msg) {
+    const kind = msg && msg.kind;
+    return kind === 'superChat' || kind === 'membership' || kind === 'bits';
   }
 
   function cssDurationMs(name, fallback) {

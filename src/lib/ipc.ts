@@ -150,7 +150,7 @@ export interface AppConfig {
   };
   tts: { backend: 'bouyomi' | 'voicevox' | 'webSpeech' | 'none'; options: TtsOptions };
   moderation: { ngWords: string[]; ngUsers: string[]; highlights: string[] };
-  ui: { maxBuffer: number; notifySound: boolean; notifyVolume: number };
+  ui: { maxBuffer: number; showDonationPanel: boolean; notifySound: boolean; notifyVolume: number };
   participation: ParticipationConfig;
   youtubeOverrides?: { apiKey?: string; clientVersion?: string; paths?: Record<string, string> };
 }
