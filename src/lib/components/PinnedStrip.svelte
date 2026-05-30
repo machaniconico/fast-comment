@@ -64,6 +64,9 @@
     background: rgba(255, 179, 0, 0.06);
     border-bottom: 1px solid rgba(255, 179, 0, 0.18);
     padding: 2px 0;
+    /* 最大5件(FIFO)。万一を考え高さを上限化し、超過時のみ縦スクロール。 */
+    max-height: 128px;
+    overflow-y: auto;
   }
 
   .pinned-row {

@@ -354,7 +354,7 @@
         bind:value={config.ui.notifyVolume}
         class="vol-slider"
         disabled={!config.ui.notifySound}
-        onchange={() => setNotify(config!.ui.notifySound, config!.ui.notifyVolume)}
+        oninput={() => setNotify(config!.ui.notifySound, config!.ui.notifyVolume)}
       />
       <span class="hint-inline">{Math.round(config.ui.notifyVolume * 100)}%</span>
     </div>
