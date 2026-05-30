@@ -27,6 +27,12 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "installerHooks": "nsis-hooks.nsh"
+      }
+    },
     "resources": {
       "../templates": "templates"
     },

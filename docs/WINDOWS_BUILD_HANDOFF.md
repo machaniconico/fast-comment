@@ -433,6 +433,17 @@ src-tauri\target\release\fast-comment.exe
 
 再配置可能な単一ファイル（依存関係は WebView2 Runtime のみ）。
 
+### 6.3 デスクトップショートカット（NSIS インストーラ）
+
+NSIS インストーラ（`*-setup.exe`）はインストール完了時に**自動でデスクトップにショートカットを作成**する。
+`src-tauri/nsis-hooks.nsh`（`NSIS_HOOK_POSTINSTALL`）を `tauri.conf.json` の
+`bundle.windows.nsis.installerHooks` で配線して実現している。
+
+- [ ] NSIS インストーラ（`*-setup.exe`）でインストール → デスクトップに `fast-comment` ショートカットができる
+- [ ] アンインストールでショートカットも消える（標準テンプレートが削除）
+- 補足: Tauri 2 には `createDesktopShortcut` 設定キーは無く、フック方式が確実（document-specialist 調査済）。
+- 補足: **MSI（WiX）側は未対応**（WiX はカスタム `.wxs` フラグメントが別途必要）。MSI でも必要なら依頼を。
+
 ---
 
 ## 7. チェックリスト
