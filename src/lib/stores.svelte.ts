@@ -14,6 +14,8 @@ import type { ChatMessage, Platform } from './types';
 import { onChatBatch, startChatListener, startTtsSpeakListener, getConfig } from './ipc';
 
 const DEFAULT_MAX_BUFFER = 2000;
+/** Max pinned comments kept in the pinned strip (oldest dropped on overflow). */
+const MAX_PINNED = 5;
 
 /** Buffer entry: the message plus a once-computed lowercase search haystack. */
 interface BufEntry {
@@ -70,6 +72,10 @@ class CommentStore {
   filterPlatform: Platform | 'all' = $state('all');
   searchQuery: string = $state('');
   hiddenIds: Set<string> = $state(new Set());
+  // Pinned comments: full ChatMessage objects (NOT ids) so a pinned comment
+  // survives ring-buffer eviction and stays visible after it scrolls out.
+  // Capped FIFO (oldest dropped) so the pinned strip never grows unbounded.
+  private _pinned: ChatMessage[] = $state([]);
 
   // Derived: filtered list
   readonly visibleMessages: ChatMessage[] = $derived.by(() => {
@@ -102,6 +108,9 @@ class CommentStore {
 
   // Derived: session donation summary (SuperChat/Bits totals + membership count)
   readonly donationSummary: DonationSummary = $derived(this._donations);
+
+  // Derived: pinned comments (oldest first)
+  readonly pinnedMessages: ChatMessage[] = $derived(this._pinned);
 
   /** Push a batch into the ring buffer, evicting oldest on overflow. */
   pushBatch(messages: ChatMessage[]): void {
@@ -168,6 +177,29 @@ class CommentStore {
     this.hiddenIds = new Set([...this.hiddenIds, id]);
   }
 
+  /** True if a comment with this id is currently pinned. */
+  isPinned(id: string): boolean {
+    return this._pinned.some((m) => m.id === id);
+  }
+
+  /** Pin a comment (no-op if already pinned). FIFO-capped at MAX_PINNED. */
+  pinMessage(msg: ChatMessage): void {
+    if (this._pinned.some((m) => m.id === msg.id)) return;
+    const next = [...this._pinned, msg];
+    this._pinned = next.length > MAX_PINNED ? next.slice(next.length - MAX_PINNED) : next;
+  }
+
+  unpinMessage(id: string): void {
+    if (!this._pinned.some((m) => m.id === id)) return;
+    this._pinned = this._pinned.filter((m) => m.id !== id);
+  }
+
+  /** Pin if not pinned, otherwise unpin. */
+  togglePin(msg: ChatMessage): void {
+    if (this.isPinned(msg.id)) this.unpinMessage(msg.id);
+    else this.pinMessage(msg);
+  }
+
   setFilterPlatform(p: Platform | 'all'): void {
     this.filterPlatform = p;
   }
@@ -191,6 +223,7 @@ class CommentStore {
     this._msgs = [];
     // Explicit clear is a session reset, so the donation summary resets too.
     this._donations = emptyDonationSummary();
+    this._pinned = [];
   }
 
   /** Call once from App.svelte onMount to start Tauri IPC listeners. */
@@ -218,6 +251,9 @@ onChatBatch((batch) => store.pushBatch(batch));
 
 // Convenience re-exports so call sites stay terse
 export function hideMessage(id: string): void { store.hideMessage(id); }
+export function pinMessage(msg: ChatMessage): void { store.pinMessage(msg); }
+export function unpinMessage(id: string): void { store.unpinMessage(id); }
+export function togglePin(msg: ChatMessage): void { store.togglePin(msg); }
 export function setFilterPlatform(p: Platform | 'all'): void { store.setFilterPlatform(p); }
 export function setSearchQuery(q: string): void { store.setSearchQuery(q); }
 export function setMaxBuffer(n: number): void { store.setMaxBuffer(n); }

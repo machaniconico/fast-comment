@@ -2,6 +2,7 @@
   import { onMount, onDestroy } from 'svelte';
   import type { Platform } from './lib/types';
   import CommentList from './lib/components/CommentList.svelte';
+  import PinnedStrip from './lib/components/PinnedStrip.svelte';
   import Settings from './lib/components/Settings.svelte';
   import CommandPalette from './lib/components/CommandPalette.svelte';
   import { store, initStore, clearMessages } from './lib/stores.svelte';
@@ -150,6 +151,7 @@
   <!-- ── Main content ── -->
   <main class="main-content" role="tabpanel">
     {#if ui.activeTab === 'comments'}
+      <PinnedStrip />
       <CommentList />
     {:else}
       <Settings />

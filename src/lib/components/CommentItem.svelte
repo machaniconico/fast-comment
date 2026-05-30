@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { ChatMessage } from '../types';
-  import { store } from '../stores.svelte';
+  import { store, togglePin } from '../stores.svelte';
   import { hideMessage as ipcHideMessage } from '../ipc';
 
   interface Props {
@@ -41,6 +41,8 @@
   let kindFg = $derived(hasKindStyle ? KIND_TEXT[message.kind] : undefined);
   // 行強調(太字 + 左枠): kind 塗り or highlight バッジのどちらかで点灯。
   let isHighlighted = $derived(hasKindStyle || hasHighlightBadge);
+
+  let pinned = $derived(store.isPinned(message.id));
 
   function onHide() {
     store.hideMessage(message.id);
@@ -106,6 +108,13 @@
   <!-- Time + hide button -->
   <span class="meta">
     <span class="time">{formatTime(message.timestampMs)}</span>
+    <button
+      class="pin-btn"
+      class:pinned
+      onclick={() => togglePin(message)}
+      title={pinned ? 'ピン解除' : 'ピン留め'}
+      aria-label={pinned ? 'このコメントのピンを解除' : 'このコメントをピン留め'}
+    >📌</button>
     <button class="hide-btn" onclick={onHide} title="非表示" aria-label="このコメントを非表示">✕</button>
   </span>
 </div>
@@ -248,5 +257,33 @@
   .hide-btn:hover {
     opacity: 1 !important;
     color: #f44336;
+  }
+
+  .pin-btn {
+    background: none;
+    border: none;
+    color: inherit;
+    cursor: pointer;
+    padding: 0 2px;
+    font-size: 10px;
+    line-height: 1;
+    opacity: 0;
+    transition: opacity 0.15s;
+    filter: grayscale(1);
+  }
+
+  .comment-item:hover .pin-btn {
+    opacity: 1;
+  }
+
+  .pin-btn.pinned {
+    opacity: 1;
+    filter: none;
+    color: #ffb300;
+  }
+
+  .pin-btn:hover {
+    opacity: 1 !important;
+    filter: none;
   }
 </style>
