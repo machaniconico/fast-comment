@@ -245,11 +245,12 @@ for %%F in ("%NSIS_DIR%\*-setup.exe") do set "SETUP_EXE=%%F"
 if defined SETUP_EXE (
   echo  Launching installer: %SETUP_EXE%
   start "" "%SETUP_EXE%"
-) else (
-  echo [WARN] NSIS setup exe not found under %NSIS_DIR%.
-  echo        Opening the bundle output folder instead.
-  start "" "explorer.exe" "src-tauri\target\release\bundle"
+  REM Installer runs in its own process; close this window automatically.
+  exit /b 0
 )
+echo [WARN] NSIS setup exe not found under %NSIS_DIR%.
+echo        Opening the bundle output folder instead.
+start "" "explorer.exe" "src-tauri\target\release\bundle"
 echo.
 pause
 exit /b 0
