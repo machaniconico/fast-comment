@@ -4,6 +4,7 @@
   import CommentList from './lib/components/CommentList.svelte';
   import PinnedStrip from './lib/components/PinnedStrip.svelte';
   import Settings from './lib/components/Settings.svelte';
+  import ChannelAdd from './lib/components/ChannelAdd.svelte';
   import CommandPalette from './lib/components/CommandPalette.svelte';
   import Notifier from './lib/components/Notifier.svelte';
   import { store, initStore, clearMessages } from './lib/stores.svelte';
@@ -106,6 +107,13 @@
       >設定</button>
     </div>
   </header>
+
+  <!-- ── Channel add bar (URL paste → auto-detect) ── -->
+  {#if ui.activeTab === 'comments'}
+    <div class="channel-bar">
+      <ChannelAdd />
+    </div>
+  {/if}
 
   <!-- ── Comment tab toolbar ── -->
   {#if ui.activeTab === 'comments'}
@@ -252,6 +260,14 @@
   .tab-btn:hover:not(.active) {
     color: #bbb;
     background: rgba(255,255,255,0.05);
+  }
+
+  /* Channel add bar */
+  .channel-bar {
+    padding: 6px 8px;
+    background: #1d1d1d;
+    border-bottom: 1px solid rgba(255,255,255,0.06);
+    flex-shrink: 0;
   }
 
   /* Toolbar */
