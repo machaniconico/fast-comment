@@ -16,9 +16,15 @@ if errorlevel 1 (
   goto :fail
 )
 
+REM Rust may have just been installed; add its default bin dir to PATH for this
+REM session in case the global PATH was not refreshed yet (common when the
+REM script is launched from Explorer right after installing Rust).
+if exist "%USERPROFILE%\.cargo\bin\cargo.exe" set "PATH=%USERPROFILE%\.cargo\bin;%PATH%"
 where cargo >nul 2>nul
 if errorlevel 1 (
   echo [ERROR] Rust/cargo not found. Install from https://rustup.rs
+  echo         If you JUST installed Rust, close this window and reboot
+  echo         ^(or sign out and back in^), then run this script again.
   goto :fail
 )
 
