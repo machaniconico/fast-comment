@@ -99,6 +99,7 @@ export interface TtsOptions {
   bouyomiVolume?: number;
   bouyomiTone?: number;
   bouyomiVoice?: number;
+  bouyomiPath?: string;
   voicevoxUrl?: string;
   voicevoxSpeaker?: number;
   readName?: boolean;

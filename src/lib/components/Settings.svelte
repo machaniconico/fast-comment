@@ -80,6 +80,7 @@
   let maxLength: number = $state(MAX_LENGTH_DEFAULT);
   let stripEmoji: boolean = $state(true);
   let readName: boolean = $state(true);
+  let bouyomiPath: string = $state('');
 
   onMount(async () => {
     config = await getConfig();
@@ -91,6 +92,7 @@
       maxLength = ttsNum('maxLength', MAX_LENGTH_DEFAULT);
       stripEmoji = ttsBool('stripEmoji', true);
       readName = ttsBool('readName', true);
+      bouyomiPath = config.tts.options.bouyomiPath ?? '';
       // Backward-compat: older config.json may lack obs.template.
       if (!config.obs.template || !config.obs.template.trim()) {
         config.obs.template = 'default';
@@ -147,6 +149,7 @@
     setTtsNum('maxLength', Number.isFinite(maxLength) && maxLength >= 0 ? Math.trunc(maxLength) : MAX_LENGTH_DEFAULT);
     setTtsBool('stripEmoji', stripEmoji);
     setTtsBool('readName', readName);
+    config.tts.options.bouyomiPath = bouyomiPath.trim();
     // Normalize template before persisting (config is the single source).
     config.obs.template = (config.obs.template || 'default').trim() || 'default';
     try {
@@ -212,6 +215,19 @@
         <option value="voicevox">VOICEVOX</option>
       </select>
     </div>
+
+    {#if config.tts.backend === 'bouyomi'}
+    <div class="field-row bouyomi-path-row">
+      <label for="tts-bouyomi-path">棒読みちゃん.exe パス（自動起動）</label>
+      <input
+        id="tts-bouyomi-path"
+        type="text"
+        bind:value={bouyomiPath}
+        class="id-input path-input"
+      />
+    </div>
+    <p class="hint">指定すると起動時に未起動なら自動で立ち上げます（空欄なら手動起動）</p>
+    {/if}
 
     {#if config.tts.backend === 'voicevox'}
     <div class="field-row">
@@ -408,6 +424,7 @@
 
   .platform-select { flex-shrink: 0; }
   .id-input { flex: 1; }
+  .path-input { min-width: min(100%, 260px); }
   .obs-input { flex: 1; font-size: 12px; }
   .num-input { width: 90px; }
   .chk { width: 16px; height: 16px; accent-color: #1976d2; }
@@ -460,6 +477,15 @@
     font-size: 13px;
     color: #ccc;
     min-width: 90px;
+  }
+
+  .bouyomi-path-row {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .bouyomi-path-row label {
+    min-width: 210px;
   }
 
   .hint { font-size: 11px; color: #757575; margin: 4px 0 0; }

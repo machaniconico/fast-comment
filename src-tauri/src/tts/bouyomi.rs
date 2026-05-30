@@ -14,10 +14,12 @@
 //! | 11     | 4    | 本文バイト長(i32)                 |
 //! | 15     | n    | 本文(UTF-8)                       |
 
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::process::Command;
 use std::time::Duration;
 
 use tokio::io::AsyncWriteExt;
-use tokio::net::TcpStream;
+use tokio::net::TcpStream as TokioTcpStream;
 
 use super::TtsBackend;
 
@@ -26,6 +28,38 @@ const CHARCODE_UTF8: u8 = 0;
 
 /// 接続〜送出のタイムアウト(stall 時に速やかに失敗し Web Speech へフォールバック)。
 const SPEAK_TIMEOUT: Duration = Duration::from_secs(3);
+const LAUNCH_CHECK_TIMEOUT: Duration = Duration::from_millis(300);
+
+/// 棒読みちゃんが未起動なら、指定された exe を起動する。
+pub fn ensure_launched(path: String, host: String, port: u16) {
+    let path = path.trim().to_string();
+    if path.is_empty() {
+        return;
+    }
+
+    let addr_text = format!("{}:{}", host.trim(), port);
+    let addr = addr_text
+        .parse::<SocketAddr>()
+        .ok()
+        .or_else(|| match addr_text.to_socket_addrs() {
+            Ok(mut addrs) => addrs.next(),
+            Err(e) => {
+                tracing::warn!("棒読みちゃん接続先の解決に失敗: {addr_text}: {e}");
+                None
+            }
+        });
+
+    if let Some(addr) = addr {
+        if TcpStream::connect_timeout(&addr, LAUNCH_CHECK_TIMEOUT).is_ok() {
+            return;
+        }
+    }
+
+    match Command::new(&path).spawn() {
+        Ok(_) => tracing::info!("棒読みちゃんを自動起動しました: {path}"),
+        Err(e) => tracing::warn!("棒読みちゃんの自動起動に失敗: {path}: {e}"),
+    }
+}
 
 /// 棒読みちゃんへの送信設定。
 pub struct BouyomiBackend {
@@ -74,7 +108,7 @@ impl TtsBackend for BouyomiBackend {
         let packet = self.build_packet(&text);
         let addr = self.addr();
         tokio::time::timeout(SPEAK_TIMEOUT, async {
-            let mut stream = TcpStream::connect(&addr).await?;
+            let mut stream = TokioTcpStream::connect(&addr).await?;
             stream.write_all(&packet).await?;
             stream.flush().await?;
             Ok::<(), anyhow::Error>(())
@@ -86,7 +120,7 @@ impl TtsBackend for BouyomiBackend {
 
     async fn available(&self) -> bool {
         // ポートへ接続できるかで簡易判定(短いタイムアウト)。
-        let connect = TcpStream::connect(self.addr());
+        let connect = TokioTcpStream::connect(self.addr());
         matches!(
             tokio::time::timeout(std::time::Duration::from_millis(500), connect).await,
             Ok(Ok(_))

@@ -31,7 +31,7 @@ use crate::config::{AppConfig, ChannelConfig};
 use crate::model::{Badge, ChatMessage};
 use crate::moderation::{Moderator, Verdict};
 use crate::sources::SourceManager;
-use crate::tts::TtsDispatcher;
+use crate::tts::{bouyomi, TtsDispatcher};
 
 /// アプリ全体で共有する実行時状態。
 pub struct AppState {
@@ -454,6 +454,17 @@ pub fn run() {
                 tts_tx,
             };
             app.manage(state);
+
+            if config.tts.backend == config::TtsBackendKind::Bouyomi {
+                let path = config.tts.options.bouyomi_path.trim().to_string();
+                if !path.is_empty() {
+                    let host = config.tts.options.bouyomi_host.clone();
+                    let port = config.tts.options.bouyomi_port;
+                    tauri::async_runtime::spawn_blocking(move || {
+                        bouyomi::ensure_launched(path, host, port);
+                    });
+                }
+            }
 
             // Bus の UI forwarder と OBS サーバを起動。
             bus.spawn_ui_forwarder(handle.clone(), app_cancel.clone());

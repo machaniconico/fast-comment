@@ -115,6 +115,9 @@ pub struct TtsOptions {
     /// 棒読み: 声質(0=デフォルト)。
     #[serde(default)]
     pub bouyomi_voice: i16,
+    /// 棒読み: 自動起動する実行ファイルパス(空なら手動起動)。
+    #[serde(default)]
+    pub bouyomi_path: String,
 
     /// VOICEVOX: ベースURL。
     #[serde(default = "default_voicevox_url")]
@@ -146,6 +149,7 @@ impl Default for TtsOptions {
             bouyomi_volume: -1,
             bouyomi_tone: -1,
             bouyomi_voice: 0,
+            bouyomi_path: String::new(),
             voicevox_url: default_voicevox_url(),
             voicevox_speaker: default_voicevox_speaker(),
             read_name: true,
@@ -360,6 +364,7 @@ mod tests {
                     bouyomi_volume: 80,
                     bouyomi_tone: 70,
                     bouyomi_voice: 2,
+                    bouyomi_path: r"C:\BouyomiChan\BouyomiChan.exe".to_string(),
                     voicevox_url: "http://127.0.0.1:50022".to_string(),
                     voicevox_speaker: 3,
                     read_name: false,
@@ -405,6 +410,10 @@ mod tests {
         );
         assert_eq!(json["tts"]["options"]["bouyomiTone"].as_i64(), Some(70));
         assert_eq!(json["tts"]["options"]["bouyomiVoice"].as_i64(), Some(2));
+        assert_eq!(
+            json["tts"]["options"]["bouyomiPath"].as_str(),
+            Some(r"C:\BouyomiChan\BouyomiChan.exe")
+        );
         assert_eq!(
             json["tts"]["options"]["voicevoxUrl"].as_str(),
             Some("http://127.0.0.1:50022")
@@ -453,6 +462,7 @@ mod tests {
         assert_eq!(cfg.tts.options.bouyomi_volume, default_minus_one());
         assert_eq!(cfg.tts.options.bouyomi_tone, default_minus_one());
         assert_eq!(cfg.tts.options.bouyomi_voice, 0);
+        assert_eq!(cfg.tts.options.bouyomi_path, "");
         assert_eq!(cfg.tts.options.voicevox_url, default_voicevox_url());
         assert_eq!(cfg.tts.options.voicevox_url, "http://127.0.0.1:50021");
         assert_eq!(cfg.tts.options.voicevox_speaker, default_voicevox_speaker());
@@ -513,6 +523,7 @@ mod tests {
         assert_eq!(cfg.tts.options.bouyomi_volume, default_minus_one());
         assert_eq!(cfg.tts.options.bouyomi_tone, default_minus_one());
         assert_eq!(cfg.tts.options.bouyomi_voice, 0);
+        assert_eq!(cfg.tts.options.bouyomi_path, "");
         assert_eq!(cfg.tts.options.voicevox_url, default_voicevox_url());
         assert_eq!(cfg.tts.options.voicevox_speaker, default_voicevox_speaker());
         assert!(!cfg.tts.options.read_name);
