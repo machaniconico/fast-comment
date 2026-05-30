@@ -49,6 +49,8 @@ if errorlevel 1 (
   echo   4. CARGO_HOME points to a non-standard path.
   echo      FIX: run  echo %%CARGO_HOME%%  and look for cargo.exe there.
   echo.
+  echo   Run setup-windows.bat to install Rust and MSVC build tools automatically.
+  echo.
   goto :fail
 )
 for /f "delims=" %%V in ('cargo --version 2^>nul') do echo [OK] %%V
