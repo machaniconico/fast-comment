@@ -124,14 +124,78 @@
     }
   }
 
+  // 入力(配信URL or 生ID/名)から配信プラットフォームと識別子を判別する。
+  // URL から判別できない場合(生のチャンネル名など)は null を返し、手動選択へフォールバック。
+  type DetectedChannel = { platform: 'twitch' | 'youtube'; identifier: string };
+
+  // スキーム無しの "twitch.tv/foo" / "youtu.be/xxx" 等も URL として拾う。
+  function parseUrlLoose(input: string): URL | null {
+    try {
+      return new URL(input);
+    } catch {
+      if (/^[\w-]+(\.[\w-]+)+(\/|$)/.test(input)) {
+        try { return new URL('https://' + input); } catch { return null; }
+      }
+      return null;
+    }
+  }
+
+  // YouTube URL から videoId を抽出する(watch?v= / youtu.be / live / embed / shorts)。
+  function youtubeVideoId(url: URL): string | null {
+    const host = url.hostname.replace(/^www\./, '').toLowerCase();
+    if (host === 'youtu.be') {
+      return url.pathname.split('/').filter(Boolean)[0] ?? null;
+    }
+    const v = url.searchParams.get('v');
+    if (v) return v;
+    const seg = url.pathname.split('/').filter(Boolean);
+    if (seg.length >= 2 && ['live', 'embed', 'shorts', 'v'].includes(seg[0])) {
+      return seg[1];
+    }
+    return null;
+  }
+
+  function detectChannel(input: string): DetectedChannel | null {
+    const url = parseUrlLoose(input.trim());
+    if (!url) return null;
+    const host = url.hostname.replace(/^www\./, '').toLowerCase();
+    if (host === 'twitch.tv' || host === 'm.twitch.tv') {
+      const login = url.pathname.split('/').filter(Boolean)[0];
+      if (login && /^[a-zA-Z0-9_]{2,25}$/.test(login)) {
+        return { platform: 'twitch', identifier: login.toLowerCase() };
+      }
+      return null;
+    }
+    if (['youtube.com', 'm.youtube.com', 'music.youtube.com', 'youtu.be'].includes(host)) {
+      const id = youtubeVideoId(url);
+      return id ? { platform: 'youtube', identifier: id } : null;
+    }
+    return null;
+  }
+
+  // URL を貼ったときの自動判別結果(プレビュー表示と追加処理に使う)。
+  const detected = $derived(detectChannel(newIdentifier));
+
+  // URL から判別できたら、プラットフォーム選択も自動で追従させる。
+  $effect(() => {
+    if (detected && detected.platform !== newPlatform) newPlatform = detected.platform;
+  });
+
   async function onAddChannel() {
     addError = '';
     if (!config) return;
-    const id = newIdentifier.trim();
-    if (!id) { addError = 'チャンネル名またはIDを入力してください'; return; }
-    const identifier = newPlatform === 'youtube' ? extractYoutubeId(id) : id;
-    if (!identifier) { addError = 'YouTube動画IDを取得できませんでした'; return; }
-    const ch: ChannelConfig = { platform: newPlatform, identifier, enabled: true };
+    const raw = newIdentifier.trim();
+    if (!raw) { addError = 'URL か Twitchチャンネル名 / YouTube動画ID を入力してください'; return; }
+
+    // URL から判別できればそれを優先。生入力は手動選択 + 既存抽出へフォールバック。
+    const det = detectChannel(raw);
+    const platform = det ? det.platform : newPlatform;
+    const identifier = det
+      ? det.identifier
+      : (newPlatform === 'youtube' ? extractYoutubeId(raw) : raw);
+    if (!identifier) { addError = '識別子を取得できませんでした'; return; }
+
+    const ch: ChannelConfig = { platform, identifier, enabled: true };
     try {
       await addChannel(ch);
       // Update only the channels list to avoid discarding unsaved NG/TTS edits.
@@ -236,12 +300,18 @@
       <input
         type="text"
         bind:value={newIdentifier}
-        placeholder={newPlatform === 'twitch' ? 'チャンネル名' : 'videoId または URL'}
+        placeholder="配信URLを貼り付け（または Twitchチャンネル名 / YouTube動画ID）"
         class="id-input"
         onkeydown={(e) => e.key === 'Enter' && onAddChannel()}
       />
       <button class="add-btn" onclick={onAddChannel}>追加</button>
     </div>
+    {#if detected}
+      <p class="detect-hint">
+        → {detected.platform === 'twitch' ? 'Twitch' : 'YouTube'} として自動判別:
+        <code>{detected.identifier}</code>
+      </p>
+    {/if}
     {#if addError}<p class="error">{addError}</p>{/if}
   </section>
 
@@ -514,6 +584,13 @@
   .hint-inline { font-size: 11px; color: #757575; font-weight: 400; text-transform: none; letter-spacing: 0; }
   .error { color: #f44336; font-size: 11px; margin: 4px 0 0; }
   .empty { color: #757575; font-size: 12px; }
+  .detect-hint { color: #4caf50; font-size: 11px; margin: 4px 0 0; }
+  .detect-hint code {
+    background: rgba(255, 255, 255, 0.08);
+    padding: 0 4px;
+    border-radius: 3px;
+    font-family: ui-monospace, monospace;
+  }
 
   .save-row {
     display: flex;
