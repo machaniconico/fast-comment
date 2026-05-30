@@ -138,8 +138,11 @@ trait TtsBackend { async fn speak(&self, text: String) -> Result<()>; fn availab
   - プラットフォーム別フィルタ、検索、SuperChat/Bits/ハイライト強調、個別非表示
   - **検索**: 投稿者名+本文(emote名含む)を結合した文字列への**大文字小文字無視・部分一致**。事前計算した小文字haystackをバッファエントリに保持。検索中はツールバーにマッチ件数を表示。プラットフォームフィルタとANDで合成。
   - **オートスクロール**: 最下部にいるときのみ新着で追従。新着判定は単調増加の受信総数(`receivedCount`)で行い、フィルタ/検索の可視件数変化やバッファ飽和に影響されない。
-  - **コマンドパレット(`Ctrl`/`Cmd`+`K`)**: 機能をキーワードで呼び出す。アクション(フィルタ切替/一覧クリア/タブ切替)・設定セクションへのジャンプ(チャンネル/TTS/OBS/モデレーション)・「『<入力>』でコメント検索」フォールバック。Arrow/Enter/Esc操作・部分一致(日本語+ローマ字キーワード)。UI view状態は `ui.svelte.ts`(singleton)に集約。
-- **設定画面**: チャンネル追加(Twitch名 / YouTube videoId or URL)、テンプレ選択、TTS設定、NG/ハイライト編集、OBSサーバURLコピー。各セクションはコマンドパレットからアンカースクロールで到達可能(`id="settings-*"`)。
+  - **コマンドパレット(`Ctrl`/`Cmd`+`K`)**: 機能をキーワードで呼び出す。アクション(フィルタ切替/一覧クリア/タブ切替)・設定セクションへのジャンプ(チャンネル/TTS/OBS/モデレーション/通知)・「『<入力>』でコメント検索」フォールバック。Arrow/Enter/Esc操作・部分一致(日本語+ローマ字キーワード)。UI view状態は `ui.svelte.ts`(singleton)に集約。
+  - **投げ銭サマリー**: SuperChat/Bits を通貨別に合計金額・件数、メンバーシップ件数をヘッダーに集計表示。store側でセッション累積(バッファ退避後も保持、一覧クリアでリセット)。bits は通貨キー `bits` に正規化。
+  - **ピン留め**: 重要コメントを上部固定ストリップに表示。ピンは ChatMessage 実体を別保持しバッファ退避後も残る。最大5件FIFO。各行にピン/解除ボタン。
+  - **キーワード通知**: ハイライト一致コメント到着で効果音(Web Audio)+控えめな画面フラッシュ。ON/OFF・音量は `config.ui.notifySound`/`notifyVolume` に永続化。store の単調 `highlightCount` を `Notifier.svelte` が監視(初回非発火)。
+- **設定画面**: チャンネル追加(Twitch名 / YouTube videoId or URL)、テンプレ選択、TTS設定、NG/ハイライト編集、OBSサーバURLコピー、通知(効果音ON/OFF+音量)。各セクションはコマンドパレットからアンカースクロールで到達可能(`id="settings-*"`)。
 - **テンプレ編集**: テンプレ選択 + CSS編集 + ライブプレビュー(将来)
 - IPC: `listen("chat", ...)` でバッチ受信。型は `src/lib/types.ts`(Rust model のミラー)。
 
@@ -152,7 +155,8 @@ trait TtsBackend { async fn speak(&self, text: String) -> Result<()>; fn availab
 ## 10. 設定永続化 (`config.rs`)
 
 - 保存先: Tauri の app config dir に `config.json`。
-- 内容: channels[], obs{port}, tts{backend, options}, moderation{ngWords[], ngUsers[], highlights[]}, ui{maxBuffer}, youtubeOverrides{apiKey?, clientVersion?, paths?}。
+- 内容: channels[], obs{port}, tts{backend, options}, moderation{ngWords[], ngUsers[], highlights[]}, ui{maxBuffer, notifySound, notifyVolume}, youtubeOverrides{apiKey?, clientVersion?, paths?}。
+  - `ui.notifySound`(bool 既定false) / `ui.notifyVolume`(f32 0.0〜1.0 既定0.5): キーワード通知の効果音設定。serde default でキー欠落の旧 config も後方互換。
 - 起動時ロード、変更時保存。
 
 ## 11. フェーズ計画
