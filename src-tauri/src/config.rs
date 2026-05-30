@@ -172,7 +172,8 @@ pub struct ModerationConfig {
 }
 
 /// UI 表示設定。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// `Eq` は付けない: notify_volume が f32 で Eq 非実装(E0277)。PartialEq のみ。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UiConfig {
     /// リングバッファの保持上限件数。既定 2000。
