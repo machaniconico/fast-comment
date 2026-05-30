@@ -67,16 +67,40 @@ export async function startTtsSpeakListener(): Promise<() => void> {
   if (!isTauri()) return () => {};
   if (typeof window === 'undefined' || !('speechSynthesis' in window)) return () => {};
   const { listen } = await import('@tauri-apps/api/event');
-  const unlisten = await listen<string>('tts-speak', (event) => {
-    const text = event.payload;
+  const unlisten = await listen<TtsSpeakPayload | string>('tts-speak', (event) => {
+    const payload = typeof event.payload === 'string'
+      ? { text: event.payload, rate: 1, pitch: 1, volume: 1, voice: '' }
+      : event.payload;
+    const text = payload.text;
     if (!text) return;
     try {
-      window.speechSynthesis.speak(new SpeechSynthesisUtterance(text));
+      const utterance = new SpeechSynthesisUtterance(text);
+      utterance.rate = boundedNumber(payload.rate, 1, 0.5, 2);
+      utterance.pitch = boundedNumber(payload.pitch, 1, 0, 2);
+      utterance.volume = boundedNumber(payload.volume, 1, 0, 1);
+      if (payload.voice) {
+        const voice = window.speechSynthesis.getVoices().find((v) => v.name === payload.voice);
+        if (voice) utterance.voice = voice;
+      }
+      window.speechSynthesis.speak(utterance);
     } catch (e) {
       console.warn('[ipc] speechSynthesis.speak failed', e);
     }
   });
   return unlisten;
+}
+
+interface TtsSpeakPayload {
+  text: string;
+  rate: number;
+  pitch: number;
+  volume: number;
+  voice: string;
+}
+
+function boundedNumber(value: unknown, fallback: number, min: number, max: number): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return fallback;
+  return Math.min(max, Math.max(min, value));
 }
 
 // ---- Tauri invoke helpers ----
@@ -102,6 +126,10 @@ export interface TtsOptions {
   bouyomiPath?: string;
   voicevoxUrl?: string;
   voicevoxSpeaker?: number;
+  webSpeechRate?: number;
+  webSpeechPitch?: number;
+  webSpeechVolume?: number;
+  webSpeechVoice?: string;
   readName?: boolean;
   omitUrl?: boolean;
   stripEmoji?: boolean;
@@ -110,7 +138,16 @@ export interface TtsOptions {
 
 export interface AppConfig {
   channels: ChannelConfig[];
-  obs: { port: number; template: string };
+  obs: {
+    port: number;
+    template: string;
+    fontScalePct: number;
+    maxRows: number;
+    ttlMs: number;
+    bgOpacityPct: number;
+    position: string;
+    showPlatform: boolean;
+  };
   tts: { backend: 'bouyomi' | 'voicevox' | 'webSpeech' | 'none'; options: TtsOptions };
   moderation: { ngWords: string[]; ngUsers: string[]; highlights: string[] };
   ui: { maxBuffer: number; notifySound: boolean; notifyVolume: number };

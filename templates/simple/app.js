@@ -1,42 +1,37 @@
 /**
- * fast-comment OBS overlay — default template
+ * fast-comment OBS overlay - simple template
  * No dependencies. Plain ES2020 JS.
  *
  * URL params:
- *   ?template=default   (unused here, consumed by axum router)
- *   ?channel=<id>        optional filter: only show this channel
- *   ?max=8               max visible rows (default 8)
- *   ?ttl=12000           ms before a row auto-exits (default 12000)
- *   ?font=100            font scale percent (default 100)
- *   ?bg=0                overlay background opacity percent (default 0)
- *   ?pos=bottom          top or bottom (default bottom)
- *   ?icon=1              show platform dot: 1/0 (default 1)
- *   ?ws=ws://127.0.0.1:11180/ws  override WS endpoint
+ *   ?template=simple
+ *   ?channel=<id>
+ *   ?max=8
+ *   ?ttl=12000
+ *   ?font=100
+ *   ?bg=0
+ *   ?pos=bottom
+ *   ?icon=1
+ *   ?ws=ws://127.0.0.1:11180/ws
  */
 
 (function () {
   'use strict';
 
-  // ---- Config from URL params ----
   const params = new URLSearchParams(location.search);
   const CHANNEL_FILTER = params.get('channel') || null;
   const MAX_ROWS = positiveIntParam('max', 8);
-  const TTL_MS   = positiveIntParam('ttl', 12000);
+  const TTL_MS = positiveIntParam('ttl', 12000);
   const FONT_SCALE = boundedNumberParam('font', 100, 50, 200) / 100;
   const BG_OPACITY = boundedNumberParam('bg', 0, 0, 100) / 100;
   const POSITION = params.get('pos') === 'top' ? 'top' : 'bottom';
   const SHOW_PLATFORM = params.get('icon') !== '0';
-  const WS_URL   = buildWsUrl(params.get('ws') || 'ws://127.0.0.1:11180/ws');
+  const WS_URL = buildWsUrl(params.get('ws') || 'ws://127.0.0.1:11180/ws');
 
   const overlay = document.getElementById('overlay');
   applyAppearance();
-  const LEAVE_MS = cssDurationMs('--leave-ms', 400);
+  const LEAVE_MS = cssDurationMs('--leave-ms', 220);
 
-  // ---- Active row tracking ----
-  // Each entry: { el, timerId }
   const rows = [];
-
-  // ---- WebSocket ----
   let ws = null;
   let reconnectDelay = 1000;
   let stableTimer = null;
@@ -45,9 +40,6 @@
     ws = new WebSocket(WS_URL);
 
     ws.addEventListener('open', () => {
-      // Reset backoff only after the connection has been stable for 5 s.
-      // This prevents a fast open→close flapping loop from keeping the delay
-      // pinned at 1000 ms (the timer is cancelled in the close handler).
       stableTimer = setTimeout(() => {
         reconnectDelay = 1000;
       }, 5000);
@@ -65,8 +57,6 @@
     });
 
     ws.addEventListener('close', () => {
-      // Cancel the stability timer so a premature close does not reset the
-      // backoff before we have had a genuinely stable connection.
       clearTimeout(stableTimer);
       stableTimer = null;
       ws = null;
@@ -79,47 +69,28 @@
     });
   }
 
-  // ---- Message handler ----
   function handleMessage(msg) {
-    // Channel filter
     if (CHANNEL_FILTER && msg.channel !== CHANNEL_FILTER) return;
 
     const el = buildRow(msg);
     addRow(el);
   }
 
-  // ---- Build DOM row ----
   function buildRow(msg) {
     const div = document.createElement('div');
     div.className = 'comment';
     const kind = msg.kind || 'normal';
     const isSystem = kind === 'system';
 
-    // Kind class for CSS highlights
-    if (kind === 'superChat')  div.classList.add('superchat');
+    if (kind === 'superChat') div.classList.add('superchat');
     if (kind === 'membership') div.classList.add('membership');
-    if (kind === 'bits')       div.classList.add('bits');
+    if (kind === 'bits') div.classList.add('bits');
     if (isSystem) div.classList.add('system');
 
-    // Platform dot
     const dot = document.createElement('span');
     dot.className = 'platform-dot ' + (msg.platform || '');
     div.appendChild(dot);
 
-    // Badges
-    const badges = (msg.author && msg.author.badges) || [];
-    badges.forEach((badge) => {
-      if (isHttpUrl(badge.imageUrl)) {
-        const img = document.createElement('img');
-        img.className = 'badge-img';
-        img.src = badge.imageUrl;
-        img.alt = badge.label || '';
-        img.title = badge.label || '';
-        div.appendChild(img);
-      }
-    });
-
-    // Author name
     const author = document.createElement('span');
     author.className = 'author';
     const color = msg.author && msg.author.displayColor;
@@ -129,13 +100,11 @@
     author.textContent = (msg.author && msg.author.name) || (isSystem ? 'System' : '');
     div.appendChild(author);
 
-    // Separator
     const sep = document.createElement('span');
     sep.className = 'sep';
-    sep.textContent = ': ';
+    sep.textContent = ':';
     div.appendChild(sep);
 
-    // Amount (SuperChat / Bits)
     if (msg.amount) {
       const amt = document.createElement('span');
       amt.className = 'amount';
@@ -143,7 +112,6 @@
       div.appendChild(amt);
     }
 
-    // Fragments
     const fragWrap = document.createElement('span');
     fragWrap.className = 'fragments';
     const fragments = msg.fragments || [];
@@ -164,9 +132,7 @@
     return div;
   }
 
-  // ---- Row lifecycle ----
   function addRow(el) {
-    // Evict oldest if over limit
     while (rows.length >= MAX_ROWS) {
       evictOldest();
     }
@@ -195,7 +161,6 @@
 
   function startLeave(el) {
     el.classList.add('leaving');
-    // Remove from DOM after the CSS-driven exit animation.
     setTimeout(() => {
       if (el.parentNode) el.parentNode.removeChild(el);
     }, LEAVE_MS);
@@ -261,6 +226,5 @@
     return match[2] === 's' ? duration * 1000 : duration;
   }
 
-  // ---- Start ----
   connect();
 })();

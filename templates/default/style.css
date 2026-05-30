@@ -2,6 +2,8 @@
 
 :root {
   --leave-ms: 400ms;
+  --font-scale: 1;
+  --overlay-bg-opacity: 0;
 }
 
 *, *::before, *::after {
@@ -21,6 +23,7 @@ html, body {
 
 #overlay {
   position: fixed;
+  top: 0;
   bottom: 0;
   left: 0;
   right: 0;
@@ -32,6 +35,17 @@ html, body {
   gap: 4px;
   padding: 8px;
   pointer-events: none;
+  background: rgba(0, 0, 0, var(--overlay-bg-opacity, 0));
+}
+
+#overlay.pos-top {
+  justify-content: flex-start;
+  flex-direction: column;
+}
+
+#overlay.pos-bottom {
+  justify-content: flex-end;
+  flex-direction: column;
 }
 
 /* ---- Comment row ---- */
@@ -96,7 +110,7 @@ html, body {
 /* ---- Author ---- */
 .author {
   font-weight: 700;
-  font-size: 13px;
+  font-size: calc(13px * var(--font-scale, 1));
   color: #e0e0e0;
   flex-shrink: 0;
   white-space: nowrap;
@@ -110,7 +124,11 @@ html, body {
 /* ---- Text fragments ---- */
 .fragments {
   color: #f5f5f5;
-  font-size: 14px;
+  font-size: calc(14px * var(--font-scale, 1));
+}
+
+.hide-platform .platform-dot {
+  display: none;
 }
 
 /* ---- Emote images ---- */

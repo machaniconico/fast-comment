@@ -79,6 +79,13 @@
   let stripEmoji: boolean = $state(true);
   let readName: boolean = $state(true);
   let bouyomiPath: string = $state('');
+  let webSpeechRate: number = $state(1);
+  let webSpeechPitch: number = $state(1);
+  let webSpeechVolume: number = $state(1);
+  let webSpeechVoice: string = $state('');
+  let speechVoices: SpeechSynthesisVoice[] = $state([]);
+  let speechVoicesListenerAttached: boolean = false;
+  let obsTtlSeconds: number = $state(12);
 
   onMount(async () => {
     config = await getConfig();
@@ -91,36 +98,101 @@
       stripEmoji = ttsBool('stripEmoji', true);
       readName = ttsBool('readName', true);
       bouyomiPath = config.tts.options.bouyomiPath ?? '';
-      // Backward-compat: older config.json may lack obs.template.
-      if (!config.obs.template || !config.obs.template.trim()) {
-        config.obs.template = 'default';
-      }
+      webSpeechRate = ttsNum('webSpeechRate', 1);
+      webSpeechPitch = ttsNum('webSpeechPitch', 1);
+      webSpeechVolume = ttsNum('webSpeechVolume', 1);
+      webSpeechVoice = config.tts.options.webSpeechVoice ?? '';
+      normalizeObsConfig(true);
     }
 
     const url = await getObsUrl();
     obsBaseUrl = url ?? 'http://127.0.0.1:11180/?template=default';
+
+    refreshSpeechVoices();
+    if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+      window.speechSynthesis.addEventListener('voiceschanged', refreshSpeechVoices);
+      speechVoicesListenerAttached = true;
+    }
   });
 
   onDestroy(() => {
     if (saveMsgTimer !== null) clearTimeout(saveMsgTimer);
     if (copiedTimer !== null) clearTimeout(copiedTimer);
+    if (speechVoicesListenerAttached && typeof window !== 'undefined' && 'speechSynthesis' in window) {
+      window.speechSynthesis.removeEventListener('voiceschanged', refreshSpeechVoices);
+      speechVoicesListenerAttached = false;
+    }
   });
 
-  // Displayed OBS URL: base URL with the config template reflected in.
+  // Displayed OBS URL: base URL with the config template and appearance reflected in.
   const obsUrl = $derived.by(() => {
-    const tmpl = config?.obs.template ?? 'default';
-    return withTemplate(obsBaseUrl, tmpl);
+    return withTemplate(obsBaseUrl, config?.obs ?? null);
   });
 
-  function withTemplate(url: string, tmpl: string): string {
-    const name = (tmpl || 'default').trim() || 'default';
+  function withTemplate(url: string, obs: AppConfig['obs'] | null): string {
+    const name = (obs?.template || 'default').trim() || 'default';
     try {
       const u = new URL(url);
       u.searchParams.set('template', name);
+      u.searchParams.set('max', String(clampInt(obs?.maxRows, 8, 1, 20)));
+      u.searchParams.set('ttl', String(obs ? ttlMsFromSeconds(obsTtlSeconds) : 12000));
+      u.searchParams.set('font', String(clampInt(obs?.fontScalePct, 100, 50, 200)));
+      u.searchParams.set('bg', String(clampInt(obs?.bgOpacityPct, 0, 0, 100)));
+      u.searchParams.set('pos', obs?.position === 'top' ? 'top' : 'bottom');
+      u.searchParams.set('icon', obs?.showPlatform === false ? '0' : '1');
       return u.toString();
     } catch {
       return url;
     }
+  }
+
+  function refreshSpeechVoices() {
+    if (typeof window === 'undefined' || !('speechSynthesis' in window)) {
+      speechVoices = [];
+      return;
+    }
+    speechVoices = window.speechSynthesis.getVoices();
+  }
+
+  function clampNumber(value: unknown, fallback: number, min: number, max: number): number {
+    const n = typeof value === 'number' ? value : Number(value);
+    if (!Number.isFinite(n)) return fallback;
+    return Math.min(max, Math.max(min, n));
+  }
+
+  function clampInt(value: unknown, fallback: number, min: number, max: number): number {
+    return Math.trunc(clampNumber(value, fallback, min, max));
+  }
+
+  function positiveInt(value: unknown, fallback: number): number {
+    const n = typeof value === 'number' ? value : Number(value);
+    if (!Number.isFinite(n) || n <= 0) return fallback;
+    return Math.trunc(n);
+  }
+
+  function ttlMsFromSeconds(value: unknown): number {
+    const n = typeof value === 'number' ? value : Number(value);
+    if (!Number.isFinite(n) || n <= 0) return 12000;
+    return Math.round(n * 1000);
+  }
+
+  function normalizeObsConfig(syncSeconds: boolean) {
+    if (!config) return;
+    config.obs.template = (config.obs.template || 'default').trim() || 'default';
+    config.obs.fontScalePct = clampInt(config.obs.fontScalePct, 100, 50, 200);
+    config.obs.maxRows = clampInt(config.obs.maxRows, 8, 1, 20);
+    config.obs.ttlMs = positiveInt(config.obs.ttlMs, 12000);
+    config.obs.bgOpacityPct = clampInt(config.obs.bgOpacityPct, 0, 0, 100);
+    config.obs.position = config.obs.position === 'top' ? 'top' : 'bottom';
+    config.obs.showPlatform = config.obs.showPlatform !== false;
+    if (syncSeconds) obsTtlSeconds = config.obs.ttlMs / 1000;
+  }
+
+  function normalizeWebSpeechSettings() {
+    webSpeechRate = clampNumber(webSpeechRate, 1, 0.5, 2);
+    webSpeechPitch = clampNumber(webSpeechPitch, 1, 0, 2);
+    webSpeechVolume = clampNumber(webSpeechVolume, 1, 0, 1);
+    webSpeechVoice = webSpeechVoice.trim();
   }
 
   async function onSave() {
@@ -135,8 +207,13 @@
     setTtsBool('stripEmoji', stripEmoji);
     setTtsBool('readName', readName);
     config.tts.options.bouyomiPath = bouyomiPath.trim();
-    // Normalize template before persisting (config is the single source).
-    config.obs.template = (config.obs.template || 'default').trim() || 'default';
+    normalizeWebSpeechSettings();
+    setTtsNum('webSpeechRate', webSpeechRate);
+    setTtsNum('webSpeechPitch', webSpeechPitch);
+    setTtsNum('webSpeechVolume', webSpeechVolume);
+    config.tts.options.webSpeechVoice = webSpeechVoice;
+    config.obs.ttlMs = ttlMsFromSeconds(obsTtlSeconds);
+    normalizeObsConfig(false);
     try {
       await setConfig(config);
       setNotify(config.ui.notifySound, config.ui.notifyVolume);
@@ -205,6 +282,54 @@
     </div>
     {/if}
 
+    {#if config.tts.backend === 'webSpeech'}
+    <div class="field-row">
+      <label for="tts-web-rate">速度</label>
+      <input
+        id="tts-web-rate"
+        type="number"
+        min="0.5"
+        max="2"
+        step="0.1"
+        bind:value={webSpeechRate}
+        class="num-input"
+      />
+    </div>
+    <div class="field-row">
+      <label for="tts-web-pitch">音程</label>
+      <input
+        id="tts-web-pitch"
+        type="number"
+        min="0"
+        max="2"
+        step="0.1"
+        bind:value={webSpeechPitch}
+        class="num-input"
+      />
+    </div>
+    <div class="field-row">
+      <label for="tts-web-volume">音量</label>
+      <input
+        id="tts-web-volume"
+        type="number"
+        min="0"
+        max="1"
+        step="0.1"
+        bind:value={webSpeechVolume}
+        class="num-input"
+      />
+    </div>
+    <div class="field-row">
+      <label for="tts-web-voice">声</label>
+      <select id="tts-web-voice" bind:value={webSpeechVoice} class="platform-select voice-select">
+        <option value="">ブラウザ既定</option>
+        {#each speechVoices as voice (voice.voiceURI)}
+          <option value={voice.name}>{voice.name}{voice.lang ? ` (${voice.lang})` : ''}</option>
+        {/each}
+      </select>
+    </div>
+    {/if}
+
     <div class="field-row">
       <label for="tts-max-length">最大読み上げ文字数</label>
       <input
@@ -244,7 +369,69 @@
       />
       <datalist id="obs-template-list">
         <option value="default"></option>
+        <option value="simple"></option>
       </datalist>
+    </div>
+    <div class="field-row">
+      <label for="obs-font-scale">フォント倍率</label>
+      <input
+        id="obs-font-scale"
+        type="number"
+        min="50"
+        max="200"
+        step="1"
+        bind:value={config.obs.fontScalePct}
+        class="num-input"
+      />
+      <span class="hint-inline">%</span>
+    </div>
+    <div class="field-row">
+      <label for="obs-max-rows">最大表示行</label>
+      <input
+        id="obs-max-rows"
+        type="number"
+        min="1"
+        max="20"
+        step="1"
+        bind:value={config.obs.maxRows}
+        class="num-input"
+      />
+    </div>
+    <div class="field-row">
+      <label for="obs-ttl-seconds">表示時間</label>
+      <input
+        id="obs-ttl-seconds"
+        type="number"
+        min="1"
+        step="1"
+        bind:value={obsTtlSeconds}
+        class="num-input"
+      />
+      <span class="hint-inline">秒</span>
+    </div>
+    <div class="field-row">
+      <label for="obs-bg-opacity">背景不透明度</label>
+      <input
+        id="obs-bg-opacity"
+        type="number"
+        min="0"
+        max="100"
+        step="1"
+        bind:value={config.obs.bgOpacityPct}
+        class="num-input"
+      />
+      <span class="hint-inline">%</span>
+    </div>
+    <div class="field-row">
+      <label for="obs-position">表示位置</label>
+      <select id="obs-position" bind:value={config.obs.position} class="platform-select">
+        <option value="bottom">下</option>
+        <option value="top">上</option>
+      </select>
+    </div>
+    <div class="field-row">
+      <label for="obs-show-platform">プラットフォーム表示</label>
+      <input id="obs-show-platform" type="checkbox" bind:checked={config.obs.showPlatform} class="chk" />
     </div>
     <div class="obs-row">
       <input type="text" value={obsUrl} readonly class="obs-input" />
@@ -346,8 +533,9 @@
     font-size: 13px;
   }
 
-  .platform-select { flex-shrink: 0; }
-  .id-input { flex: 1; }
+	  .platform-select { flex-shrink: 0; }
+	  .voice-select { flex: 1 1 160px; min-width: 0; }
+	  .id-input { flex: 1; }
   .path-input { min-width: min(100%, 260px); }
   .obs-input { flex: 1; font-size: 12px; }
   .num-input { width: 90px; }
@@ -389,12 +577,13 @@
     font-family: monospace;
   }
 
-  .field-row {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    margin-top: 6px;
-  }
+	  .field-row {
+	    display: flex;
+	    align-items: center;
+	    gap: 10px;
+	    margin-top: 6px;
+	    flex-wrap: wrap;
+	  }
 
   .field-row label {
     font-size: 13px;

@@ -46,6 +46,24 @@ pub struct ObsConfig {
     /// SPEC §10 に従い config を唯一の永続化先とする(localStorage 非使用)。
     #[serde(default = "default_obs_template")]
     pub template: String,
+    /// OBS オーバーレイのフォント倍率(%)。既定 100。
+    #[serde(default = "default_obs_font_scale_pct")]
+    pub font_scale_pct: u16,
+    /// OBS オーバーレイの最大表示行数。既定 8。
+    #[serde(default = "default_obs_max_rows")]
+    pub max_rows: u16,
+    /// OBS オーバーレイの表示時間(ms)。既定 12000。
+    #[serde(default = "default_obs_ttl_ms")]
+    pub ttl_ms: u32,
+    /// OBS オーバーレイ全体背景の不透明度(%)。既定 0。
+    #[serde(default = "default_obs_bg_opacity_pct")]
+    pub bg_opacity_pct: u16,
+    /// OBS オーバーレイの表示位置("top" / "bottom")。既定 "bottom"。
+    #[serde(default = "default_obs_position")]
+    pub position: String,
+    /// プラットフォーム表示を出すか。既定 true。
+    #[serde(default = "default_true")]
+    pub show_platform: bool,
 }
 
 impl Default for ObsConfig {
@@ -53,6 +71,12 @@ impl Default for ObsConfig {
         ObsConfig {
             port: default_obs_port(),
             template: default_obs_template(),
+            font_scale_pct: default_obs_font_scale_pct(),
+            max_rows: default_obs_max_rows(),
+            ttl_ms: default_obs_ttl_ms(),
+            bg_opacity_pct: default_obs_bg_opacity_pct(),
+            position: default_obs_position(),
+            show_platform: true,
         }
     }
 }
@@ -126,6 +150,19 @@ pub struct TtsOptions {
     #[serde(default = "default_voicevox_speaker")]
     pub voicevox_speaker: u32,
 
+    /// Web Speech: 読み上げ速度。
+    #[serde(default = "default_web_speech_rate")]
+    pub web_speech_rate: f32,
+    /// Web Speech: 音程。
+    #[serde(default = "default_web_speech_pitch")]
+    pub web_speech_pitch: f32,
+    /// Web Speech: 音量。
+    #[serde(default = "default_web_speech_volume")]
+    pub web_speech_volume: f32,
+    /// Web Speech: 音声名(空ならブラウザ既定)。
+    #[serde(default = "default_web_speech_voice")]
+    pub web_speech_voice: String,
+
     /// 名前を読み上げるか。
     #[serde(default = "default_true")]
     pub read_name: bool,
@@ -152,6 +189,10 @@ impl Default for TtsOptions {
             bouyomi_path: String::new(),
             voicevox_url: default_voicevox_url(),
             voicevox_speaker: default_voicevox_speaker(),
+            web_speech_rate: default_web_speech_rate(),
+            web_speech_pitch: default_web_speech_pitch(),
+            web_speech_volume: default_web_speech_volume(),
+            web_speech_voice: default_web_speech_voice(),
             read_name: true,
             omit_url: true,
             strip_emoji: true,
@@ -308,6 +349,21 @@ fn default_obs_port() -> u16 {
 fn default_obs_template() -> String {
     "default".to_string()
 }
+fn default_obs_font_scale_pct() -> u16 {
+    100
+}
+fn default_obs_max_rows() -> u16 {
+    8
+}
+fn default_obs_ttl_ms() -> u32 {
+    12000
+}
+fn default_obs_bg_opacity_pct() -> u16 {
+    0
+}
+fn default_obs_position() -> String {
+    "bottom".to_string()
+}
 fn default_bouyomi_host() -> String {
     "127.0.0.1".to_string()
 }
@@ -319,6 +375,18 @@ fn default_voicevox_url() -> String {
 }
 fn default_voicevox_speaker() -> u32 {
     1
+}
+fn default_web_speech_rate() -> f32 {
+    1.0
+}
+fn default_web_speech_pitch() -> f32 {
+    1.0
+}
+fn default_web_speech_volume() -> f32 {
+    1.0
+}
+fn default_web_speech_voice() -> String {
+    String::new()
 }
 fn default_notify_volume() -> f32 {
     0.5
@@ -354,6 +422,12 @@ mod tests {
             obs: ObsConfig {
                 port: 12000,
                 template: "compact".to_string(),
+                font_scale_pct: 125,
+                max_rows: 12,
+                ttl_ms: 9000,
+                bg_opacity_pct: 35,
+                position: "top".to_string(),
+                show_platform: false,
             },
             tts: TtsConfig {
                 backend: TtsBackendKind::Voicevox,
@@ -367,6 +441,10 @@ mod tests {
                     bouyomi_path: r"C:\BouyomiChan\BouyomiChan.exe".to_string(),
                     voicevox_url: "http://127.0.0.1:50022".to_string(),
                     voicevox_speaker: 3,
+                    web_speech_rate: 1.4,
+                    web_speech_pitch: 0.8,
+                    web_speech_volume: 0.6,
+                    web_speech_voice: "Test Voice".to_string(),
                     read_name: false,
                     omit_url: false,
                     strip_emoji: false,
@@ -394,6 +472,12 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(&text).expect("parse serialized JSON");
 
         assert_eq!(json["obs"]["template"].as_str(), Some("compact"));
+        assert_eq!(json["obs"]["fontScalePct"].as_u64(), Some(125));
+        assert_eq!(json["obs"]["maxRows"].as_u64(), Some(12));
+        assert_eq!(json["obs"]["ttlMs"].as_u64(), Some(9000));
+        assert_eq!(json["obs"]["bgOpacityPct"].as_u64(), Some(35));
+        assert_eq!(json["obs"]["position"].as_str(), Some("top"));
+        assert_eq!(json["obs"]["showPlatform"].as_bool(), Some(false));
         assert_eq!(json["ui"]["maxBuffer"].as_u64(), Some(1234));
         assert_eq!(json["ui"]["notifySound"].as_bool(), Some(true));
         // f32→JSON→f64 はビット表現が変わるので近似比較する。
@@ -421,6 +505,34 @@ mod tests {
         assert_eq!(
             json["tts"]["options"]["voicevoxSpeaker"].as_u64(),
             Some(3)
+        );
+        assert!(
+            (json["tts"]["options"]["webSpeechRate"]
+                .as_f64()
+                .expect("webSpeechRate")
+                - 1.4)
+                .abs()
+                < 1e-6
+        );
+        assert!(
+            (json["tts"]["options"]["webSpeechPitch"]
+                .as_f64()
+                .expect("webSpeechPitch")
+                - 0.8)
+                .abs()
+                < 1e-6
+        );
+        assert!(
+            (json["tts"]["options"]["webSpeechVolume"]
+                .as_f64()
+                .expect("webSpeechVolume")
+                - 0.6)
+                .abs()
+                < 1e-6
+        );
+        assert_eq!(
+            json["tts"]["options"]["webSpeechVoice"].as_str(),
+            Some("Test Voice")
         );
         assert_eq!(json["tts"]["options"]["readName"].as_bool(), Some(false));
         assert_eq!(json["tts"]["options"]["omitUrl"].as_bool(), Some(false));
@@ -453,6 +565,17 @@ mod tests {
         assert_eq!(cfg.obs.port, 11180);
         assert_eq!(cfg.obs.template, default_obs_template());
         assert_eq!(cfg.obs.template, "default");
+        assert_eq!(cfg.obs.font_scale_pct, default_obs_font_scale_pct());
+        assert_eq!(cfg.obs.font_scale_pct, 100);
+        assert_eq!(cfg.obs.max_rows, default_obs_max_rows());
+        assert_eq!(cfg.obs.max_rows, 8);
+        assert_eq!(cfg.obs.ttl_ms, default_obs_ttl_ms());
+        assert_eq!(cfg.obs.ttl_ms, 12000);
+        assert_eq!(cfg.obs.bg_opacity_pct, default_obs_bg_opacity_pct());
+        assert_eq!(cfg.obs.bg_opacity_pct, 0);
+        assert_eq!(cfg.obs.position, default_obs_position());
+        assert_eq!(cfg.obs.position, "bottom");
+        assert_eq!(cfg.obs.show_platform, default_true());
         assert_eq!(cfg.tts.backend, TtsBackendKind::WebSpeech);
         assert_eq!(cfg.tts.options.bouyomi_host, default_bouyomi_host());
         assert_eq!(cfg.tts.options.bouyomi_host, "127.0.0.1");
@@ -467,6 +590,14 @@ mod tests {
         assert_eq!(cfg.tts.options.voicevox_url, "http://127.0.0.1:50021");
         assert_eq!(cfg.tts.options.voicevox_speaker, default_voicevox_speaker());
         assert_eq!(cfg.tts.options.voicevox_speaker, 1);
+        assert_eq!(cfg.tts.options.web_speech_rate, default_web_speech_rate());
+        assert_eq!(cfg.tts.options.web_speech_rate, 1.0);
+        assert_eq!(cfg.tts.options.web_speech_pitch, default_web_speech_pitch());
+        assert_eq!(cfg.tts.options.web_speech_pitch, 1.0);
+        assert_eq!(cfg.tts.options.web_speech_volume, default_web_speech_volume());
+        assert_eq!(cfg.tts.options.web_speech_volume, 1.0);
+        assert_eq!(cfg.tts.options.web_speech_voice, default_web_speech_voice());
+        assert_eq!(cfg.tts.options.web_speech_voice, "");
         assert_eq!(cfg.tts.options.read_name, default_true());
         assert_eq!(cfg.tts.options.omit_url, default_true());
         assert_eq!(cfg.tts.options.strip_emoji, default_true());
@@ -516,6 +647,12 @@ mod tests {
         assert_eq!(cfg.channels[0].enabled, default_true());
         assert_eq!(cfg.obs.port, 12345);
         assert_eq!(cfg.obs.template, default_obs_template());
+        assert_eq!(cfg.obs.font_scale_pct, default_obs_font_scale_pct());
+        assert_eq!(cfg.obs.max_rows, default_obs_max_rows());
+        assert_eq!(cfg.obs.ttl_ms, default_obs_ttl_ms());
+        assert_eq!(cfg.obs.bg_opacity_pct, default_obs_bg_opacity_pct());
+        assert_eq!(cfg.obs.position, default_obs_position());
+        assert_eq!(cfg.obs.show_platform, default_true());
         assert_eq!(cfg.tts.backend, TtsBackendKind::Bouyomi);
         assert_eq!(cfg.tts.options.bouyomi_host, default_bouyomi_host());
         assert_eq!(cfg.tts.options.bouyomi_port, 50003);
@@ -526,6 +663,10 @@ mod tests {
         assert_eq!(cfg.tts.options.bouyomi_path, "");
         assert_eq!(cfg.tts.options.voicevox_url, default_voicevox_url());
         assert_eq!(cfg.tts.options.voicevox_speaker, default_voicevox_speaker());
+        assert_eq!(cfg.tts.options.web_speech_rate, default_web_speech_rate());
+        assert_eq!(cfg.tts.options.web_speech_pitch, default_web_speech_pitch());
+        assert_eq!(cfg.tts.options.web_speech_volume, default_web_speech_volume());
+        assert_eq!(cfg.tts.options.web_speech_voice, default_web_speech_voice());
         assert!(!cfg.tts.options.read_name);
         assert_eq!(cfg.tts.options.omit_url, default_true());
         assert_eq!(cfg.tts.options.strip_emoji, default_true());

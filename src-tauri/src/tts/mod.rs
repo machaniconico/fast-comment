@@ -18,10 +18,21 @@ pub mod voicevox;
 /// 流れるのを防ぐバックストップとしてのみ機能する。
 const TTS_UNLIMITED_HARD_CAP: usize = 500;
 
+use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 
 use crate::config::{TtsBackendKind, TtsConfig};
 use crate::model::{ChatMessage, Fragment};
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WebSpeechPayload {
+    text: String,
+    rate: f32,
+    pitch: f32,
+    volume: f32,
+    voice: String,
+}
 
 /// 読み上げバックエンドの共通インタフェース。
 #[allow(async_fn_in_trait)]
@@ -140,7 +151,16 @@ impl TtsDispatcher {
 
     /// Web Speech 用に「読み上げテキスト」を UI へ送る(実再生は UI)。
     fn emit_webspeech(&self, text: &str) {
-        if let Err(e) = self.app.emit("tts-speak", text) {
+        let opt = &self.config.options;
+        let payload = WebSpeechPayload {
+            text: text.to_string(),
+            rate: opt.web_speech_rate,
+            pitch: opt.web_speech_pitch,
+            volume: opt.web_speech_volume,
+            voice: opt.web_speech_voice.clone(),
+        };
+
+        if let Err(e) = self.app.emit("tts-speak", payload) {
             tracing::warn!("tts-speak emit 失敗: {e}");
         }
     }
