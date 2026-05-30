@@ -9,6 +9,29 @@
 
   let unlisten: (() => void) | null = null;
 
+  // ── Donation summary helpers ──────────────────────────────────────────────
+
+  const CURRENCY_SYMBOL: Record<string, string> = {
+    JPY: '¥', USD: '$', EUR: '€', GBP: '£',
+  };
+
+  function formatDonationAmount(currency: string, total: number): string {
+    if (currency.toLowerCase() === 'bits') {
+      return `${total.toLocaleString('ja-JP')} bits`;
+    }
+    const sym = CURRENCY_SYMBOL[currency] ?? currency + ' ';
+    return `${sym}${new Intl.NumberFormat('ja-JP').format(total)}`;
+  }
+
+  /** Entries to render: only currencies with count > 0. */
+  const donationEntries = $derived(
+    Object.entries(store.donationSummary.byCurrency).filter(([, t]) => t.count > 0)
+  );
+
+  const hasDonations = $derived(
+    donationEntries.length > 0 || store.donationSummary.memberships > 0
+  );
+
   onMount(async () => {
     unlisten = await initStore();
   });
@@ -47,6 +70,20 @@
     <div class="header-left">
       <span class="app-title">fast-comment</span>
       <span class="msg-count">{store.totalCount}</span>
+      {#if hasDonations}
+        <div class="donation-summary">
+          {#each donationEntries as [currency, tally]}
+            <span class="donation-badge">
+              💰 {formatDonationAmount(currency, tally.total)} ({tally.count})
+            </span>
+          {/each}
+          {#if store.donationSummary.memberships > 0}
+            <span class="donation-badge donation-badge--member">
+              👑 {store.donationSummary.memberships}
+            </span>
+          {/if}
+        </div>
+      {/if}
     </div>
 
     <!-- Tab switcher -->
@@ -296,5 +333,29 @@
     overflow: hidden;
     display: flex;
     flex-direction: column;
+  }
+
+  /* Donation summary badges in header */
+  .donation-summary {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    overflow: hidden;
+    flex-shrink: 1;
+    min-width: 0;
+  }
+
+  .donation-badge {
+    background: rgba(255,255,255,0.08);
+    color: #ffd600;
+    font-size: 11px;
+    padding: 1px 6px;
+    border-radius: 10px;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+
+  .donation-badge--member {
+    color: #9e9e9e;
   }
 </style>

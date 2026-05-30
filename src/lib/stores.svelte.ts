@@ -28,6 +28,28 @@ function buildSearch(m: ChatMessage): string {
   return (m.author.name + ' ' + body).toLowerCase();
 }
 
+/** Per-currency monetary tally (SuperChat + Bits). */
+export interface CurrencyTally {
+  total: number;
+  count: number;
+}
+
+/**
+ * Session donation summary. Accumulated incrementally per batch and reset on
+ * clear — a SESSION total, intentionally NOT limited to the ring buffer, so
+ * donations evicted from the buffer still count toward the running totals.
+ */
+export interface DonationSummary {
+  /** SuperChat + Bits totals keyed by currency code (e.g. "JPY", "USD", "bits"). */
+  byCurrency: Record<string, CurrencyTally>;
+  /** Number of membership / new-member events seen this session. */
+  memberships: number;
+}
+
+function emptyDonationSummary(): DonationSummary {
+  return { byCurrency: {}, memberships: 0 };
+}
+
 class CommentStore {
   // Private backing state — entries carry a precomputed search string.
   private _buf: BufEntry[] = $state([]);
@@ -39,6 +61,10 @@ class CommentStore {
   // never reset on clear. Used by CommentList to detect genuinely new messages
   // regardless of buffer saturation or filter state.
   private _received: number = $state(0);
+  // Session donation tally — accumulated per batch, reset only on clear.
+  // Intentionally a session total (not buffer-bounded): evicted donations stay
+  // counted, same rationale as _received.
+  private _donations: DonationSummary = $state(emptyDonationSummary());
 
   // Public filter state
   filterPlatform: Platform | 'all' = $state('all');
@@ -74,10 +100,41 @@ class CommentStore {
   // Derived: monotonically increasing received count (never decreases on clear)
   readonly receivedCount: number = $derived(this._received);
 
+  // Derived: session donation summary (SuperChat/Bits totals + membership count)
+  readonly donationSummary: DonationSummary = $derived(this._donations);
+
   /** Push a batch into the ring buffer, evicting oldest on overflow. */
   pushBatch(messages: ChatMessage[]): void {
     const incoming = messages.map((msg) => ({ msg, search: buildSearch(msg) }));
     this._received += incoming.length;
+
+    // Accumulate the session donation tally (clone-on-write so the reactive
+    // object is only reallocated when this batch actually carries donations).
+    const don = this._donations;
+    let byCurrency = don.byCurrency;
+    let memberships = don.memberships;
+    let donChanged = false;
+    for (const msg of messages) {
+      if (msg.kind === 'membership') {
+        memberships += 1;
+        donChanged = true;
+      } else if (
+        (msg.kind === 'superChat' || msg.kind === 'bits') &&
+        msg.amount &&
+        Number.isFinite(msg.amount.value) &&
+        msg.amount.value > 0
+      ) {
+        // Bits は Rust 側が currency="BITS" を送るが、表示キーは casing に依存しない
+        // 正準値 'bits' に寄せる(SuperChat は通貨コード/記号をそのまま使う)。
+        const cur = msg.kind === 'bits' ? 'bits' : (msg.amount.currency || '?');
+        if (byCurrency === don.byCurrency) byCurrency = { ...don.byCurrency };
+        const prev = byCurrency[cur] ?? { total: 0, count: 0 };
+        byCurrency[cur] = { total: prev.total + msg.amount.value, count: prev.count + 1 };
+        donChanged = true;
+      }
+    }
+    if (donChanged) this._donations = { byCurrency, memberships };
+
     const combined = this._buf.concat(incoming);
     if (combined.length > this._maxBuffer) {
       this._buf = combined.slice(combined.length - this._maxBuffer);
@@ -132,6 +189,8 @@ class CommentStore {
   clearMessages(): void {
     this._buf = [];
     this._msgs = [];
+    // Explicit clear is a session reset, so the donation summary resets too.
+    this._donations = emptyDonationSummary();
   }
 
   /** Call once from App.svelte onMount to start Tauri IPC listeners. */
