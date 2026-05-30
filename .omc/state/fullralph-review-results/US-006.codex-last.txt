@@ -1,7 +1,0 @@
-**Findings**
-
-- Scope violation: `git diff --name-only` shows many files outside the allowed US-006 touchedFiles. Examples include `src/lib/components/Settings.svelte`, `src/lib/components/CommentList.svelte`, `src/lib/components/CommentItem.svelte`, multiple `src-tauri/**` files, templates, and `.omc/**` files. The story explicitly restricts edits to `src/lib/ipc.ts`, `src/lib/stores.svelte.ts`, and `src/App.svelte`, so acceptance criterion 6 fails.
-
-Scoped implementation review: within `ipc.ts` and `stores.svelte.ts`, AC1-5 look satisfied by inspection. `setConfig` calls `update_config` with `{ newConfig }`, TTS listener/unlisten/no-op guard exists, mutation invokes propagate rejects, search haystack is precomputed, and hidden IDs are pruned on eviction. `git diff --check` for the three scoped files passed. Build/tests were not run per the WSL visual-review constraint.
-
-FULLRALPH-VERDICT: FAIL -- working tree diff includes files outside the allowed US-006 touchedFiles scope

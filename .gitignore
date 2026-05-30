@@ -10,3 +10,8 @@ src-tauri/gen/
 # local runtime
 logs/
 config.local.json
+
+# AI orchestration / internal state (local only, not part of the app)
+.omc/
+.claude/scheduled_tasks.lock
+.claude/settings.local.json

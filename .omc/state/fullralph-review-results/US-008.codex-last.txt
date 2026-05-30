@@ -1,9 +1,0 @@
-指摘なし。
-
-`CommentItem.svelte` は全行 `height: 28px` / `box-sizing: border-box` に統一され、強調行も背景色と左ボーダーのみで表現されているため、仮想スクロールの固定 `ROW_HEIGHT=28` 前提と整合しています。
-
-`CommentList.svelte` も `clientHeight=0` + `measured` ゲートで初回の600px仮定を排除し、`prevCount` は `untrack` を使った追跡に置換されています。最新追従、一時停止、最新へジャンプの既存ロジックも維持されています。
-
-ビルド/型チェックは、指定どおりWSLビルド不可前提のため目視レビューのみです。
-
-FULLRALPH-VERDICT: PASS

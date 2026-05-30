@@ -1,7 +1,0 @@
-Findings: none for the supplied US-001 diff.
-
-The `received_data` path is now gated on `handle_line(...).emitted_privmsg`, which is only set after `PRIVMSG` normalization and successful `tx.send`. Control IRC lines such as CAP ACK and numerics do not set it. Emote slicing now uses `encode_utf16` with inclusive UTF-16 ranges, and `PING -> PONG` handling is still preserved through `HandleLineResult.reply`.
-
-The supplied diff only touches `src-tauri/src/sources/twitch.rs`. I could not validate with `cargo` in this environment, but the shown Rust changes are statically coherent.
-
-FULLRALPH-VERDICT: PASS
