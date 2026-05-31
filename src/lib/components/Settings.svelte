@@ -1,8 +1,8 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
-  import type { AppConfig, TtsOptions } from '../ipc';
+  import type { AppConfig, GoalsConfig, TtsOptions } from '../ipc';
   import {
-    getConfig, setConfig, getObsUrl
+    getConfig, setConfig, getObsUrl, getObsGoalsUrl
   } from '../ipc';
   import { ui, SETTINGS_ANCHOR_IDS } from '../ui.svelte';
   import { setNotify } from '../stores.svelte';
@@ -15,8 +15,10 @@
 
   let config: AppConfig | null = $state(null);
   let obsBaseUrl: string = $state('');
+  let obsGoalsBaseUrl: string = $state('');
   let copiedObs: boolean = $state(false);
   let copiedGiftObs: boolean = $state(false);
+  let copiedGoalsObs: boolean = $state(false);
 
   // NG / highlight edit buffers
   let ngWordsText: string = $state('');
@@ -50,6 +52,7 @@
   let saveMsgTimer: ReturnType<typeof setTimeout> | null = null;
   let copiedObsTimer: ReturnType<typeof setTimeout> | null = null;
   let copiedGiftObsTimer: ReturnType<typeof setTimeout> | null = null;
+  let copiedGoalsObsTimer: ReturnType<typeof setTimeout> | null = null;
 
   // ── TTS options accessors (config.tts.options mirrors Rust TtsOptions) ──
   // Keys are partitioned by value type so reads/writes stay type-checked
@@ -111,11 +114,13 @@
       webSpeechVolume = ttsNum('webSpeechVolume', 1);
       webSpeechVoice = config.tts.options.webSpeechVoice ?? '';
       normalizeObsConfig(true);
+      normalizeGoalsConfig();
       normalizeParticipationConfig();
     }
 
     const url = await getObsUrl();
     obsBaseUrl = url ?? 'http://127.0.0.1:11180/?template=default';
+    obsGoalsBaseUrl = await getObsGoalsUrl();
 
     refreshSpeechVoices();
     if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
@@ -128,6 +133,7 @@
     if (saveMsgTimer !== null) clearTimeout(saveMsgTimer);
     if (copiedObsTimer !== null) clearTimeout(copiedObsTimer);
     if (copiedGiftObsTimer !== null) clearTimeout(copiedGiftObsTimer);
+    if (copiedGoalsObsTimer !== null) clearTimeout(copiedGoalsObsTimer);
     if (speechVoicesListenerAttached && typeof window !== 'undefined' && 'speechSynthesis' in window) {
       window.speechSynthesis.removeEventListener('voiceschanged', refreshSpeechVoices);
       speechVoicesListenerAttached = false;
@@ -141,6 +147,10 @@
 
   const giftObsUrl = $derived.by(() => {
     return withOnlyGift(obsUrl);
+  });
+
+  const goalsObsUrl = $derived.by(() => {
+    return withGoalsParams(obsGoalsBaseUrl, config?.obs ?? null);
   });
 
   function withTemplate(url: string, obs: AppConfig['obs'] | null): string {
@@ -164,6 +174,19 @@
     try {
       const u = new URL(url);
       u.searchParams.set('only', 'gift');
+      return u.toString();
+    } catch {
+      return url;
+    }
+  }
+
+  function withGoalsParams(url: string, obs: AppConfig['obs'] | null): string {
+    try {
+      const u = new URL(url);
+      u.searchParams.set('template', 'goals');
+      u.searchParams.set('font', String(clampInt(obs?.fontScalePct, 100, 50, 200)));
+      u.searchParams.set('bg', String(clampInt(obs?.bgOpacityPct, 0, 0, 100)));
+      u.searchParams.set('pos', obs?.position === 'top' ? 'top' : 'bottom');
       return u.toString();
     } catch {
       return url;
@@ -217,6 +240,20 @@
     config.participation.max = clampInt(config.participation.max, 0, 0, 4294967295);
   }
 
+  function defaultGoals(): GoalsConfig {
+    return { enabled: false, comments: 0, viewers: 0, likes: 0 };
+  }
+
+  function normalizeGoalsConfig() {
+    if (!config) return;
+    const editable = config as AppConfig & { goals?: GoalsConfig };
+    if (!editable.goals) editable.goals = defaultGoals();
+    editable.goals.enabled = editable.goals.enabled === true;
+    editable.goals.comments = clampInt(editable.goals.comments, 0, 0, 4294967295);
+    editable.goals.viewers = clampInt(editable.goals.viewers, 0, 0, 4294967295);
+    editable.goals.likes = clampInt(editable.goals.likes, 0, 0, 4294967295);
+  }
+
   function normalizeWebSpeechSettings() {
     webSpeechRate = clampNumber(webSpeechRate, 1, 0.5, 2);
     webSpeechPitch = clampNumber(webSpeechPitch, 1, 0, 2);
@@ -243,6 +280,7 @@
     config.tts.options.webSpeechVoice = webSpeechVoice;
     config.obs.ttlMs = ttlMsFromSeconds(obsTtlSeconds);
     normalizeObsConfig(false);
+    normalizeGoalsConfig();
     normalizeParticipationConfig();
     try {
       await setConfig(config);
@@ -279,6 +317,14 @@
       copiedGiftObs = true;
       if (copiedGiftObsTimer !== null) clearTimeout(copiedGiftObsTimer);
       copiedGiftObsTimer = setTimeout(() => { copiedGiftObs = false; copiedGiftObsTimer = null; }, 1500);
+    });
+  }
+
+  function onCopyGoalsObs() {
+    copyText(goalsObsUrl, () => {
+      copiedGoalsObs = true;
+      if (copiedGoalsObsTimer !== null) clearTimeout(copiedGoalsObsTimer);
+      copiedGoalsObsTimer = setTimeout(() => { copiedGoalsObs = false; copiedGoalsObsTimer = null; }, 1500);
     });
   }
 </script>
@@ -493,6 +539,62 @@
       </button>
     </div>
     <p class="hint">OBSのブラウザソースにこのURLを貼り付けてください。</p>
+  </section>
+
+  <!-- ── Goals ── -->
+  <section id="settings-goals">
+    <h3>目標（Goals）</h3>
+    <div class="field-row">
+      <label for="goals-enabled">目標ゲージを有効化</label>
+      <input id="goals-enabled" type="checkbox" bind:checked={config.goals.enabled} class="chk" />
+    </div>
+    <div class="field-row">
+      <label for="goals-comments">コメント</label>
+      <input
+        id="goals-comments"
+        type="number"
+        min="0"
+        max="4294967295"
+        step="1"
+        bind:value={config.goals.comments}
+        class="num-input"
+      />
+      <span class="hint-inline">（0で非表示）</span>
+    </div>
+    <div class="field-row">
+      <label for="goals-viewers">視聴者</label>
+      <input
+        id="goals-viewers"
+        type="number"
+        min="0"
+        max="4294967295"
+        step="1"
+        bind:value={config.goals.viewers}
+        class="num-input"
+      />
+      <span class="hint-inline">（0で非表示）</span>
+    </div>
+    <div class="field-row">
+      <label for="goals-likes">高評価</label>
+      <input
+        id="goals-likes"
+        type="number"
+        min="0"
+        max="4294967295"
+        step="1"
+        bind:value={config.goals.likes}
+        class="num-input"
+      />
+      <span class="hint-inline">（0で非表示）</span>
+    </div>
+    <div class="obs-label">GoalsオーバーレイURL</div>
+    <div class="obs-row">
+      <input type="text" value={goalsObsUrl} readonly class="obs-input" />
+      <button class="copy-btn" class:copied={copiedGoalsObs} onclick={onCopyGoalsObs}>
+        {copiedGoalsObs ? 'コピー済' : 'コピー'}
+      </button>
+    </div>
+    <p class="hint">コメント・視聴者・高評価の目標ゲージをOBSに表示します。</p>
   </section>
 
   <!-- ── Participation ── -->

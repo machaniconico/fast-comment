@@ -7,6 +7,7 @@
 //!   パス探索し、欠落しても None で安全に劣化。解析不能アクションはログへ追記。
 
 pub mod innertube;
+pub mod metadata;
 pub mod parser;
 
 use tokio::sync::broadcast;

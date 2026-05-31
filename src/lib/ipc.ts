@@ -148,11 +148,35 @@ export interface AppConfig {
     position: string;
     showPlatform: boolean;
   };
+  goals: GoalsConfig;
   tts: { backend: 'bouyomi' | 'voicevox' | 'webSpeech' | 'none'; options: TtsOptions };
   moderation: { ngWords: string[]; ngUsers: string[]; highlights: string[] };
   ui: { maxBuffer: number; showDonationPanel: boolean; notifySound: boolean; notifyVolume: number };
   participation: ParticipationConfig;
   youtubeOverrides?: { apiKey?: string; clientVersion?: string; paths?: Record<string, string> };
+}
+
+export interface GoalsConfig {
+  enabled: boolean;
+  comments: number;
+  viewers: number;
+  likes: number;
+}
+
+export interface GoalsSnapshot {
+  comments: number;
+  viewers: number;
+  likes: number;
+}
+
+export interface StatsSnapshot {
+  comments: number;
+  viewers: number;
+  viewersMax: number;
+  likes: number;
+  likesAvailable: boolean;
+  goals: GoalsSnapshot;
+  updatedAt: number;
 }
 
 export interface ParticipationConfig {
@@ -205,6 +229,10 @@ export async function hideMessage(id: string): Promise<void> {
 
 export async function getObsUrl(): Promise<string | null> {
   return invoke<string>('get_obs_url');
+}
+
+export async function getObsGoalsUrl(): Promise<string> {
+  return (await invoke<string>('get_obs_goals_url')) ?? 'http://127.0.0.1:11180/?template=goals&ws=ws://127.0.0.1:11180/stats';
 }
 
 export async function getParticipants(): Promise<Participant[] | null> {

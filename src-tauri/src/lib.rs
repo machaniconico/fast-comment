@@ -16,6 +16,7 @@ pub mod config;
 pub mod model;
 pub mod moderation;
 pub mod sources;
+pub mod stats;
 pub mod tts;
 mod update;
 
@@ -25,14 +26,15 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tauri::{AppHandle, Emitter, Manager, State};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::bus::{is_valid_template_name, Bus};
-use crate::config::{AppConfig, ChannelConfig};
+use crate::config::{AppConfig, ChannelConfig, ChannelPlatform};
 use crate::model::{Badge, ChatMessage, Participant, Platform};
 use crate::moderation::{Moderator, Verdict};
 use crate::sources::SourceManager;
+use crate::stats::{spawn_stats_aggregator, StatsSnapshot, YoutubeMetadataUpdate};
 use crate::tts::{bouyomi, TtsDispatcher};
 use crate::update::{check_for_update, open_url};
 
@@ -40,6 +42,8 @@ use crate::update::{check_for_update, open_url};
 pub struct AppState {
     /// 現在の設定。
     config: Mutex<AppConfig>,
+    /// stats 集約などへ設定変更を伝える watch 送信端。
+    config_tx: watch::Sender<AppConfig>,
     /// 設定の保存先ディレクトリ(app config dir)。
     config_dir: PathBuf,
     /// Source → パイプラインへ流す内部 broadcast 送信端。
@@ -58,6 +62,8 @@ pub struct AppState {
     moderator: Mutex<Moderator>,
     /// 長命 TTS ワーカーへの bounded 送信端(溢れたら drop)。
     tts_tx: mpsc::Sender<ChatMessage>,
+    /// YouTube メタデータ poller → stats 集約への bounded 送信端。
+    metadata_tx: mpsc::Sender<YoutubeMetadataUpdate>,
     /// 参加型配信の参加者一覧。
     participants: Mutex<Vec<Participant>>,
 }
@@ -116,7 +122,9 @@ fn update_config(
 
     // 設定を先に確定する。これにより、続く差分適用で起動される新規 Source が
     // 最新の youtube_overrides を読む(#8 / SPEC §4.2「再ビルド無しで overrides 反映」)。
+    let committed_config = new_config.clone();
     *state.config.lock().unwrap() = new_config;
+    let _ = state.config_tx.send(committed_config);
 
     // チャンネル差分適用(コミット済み設定を参照する)。
     apply_channel_diff(&app, &state, &desired_channels);
@@ -131,7 +139,7 @@ fn add_channel(
     state: State<'_, AppState>,
     channel: ChannelConfig,
 ) -> Result<(), String> {
-    {
+    let next_config = {
         let mut cfg = state.config.lock().unwrap();
         // 既存の同一キーがあれば重複追加しない。
         let key = AppState::channel_key(&channel);
@@ -144,7 +152,9 @@ fn add_channel(
         }
         cfg.channels.push(channel.clone());
         cfg.save(&state.config_dir).map_err(|e| e.to_string())?;
-    }
+        cfg.clone()
+    };
+    let _ = state.config_tx.send(next_config);
 
     spawn_one_channel(&app, &state, &channel);
     Ok(())
@@ -158,10 +168,14 @@ fn remove_channel(state: State<'_, AppState>, key: String) -> Result<(), String>
         token.cancel();
     }
     // 設定から除去して保存。
-    let mut cfg = state.config.lock().unwrap();
-    cfg.channels
-        .retain(|c| AppState::channel_key(c) != key);
-    cfg.save(&state.config_dir).map_err(|e| e.to_string())?;
+    let next_config = {
+        let mut cfg = state.config.lock().unwrap();
+        cfg.channels
+            .retain(|c| AppState::channel_key(c) != key);
+        cfg.save(&state.config_dir).map_err(|e| e.to_string())?;
+        cfg.clone()
+    };
+    let _ = state.config_tx.send(next_config);
     Ok(())
 }
 
@@ -197,6 +211,15 @@ fn get_obs_url(
         url.push_str(&format!("&channel={ch}"));
     }
     Ok(url)
+}
+
+/// OBS Goals overlay 用 URL を返す。
+#[tauri::command]
+fn get_obs_goals_url(state: State<'_, AppState>) -> Result<String, String> {
+    let port = state.obs_server.lock().unwrap().port;
+    Ok(format!(
+        "http://127.0.0.1:{port}/?template=goals&ws=ws://127.0.0.1:{port}/stats"
+    ))
 }
 
 /// 参加者一覧を取得する。
@@ -391,8 +414,22 @@ fn spawn_one_channel(_app: &AppHandle, state: &AppState, ch: &ChannelConfig) {
     }
     let key = AppState::channel_key(ch);
     let overrides = state.config.lock().unwrap().youtube_overrides.clone();
-    let manager = SourceManager::new(state.source_tx.clone(), overrides);
+    let manager = SourceManager::new(state.source_tx.clone(), overrides.clone());
     let token = manager.spawn_channel(ch);
+    let app_cancel = state.app_cancel.clone();
+    let token_for_app_cancel = token.clone();
+    tauri::async_runtime::spawn(async move {
+        app_cancel.cancelled().await;
+        token_for_app_cancel.cancel();
+    });
+    if ch.platform == ChannelPlatform::Youtube {
+        sources::youtube::metadata::spawn_metadata_poller(
+            ch.identifier.clone(),
+            overrides,
+            state.metadata_tx.clone(),
+            token.clone(),
+        );
+    }
     let mut map = state.channels.lock().unwrap();
     // 同一キーの旧タスクが残っていれば確実にキャンセルしてからリーク無く差し替える(#18)。
     if let Some(old) = map.insert(key, token) {
@@ -562,8 +599,13 @@ pub fn run() {
             // 長命 TTS ワーカー用 bounded channel(溢れたら drop)。
             let (tts_tx, tts_rx) = mpsc::channel::<ChatMessage>(64);
 
+            // Goals stats 用 channel。
+            let (stats_tx, _stats_rx) = watch::channel::<StatsSnapshot>(StatsSnapshot::default());
+            let (config_tx, config_rx) = watch::channel::<AppConfig>(config.clone());
+            let (metadata_tx, metadata_rx) = mpsc::channel::<YoutubeMetadataUpdate>(64);
+
             // 下流 Bus(パイプライン → UI/OBS)。
-            let bus = Bus::new(obs_port);
+            let bus = Bus::new(obs_port, stats_tx.clone());
 
             // モデレータ。
             let moderator = Moderator::new(&config.moderation);
@@ -575,6 +617,7 @@ pub fn run() {
 
             let state = AppState {
                 config: Mutex::new(config.clone()),
+                config_tx,
                 config_dir,
                 source_tx: source_tx.clone(),
                 bus: bus.clone(),
@@ -587,6 +630,7 @@ pub fn run() {
                 channels: Mutex::new(HashMap::new()),
                 moderator: Mutex::new(moderator),
                 tts_tx,
+                metadata_tx,
                 participants: Mutex::new(Vec::new()),
             };
             app.manage(state);
@@ -607,6 +651,16 @@ pub fn run() {
             if let Err(e) = bus.spawn_obs_server(templates_dir, obs_cancel) {
                 tracing::error!("{e}");
             }
+
+            // Goals stats 集約を起動。
+            spawn_stats_aggregator(
+                bus.subscribe(),
+                stats_tx,
+                config_rx,
+                metadata_rx,
+                handle.clone(),
+                app_cancel.clone(),
+            );
 
             // moderation + TTS パイプライン起動。
             spawn_pipeline(handle.clone(), app_cancel.clone());
@@ -632,6 +686,7 @@ pub fn run() {
             hide_message,
             unhide_message,
             get_obs_url,
+            get_obs_goals_url,
             get_participants,
             pick_next_participant,
             pick_random_participant,

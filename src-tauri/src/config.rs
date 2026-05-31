@@ -81,6 +81,20 @@ impl Default for ObsConfig {
     }
 }
 
+/// OBS 配信目標ゲージ(Goals overlay)設定。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct GoalsConfig {
+    /// Goals overlay を有効にするか。false のときは全ゲージを非表示扱いにする。
+    pub enabled: bool,
+    /// コメント数目標。0 は非表示。
+    pub comments: u32,
+    /// 視聴者数目標。0 は非表示。
+    pub viewers: u32,
+    /// 高評価数目標。0 は非表示。
+    pub likes: u32,
+}
+
 /// TTS(読み上げ)設定。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -294,6 +308,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub obs: ObsConfig,
     #[serde(default)]
+    pub goals: GoalsConfig,
+    #[serde(default)]
     pub tts: TtsConfig,
     #[serde(default)]
     pub moderation: ModerationConfig,
@@ -310,6 +326,7 @@ impl Default for AppConfig {
         AppConfig {
             channels: Vec::new(),
             obs: ObsConfig::default(),
+            goals: GoalsConfig::default(),
             tts: TtsConfig::default(),
             moderation: ModerationConfig::default(),
             ui: UiConfig::default(),
@@ -461,6 +478,12 @@ mod tests {
                 position: "top".to_string(),
                 show_platform: false,
             },
+            goals: GoalsConfig {
+                enabled: true,
+                comments: 100,
+                viewers: 50,
+                likes: 25,
+            },
             tts: TtsConfig {
                 backend: TtsBackendKind::Voicevox,
                 options: TtsOptions {
@@ -516,6 +539,10 @@ mod tests {
         assert_eq!(json["obs"]["bgOpacityPct"].as_u64(), Some(35));
         assert_eq!(json["obs"]["position"].as_str(), Some("top"));
         assert_eq!(json["obs"]["showPlatform"].as_bool(), Some(false));
+        assert_eq!(json["goals"]["enabled"].as_bool(), Some(true));
+        assert_eq!(json["goals"]["comments"].as_u64(), Some(100));
+        assert_eq!(json["goals"]["viewers"].as_u64(), Some(50));
+        assert_eq!(json["goals"]["likes"].as_u64(), Some(25));
         assert_eq!(json["ui"]["maxBuffer"].as_u64(), Some(1234));
         assert_eq!(json["ui"]["showDonationPanel"].as_bool(), Some(true));
         assert_eq!(json["ui"]["notifySound"].as_bool(), Some(true));
@@ -618,6 +645,11 @@ mod tests {
         assert_eq!(cfg.obs.position, default_obs_position());
         assert_eq!(cfg.obs.position, "bottom");
         assert_eq!(cfg.obs.show_platform, default_true());
+        assert_eq!(cfg.goals, GoalsConfig::default());
+        assert!(!cfg.goals.enabled);
+        assert_eq!(cfg.goals.comments, 0);
+        assert_eq!(cfg.goals.viewers, 0);
+        assert_eq!(cfg.goals.likes, 0);
         assert_eq!(cfg.tts.backend, TtsBackendKind::WebSpeech);
         assert_eq!(cfg.tts.options.bouyomi_host, default_bouyomi_host());
         assert_eq!(cfg.tts.options.bouyomi_host, "127.0.0.1");
@@ -700,6 +732,7 @@ mod tests {
         assert_eq!(cfg.obs.bg_opacity_pct, default_obs_bg_opacity_pct());
         assert_eq!(cfg.obs.position, default_obs_position());
         assert_eq!(cfg.obs.show_platform, default_true());
+        assert_eq!(cfg.goals, GoalsConfig::default());
         assert_eq!(cfg.tts.backend, TtsBackendKind::Bouyomi);
         assert_eq!(cfg.tts.options.bouyomi_host, default_bouyomi_host());
         assert_eq!(cfg.tts.options.bouyomi_port, 50003);
