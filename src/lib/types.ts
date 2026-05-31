@@ -52,3 +52,12 @@ export interface ChatMessage {
   timestampMs: number;
   raw?: unknown;
 }
+
+/**
+ * Frontend-only projection of ChatMessage.
+ * Keep ChatMessage itself a strict mirror of the Rust model.
+ */
+export type UiChatMessage = ChatMessage & {
+  /** Session sequence number for this viewer, derived in the UI store. */
+  viewerSeq?: number;
+};

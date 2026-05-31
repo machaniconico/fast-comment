@@ -10,7 +10,7 @@
  * - Wired to ipc.ts via onChatBatch + startChatListener (+ startTtsSpeakListener).
  */
 
-import type { ChatMessage, Platform } from './types';
+import type { ChatMessage, Platform, UiChatMessage } from './types';
 import { onChatBatch, startChatListener, startTtsSpeakListener, getConfig } from './ipc';
 
 const DEFAULT_MAX_BUFFER = 2000;
@@ -19,7 +19,7 @@ const MAX_PINNED = 5;
 
 /** Buffer entry: the message plus a once-computed lowercase search haystack. */
 interface BufEntry {
-  msg: ChatMessage;
+  msg: UiChatMessage;
   /** Lowercased "author name + fragment text" used for substring search. */
   search: string;
 }
@@ -28,6 +28,17 @@ interface BufEntry {
 function buildSearch(m: ChatMessage): string {
   const body = m.fragments.map((f) => (f.type === 'text' ? f.text : f.name)).join('');
   return (m.author.name + ' ' + body).toLowerCase();
+}
+
+/** Stable viewer key. Falls back to name only when the backend has no author id. */
+function viewerKey(m: ChatMessage): string | null {
+  const scope = `${m.platform}\0${m.channel}`;
+  const authorId = m.author.id.trim();
+  if (authorId !== '') return `${scope}\0id\0${authorId}`;
+
+  const authorName = m.author.name.trim().toLowerCase();
+  if (authorName !== '') return `${scope}\0name\0${authorName}`;
+  return null;
 }
 
 /** Per-currency monetary tally (SuperChat + Bits). */
@@ -51,7 +62,7 @@ export interface DonationSummary {
 export type DonationKind = 'superchat' | 'bits' | 'membership';
 
 export interface DonationMessage {
-  message: ChatMessage;
+  message: UiChatMessage;
   donationKind: DonationKind;
 }
 
@@ -77,7 +88,11 @@ class CommentStore {
   private _buf: BufEntry[] = $state([]);
   // msg-only projection of _buf, rebuilt only on push/eviction/clear so the
   // no-filter fast path can return it without re-mapping all entries.
-  private _msgs: ChatMessage[] = $state([]);
+  private _msgs: UiChatMessage[] = $state([]);
+  // Viewer counts are internal mutable bookkeeping; _uniqueViewers is the
+  // reactive projection exposed to Svelte consumers.
+  private _viewerCounts: Map<string, number> = new Map();
+  private _uniqueViewers: number = $state(0);
   private _maxBuffer: number = $state(DEFAULT_MAX_BUFFER);
   // Monotonically increasing counter — incremented by every pushBatch call,
   // never reset on clear. Used by CommentList to detect genuinely new messages
@@ -102,10 +117,10 @@ class CommentStore {
   // Pinned comments: full ChatMessage objects (NOT ids) so a pinned comment
   // survives ring-buffer eviction and stays visible after it scrolls out.
   // Capped FIFO (oldest dropped) so the pinned strip never grows unbounded.
-  private _pinned: ChatMessage[] = $state([]);
+  private _pinned: UiChatMessage[] = $state([]);
 
   // Derived: filtered list
-  readonly visibleMessages: ChatMessage[] = $derived.by(() => {
+  readonly visibleMessages: UiChatMessage[] = $derived.by(() => {
     const hidden = this.hiddenIds;
     const platform = this.filterPlatform;
     const q = this.searchQuery.trim().toLowerCase();
@@ -117,7 +132,7 @@ class CommentStore {
       return this._buf.filter((e) => !hidden.has(e.msg.id)).map((e) => e.msg);
     }
 
-    const out: ChatMessage[] = [];
+    const out: UiChatMessage[] = [];
     for (const e of this._buf) {
       if (hidden.has(e.msg.id)) continue;
       if (platform !== 'all' && e.msg.platform !== platform) continue;
@@ -129,6 +144,9 @@ class CommentStore {
 
   // Derived: total buffered count
   readonly totalCount: number = $derived(this._buf.length);
+
+  // Derived: unique viewers seen since the last explicit clear.
+  readonly uniqueViewers: number = $derived(this._uniqueViewers);
 
   // Derived: monotonically increasing received count (never decreases on clear)
   readonly receivedCount: number = $derived(this._received);
@@ -151,16 +169,13 @@ class CommentStore {
   });
 
   // Derived: pinned comments (oldest first)
-  readonly pinnedMessages: ChatMessage[] = $derived(this._pinned);
+  readonly pinnedMessages: UiChatMessage[] = $derived(this._pinned);
 
   // Derived: monotonically increasing highlight-message count (notification trigger)
   readonly highlightCount: number = $derived(this._highlightSeq);
 
   /** Push a batch into the ring buffer, evicting oldest on overflow. */
   pushBatch(messages: ChatMessage[]): void {
-    const incoming = messages.map((msg) => ({ msg, search: buildSearch(msg) }));
-    this._received += incoming.length;
-
     // Accumulate the session donation tally (clone-on-write so the reactive
     // object is only reallocated when this batch actually carries donations).
     const don = this._donations;
@@ -168,7 +183,20 @@ class CommentStore {
     let memberships = don.memberships;
     let donChanged = false;
     let highlightDelta = 0;
+    let newViewerCount = 0;
+    const incoming: BufEntry[] = [];
+
     for (const msg of messages) {
+      const key = viewerKey(msg);
+      let uiMsg: UiChatMessage = msg;
+      if (key) {
+        const seq = (this._viewerCounts.get(key) ?? 0) + 1;
+        if (seq === 1) newViewerCount += 1;
+        this._viewerCounts.set(key, seq);
+        uiMsg = { ...msg, viewerSeq: seq };
+      }
+      incoming.push({ msg: uiMsg, search: buildSearch(msg) });
+
       // Highlight detection is independent of kind (a SuperChat can also be a
       // highlight), so check it separately from the donation tally below.
       if (msg.author.badges.some((b) => b.kind === 'highlight')) highlightDelta += 1;
@@ -189,6 +217,8 @@ class CommentStore {
         donChanged = true;
       }
     }
+    this._received += incoming.length;
+    if (newViewerCount) this._uniqueViewers += newViewerCount;
     if (donChanged) this._donations = { byCurrency, memberships };
     if (highlightDelta) this._highlightSeq += highlightDelta;
 
@@ -231,7 +261,7 @@ class CommentStore {
   }
 
   /** Pin a comment (no-op if already pinned). FIFO-capped at MAX_PINNED. */
-  pinMessage(msg: ChatMessage): void {
+  pinMessage(msg: UiChatMessage): void {
     if (this._pinned.some((m) => m.id === msg.id)) return;
     const next = [...this._pinned, msg];
     this._pinned = next.length > MAX_PINNED ? next.slice(next.length - MAX_PINNED) : next;
@@ -243,7 +273,7 @@ class CommentStore {
   }
 
   /** Pin if not pinned, otherwise unpin. */
-  togglePin(msg: ChatMessage): void {
+  togglePin(msg: UiChatMessage): void {
     if (this.isPinned(msg.id)) this.unpinMessage(msg.id);
     else this.pinMessage(msg);
   }
@@ -275,6 +305,8 @@ class CommentStore {
   clearMessages(): void {
     this._buf = [];
     this._msgs = [];
+    this._viewerCounts.clear();
+    this._uniqueViewers = 0;
     // Explicit clear is a session reset, so the donation summary resets too.
     this._donations = emptyDonationSummary();
     this._pinned = [];
@@ -308,9 +340,9 @@ onChatBatch((batch) => store.pushBatch(batch));
 
 // Convenience re-exports so call sites stay terse
 export function hideMessage(id: string): void { store.hideMessage(id); }
-export function pinMessage(msg: ChatMessage): void { store.pinMessage(msg); }
+export function pinMessage(msg: UiChatMessage): void { store.pinMessage(msg); }
 export function unpinMessage(id: string): void { store.unpinMessage(id); }
-export function togglePin(msg: ChatMessage): void { store.togglePin(msg); }
+export function togglePin(msg: UiChatMessage): void { store.togglePin(msg); }
 export function setNotify(sound: boolean, volume: number): void { store.setNotify(sound, volume); }
 export function setFilterPlatform(p: Platform | 'all'): void { store.setFilterPlatform(p); }
 export function setSearchQuery(q: string): void { store.setSearchQuery(q); }

@@ -1,10 +1,10 @@
 <script lang="ts">
-  import type { ChatMessage } from '../types';
+  import type { UiChatMessage } from '../types';
   import { store, togglePin } from '../stores.svelte';
   import { hideMessage as ipcHideMessage } from '../ipc';
 
   interface Props {
-    message: ChatMessage;
+    message: UiChatMessage;
   }
 
   let { message }: Props = $props();
@@ -41,6 +41,9 @@
   let kindFg = $derived(hasKindStyle ? KIND_TEXT[message.kind] : undefined);
   // 行強調(太字 + 左枠): kind 塗り or highlight バッジのどちらかで点灯。
   let isHighlighted = $derived(hasKindStyle || hasHighlightBadge);
+  let viewerSeq = $derived(message.viewerSeq);
+  let viewerBadgeText = $derived(formatViewerBadgeText(viewerSeq));
+  let viewerBadgeLabel = $derived(formatViewerBadgeLabel(viewerSeq));
 
   let pinned = $derived(store.isPinned(message.id));
 
@@ -55,6 +58,20 @@
     const m = d.getMinutes().toString().padStart(2, '0');
     const s = d.getSeconds().toString().padStart(2, '0');
     return `${h}:${m}:${s}`;
+  }
+
+  function formatViewerBadgeText(seq: number | undefined): string {
+    if (!seq) return '';
+    if (seq === 1) return '初';
+    if (seq < 10) return String(seq);
+    return `常連 ${seq}`;
+  }
+
+  function formatViewerBadgeLabel(seq: number | undefined): string {
+    if (!seq) return '';
+    if (seq === 1) return 'この視聴者の初回コメント';
+    if (seq < 10) return `この視聴者の${seq}回目のコメント`;
+    return `常連視聴者の${seq}回目のコメント`;
   }
 </script>
 
@@ -77,6 +94,20 @@
       <span class="badge-text" title={badge.label}>{badge.kind[0]?.toUpperCase()}</span>
     {/if}
   {/each}
+
+  <!-- Viewer sequence badge: after platform/role badges so Host/Mod stay first. -->
+  {#if viewerSeq}
+    <span
+      class="viewer-badge"
+      class:badge-first={viewerSeq === 1}
+      class:badge-count={viewerSeq > 1 && viewerSeq < 10}
+      class:badge-regular={viewerSeq >= 10}
+      title={viewerBadgeLabel}
+      aria-label={viewerBadgeLabel}
+    >
+      {viewerBadgeText}
+    </span>
+  {/if}
 
   <!-- Author name -->
   <span
@@ -184,6 +215,38 @@
     background: rgba(255, 255, 255, 0.2);
     border-radius: 2px;
     flex-shrink: 0;
+  }
+
+  .viewer-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    box-sizing: border-box;
+    height: 16px;
+    min-width: 16px;
+    padding: 0 4px;
+    border-radius: 2px;
+    font-size: 10px;
+    line-height: 16px;
+    font-weight: 700;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+
+  .badge-first {
+    background: #fdd835;
+    color: #1b1b1b;
+  }
+
+  .badge-count {
+    border: 1px solid rgba(255, 255, 255, 0.28);
+    background: rgba(255, 255, 255, 0.14);
+    color: inherit;
+  }
+
+  .badge-regular {
+    background: #26a69a;
+    color: #061b18;
   }
 
   .author-name {
