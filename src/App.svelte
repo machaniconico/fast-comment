@@ -3,6 +3,7 @@
   import type { Platform } from './lib/types';
   import CommentList from './lib/components/CommentList.svelte';
   import DonationPanel from './lib/components/DonationPanel.svelte';
+  import GoalsBar from './lib/components/GoalsBar.svelte';
   import PinnedStrip from './lib/components/PinnedStrip.svelte';
   import Participation from './lib/components/Participation.svelte';
   import Settings from './lib/components/Settings.svelte';
@@ -46,7 +47,12 @@
     return cfg?.ui.showDonationPanel === true;
   }
 
+  function isGoalsBarEnabled(cfg: AppConfig | null): boolean {
+    return cfg?.goals?.enabled === true && cfg?.goals?.showInApp === true;
+  }
+
   const showDonationPanel = $derived(isDonationPanelEnabled(config));
+  const showGoalsBar = $derived(isGoalsBarEnabled(config));
 
   $effect(() => {
     if (!showDonationPanel && ui.activeTab === 'donations') ui.setTab('comments');
@@ -195,6 +201,10 @@
       >設定</button>
     </div>
   </header>
+
+  {#if showGoalsBar}
+    <GoalsBar />
+  {/if}
 
   <!-- ── Channel add bar (URL paste → auto-detect) ── -->
   {#if ui.activeTab === 'comments'}

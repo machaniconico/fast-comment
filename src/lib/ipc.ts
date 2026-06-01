@@ -158,6 +158,7 @@ export interface AppConfig {
 
 export interface GoalsConfig {
   enabled: boolean;
+  showInApp: boolean;
   comments: number;
   viewers: number;
   likes: number;

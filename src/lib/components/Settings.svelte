@@ -241,14 +241,15 @@
   }
 
   function defaultGoals(): GoalsConfig {
-    return { enabled: false, comments: 0, viewers: 0, likes: 0 };
+    return { enabled: false, showInApp: false, comments: 0, viewers: 0, likes: 0 };
   }
 
   function normalizeGoalsConfig() {
     if (!config) return;
-    const editable = config as AppConfig & { goals?: GoalsConfig };
+    const editable = config as AppConfig & { goals?: Partial<GoalsConfig> };
     if (!editable.goals) editable.goals = defaultGoals();
     editable.goals.enabled = editable.goals.enabled === true;
+    editable.goals.showInApp = editable.goals.showInApp === true;
     editable.goals.comments = clampInt(editable.goals.comments, 0, 0, 4294967295);
     editable.goals.viewers = clampInt(editable.goals.viewers, 0, 0, 4294967295);
     editable.goals.likes = clampInt(editable.goals.likes, 0, 0, 4294967295);
@@ -547,6 +548,10 @@
     <div class="field-row">
       <label for="goals-enabled">目標ゲージを有効化</label>
       <input id="goals-enabled" type="checkbox" bind:checked={config.goals.enabled} class="chk" />
+    </div>
+    <div class="field-row">
+      <label for="goals-show-in-app">アプリ内にも表示</label>
+      <input id="goals-show-in-app" type="checkbox" bind:checked={config.goals.showInApp} class="chk" />
     </div>
     <div class="field-row">
       <label for="goals-comments">コメント</label>

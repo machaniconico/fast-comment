@@ -87,6 +87,9 @@ impl Default for ObsConfig {
 pub struct GoalsConfig {
     /// Goals overlay を有効にするか。false のときは全ゲージを非表示扱いにする。
     pub enabled: bool,
+    /// アプリ本体内にも GoalsBar を常設表示するか。既定 false。
+    #[serde(default)]
+    pub show_in_app: bool,
     /// コメント数目標。0 は非表示。
     pub comments: u32,
     /// 視聴者数目標。0 は非表示。
@@ -480,6 +483,7 @@ mod tests {
             },
             goals: GoalsConfig {
                 enabled: true,
+                show_in_app: true,
                 comments: 100,
                 viewers: 50,
                 likes: 25,
@@ -540,6 +544,7 @@ mod tests {
         assert_eq!(json["obs"]["position"].as_str(), Some("top"));
         assert_eq!(json["obs"]["showPlatform"].as_bool(), Some(false));
         assert_eq!(json["goals"]["enabled"].as_bool(), Some(true));
+        assert_eq!(json["goals"]["showInApp"].as_bool(), Some(true));
         assert_eq!(json["goals"]["comments"].as_u64(), Some(100));
         assert_eq!(json["goals"]["viewers"].as_u64(), Some(50));
         assert_eq!(json["goals"]["likes"].as_u64(), Some(25));
@@ -647,6 +652,7 @@ mod tests {
         assert_eq!(cfg.obs.show_platform, default_true());
         assert_eq!(cfg.goals, GoalsConfig::default());
         assert!(!cfg.goals.enabled);
+        assert!(!cfg.goals.show_in_app);
         assert_eq!(cfg.goals.comments, 0);
         assert_eq!(cfg.goals.viewers, 0);
         assert_eq!(cfg.goals.likes, 0);
@@ -755,6 +761,38 @@ mod tests {
         assert!(!cfg.ui.show_donation_panel);
         assert_eq!(cfg.participation, ParticipationConfig::default());
         assert_eq!(cfg.youtube_overrides, YoutubeOverrides::default());
+    }
+
+    #[test]
+    fn goals_show_in_app_defaults_false_and_roundtrips() {
+        let legacy_goals: GoalsConfig = serde_json::from_str(
+            r#"{
+                "enabled": true,
+                "comments": 10,
+                "viewers": 20,
+                "likes": 30
+            }"#,
+        )
+        .expect("deserialize legacy goals config");
+        assert!(legacy_goals.enabled);
+        assert!(!legacy_goals.show_in_app);
+        assert_eq!(legacy_goals.comments, 10);
+        assert_eq!(legacy_goals.viewers, 20);
+        assert_eq!(legacy_goals.likes, 30);
+
+        let cfg = GoalsConfig {
+            enabled: true,
+            show_in_app: true,
+            comments: 100,
+            viewers: 50,
+            likes: 25,
+        };
+        let text = serde_json::to_string(&cfg).expect("serialize goals config");
+        let json: serde_json::Value = serde_json::from_str(&text).expect("parse goals json");
+        assert_eq!(json["showInApp"].as_bool(), Some(true));
+
+        let decoded: GoalsConfig = serde_json::from_str(&text).expect("deserialize goals config");
+        assert_eq!(decoded, cfg);
     }
 
     #[test]
