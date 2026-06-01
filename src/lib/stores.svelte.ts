@@ -32,7 +32,13 @@ function buildSearch(m: ChatMessage): string {
 
 /** RFC 4180-style CSV cell escaping. Always quote cells for Excel-safe output. */
 export function escapeCsvCell(value: unknown): string {
-  const text = value == null ? '' : String(value);
+  let text = value == null ? '' : String(value);
+  // CSV formula injection 対策: =, +, -, @, タブ, CR で始まるセルは Excel/
+  // Google スプレッドシート等が数式として評価し得る。先頭にシングルクオートを
+  // 付けて無害化する(表示は元の文字列のまま読める)。
+  if (/^[=+\-@\t\r]/.test(text)) {
+    text = `'${text}`;
+  }
   return `"${text.replace(/"/g, '""')}"`;
 }
 
