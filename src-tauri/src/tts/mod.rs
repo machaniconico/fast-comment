@@ -21,7 +21,7 @@ const TTS_UNLIMITED_HARD_CAP: usize = 500;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 
-use crate::config::{TtsBackendKind, TtsConfig};
+use crate::config::{TtsBackendKind, TtsConfig, TtsOptions};
 use crate::model::{ChatMessage, Fragment};
 
 #[derive(Clone, Serialize)]
@@ -167,8 +167,10 @@ impl TtsDispatcher {
 
     /// メッセージを読み上げ用テキストへ整形する。
     fn format_for_speech(&self, msg: &ChatMessage) -> String {
-        let opt = &self.config.options;
+        Self::format_for_speech_with_options(&self.config.options, msg)
+    }
 
+    fn format_for_speech_with_options(opt: &TtsOptions, msg: &ChatMessage) -> String {
         // 本文を組み立てる(絵文字除去オプション対応)。
         let mut body = String::new();
         for frag in &msg.fragments {
@@ -185,6 +187,12 @@ impl TtsDispatcher {
         // URL 省略。
         if opt.omit_url {
             body = omit_urls(&body);
+        }
+
+        for entry in &opt.dictionary {
+            if !entry.from.is_empty() {
+                body = body.replace(&entry.from, &entry.to);
+            }
         }
 
         // 名前の前置。
@@ -228,4 +236,73 @@ fn omit_urls(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{TtsDictEntry, TtsOptions};
+    use crate::model::{Author, MessageKind, Platform, Roles};
+
+    fn message(author_name: &str, body: &str) -> ChatMessage {
+        ChatMessage {
+            id: "msg-1".to_string(),
+            platform: Platform::Youtube,
+            channel: "channel".to_string(),
+            author: Author {
+                id: "author-1".to_string(),
+                name: author_name.to_string(),
+                display_color: None,
+                badges: Vec::new(),
+                roles: Roles::default(),
+            },
+            fragments: vec![Fragment::Text {
+                text: body.to_string(),
+            }],
+            kind: MessageKind::Normal,
+            amount: None,
+            timestamp_ms: 0,
+            raw: None,
+            skip_tts: false,
+        }
+    }
+
+    #[test]
+    fn format_for_speech_applies_dictionary_to_body_before_name_and_truncation() {
+        let mut options = TtsOptions {
+            read_name: true,
+            omit_url: true,
+            strip_emoji: true,
+            max_length: 10,
+            dictionary: vec![
+                TtsDictEntry {
+                    from: "fast".to_string(),
+                    to: "slow".to_string(),
+                },
+                TtsDictEntry {
+                    from: "slow comment".to_string(),
+                    to: "読み上げ辞書".to_string(),
+                },
+                TtsDictEntry {
+                    from: "".to_string(),
+                    to: "ignored".to_string(),
+                },
+                TtsDictEntry {
+                    from: "URL省略".to_string(),
+                    to: "リンク".to_string(),
+                },
+            ],
+            ..TtsOptions::default()
+        };
+
+        let msg = message("fast", "fast comment https://example.com trailing");
+        let text = TtsDispatcher::format_for_speech_with_options(&options, &msg);
+
+        assert_eq!(text, "fast 読み上げ辞");
+
+        options.read_name = false;
+        options.max_length = 0;
+        let text = TtsDispatcher::format_for_speech_with_options(&options, &msg);
+        assert_eq!(text, "読み上げ辞書 リンク trailing");
+    }
 }

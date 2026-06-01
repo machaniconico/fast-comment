@@ -134,6 +134,18 @@ pub enum TtsBackendKind {
     None,
 }
 
+/// 読み上げ前に本文へ適用するユーザー定義置換の1件。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TtsDictEntry {
+    /// 置換前のプレーン文字列。空なら適用時にスキップする。
+    #[serde(default)]
+    pub from: String,
+    /// 置換後のプレーン文字列。
+    #[serde(default)]
+    pub to: String,
+}
+
 /// 読み上げの整形/エンジン調整パラメータ。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -192,6 +204,9 @@ pub struct TtsOptions {
     /// 1メッセージあたりの最大読み上げ文字数(超過分はカット)。
     #[serde(default = "default_max_read_len")]
     pub max_length: usize,
+    /// 読み上げ本文に適用するユーザー定義のプレーン文字列置換辞書。
+    #[serde(default)]
+    pub dictionary: Vec<TtsDictEntry>,
 }
 
 impl Default for TtsOptions {
@@ -214,6 +229,7 @@ impl Default for TtsOptions {
             omit_url: true,
             strip_emoji: true,
             max_length: default_max_read_len(),
+            dictionary: Vec::new(),
         }
     }
 }
@@ -508,6 +524,16 @@ mod tests {
                     omit_url: false,
                     strip_emoji: false,
                     max_length: 280,
+                    dictionary: vec![
+                        TtsDictEntry {
+                            from: "fast".to_string(),
+                            to: "ファスト".to_string(),
+                        },
+                        TtsDictEntry {
+                            from: "comment".to_string(),
+                            to: "コメント".to_string(),
+                        },
+                    ],
                 },
             },
             moderation: ModerationConfig {
@@ -613,6 +639,22 @@ mod tests {
         assert_eq!(json["tts"]["options"]["stripEmoji"].as_bool(), Some(false));
         assert_eq!(json["tts"]["options"]["maxLength"].as_u64(), Some(280));
         assert_eq!(
+            json["tts"]["options"]["dictionary"][0]["from"].as_str(),
+            Some("fast")
+        );
+        assert_eq!(
+            json["tts"]["options"]["dictionary"][0]["to"].as_str(),
+            Some("ファスト")
+        );
+        assert_eq!(
+            json["tts"]["options"]["dictionary"][1]["from"].as_str(),
+            Some("comment")
+        );
+        assert_eq!(
+            json["tts"]["options"]["dictionary"][1]["to"].as_str(),
+            Some("コメント")
+        );
+        assert_eq!(
             json["youtubeOverrides"]["apiKey"].as_str(),
             Some("test-api-key")
         );
@@ -683,6 +725,7 @@ mod tests {
         assert_eq!(cfg.tts.options.strip_emoji, default_true());
         assert_eq!(cfg.tts.options.max_length, default_max_read_len());
         assert_eq!(cfg.tts.options.max_length, 140);
+        assert!(cfg.tts.options.dictionary.is_empty());
         assert!(cfg.moderation.ng_words.is_empty());
         assert!(cfg.moderation.ng_users.is_empty());
         assert!(cfg.moderation.highlights.is_empty());
@@ -757,10 +800,49 @@ mod tests {
         assert_eq!(cfg.tts.options.omit_url, default_true());
         assert_eq!(cfg.tts.options.strip_emoji, default_true());
         assert_eq!(cfg.tts.options.max_length, default_max_read_len());
+        assert!(cfg.tts.options.dictionary.is_empty());
         assert_eq!(cfg.ui.max_buffer, 321);
         assert!(!cfg.ui.show_donation_panel);
         assert_eq!(cfg.participation, ParticipationConfig::default());
         assert_eq!(cfg.youtube_overrides, YoutubeOverrides::default());
+    }
+
+    #[test]
+    fn tts_dictionary_defaults_and_roundtrips() {
+        let legacy: TtsOptions = serde_json::from_str(
+            r#"{
+                "readName": false
+            }"#,
+        )
+        .expect("deserialize legacy tts options");
+        assert!(legacy.dictionary.is_empty());
+
+        let options = TtsOptions {
+            dictionary: vec![
+                TtsDictEntry {
+                    from: "FC".to_string(),
+                    to: "ファストコメント".to_string(),
+                },
+                TtsDictEntry {
+                    from: "".to_string(),
+                    to: "ignored".to_string(),
+                },
+            ],
+            ..TtsOptions::default()
+        };
+
+        let text = serde_json::to_string(&options).expect("serialize tts options");
+        let json: serde_json::Value = serde_json::from_str(&text).expect("parse tts options json");
+        assert_eq!(json["dictionary"][0]["from"].as_str(), Some("FC"));
+        assert_eq!(
+            json["dictionary"][0]["to"].as_str(),
+            Some("ファストコメント")
+        );
+        assert_eq!(json["dictionary"][1]["from"].as_str(), Some(""));
+        assert_eq!(json["dictionary"][1]["to"].as_str(), Some("ignored"));
+
+        let decoded: TtsOptions = serde_json::from_str(&text).expect("deserialize tts options");
+        assert_eq!(decoded, options);
     }
 
     #[test]

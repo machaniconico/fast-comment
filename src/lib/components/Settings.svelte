@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
-  import type { AppConfig, GoalsConfig, TtsOptions } from '../ipc';
+  import type { AppConfig, GoalsConfig, TtsDictEntry, TtsOptions } from '../ipc';
   import {
     getConfig, setConfig, getObsUrl, getObsGoalsUrl
   } from '../ipc';
@@ -94,6 +94,7 @@
   let webSpeechPitch: number = $state(1);
   let webSpeechVolume: number = $state(1);
   let webSpeechVoice: string = $state('');
+  let ttsDictionary: TtsDictEntry[] = $state([]);
   let speechVoices: SpeechSynthesisVoice[] = $state([]);
   let speechVoicesListenerAttached: boolean = false;
   let obsTtlSeconds: number = $state(12);
@@ -113,6 +114,8 @@
       webSpeechPitch = ttsNum('webSpeechPitch', 1);
       webSpeechVolume = ttsNum('webSpeechVolume', 1);
       webSpeechVoice = config.tts.options.webSpeechVoice ?? '';
+      ttsDictionary = normalizeTtsDictionary(config.tts.options.dictionary);
+      config.tts.options.dictionary = ttsDictionary;
       normalizeObsConfig(true);
       normalizeGoalsConfig();
       normalizeParticipationConfig();
@@ -262,6 +265,26 @@
     webSpeechVoice = webSpeechVoice.trim();
   }
 
+  function normalizeTtsDictionary(entries: TtsOptions['dictionary']): TtsDictEntry[] {
+    return (entries ?? []).map((entry) => ({
+      from: typeof entry.from === 'string' ? entry.from : '',
+      to: typeof entry.to === 'string' ? entry.to : ''
+    }));
+  }
+
+  function addTtsDictionaryEntry() {
+    ttsDictionary = [...ttsDictionary, { from: '', to: '' }];
+  }
+
+  function removeTtsDictionaryEntry(index: number) {
+    ttsDictionary = ttsDictionary.filter((_, i) => i !== index);
+  }
+
+  function syncTtsDictionaryToConfig() {
+    if (!config) return;
+    config.tts.options.dictionary = normalizeTtsDictionary(ttsDictionary);
+  }
+
   async function onSave() {
     if (!config) return;
     saving = true;
@@ -279,6 +302,7 @@
     setTtsNum('webSpeechPitch', webSpeechPitch);
     setTtsNum('webSpeechVolume', webSpeechVolume);
     config.tts.options.webSpeechVoice = webSpeechVoice;
+    syncTtsDictionaryToConfig();
     config.obs.ttlMs = ttlMsFromSeconds(obsTtlSeconds);
     normalizeObsConfig(false);
     normalizeGoalsConfig();
@@ -443,6 +467,37 @@
     <div class="field-row">
       <label for="strip-emoji">絵文字を除去</label>
       <input id="strip-emoji" type="checkbox" bind:checked={stripEmoji} class="chk" />
+    </div>
+
+    <div class="dict-editor">
+      <div class="dict-header">
+        <span>読み上げ辞書</span>
+        <button type="button" class="copy-btn" onclick={addTtsDictionaryEntry}>行追加</button>
+      </div>
+      {#if ttsDictionary.length === 0}
+        <p class="hint">置換前と置換後を入力すると、読み上げ本文だけに上から順に適用されます。</p>
+      {/if}
+      {#each ttsDictionary as entry, index (entry)}
+        <div class="dict-row">
+          <label for={`tts-dict-from-${index}`} class="dict-label">from</label>
+          <input
+            id={`tts-dict-from-${index}`}
+            type="text"
+            bind:value={entry.from}
+            class="id-input dict-input"
+            placeholder="置換前"
+          />
+          <label for={`tts-dict-to-${index}`} class="dict-label">to</label>
+          <input
+            id={`tts-dict-to-${index}`}
+            type="text"
+            bind:value={entry.to}
+            class="id-input dict-input"
+            placeholder="置換後"
+          />
+          <button type="button" class="copy-btn dict-delete" onclick={() => removeTtsDictionaryEntry(index)}>削除</button>
+        </div>
+      {/each}
     </div>
   </section>
 
@@ -764,6 +819,42 @@
   .save-btn { background: #1976d2; color: #fff; padding: 7px 18px; }
   .save-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
+  .dict-editor {
+    margin-top: 10px;
+  }
+
+  .dict-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    justify-content: space-between;
+    color: #ccc;
+    font-size: 13px;
+    font-weight: 600;
+  }
+
+  .dict-row {
+    display: grid;
+    grid-template-columns: auto minmax(120px, 1fr) auto minmax(120px, 1fr) auto;
+    gap: 6px;
+    align-items: center;
+    margin-top: 6px;
+  }
+
+  .dict-label {
+    color: #9e9e9e;
+    font-size: 11px;
+    font-family: monospace;
+  }
+
+  .dict-input {
+    min-width: 0;
+  }
+
+  .dict-delete {
+    background: #4e342e;
+  }
+
   .obs-label {
     margin-top: 8px;
     color: #bdbdbd;
@@ -824,4 +915,15 @@
   }
 
   .save-ok { color: #66bb6a; font-size: 12px; }
+
+  @media (max-width: 720px) {
+    .dict-row {
+      grid-template-columns: auto minmax(0, 1fr);
+    }
+
+    .dict-delete {
+      grid-column: 2;
+      justify-self: flex-start;
+    }
+  }
 </style>

@@ -116,6 +116,11 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
 // Mirror of Rust `TtsOptions` (src-tauri/src/config.rs), serde camelCase.
 // All fields optional so partially-written configs deserialize cleanly and the
 // UI can read individual keys without asserting the whole object is present.
+export interface TtsDictEntry {
+  from: string;
+  to: string;
+}
+
 export interface TtsOptions {
   bouyomiHost?: string;
   bouyomiPort?: number;
@@ -134,6 +139,7 @@ export interface TtsOptions {
   omitUrl?: boolean;
   stripEmoji?: boolean;
   maxLength?: number;
+  dictionary?: TtsDictEntry[];
 }
 
 export interface AppConfig {
