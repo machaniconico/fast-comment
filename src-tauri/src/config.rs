@@ -98,6 +98,33 @@ pub struct GoalsConfig {
     pub likes: u32,
 }
 
+/// コメント本文に反応してアプリ内エフェクトを表示するルール。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EffectRule {
+    /// 大文字小文字を区別せずに本文へ単純 includes するキーワード。
+    #[serde(default)]
+    pub keyword: String,
+    /// 表示する文字列。絵文字以外も許可する。
+    #[serde(default)]
+    pub emoji: String,
+    /// 1回の一致で生成するパーティクル数。
+    #[serde(default = "default_effect_count")]
+    pub count: u32,
+}
+
+/// コメント連動エフェクト設定。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct EffectsConfig {
+    /// アプリ内コメント連動エフェクトを有効にするか。既定 false。
+    #[serde(default)]
+    pub enabled: bool,
+    /// キーワード一致ルール。
+    #[serde(default)]
+    pub rules: Vec<EffectRule>,
+}
+
 /// TTS(読み上げ)設定。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -329,6 +356,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub goals: GoalsConfig,
     #[serde(default)]
+    pub effects: EffectsConfig,
+    #[serde(default)]
     pub tts: TtsConfig,
     #[serde(default)]
     pub moderation: ModerationConfig,
@@ -346,6 +375,7 @@ impl Default for AppConfig {
             channels: Vec::new(),
             obs: ObsConfig::default(),
             goals: GoalsConfig::default(),
+            effects: EffectsConfig::default(),
             tts: TtsConfig::default(),
             moderation: ModerationConfig::default(),
             ui: UiConfig::default(),
@@ -466,6 +496,9 @@ fn default_max_read_len() -> usize {
 fn default_participation_keyword() -> String {
     "参加".to_string()
 }
+fn default_effect_count() -> u32 {
+    12
+}
 
 #[cfg(test)]
 mod tests {
@@ -503,6 +536,14 @@ mod tests {
                 comments: 100,
                 viewers: 50,
                 likes: 25,
+            },
+            effects: EffectsConfig {
+                enabled: true,
+                rules: vec![EffectRule {
+                    keyword: "party".to_string(),
+                    emoji: "🎉".to_string(),
+                    count: 24,
+                }],
             },
             tts: TtsConfig {
                 backend: TtsBackendKind::Voicevox,
@@ -574,6 +615,10 @@ mod tests {
         assert_eq!(json["goals"]["comments"].as_u64(), Some(100));
         assert_eq!(json["goals"]["viewers"].as_u64(), Some(50));
         assert_eq!(json["goals"]["likes"].as_u64(), Some(25));
+        assert_eq!(json["effects"]["enabled"].as_bool(), Some(true));
+        assert_eq!(json["effects"]["rules"][0]["keyword"].as_str(), Some("party"));
+        assert_eq!(json["effects"]["rules"][0]["emoji"].as_str(), Some("🎉"));
+        assert_eq!(json["effects"]["rules"][0]["count"].as_u64(), Some(24));
         assert_eq!(json["ui"]["maxBuffer"].as_u64(), Some(1234));
         assert_eq!(json["ui"]["showDonationPanel"].as_bool(), Some(true));
         assert_eq!(json["ui"]["notifySound"].as_bool(), Some(true));
@@ -698,6 +743,9 @@ mod tests {
         assert_eq!(cfg.goals.comments, 0);
         assert_eq!(cfg.goals.viewers, 0);
         assert_eq!(cfg.goals.likes, 0);
+        assert_eq!(cfg.effects, EffectsConfig::default());
+        assert!(!cfg.effects.enabled);
+        assert!(cfg.effects.rules.is_empty());
         assert_eq!(cfg.tts.backend, TtsBackendKind::WebSpeech);
         assert_eq!(cfg.tts.options.bouyomi_host, default_bouyomi_host());
         assert_eq!(cfg.tts.options.bouyomi_host, "127.0.0.1");
@@ -782,6 +830,7 @@ mod tests {
         assert_eq!(cfg.obs.position, default_obs_position());
         assert_eq!(cfg.obs.show_platform, default_true());
         assert_eq!(cfg.goals, GoalsConfig::default());
+        assert_eq!(cfg.effects, EffectsConfig::default());
         assert_eq!(cfg.tts.backend, TtsBackendKind::Bouyomi);
         assert_eq!(cfg.tts.options.bouyomi_host, default_bouyomi_host());
         assert_eq!(cfg.tts.options.bouyomi_port, 50003);
@@ -874,6 +923,46 @@ mod tests {
         assert_eq!(json["showInApp"].as_bool(), Some(true));
 
         let decoded: GoalsConfig = serde_json::from_str(&text).expect("deserialize goals config");
+        assert_eq!(decoded, cfg);
+    }
+
+    #[test]
+    fn effects_config_defaults_and_roundtrips() {
+        let legacy_effects: EffectsConfig = serde_json::from_str(
+            r#"{
+                "enabled": true,
+                "rules": [
+                    {
+                        "keyword": "nice",
+                        "emoji": "✨"
+                    }
+                ]
+            }"#,
+        )
+        .expect("deserialize legacy effects config");
+        assert!(legacy_effects.enabled);
+        assert_eq!(legacy_effects.rules.len(), 1);
+        assert_eq!(legacy_effects.rules[0].keyword, "nice");
+        assert_eq!(legacy_effects.rules[0].emoji, "✨");
+        assert_eq!(legacy_effects.rules[0].count, default_effect_count());
+
+        let cfg = EffectsConfig {
+            enabled: true,
+            rules: vec![EffectRule {
+                keyword: "party".to_string(),
+                emoji: "🎉".to_string(),
+                count: 24,
+            }],
+        };
+        let text = serde_json::to_string(&cfg).expect("serialize effects config");
+        let json: serde_json::Value = serde_json::from_str(&text).expect("parse effects json");
+        assert_eq!(json["enabled"].as_bool(), Some(true));
+        assert_eq!(json["rules"][0]["keyword"].as_str(), Some("party"));
+        assert_eq!(json["rules"][0]["emoji"].as_str(), Some("🎉"));
+        assert_eq!(json["rules"][0]["count"].as_u64(), Some(24));
+
+        let decoded: EffectsConfig =
+            serde_json::from_str(&text).expect("deserialize effects config");
         assert_eq!(decoded, cfg);
     }
 

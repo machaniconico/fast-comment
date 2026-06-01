@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
-  import type { AppConfig, GoalsConfig, TtsDictEntry, TtsOptions } from '../ipc';
+  import type { AppConfig, EffectRule, EffectsConfig, GoalsConfig, TtsDictEntry, TtsOptions } from '../ipc';
   import {
     getConfig, setConfig, getObsUrl, getObsGoalsUrl, exportCommentsCsv
   } from '../ipc';
@@ -123,6 +123,7 @@
       config.tts.options.dictionary = ttsDictionary;
       normalizeObsConfig(true);
       normalizeGoalsConfig();
+      normalizeEffectsConfig();
       normalizeParticipationConfig();
     }
 
@@ -264,6 +265,37 @@
     editable.goals.likes = clampInt(editable.goals.likes, 0, 0, 4294967295);
   }
 
+  function defaultEffects(): EffectsConfig {
+    return { enabled: false, rules: [] };
+  }
+
+  function normalizeEffectsConfig() {
+    if (!config) return;
+    const editable = config as AppConfig & { effects?: Partial<EffectsConfig> };
+    if (!editable.effects) editable.effects = defaultEffects();
+    editable.effects.enabled = editable.effects.enabled === true;
+    editable.effects.rules = normalizeEffectRules(editable.effects.rules);
+  }
+
+  function normalizeEffectRules(rules: Partial<EffectRule>[] | undefined): EffectRule[] {
+    return (rules ?? []).map((rule) => ({
+      keyword: typeof rule.keyword === 'string' ? rule.keyword : '',
+      emoji: typeof rule.emoji === 'string' ? rule.emoji : '',
+      count: clampInt(rule.count, 12, 0, 4294967295)
+    }));
+  }
+
+  function addEffectRule() {
+    if (!config) return;
+    normalizeEffectsConfig();
+    config.effects.rules = [...config.effects.rules, { keyword: '', emoji: '🎉', count: 12 }];
+  }
+
+  function removeEffectRule(index: number) {
+    if (!config) return;
+    config.effects.rules = config.effects.rules.filter((_, i) => i !== index);
+  }
+
   function normalizeWebSpeechSettings() {
     webSpeechRate = clampNumber(webSpeechRate, 1, 0.5, 2);
     webSpeechPitch = clampNumber(webSpeechPitch, 1, 0, 2);
@@ -312,6 +344,7 @@
     config.obs.ttlMs = ttlMsFromSeconds(obsTtlSeconds);
     normalizeObsConfig(false);
     normalizeGoalsConfig();
+    normalizeEffectsConfig();
     normalizeParticipationConfig();
     try {
       await setConfig(config);
@@ -692,6 +725,56 @@
     <p class="hint">コメント・視聴者・高評価の目標ゲージをOBSに表示します。</p>
   </section>
 
+  <!-- ── Effects ── -->
+  <section id="settings-effects">
+    <h3>コメントエフェクト</h3>
+    <div class="field-row">
+      <label for="effects-enabled">有効化</label>
+      <input id="effects-enabled" type="checkbox" bind:checked={config.effects.enabled} class="chk" />
+    </div>
+
+    <div class="dict-editor">
+      <div class="dict-header">
+        <span>キーワードルール</span>
+        <button type="button" class="copy-btn" onclick={addEffectRule}>行追加</button>
+      </div>
+      {#if config.effects.rules.length === 0}
+        <p class="hint">コメント本文にキーワードが含まれると、指定した文字列をアプリ内に表示します。</p>
+      {/if}
+      {#each config.effects.rules as rule, index (rule)}
+        <div class="effect-row">
+          <label for={`effect-keyword-${index}`} class="dict-label">keyword</label>
+          <input
+            id={`effect-keyword-${index}`}
+            type="text"
+            bind:value={rule.keyword}
+            class="id-input dict-input"
+            placeholder="キーワード"
+          />
+          <label for={`effect-emoji-${index}`} class="dict-label">emoji</label>
+          <input
+            id={`effect-emoji-${index}`}
+            type="text"
+            bind:value={rule.emoji}
+            class="id-input effect-emoji-input"
+            placeholder="🎉"
+          />
+          <label for={`effect-count-${index}`} class="dict-label">count</label>
+          <input
+            id={`effect-count-${index}`}
+            type="number"
+            min="0"
+            max="4294967295"
+            step="1"
+            bind:value={rule.count}
+            class="num-input"
+          />
+          <button type="button" class="copy-btn dict-delete" onclick={() => removeEffectRule(index)}>削除</button>
+        </div>
+      {/each}
+    </div>
+  </section>
+
   <!-- ── Participation ── -->
   <section id="settings-participation">
     <h3>参加型</h3>
@@ -897,6 +980,14 @@
     margin-top: 6px;
   }
 
+  .effect-row {
+    display: grid;
+    grid-template-columns: auto minmax(120px, 1fr) auto minmax(70px, 120px) auto 90px auto;
+    gap: 6px;
+    align-items: center;
+    margin-top: 6px;
+  }
+
   .dict-label {
     color: #9e9e9e;
     font-size: 11px;
@@ -904,6 +995,10 @@
   }
 
   .dict-input {
+    min-width: 0;
+  }
+
+  .effect-emoji-input {
     min-width: 0;
   }
 
@@ -978,6 +1073,10 @@
 
   @media (max-width: 720px) {
     .dict-row {
+      grid-template-columns: auto minmax(0, 1fr);
+    }
+
+    .effect-row {
       grid-template-columns: auto minmax(0, 1fr);
     }
 

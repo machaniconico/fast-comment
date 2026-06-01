@@ -155,6 +155,7 @@ export interface AppConfig {
     showPlatform: boolean;
   };
   goals: GoalsConfig;
+  effects: EffectsConfig;
   tts: { backend: 'bouyomi' | 'voicevox' | 'webSpeech' | 'none'; options: TtsOptions };
   moderation: { ngWords: string[]; ngUsers: string[]; highlights: string[] };
   ui: { maxBuffer: number; showDonationPanel: boolean; notifySound: boolean; notifyVolume: number };
@@ -168,6 +169,17 @@ export interface GoalsConfig {
   comments: number;
   viewers: number;
   likes: number;
+}
+
+export interface EffectRule {
+  keyword: string;
+  emoji: string;
+  count: number;
+}
+
+export interface EffectsConfig {
+  enabled: boolean;
+  rules: EffectRule[];
 }
 
 export interface GoalsSnapshot {

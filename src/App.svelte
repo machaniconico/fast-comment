@@ -3,6 +3,7 @@
   import type { Platform } from './lib/types';
   import CommentList from './lib/components/CommentList.svelte';
   import DonationPanel from './lib/components/DonationPanel.svelte';
+  import Effects from './lib/components/Effects.svelte';
   import GoalsBar from './lib/components/GoalsBar.svelte';
   import PinnedStrip from './lib/components/PinnedStrip.svelte';
   import Participation from './lib/components/Participation.svelte';
@@ -51,8 +52,13 @@
     return cfg?.goals?.enabled === true && cfg?.goals?.showInApp === true;
   }
 
+  function isEffectsEnabled(cfg: AppConfig | null): boolean {
+    return cfg?.effects?.enabled === true;
+  }
+
   const showDonationPanel = $derived(isDonationPanelEnabled(config));
   const showGoalsBar = $derived(isGoalsBarEnabled(config));
+  const showEffects = $derived(isEffectsEnabled(config));
 
   $effect(() => {
     if (!showDonationPanel && ui.activeTab === 'donations') ui.setTab('comments');
@@ -111,7 +117,7 @@
   }
 
   function onSettingsSaved(nextConfig: AppConfig) {
-    config = { ...nextConfig, ui: { ...nextConfig.ui } };
+    config = { ...nextConfig, ui: { ...nextConfig.ui }, effects: { ...nextConfig.effects } };
   }
 
   async function onUpdateDownloadClick(e: MouseEvent) {
@@ -127,6 +133,10 @@
 </script>
 
 <svelte:window onkeydown={onWindowKey} />
+
+{#if showEffects && config?.effects}
+  <Effects config={config.effects} />
+{/if}
 
 <div class="app">
   {#if updateStatus?.updateAvailable && !updateDismissed}
