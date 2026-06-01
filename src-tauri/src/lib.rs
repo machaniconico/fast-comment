@@ -124,10 +124,24 @@ fn update_config(
     // 最新の youtube_overrides を読む(#8 / SPEC §4.2「再ビルド無しで overrides 反映」)。
     let committed_config = new_config.clone();
     *state.config.lock().unwrap() = new_config;
-    let _ = state.config_tx.send(committed_config);
+    let _ = state.config_tx.send(committed_config.clone());
 
     // チャンネル差分適用(コミット済み設定を参照する)。
     apply_channel_diff(&app, &state, &desired_channels);
+
+    // 棒読みちゃん自動起動: 設定保存時にも(起動時だけでなく)未起動なら立ち上げる。
+    // パスを設定した直後に効くようにする。ensure_launched 側で TCP 接続を確認し、
+    // 既起動なら何もしないため、保存のたびに呼んでも無害。
+    if committed_config.tts.backend == config::TtsBackendKind::Bouyomi {
+        let path = committed_config.tts.options.bouyomi_path.trim().to_string();
+        if !path.is_empty() {
+            let host = committed_config.tts.options.bouyomi_host.clone();
+            let port = committed_config.tts.options.bouyomi_port;
+            tauri::async_runtime::spawn_blocking(move || {
+                bouyomi::ensure_launched(path, host, port);
+            });
+        }
+    }
 
     Ok(())
 }

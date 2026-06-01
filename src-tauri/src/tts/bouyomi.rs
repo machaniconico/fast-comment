@@ -16,7 +16,8 @@
 
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::process::Command;
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream as TokioTcpStream;
@@ -30,10 +31,19 @@ const CHARCODE_UTF8: u8 = 0;
 const SPEAK_TIMEOUT: Duration = Duration::from_secs(3);
 const LAUNCH_CHECK_TIMEOUT: Duration = Duration::from_millis(300);
 
+/// 起動試行のクールダウン。棒読みちゃんは spawn 後 TCP を listen し始めるまで
+/// 数秒かかるため、その間に再度 ensure_launched が呼ばれても二重起動しないよう、
+/// 直近の起動試行からこの時間内は再 spawn を抑止する。
+const LAUNCH_COOLDOWN: Duration = Duration::from_secs(15);
+
+/// 最後に起動を試みた時刻(プロセス全体で共有)。重複起動防止に用いる。
+static LAST_LAUNCH_ATTEMPT: Mutex<Option<Instant>> = Mutex::new(None);
+
 /// 棒読みちゃんが未起動なら、指定された exe を起動する。
 pub fn ensure_launched(path: String, host: String, port: u16) {
     let path = path.trim().to_string();
     if path.is_empty() {
+        tracing::info!("棒読みちゃん: パス未設定のため自動起動しません");
         return;
     }
 
@@ -51,13 +61,41 @@ pub fn ensure_launched(path: String, host: String, port: u16) {
 
     if let Some(addr) = addr {
         if TcpStream::connect_timeout(&addr, LAUNCH_CHECK_TIMEOUT).is_ok() {
+            tracing::info!("棒読みちゃん: 既に {addr} で応答があるため自動起動しません");
             return;
         }
     }
+    tracing::info!("棒読みちゃん: 未応答のため自動起動を試みます: {path}");
 
-    match Command::new(&path).spawn() {
+    // 重複起動防止: TCP 未応答でも、直近に起動を試みた直後なら棒読みちゃんがまだ
+    // 起動処理中(listen 開始前)であり得る。クールダウン内なら再 spawn しない。
+    {
+        let mut last = LAST_LAUNCH_ATTEMPT.lock().unwrap();
+        if let Some(t) = *last {
+            if t.elapsed() < LAUNCH_COOLDOWN {
+                tracing::info!("棒読みちゃん: 直近に起動を試みたばかり(起動処理中とみなし)、再起動をスキップします");
+                return;
+            }
+        }
+        *last = Some(Instant::now());
+    }
+
+    let mut cmd = Command::new(&path);
+    // BouyomiChan は自身のフォルダを基準に設定/辞書を読むため、作業ディレクトリを
+    // exe のあるフォルダに合わせる(別 cwd から起動すると初期化に失敗し即終了することがある)。
+    if let Some(dir) = std::path::Path::new(&path).parent() {
+        if !dir.as_os_str().is_empty() {
+            cmd.current_dir(dir);
+        }
+    }
+    match cmd.spawn() {
         Ok(_) => tracing::info!("棒読みちゃんを自動起動しました: {path}"),
-        Err(e) => tracing::warn!("棒読みちゃんの自動起動に失敗: {path}: {e}"),
+        Err(e) => {
+            tracing::warn!("棒読みちゃんの自動起動に失敗: {path}: {e}");
+            // 起動に失敗した場合はクールダウンを解除し、次回(パス修正後など)に
+            // 即座に再試行できるようにする。失敗試行で 15 秒ブロックしない。
+            *LAST_LAUNCH_ATTEMPT.lock().unwrap() = None;
+        }
     }
 }
 
