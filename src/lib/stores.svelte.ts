@@ -30,6 +30,23 @@ function buildSearch(m: ChatMessage): string {
   return (m.author.name + ' ' + body).toLowerCase();
 }
 
+/** RFC 4180-style CSV cell escaping. Always quote cells for Excel-safe output. */
+export function escapeCsvCell(value: unknown): string {
+  const text = value == null ? '' : String(value);
+  return `"${text.replace(/"/g, '""')}"`;
+}
+
+function messageText(m: ChatMessage): string {
+  return m.fragments.map((f) => (f.type === 'text' ? f.text : f.name)).join('');
+}
+
+function amountText(m: ChatMessage): string {
+  if (!m.amount) return '';
+  if (m.amount.rawText) return m.amount.rawText;
+  const currency = m.amount.currency ? ` ${m.amount.currency}` : '';
+  return `${m.amount.value}${currency}`;
+}
+
 /** Stable viewer key. Falls back to name only when the backend has no author id. */
 function viewerKey(m: ChatMessage): string | null {
   const scope = `${m.platform}\0${m.channel}`;
@@ -312,6 +329,22 @@ class CommentStore {
     this._pinned = [];
   }
 
+  buildCsv(): string {
+    const rows = [
+      ['timestamp', 'platform', 'channel', 'author', 'kind', 'text', 'amount'],
+      ...this._buf.map(({ msg }) => [
+        Number.isFinite(msg.timestampMs) ? new Date(msg.timestampMs).toISOString() : '',
+        msg.platform,
+        msg.channel,
+        msg.author.name,
+        msg.kind,
+        messageText(msg),
+        amountText(msg),
+      ]),
+    ];
+    return `${rows.map((row) => row.map(escapeCsvCell).join(',')).join('\r\n')}\r\n`;
+  }
+
   /** Call once from App.svelte onMount to start Tauri IPC listeners. */
   async init(): Promise<() => void> {
     const config = await getConfig();
@@ -348,4 +381,5 @@ export function setFilterPlatform(p: Platform | 'all'): void { store.setFilterPl
 export function setSearchQuery(q: string): void { store.setSearchQuery(q); }
 export function setMaxBuffer(n: number): void { store.setMaxBuffer(n); }
 export function clearMessages(): void { store.clearMessages(); }
+export function buildCsv(): string { return store.buildCsv(); }
 export async function initStore(): Promise<() => void> { return store.init(); }

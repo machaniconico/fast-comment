@@ -21,6 +21,7 @@ pub mod tts;
 mod update;
 
 use std::collections::HashMap;
+use std::fs;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -91,6 +92,31 @@ impl AppState {
 #[tauri::command]
 fn get_config(state: State<'_, AppState>) -> Result<AppConfig, String> {
     Ok(state.config.lock().unwrap().clone())
+}
+
+/// 現在のコメントログ CSV を config dir 配下 `exports/` に書き出す。
+#[tauri::command]
+fn export_comments_csv(app: AppHandle, csv: String) -> Result<String, String> {
+    let config_dir = app
+        .path()
+        .app_config_dir()
+        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let exports_dir = config_dir.join("exports");
+    fs::create_dir_all(&exports_dir)
+        .map_err(|e| format!("CSV出力ディレクトリ作成失敗 {}: {e}", exports_dir.display()))?;
+
+    let epoch_millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| format!("現在時刻取得失敗: {e}"))?
+        .as_millis();
+    let path = exports_dir.join(format!("comments_{epoch_millis}.csv"));
+    let mut body = String::with_capacity(csv.len() + 3);
+    body.push('\u{feff}');
+    body.push_str(&csv);
+    fs::write(&path, body.as_bytes())
+        .map_err(|e| format!("CSVファイル書込失敗 {}: {e}", path.display()))?;
+
+    Ok(path.to_string_lossy().into_owned())
 }
 
 /// 設定全体を更新して保存する。moderation/tts/obs などの実行時状態も反映する。
@@ -694,6 +720,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_config,
+            export_comments_csv,
             update_config,
             add_channel,
             remove_channel,

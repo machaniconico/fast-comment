@@ -216,6 +216,10 @@ export async function getConfig(): Promise<AppConfig | null> {
   return invoke<AppConfig>('get_config');
 }
 
+export async function exportCommentsCsv(csv: string): Promise<string | null> {
+  return invoke<string>('export_comments_csv', { csv });
+}
+
 export async function setConfig(config: AppConfig): Promise<void> {
   // Rust command is `update_config(new_config)`; Tauri maps the snake_case
   // param `new_config` to the JS key `newConfig`.

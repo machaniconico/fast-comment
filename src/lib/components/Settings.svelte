@@ -2,10 +2,10 @@
   import { onMount, onDestroy } from 'svelte';
   import type { AppConfig, GoalsConfig, TtsDictEntry, TtsOptions } from '../ipc';
   import {
-    getConfig, setConfig, getObsUrl, getObsGoalsUrl
+    getConfig, setConfig, getObsUrl, getObsGoalsUrl, exportCommentsCsv
   } from '../ipc';
   import { ui, SETTINGS_ANCHOR_IDS } from '../ui.svelte';
-  import { setNotify } from '../stores.svelte';
+  import { buildCsv, setNotify, store } from '../stores.svelte';
 
   interface Props {
     onConfigSaved?: (config: AppConfig) => void;
@@ -19,6 +19,7 @@
   let copiedObs: boolean = $state(false);
   let copiedGiftObs: boolean = $state(false);
   let copiedGoalsObs: boolean = $state(false);
+  let copiedCsvPath: boolean = $state(false);
 
   // NG / highlight edit buffers
   let ngWordsText: string = $state('');
@@ -30,6 +31,9 @@
 
   let saving: boolean = $state(false);
   let saveMsg: string = $state('');
+  let exportingCsv: boolean = $state(false);
+  let csvExportPath: string = $state('');
+  let csvExportMsg: string = $state('');
 
   // Scroll to settings section when the command palette sets a settingsAnchor.
   // Gate on `config`: the tts/obs/moderation sections live inside {#if config},
@@ -53,6 +57,7 @@
   let copiedObsTimer: ReturnType<typeof setTimeout> | null = null;
   let copiedGiftObsTimer: ReturnType<typeof setTimeout> | null = null;
   let copiedGoalsObsTimer: ReturnType<typeof setTimeout> | null = null;
+  let copiedCsvPathTimer: ReturnType<typeof setTimeout> | null = null;
 
   // ── TTS options accessors (config.tts.options mirrors Rust TtsOptions) ──
   // Keys are partitioned by value type so reads/writes stay type-checked
@@ -137,6 +142,7 @@
     if (copiedObsTimer !== null) clearTimeout(copiedObsTimer);
     if (copiedGiftObsTimer !== null) clearTimeout(copiedGiftObsTimer);
     if (copiedGoalsObsTimer !== null) clearTimeout(copiedGoalsObsTimer);
+    if (copiedCsvPathTimer !== null) clearTimeout(copiedCsvPathTimer);
     if (speechVoicesListenerAttached && typeof window !== 'undefined' && 'speechSynthesis' in window) {
       window.speechSynthesis.removeEventListener('voiceschanged', refreshSpeechVoices);
       speechVoicesListenerAttached = false;
@@ -350,6 +356,35 @@
       copiedGoalsObs = true;
       if (copiedGoalsObsTimer !== null) clearTimeout(copiedGoalsObsTimer);
       copiedGoalsObsTimer = setTimeout(() => { copiedGoalsObs = false; copiedGoalsObsTimer = null; }, 1500);
+    });
+  }
+
+  async function onExportCommentsCsv() {
+    if (store.totalCount === 0 || exportingCsv) return;
+    exportingCsv = true;
+    csvExportMsg = '';
+    csvExportPath = '';
+    try {
+      const path = await exportCommentsCsv(buildCsv());
+      if (path) {
+        csvExportPath = path;
+        csvExportMsg = 'CSVを出力しました';
+      } else {
+        csvExportMsg = 'Tauri環境でのみCSV出力できます';
+      }
+    } catch (e) {
+      csvExportMsg = `CSV出力に失敗しました: ${e instanceof Error ? e.message : String(e)}`;
+    } finally {
+      exportingCsv = false;
+    }
+  }
+
+  function onCopyCsvPath() {
+    if (!csvExportPath) return;
+    copyText(csvExportPath, () => {
+      copiedCsvPath = true;
+      if (copiedCsvPathTimer !== null) clearTimeout(copiedCsvPathTimer);
+      copiedCsvPathTimer = setTimeout(() => { copiedCsvPath = false; copiedCsvPathTimer = null; }, 1500);
     });
   }
 </script>
@@ -745,6 +780,26 @@
     </div>
   </section>
 
+  <!-- ── Export ── -->
+  <section id="settings-export">
+    <h3>エクスポート</h3>
+    <div class="field-row">
+      <button class="export-btn" onclick={onExportCommentsCsv} disabled={exportingCsv || store.totalCount === 0}>
+        {exportingCsv ? 'CSV出力中...' : 'コメントログをCSV出力'}
+      </button>
+      <span class="hint-inline">保持中 {store.totalCount} 件</span>
+    </div>
+    {#if csvExportMsg}<p class="hint">{csvExportMsg}</p>{/if}
+    {#if csvExportPath}
+      <div class="obs-row csv-path-row">
+        <input type="text" value={csvExportPath} readonly class="obs-input" />
+        <button class="copy-btn" class:copied={copiedCsvPath} onclick={onCopyCsvPath}>
+          {copiedCsvPath ? 'コピー済' : 'コピー'}
+        </button>
+      </div>
+    {/if}
+  </section>
+
   <!-- ── Save ── -->
   <div class="save-row">
     <button class="save-btn" onclick={onSave} disabled={saving}>
@@ -804,7 +859,7 @@
   .vol-slider { flex: 1; max-width: 160px; accent-color: #1976d2; }
   .vol-slider:disabled { opacity: 0.4; }
 
-  .copy-btn, .save-btn {
+  .copy-btn, .save-btn, .export-btn {
     border: none;
     border-radius: 4px;
     cursor: pointer;
@@ -817,7 +872,8 @@
   .copy-btn { background: #37474f; color: #fff; min-width: 60px; }
   .copy-btn.copied { background: #2e7d32; }
   .save-btn { background: #1976d2; color: #fff; padding: 7px 18px; }
-  .save-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .export-btn { background: #1976d2; color: #fff; padding: 7px 14px; }
+  .save-btn:disabled, .export-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
   .dict-editor {
     margin-top: 10px;
@@ -866,6 +922,10 @@
     display: flex;
     gap: 6px;
     align-items: center;
+  }
+
+  .csv-path-row {
+    margin-top: 6px;
   }
 
   .mod-area {
