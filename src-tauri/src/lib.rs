@@ -101,6 +101,7 @@ impl AppState {
         let p = match ch.platform {
             config::ChannelPlatform::Twitch => "twitch",
             config::ChannelPlatform::Youtube => "youtube",
+            config::ChannelPlatform::Niconico => "niconico",
         };
         format!("{p}:{}", ch.identifier)
     }
@@ -529,7 +530,7 @@ fn add_channel(
     Ok(())
 }
 
-/// チャンネルを1件削除して停止する。`key` は `twitch:name` / `youtube:videoId`。
+/// チャンネルを1件削除して停止する。`key` は `twitch:name` / `youtube:videoId` / `niconico:lvId`。
 #[tauri::command]
 fn remove_channel(state: State<'_, AppState>, key: String) -> Result<(), String> {
     // 起動中タスクを停止。
@@ -843,6 +844,7 @@ fn inject_test_comment(
     let platform = match platform.as_str() {
         "twitch" => Platform::Twitch,
         "youtube" => Platform::Youtube,
+        "niconico" => Platform::Niconico,
         other => return Err(format!("不正な platform です: {other}")),
     };
     let kind = match kind.as_deref().unwrap_or("normal") {
@@ -907,6 +909,7 @@ fn participant_platform(platform: Platform) -> &'static str {
     match platform {
         Platform::Twitch => "twitch",
         Platform::Youtube => "youtube",
+        Platform::Niconico => "niconico",
     }
 }
 

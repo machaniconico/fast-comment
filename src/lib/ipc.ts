@@ -324,13 +324,13 @@ export interface Participant {
 }
 
 export interface ChannelConfig {
-  platform: 'twitch' | 'youtube';
-  identifier: string; // Twitch: channel name, YouTube: videoId
+  platform: 'twitch' | 'youtube' | 'niconico';
+  identifier: string; // Twitch: channel name, YouTube: videoId, Niconico: lv ID
   enabled: boolean; // Rust ChannelConfig.enabled (serde default true)
 }
 
 export interface InjectTestCommentOptions {
-  platform: 'twitch' | 'youtube';
+  platform: 'twitch' | 'youtube' | 'niconico';
   name: string;
   text: string;
   kind?: 'normal' | 'superChat' | 'membership' | 'bits';

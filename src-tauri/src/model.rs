@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 pub enum Platform {
     Twitch,
     Youtube,
+    Niconico,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

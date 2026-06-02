@@ -123,12 +123,14 @@
 
   const TWITCH_HOSTS = new Set(['twitch.tv', 'm.twitch.tv']);
   const YOUTUBE_HOSTS = new Set(['youtube.com', 'm.youtube.com', 'music.youtube.com', 'youtu.be']);
+  const NICONICO_HOSTS = new Set(['live.nicovideo.jp', 'live2.nicovideo.jp']);
   const YOUTUBE_PATH_ID_PREFIXES = new Set(['live', 'embed', 'shorts', 'v']);
   const YOUTUBE_VIDEO_ID_RE = /^[A-Za-z0-9_-]{11}$/;
   const YOUTUBE_CHANNEL_ID_RE = /^UC[A-Za-z0-9_-]{22}$/;
   // YouTube ハンドルは Unicode(日本語等)も許可される。ASCII 限定にすると @まちゃ05 を弾くため
   // Unicode 文字クラスで判定する。
   const YOUTUBE_HANDLE_RE = /^@[\p{L}\p{N}._-]+$/u;
+  const NICONICO_LIVE_ID_RE = /^lv\d+$/i;
   const TWITCH_LOGIN_RE = /^[a-z0-9_]{2,25}$/;
   const TWITCH_RESERVED_PATHS = new Set([
     'about', 'admin', 'bits', 'broadcast', 'clip', 'clips', 'creatorcamp',
@@ -139,7 +141,7 @@
     'turbo', 'user', 'videos', 'wallet', 'whispers'
   ]);
   const SUPPORTED_SCHEMELESS_URL_RE =
-    /^(?:(?:www|m)\.twitch\.tv|twitch\.tv|(?:www|m|music)\.youtube\.com|youtube\.com|youtu\.be)(?::\d{1,5})?(?:[/?#].*)?$/i;
+    /^(?:(?:www|m)\.twitch\.tv|twitch\.tv|(?:www|m|music)\.youtube\.com|youtube\.com|youtu\.be|live2?\.nicovideo\.jp)(?::\d{1,5})?(?:[/?#].*)?$/i;
 
   // スキーム無しの "twitch.tv/foo" / "youtu.be/xxx" 等も URL として拾う。
   function parseUrlLoose(input: string): URL | null {
@@ -235,8 +237,20 @@
     return null;
   }
 
+  // ニコ生 視聴URL(/watch/lvXXXX)から番組IDを抽出する。
+  function extractNiconicoLiveId(url: URL): string | null {
+    const segments = url.pathname.split('/').filter(Boolean);
+    if (segments[0]?.toLowerCase() !== 'watch') return null;
+    const candidate = segments[1]?.toLowerCase() ?? null;
+    return candidate && NICONICO_LIVE_ID_RE.test(candidate) ? candidate : null;
+  }
+
   function detectChannel(input: string): ChannelDetection {
     const raw = input.trim();
+    // 生入力(URLでない): lv番組ID を最優先で判別。
+    if (NICONICO_LIVE_ID_RE.test(raw)) {
+      return { kind: 'detected', platform: 'niconico', identifier: raw.toLowerCase() };
+    }
     const url = parseUrlLoose(raw);
     if (!url) {
       const youtubeChannelIdentifier =
@@ -286,10 +300,22 @@
       };
     }
 
+    if (NICONICO_HOSTS.has(host)) {
+      const id = extractNiconicoLiveId(url);
+      if (id) {
+        return { kind: 'detected', platform: 'niconico', identifier: id };
+      }
+      return {
+        kind: 'known-url',
+        platform: 'niconico',
+        message: 'ニコ生の番組IDが見つかりません。lvから始まる番組IDを入力してください。'
+      };
+    }
+
     return {
       kind: 'unsupported-url',
       host,
-      message: `未対応のURLです (${host})。Twitch/YouTubeの配信URLか識別子を入力してください。`
+      message: `未対応のURLです (${host})。Twitch/YouTube/ニコ生の配信URLか識別子を入力してください。`
     };
   }
 
@@ -305,9 +331,11 @@
     if (detection.kind === 'detected') {
       const label = detection.platform === 'twitch'
         ? 'Twitch'
-        : detection.youtubeKind === 'channel'
-          ? 'YouTubeチャンネル'
-          : 'YouTube動画';
+        : detection.platform === 'niconico'
+          ? 'ニコ生'
+          : detection.youtubeKind === 'channel'
+            ? 'YouTubeチャンネル'
+            : 'YouTube動画';
       return { tone: 'ok', message: `${label} として自動判別:`, identifier: detection.identifier };
     }
     if (detection.kind === 'known-url' || detection.kind === 'unsupported-url') {
@@ -319,7 +347,7 @@
   async function onAddChannel() {
     addError = '';
     const raw = newIdentifier.trim();
-    if (!raw) { addError = 'URL か Twitchチャンネル名 / YouTube動画ID / YouTubeチャンネル指定を入力してください'; return; }
+    if (!raw) { addError = 'URL か Twitchチャンネル名 / YouTube動画ID / YouTubeチャンネル指定 / lv番組ID を入力してください'; return; }
 
     // URL から判別できればそれを優先。生入力は手動選択 + 生ID/名として追加する。
     const det = detectChannel(raw);
@@ -353,18 +381,19 @@
       aria-label="プラットフォーム"
       onchange={(e) => {
         const value = (e.currentTarget as HTMLSelectElement).value;
-        if (value === 'twitch' || value === 'youtube') newPlatform = value;
+        if (value === 'twitch' || value === 'youtube' || value === 'niconico') newPlatform = value;
       }}
     >
       <option value="twitch">Twitch</option>
       <option value="youtube">YouTube</option>
+      <option value="niconico">ニコ生</option>
     </select>
     <input
       type="text"
       bind:value={newIdentifier}
-      placeholder="配信URLを貼り付け（または Twitchチャンネル名 / YouTube動画ID / @handle / チャンネルURL）"
+      placeholder="配信URLを貼り付け（または Twitchチャンネル名 / YouTube動画ID / @handle / lv番組ID）"
       class="id-input"
-      aria-label="配信URL または チャンネル名 / 動画ID / YouTubeチャンネル指定"
+      aria-label="配信URL または チャンネル名 / 動画ID / YouTubeチャンネル / lv番組ID"
       onkeydown={(e) => e.key === 'Enter' && onAddChannel()}
     />
     <button class="add-btn" onclick={onAddChannel}>追加</button>
@@ -389,6 +418,7 @@
           class="chip"
           class:twitch={ch.platform === 'twitch'}
           class:youtube={ch.platform === 'youtube'}
+          class:niconico={ch.platform === 'niconico'}
           class:live={isLive}
           class:idle={isIdle}
           role="listitem"
@@ -494,6 +524,12 @@
     background: rgba(255,0,0,0.12);
   }
   .chip.youtube .chip-dot { background: #ff0000; }
+
+  .chip.niconico {
+    border-color: rgba(255,190,0,0.55);
+    background: rgba(255,190,0,0.12);
+  }
+  .chip.niconico .chip-dot { background: #ffbe00; }
 
   .chip.live .chip-dot {
     animation: live-pulse 1.3s ease-in-out infinite;

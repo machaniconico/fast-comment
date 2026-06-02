@@ -4,6 +4,7 @@
 //! 各 Source は `run()` の中で自前の指数バックオフ再接続を持ち、
 //! 正規化済み `ChatMessage` を `broadcast::Sender` へ流す。
 
+pub mod niconico;
 pub mod twitch;
 pub mod twitch_helix;
 pub mod twitch_send;
@@ -113,6 +114,12 @@ impl SourceManager {
             }
             ChannelPlatform::Youtube => {
                 let src = youtube::YoutubeSource::new(identifier, overrides);
+                tauri::async_runtime::spawn(async move {
+                    run_with_logging(&src, tx, child).await;
+                });
+            }
+            ChannelPlatform::Niconico => {
+                let src = niconico::NiconicoSource::new(identifier);
                 tauri::async_runtime::spawn(async move {
                     run_with_logging(&src, tx, child).await;
                 });
