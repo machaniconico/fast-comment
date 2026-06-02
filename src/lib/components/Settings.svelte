@@ -1,7 +1,8 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
   import type {
-    AppConfig, EffectRule, EffectsConfig, GoalsConfig, InjectTestCommentOptions, TtsDictEntry, TtsOptions
+    AppConfig, EffectRule, EffectsConfig, GoalsConfig, InjectTestCommentOptions, TtsDictEntry, TtsOptions,
+    WelcomeConfig
   } from '../ipc';
   import {
     getConfig, setConfig, getObsUrl, getObsGoalsUrl, exportCommentsCsv, injectTestComment,
@@ -144,6 +145,7 @@
       normalizeObsConfig(true);
       normalizeGoalsConfig();
       normalizeEffectsConfig();
+      normalizeWelcomeConfig();
       normalizeParticipationConfig();
     }
 
@@ -305,6 +307,33 @@
       emoji: typeof rule.emoji === 'string' ? rule.emoji : '',
       count: clampInt(rule.count, 12, 0, 4294967295)
     }));
+  }
+
+  function defaultWelcome(): WelcomeConfig {
+    return {
+      enabled: false,
+      greeting: '{name} さん、いらっしゃい！',
+      tts: false,
+      emoji: '👋',
+      count: 8
+    };
+  }
+
+  function normalizeWelcomeConfig() {
+    if (!config) return;
+    const editable = config as AppConfig & { welcome?: Partial<WelcomeConfig> };
+    if (!editable.welcome) editable.welcome = defaultWelcome();
+    editable.welcome.enabled = editable.welcome.enabled === true;
+    editable.welcome.greeting =
+      typeof editable.welcome.greeting === 'string' && editable.welcome.greeting.trim() !== ''
+        ? editable.welcome.greeting
+        : '{name} さん、いらっしゃい！';
+    editable.welcome.tts = editable.welcome.tts === true;
+    editable.welcome.emoji =
+      typeof editable.welcome.emoji === 'string' && editable.welcome.emoji.trim() !== ''
+        ? editable.welcome.emoji.trim()
+        : '👋';
+    editable.welcome.count = clampInt(editable.welcome.count, 8, 0, 4294967295);
   }
 
   function addEffectRule() {
@@ -471,6 +500,7 @@
     normalizeObsConfig(false);
     normalizeGoalsConfig();
     normalizeEffectsConfig();
+    normalizeWelcomeConfig();
     normalizeParticipationConfig();
     try {
       await setConfig(config);
@@ -992,6 +1022,50 @@
     </div>
   </section>
 
+  <!-- ── Welcome ── -->
+  <section id="settings-welcome">
+    <h3>初見歓迎</h3>
+    <div class="field-row">
+      <label for="welcome-enabled">有効化</label>
+      <input id="welcome-enabled" type="checkbox" bind:checked={config.welcome.enabled} class="chk" />
+    </div>
+    <div class="field-row">
+      <label for="welcome-greeting">挨拶テンプレ</label>
+      <input
+        id="welcome-greeting"
+        type="text"
+        bind:value={config.welcome.greeting}
+        class="id-input"
+        placeholder="{name} さん、いらっしゃい！"
+      />
+      <span class="hint-inline">{'{name}'} を名前に置換</span>
+    </div>
+    <div class="field-row">
+      <label for="welcome-tts">挨拶を読み上げ</label>
+      <input id="welcome-tts" type="checkbox" bind:checked={config.welcome.tts} class="chk" />
+    </div>
+    <div class="field-row">
+      <label for="welcome-emoji">emoji</label>
+      <input
+        id="welcome-emoji"
+        type="text"
+        bind:value={config.welcome.emoji}
+        class="id-input welcome-emoji-input"
+        placeholder="👋"
+      />
+      <label for="welcome-count" class="compact-label">count</label>
+      <input
+        id="welcome-count"
+        type="number"
+        min="0"
+        max="4294967295"
+        step="1"
+        bind:value={config.welcome.count}
+        class="num-input"
+      />
+    </div>
+  </section>
+
   <!-- ── Participation ── -->
   <section id="settings-participation">
     <h3>参加型</h3>
@@ -1226,6 +1300,11 @@
 
   .effect-emoji-input {
     min-width: 0;
+  }
+
+  .welcome-emoji-input {
+    flex: 0 1 120px;
+    min-width: 70px;
   }
 
   .dict-delete {

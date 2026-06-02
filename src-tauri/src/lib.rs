@@ -122,6 +122,46 @@ fn skip_current_tts(app: AppHandle) -> Result<(), String> {
         .map_err(|e| format!("TTSキャンセルイベント送信失敗: {e}"))
 }
 
+/// 任意テキストを TTS キューへ直接投入する。UI/OBS には流さない。
+#[tauri::command]
+fn tts_speak_text(state: State<'_, AppState>, text: String) -> Result<(), String> {
+    if text.trim().is_empty() {
+        return Ok(());
+    }
+    let epoch_millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| format!("現在時刻取得失敗: {e}"))?
+        .as_millis();
+    let timestamp_ms = i64::try_from(epoch_millis).unwrap_or(i64::MAX);
+    let msg = ChatMessage {
+        id: format!("tts-text-{epoch_millis}"),
+        platform: Platform::Youtube,
+        channel: "system".to_string(),
+        author: Author {
+            id: String::new(),
+            name: String::new(),
+            display_color: None,
+            badges: Vec::new(),
+            roles: Roles::default(),
+        },
+        fragments: vec![Fragment::text(text)],
+        kind: MessageKind::System,
+        amount: None,
+        timestamp_ms,
+        raw: None,
+        skip_tts: false,
+    };
+
+    match state.tts_tx.try_send(msg) {
+        Ok(()) => Ok(()),
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            tracing::debug!("TTS キュー満杯につき任意テキスト読み上げを drop");
+            Ok(())
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => Err("TTS キューが閉じています".to_string()),
+    }
+}
+
 /// 現在のコメントログ CSV を config dir 配下 `exports/` に書き出す。
 #[tauri::command]
 fn export_comments_csv(app: AppHandle, csv: String) -> Result<String, String> {
@@ -837,6 +877,7 @@ pub fn run() {
             set_tts_paused,
             clear_tts_queue,
             skip_current_tts,
+            tts_speak_text,
             export_comments_csv,
             update_config,
             add_channel,

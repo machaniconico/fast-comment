@@ -174,6 +174,7 @@ export interface AppConfig {
   };
   goals: GoalsConfig;
   effects: EffectsConfig;
+  welcome: WelcomeConfig;
   tts: { backend: 'bouyomi' | 'voicevox' | 'webSpeech' | 'none'; options: TtsOptions };
   moderation: { ngWords: string[]; ngUsers: string[]; highlights: string[] };
   ui: { maxBuffer: number; showDonationPanel: boolean; notifySound: boolean; notifyVolume: number };
@@ -198,6 +199,14 @@ export interface EffectRule {
 export interface EffectsConfig {
   enabled: boolean;
   rules: EffectRule[];
+}
+
+export interface WelcomeConfig {
+  enabled: boolean;
+  greeting: string;
+  tts: boolean;
+  emoji: string;
+  count: number;
 }
 
 export interface GoalsSnapshot {
@@ -275,6 +284,10 @@ export async function clearTtsQueue(): Promise<void> {
 
 export async function skipCurrentTts(): Promise<void> {
   await invoke<void>('skip_current_tts');
+}
+
+export async function ttsSpeakText(text: string): Promise<void> {
+  await invoke<void>('tts_speak_text', { text });
 }
 
 export async function addChannel(channel: ChannelConfig): Promise<void> {

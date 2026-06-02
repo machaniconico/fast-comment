@@ -125,6 +125,39 @@ pub struct EffectsConfig {
     pub rules: Vec<EffectRule>,
 }
 
+/// セッション初コメント視聴者への歓迎演出設定。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WelcomeConfig {
+    /// 初見歓迎演出を有効にするか。既定 false。
+    #[serde(default)]
+    pub enabled: bool,
+    /// 挨拶テンプレート。`{name}` を視聴者名に置換する。
+    #[serde(default = "default_welcome_greeting")]
+    pub greeting: String,
+    /// 挨拶を TTS で読み上げるか。既定 false。
+    #[serde(default)]
+    pub tts: bool,
+    /// パーティクルに使う文字列。既定 "👋"。
+    #[serde(default = "default_welcome_emoji")]
+    pub emoji: String,
+    /// 生成するパーティクル数。既定 8。
+    #[serde(default = "default_welcome_count")]
+    pub count: u32,
+}
+
+impl Default for WelcomeConfig {
+    fn default() -> Self {
+        WelcomeConfig {
+            enabled: false,
+            greeting: default_welcome_greeting(),
+            tts: false,
+            emoji: default_welcome_emoji(),
+            count: default_welcome_count(),
+        }
+    }
+}
+
 /// TTS(読み上げ)設定。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -358,6 +391,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub effects: EffectsConfig,
     #[serde(default)]
+    pub welcome: WelcomeConfig,
+    #[serde(default)]
     pub tts: TtsConfig,
     #[serde(default)]
     pub moderation: ModerationConfig,
@@ -376,6 +411,7 @@ impl Default for AppConfig {
             obs: ObsConfig::default(),
             goals: GoalsConfig::default(),
             effects: EffectsConfig::default(),
+            welcome: WelcomeConfig::default(),
             tts: TtsConfig::default(),
             moderation: ModerationConfig::default(),
             ui: UiConfig::default(),
@@ -499,6 +535,15 @@ fn default_participation_keyword() -> String {
 fn default_effect_count() -> u32 {
     12
 }
+fn default_welcome_greeting() -> String {
+    "{name} さん、いらっしゃい！".to_string()
+}
+fn default_welcome_emoji() -> String {
+    "👋".to_string()
+}
+fn default_welcome_count() -> u32 {
+    8
+}
 
 #[cfg(test)]
 mod tests {
@@ -544,6 +589,13 @@ mod tests {
                     emoji: "🎉".to_string(),
                     count: 24,
                 }],
+            },
+            welcome: WelcomeConfig {
+                enabled: true,
+                greeting: "{name} さん、ようこそ！".to_string(),
+                tts: true,
+                emoji: "🌟".to_string(),
+                count: 16,
             },
             tts: TtsConfig {
                 backend: TtsBackendKind::Voicevox,
@@ -619,6 +671,14 @@ mod tests {
         assert_eq!(json["effects"]["rules"][0]["keyword"].as_str(), Some("party"));
         assert_eq!(json["effects"]["rules"][0]["emoji"].as_str(), Some("🎉"));
         assert_eq!(json["effects"]["rules"][0]["count"].as_u64(), Some(24));
+        assert_eq!(json["welcome"]["enabled"].as_bool(), Some(true));
+        assert_eq!(
+            json["welcome"]["greeting"].as_str(),
+            Some("{name} さん、ようこそ！")
+        );
+        assert_eq!(json["welcome"]["tts"].as_bool(), Some(true));
+        assert_eq!(json["welcome"]["emoji"].as_str(), Some("🌟"));
+        assert_eq!(json["welcome"]["count"].as_u64(), Some(16));
         assert_eq!(json["ui"]["maxBuffer"].as_u64(), Some(1234));
         assert_eq!(json["ui"]["showDonationPanel"].as_bool(), Some(true));
         assert_eq!(json["ui"]["notifySound"].as_bool(), Some(true));
@@ -746,6 +806,15 @@ mod tests {
         assert_eq!(cfg.effects, EffectsConfig::default());
         assert!(!cfg.effects.enabled);
         assert!(cfg.effects.rules.is_empty());
+        assert_eq!(cfg.welcome, WelcomeConfig::default());
+        assert!(!cfg.welcome.enabled);
+        assert_eq!(cfg.welcome.greeting, default_welcome_greeting());
+        assert_eq!(cfg.welcome.greeting, "{name} さん、いらっしゃい！");
+        assert!(!cfg.welcome.tts);
+        assert_eq!(cfg.welcome.emoji, default_welcome_emoji());
+        assert_eq!(cfg.welcome.emoji, "👋");
+        assert_eq!(cfg.welcome.count, default_welcome_count());
+        assert_eq!(cfg.welcome.count, 8);
         assert_eq!(cfg.tts.backend, TtsBackendKind::WebSpeech);
         assert_eq!(cfg.tts.options.bouyomi_host, default_bouyomi_host());
         assert_eq!(cfg.tts.options.bouyomi_host, "127.0.0.1");
@@ -831,6 +900,7 @@ mod tests {
         assert_eq!(cfg.obs.show_platform, default_true());
         assert_eq!(cfg.goals, GoalsConfig::default());
         assert_eq!(cfg.effects, EffectsConfig::default());
+        assert_eq!(cfg.welcome, WelcomeConfig::default());
         assert_eq!(cfg.tts.backend, TtsBackendKind::Bouyomi);
         assert_eq!(cfg.tts.options.bouyomi_host, default_bouyomi_host());
         assert_eq!(cfg.tts.options.bouyomi_port, 50003);
@@ -963,6 +1033,40 @@ mod tests {
 
         let decoded: EffectsConfig =
             serde_json::from_str(&text).expect("deserialize effects config");
+        assert_eq!(decoded, cfg);
+    }
+
+    #[test]
+    fn welcome_config_defaults_and_roundtrips() {
+        let legacy_welcome: WelcomeConfig = serde_json::from_str(
+            r#"{
+                "enabled": true
+            }"#,
+        )
+        .expect("deserialize legacy welcome config");
+        assert!(legacy_welcome.enabled);
+        assert_eq!(legacy_welcome.greeting, default_welcome_greeting());
+        assert!(!legacy_welcome.tts);
+        assert_eq!(legacy_welcome.emoji, default_welcome_emoji());
+        assert_eq!(legacy_welcome.count, default_welcome_count());
+
+        let cfg = WelcomeConfig {
+            enabled: true,
+            greeting: "こんにちは、{name}さん".to_string(),
+            tts: true,
+            emoji: "👏".to_string(),
+            count: 18,
+        };
+        let text = serde_json::to_string(&cfg).expect("serialize welcome config");
+        let json: serde_json::Value = serde_json::from_str(&text).expect("parse welcome json");
+        assert_eq!(json["enabled"].as_bool(), Some(true));
+        assert_eq!(json["greeting"].as_str(), Some("こんにちは、{name}さん"));
+        assert_eq!(json["tts"].as_bool(), Some(true));
+        assert_eq!(json["emoji"].as_str(), Some("👏"));
+        assert_eq!(json["count"].as_u64(), Some(18));
+
+        let decoded: WelcomeConfig =
+            serde_json::from_str(&text).expect("deserialize welcome config");
         assert_eq!(decoded, cfg);
     }
 

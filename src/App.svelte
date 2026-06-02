@@ -7,6 +7,7 @@
   import GoalsBar from './lib/components/GoalsBar.svelte';
   import PinnedStrip from './lib/components/PinnedStrip.svelte';
   import Participation from './lib/components/Participation.svelte';
+  import Welcome from './lib/components/Welcome.svelte';
   import Settings from './lib/components/Settings.svelte';
   import ChannelAdd from './lib/components/ChannelAdd.svelte';
   import CommandPalette from './lib/components/CommandPalette.svelte';
@@ -56,9 +57,14 @@
     return cfg?.effects?.enabled === true;
   }
 
+  function isWelcomeEnabled(cfg: AppConfig | null): boolean {
+    return cfg?.welcome?.enabled === true;
+  }
+
   const showDonationPanel = $derived(isDonationPanelEnabled(config));
   const showGoalsBar = $derived(isGoalsBarEnabled(config));
   const showEffects = $derived(isEffectsEnabled(config));
+  const showWelcome = $derived(isWelcomeEnabled(config));
 
   $effect(() => {
     if (!showDonationPanel && ui.activeTab === 'donations') ui.setTab('comments');
@@ -117,7 +123,12 @@
   }
 
   function onSettingsSaved(nextConfig: AppConfig) {
-    config = { ...nextConfig, ui: { ...nextConfig.ui }, effects: { ...nextConfig.effects } };
+    config = {
+      ...nextConfig,
+      ui: { ...nextConfig.ui },
+      effects: { ...nextConfig.effects },
+      welcome: { ...nextConfig.welcome }
+    };
   }
 
   async function onUpdateDownloadClick(e: MouseEvent) {
@@ -136,6 +147,10 @@
 
 {#if showEffects && config?.effects}
   <Effects config={config.effects} />
+{/if}
+
+{#if showWelcome && config?.welcome}
+  <Welcome config={config.welcome} />
 {/if}
 
 <div class="app">
