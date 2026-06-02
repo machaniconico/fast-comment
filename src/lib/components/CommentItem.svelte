@@ -1,13 +1,21 @@
 <script lang="ts">
   import type { UiChatMessage } from '../types';
   import { store, togglePin } from '../stores.svelte';
-  import { hideMessage as ipcHideMessage } from '../ipc';
+  import { getConfig, hideMessage as ipcHideMessage, setConfig, ttsSpeakText } from '../ipc';
+  import type { ContextMenuItem } from './ContextMenu.svelte';
+
+  interface CommentContextMenuRequest {
+    x: number;
+    y: number;
+    items: ContextMenuItem[];
+  }
 
   interface Props {
     message: UiChatMessage;
+    onOpenContextMenu: (request: CommentContextMenuRequest) => void;
   }
 
-  let { message }: Props = $props();
+  let { message, onOpenContextMenu }: Props = $props();
 
   const PLATFORM_COLORS: Record<string, string> = {
     twitch: '#9146ff',
@@ -52,6 +60,98 @@
     ipcHideMessage(message.id);
   }
 
+  function getMessageText(): string {
+    return message.fragments.map((frag) => frag.type === 'text' ? frag.text : frag.name).join('');
+  }
+
+  function getNgWordCandidate(): string {
+    const selected = typeof window === 'undefined' ? '' : window.getSelection()?.toString().trim() ?? '';
+    if (selected) return selected;
+    return getMessageText().trim().match(/\S+/)?.[0] ?? '';
+  }
+
+  function copyText(text: string) {
+    if (!text || typeof navigator === 'undefined' || !navigator.clipboard?.writeText) return;
+    void navigator.clipboard.writeText(text).catch(() => {});
+  }
+
+  async function appendModerationValue(kind: 'ngUsers' | 'ngWords', value: string) {
+    const normalized = value.trim();
+    if (!normalized) return;
+
+    const config = await getConfig();
+    if (!config) return;
+
+    const current = config.moderation[kind] ?? [];
+    if (current.includes(normalized)) return;
+    config.moderation[kind] = [...current, normalized];
+    await setConfig(config);
+  }
+
+  function speakNow() {
+    const text = getMessageText().trim();
+    if (!text) return;
+    if (typeof window !== 'undefined' && (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__) {
+      void ttsSpeakText(text).catch(() => speakWithWebSpeech(text));
+      return;
+    }
+    speakWithWebSpeech(text);
+  }
+
+  function speakWithWebSpeech(text: string) {
+    if (typeof window === 'undefined' || !('speechSynthesis' in window)) return;
+    try {
+      window.speechSynthesis.speak(new SpeechSynthesisUtterance(text));
+    } catch {
+      // TTS is best-effort from the context menu.
+    }
+  }
+
+  function buildMenuItems(): ContextMenuItem[] {
+    const pinnedLabel = pinned ? 'ピン留め解除' : 'ピン留め';
+    const ngWord = getNgWordCandidate();
+    return [
+      { label: pinnedLabel, action: () => togglePin(message) },
+      { label: '本文をコピー', action: () => copyText(getMessageText()) },
+      { label: '投稿者名をコピー', action: () => copyText(message.author.name) },
+      {
+        label: 'この人をNGユーザーに追加',
+        danger: true,
+        action: () => {
+          store.hideMessage(message.id);
+          void ipcHideMessage(message.id);
+          void appendModerationValue('ngUsers', message.author.name);
+        },
+      },
+      {
+        label: 'この語をNGワードに追加',
+        danger: true,
+        action: () => {
+          if (!ngWord) return;
+          store.hideMessage(message.id);
+          void ipcHideMessage(message.id);
+          void appendModerationValue('ngWords', ngWord);
+        },
+      },
+      { label: '今すぐ読み上げ', action: speakNow },
+    ];
+  }
+
+  function openContextMenu(x: number, y: number) {
+    onOpenContextMenu({ x, y, items: buildMenuItems() });
+  }
+
+  function onContextMenu(event: MouseEvent) {
+    event.preventDefault();
+    openContextMenu(event.clientX, event.clientY);
+  }
+
+  function onMoreClick(event: MouseEvent) {
+    const target = event.currentTarget as HTMLElement;
+    const rect = target.getBoundingClientRect();
+    openContextMenu(rect.right, rect.bottom);
+  }
+
   function formatTime(ms: number): string {
     const d = new Date(ms);
     const h = d.getHours().toString().padStart(2, '0');
@@ -82,6 +182,7 @@
   style:background={kindBg}
   style:color={kindFg}
   role="listitem"
+  oncontextmenu={onContextMenu}
 >
   <!-- Platform indicator -->
   <span class="platform-dot" style:background={platformColor} title={message.platform}></span>
@@ -146,6 +247,12 @@
       title={pinned ? 'ピン解除' : 'ピン留め'}
       aria-label={pinned ? 'このコメントのピンを解除' : 'このコメントをピン留め'}
     >📌</button>
+    <button
+      class="menu-btn"
+      onclick={onMoreClick}
+      title="コメント操作"
+      aria-label="コメント操作メニューを開く"
+    >...</button>
     <button class="hide-btn" onclick={onHide} title="非表示" aria-label="このコメントを非表示">✕</button>
   </span>
 </div>
@@ -170,7 +277,8 @@
     position: relative;
   }
 
-  .comment-item:hover .hide-btn {
+  .comment-item:hover .hide-btn,
+  .comment-item:hover .menu-btn {
     opacity: 1;
   }
 
@@ -305,7 +413,8 @@
     white-space: nowrap;
   }
 
-  .hide-btn {
+  .hide-btn,
+  .menu-btn {
     background: none;
     border: none;
     color: inherit;
@@ -320,6 +429,11 @@
   .hide-btn:hover {
     opacity: 1 !important;
     color: #f44336;
+  }
+
+  .menu-btn:hover {
+    opacity: 1 !important;
+    color: #90caf9;
   }
 
   .pin-btn {

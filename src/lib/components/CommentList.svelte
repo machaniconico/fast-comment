@@ -8,6 +8,8 @@
    */
   import { onMount, untrack } from 'svelte';
   import type { ChatMessage } from '../types';
+  import ContextMenu from './ContextMenu.svelte';
+  import type { ContextMenuItem } from './ContextMenu.svelte';
   import CommentItem from './CommentItem.svelte';
   import { store } from '../stores.svelte';
 
@@ -24,6 +26,7 @@
   let clientHeight = $state(0);
   let measured = $state(false);
   let isAtBottom = $state(true);
+  let menu: { x: number; y: number; items: ContextMenuItem[] } | null = $state(null);
 
   let messages: ChatMessage[] = $derived(store.visibleMessages);
   let totalCount = $derived(messages.length);
@@ -71,10 +74,19 @@
 
   function onScroll() {
     if (!containerEl) return;
+    menu = null;
     scrollTop = containerEl.scrollTop;
     clientHeight = containerEl.clientHeight;
     const distFromBottom = containerEl.scrollHeight - containerEl.scrollTop - containerEl.clientHeight;
     isAtBottom = distFromBottom < ROW_HEIGHT * 2;
+  }
+
+  function openContextMenu(request: { x: number; y: number; items: ContextMenuItem[] }) {
+    menu = request;
+  }
+
+  function closeContextMenu() {
+    menu = null;
   }
 
   onMount(() => {
@@ -100,10 +112,14 @@
     <!-- Rendered window -->
     <div class="window" style:transform="translateY({paddingTop}px)">
       {#each visibleSlice as msg (msg.id)}
-        <CommentItem message={msg} />
+        <CommentItem message={msg} onOpenContextMenu={openContextMenu} />
       {/each}
     </div>
   </div>
+
+  {#if menu}
+    <ContextMenu x={menu.x} y={menu.y} items={menu.items} onClose={closeContextMenu} />
+  {/if}
 
   <!-- Scroll-to-bottom button when not at bottom -->
   {#if !isAtBottom && totalCount > 0}
