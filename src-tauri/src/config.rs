@@ -611,6 +611,7 @@ mod tests {
                     bouyomi_tone: 70,
                     bouyomi_voice: 2,
                     bouyomi_path: r"C:\BouyomiChan\BouyomiChan.exe".to_string(),
+                    bouyomi_launch_elevated: false,
                     voicevox_url: "http://127.0.0.1:50022".to_string(),
                     voicevox_speaker: 3,
                     web_speech_rate: 1.4,
