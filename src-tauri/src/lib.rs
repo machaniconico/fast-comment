@@ -22,10 +22,11 @@ mod update;
 
 use std::collections::HashMap;
 use std::fs;
+use std::net::TcpStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::{broadcast, mpsc, watch, Notify};
@@ -39,7 +40,7 @@ use crate::model::{
 use crate::moderation::{Moderator, Verdict};
 use crate::sources::SourceManager;
 use crate::stats::{spawn_stats_aggregator, StatsSnapshot, YoutubeMetadataUpdate};
-use crate::tts::{bouyomi, TtsBackend, TtsDispatcher};
+use crate::tts::{bouyomi, TtsBackend, TtsDispatcher, TtsNoticePayload};
 use crate::update::{check_for_update, open_url};
 
 /// アプリ全体で共有する実行時状態。
@@ -93,6 +94,58 @@ impl AppState {
         };
         format!("{p}:{}", ch.identifier)
     }
+}
+
+fn emit_tts_notice(app: &AppHandle, level: &'static str, message: String) {
+    let payload = TtsNoticePayload { level, message };
+    if let Err(e) = app.emit("tts-notice", payload) {
+        tracing::warn!("tts-notice emit 失敗: {e}");
+    }
+}
+
+fn emit_bouyomi_launch_notice(app: &AppHandle, outcome: bouyomi::LaunchOutcome) {
+    match outcome {
+        bouyomi::LaunchOutcome::Launched => emit_tts_notice(
+            app,
+            "info",
+            "棒読みちゃんを自動起動しました".to_string(),
+        ),
+        bouyomi::LaunchOutcome::Failed(e) => emit_tts_notice(
+            app,
+            "warn",
+            format!("棒読みちゃんの自動起動に失敗しました: {e}（パス/権限を確認してください）"),
+        ),
+        bouyomi::LaunchOutcome::NoPath
+        | bouyomi::LaunchOutcome::AlreadyRunning
+        | bouyomi::LaunchOutcome::CooldownSkip => {}
+    }
+}
+
+async fn ensure_bouyomi_launched_and_emit_notice(
+    app: AppHandle,
+    path: String,
+    host: String,
+    port: u16,
+) {
+    let launch = tauri::async_runtime::spawn_blocking(move || {
+        let outcome = bouyomi::ensure_launched(path, host, port);
+        (app, outcome)
+    });
+
+    match launch.await {
+        Ok((app, outcome)) => emit_bouyomi_launch_notice(&app, outcome),
+        Err(e) => tracing::warn!("棒読みちゃん自動起動タスク失敗: {e}"),
+    }
+}
+
+async fn wait_for_bouyomi_socket(host: &str, port: u16) -> bool {
+    for _ in 0..20 {
+        if TcpStream::connect((host, port)).is_ok() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    false
 }
 
 // ============ Tauri コマンド ============
@@ -179,6 +232,26 @@ async fn test_tts(state: State<'_, AppState>) -> Result<String, String> {
         TtsBackendKind::Bouyomi => {
             let host = opt.bouyomi_host.clone();
             let port = opt.bouyomi_port;
+            let path = opt.bouyomi_path.clone();
+            let launch_host = host.clone();
+            let launch_outcome = tauri::async_runtime::spawn_blocking(move || {
+                bouyomi::ensure_launched(path, launch_host, port)
+            })
+            .await
+            .map_err(|e| format!("棒読みちゃんの自動起動処理に失敗しました: {e}"))?;
+
+            if let bouyomi::LaunchOutcome::Failed(e) = &launch_outcome {
+                return Err(format!(
+                    "棒読みちゃんの自動起動に失敗しました: {e}。BouyomiChan のパス/権限を確認してください"
+                ));
+            }
+
+            if !wait_for_bouyomi_socket(&host, port).await {
+                return Err(format!(
+                    "棒読みちゃんに接続できません: {host}:{port}。BouyomiChan のパス、起動状態、または『プログラム連携 → ソケット通信を許可』とポート設定を確認してください"
+                ));
+            }
+
             let backend = bouyomi::BouyomiBackend::new(
                 host.clone(),
                 port,
@@ -189,7 +262,15 @@ async fn test_tts(state: State<'_, AppState>) -> Result<String, String> {
             );
 
             match backend.speak("読み上げテストです".to_string()).await {
-                Ok(()) => Ok(format!("棒読みちゃんへ送出しました ({host}:{port})")),
+                Ok(()) => {
+                    let launch_note =
+                        if matches!(launch_outcome, bouyomi::LaunchOutcome::Launched) {
+                            " (自動起動しました)"
+                        } else {
+                            ""
+                        };
+                    Ok(format!("棒読みちゃんへ送出しました ({host}:{port}){launch_note}"))
+                }
                 Err(e) => {
                     if let Some(detail) = bouyomi::connect_error_detail(&e) {
                         Err(format!(
@@ -242,7 +323,7 @@ fn export_comments_csv(app: AppHandle, csv: String) -> Result<String, String> {
 ///
 /// チャンネル一覧の差分適用(追加/削除)も行う。
 #[tauri::command]
-fn update_config(
+async fn update_config(
     app: AppHandle,
     state: State<'_, AppState>,
     new_config: AppConfig,
@@ -279,13 +360,9 @@ fn update_config(
     // 既起動なら何もしないため、保存のたびに呼んでも無害。
     if committed_config.tts.backend == config::TtsBackendKind::Bouyomi {
         let path = committed_config.tts.options.bouyomi_path.trim().to_string();
-        if !path.is_empty() {
-            let host = committed_config.tts.options.bouyomi_host.clone();
-            let port = committed_config.tts.options.bouyomi_port;
-            tauri::async_runtime::spawn_blocking(move || {
-                bouyomi::ensure_launched(path, host, port);
-            });
-        }
+        let host = committed_config.tts.options.bouyomi_host.clone();
+        let port = committed_config.tts.options.bouyomi_port;
+        ensure_bouyomi_launched_and_emit_notice(app.clone(), path, host, port).await;
     }
 
     Ok(())
@@ -893,13 +970,14 @@ pub fn run() {
 
             if config.tts.backend == config::TtsBackendKind::Bouyomi {
                 let path = config.tts.options.bouyomi_path.trim().to_string();
-                if !path.is_empty() {
-                    let host = config.tts.options.bouyomi_host.clone();
-                    let port = config.tts.options.bouyomi_port;
-                    tauri::async_runtime::spawn_blocking(move || {
-                        bouyomi::ensure_launched(path, host, port);
-                    });
-                }
+                let host = config.tts.options.bouyomi_host.clone();
+                let port = config.tts.options.bouyomi_port;
+                tauri::async_runtime::spawn(ensure_bouyomi_launched_and_emit_notice(
+                    handle.clone(),
+                    path,
+                    host,
+                    port,
+                ));
             }
 
             // Bus の UI forwarder と OBS サーバを起動。

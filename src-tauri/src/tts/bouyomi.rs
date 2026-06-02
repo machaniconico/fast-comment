@@ -38,6 +38,14 @@ const LAUNCH_COOLDOWN: Duration = Duration::from_secs(15);
 /// 最後に起動を試みた時刻(プロセス全体で共有)。重複起動防止に用いる。
 static LAST_LAUNCH_ATTEMPT: Mutex<Option<Instant>> = Mutex::new(None);
 
+pub enum LaunchOutcome {
+    NoPath,
+    AlreadyRunning,
+    CooldownSkip,
+    Launched,
+    Failed(String),
+}
+
 #[derive(Debug)]
 pub struct BouyomiConnectError {
     detail: String,
@@ -85,11 +93,11 @@ fn resolve_first_addr(addr_text: &str) -> Result<SocketAddr, BouyomiConnectError
 }
 
 /// 棒読みちゃんが未起動なら、指定された exe を起動する。
-pub fn ensure_launched(path: String, host: String, port: u16) {
+pub fn ensure_launched(path: String, host: String, port: u16) -> LaunchOutcome {
     let path = path.trim().to_string();
     if path.is_empty() {
         tracing::info!("棒読みちゃん: パス未設定のため自動起動しません");
-        return;
+        return LaunchOutcome::NoPath;
     }
 
     let addr_text = format!("{}:{}", host.trim(), port);
@@ -107,7 +115,7 @@ pub fn ensure_launched(path: String, host: String, port: u16) {
     if let Some(addr) = addr {
         if TcpStream::connect_timeout(&addr, LAUNCH_CHECK_TIMEOUT).is_ok() {
             tracing::info!("棒読みちゃん: 既に {addr} で応答があるため自動起動しません");
-            return;
+            return LaunchOutcome::AlreadyRunning;
         }
     }
     tracing::info!("棒読みちゃん: 未応答のため自動起動を試みます: {path}");
@@ -118,8 +126,8 @@ pub fn ensure_launched(path: String, host: String, port: u16) {
         let mut last = LAST_LAUNCH_ATTEMPT.lock().unwrap();
         if let Some(t) = *last {
             if t.elapsed() < LAUNCH_COOLDOWN {
-                tracing::info!("棒読みちゃん: 直近に起動を試みたばかり(起動処理中とみなし)、再起動をスキップします");
-                return;
+                tracing::debug!("棒読みちゃん: 直近に起動を試みたばかり(起動処理中とみなし)、再起動をスキップします");
+                return LaunchOutcome::CooldownSkip;
             }
         }
         *last = Some(Instant::now());
@@ -129,17 +137,21 @@ pub fn ensure_launched(path: String, host: String, port: u16) {
     // BouyomiChan は自身のフォルダを基準に設定/辞書を読むため、作業ディレクトリを
     // exe のあるフォルダに合わせる(別 cwd から起動すると初期化に失敗し即終了することがある)。
     if let Some(dir) = std::path::Path::new(&path).parent() {
-        if !dir.as_os_str().is_empty() {
+        if !dir.as_os_str().is_empty() && dir.exists() {
             cmd.current_dir(dir);
         }
     }
     match cmd.spawn() {
-        Ok(_) => tracing::info!("棒読みちゃんを自動起動しました: {path}"),
+        Ok(_) => {
+            tracing::info!("棒読みちゃんを自動起動しました: {path}");
+            LaunchOutcome::Launched
+        }
         Err(e) => {
             tracing::warn!("棒読みちゃんの自動起動に失敗: {path}: {e}");
             // 起動に失敗した場合はクールダウンを解除し、次回(パス修正後など)に
             // 即座に再試行できるようにする。失敗試行で 15 秒ブロックしない。
             *LAST_LAUNCH_ATTEMPT.lock().unwrap() = None;
+            LaunchOutcome::Failed(format!("{e}"))
         }
     }
 }

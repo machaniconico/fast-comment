@@ -195,7 +195,11 @@
   {/if}
 
   {#if ttsNotice}
-    <div class="tts-notice-banner" role="status" aria-live="polite">
+    <div
+      class={`tts-notice-banner${ttsNotice.level === 'info' ? ' tts-notice-banner--info' : ''}`}
+      role="status"
+      aria-live="polite"
+    >
       <span class="tts-notice-banner__text">{ttsNotice.message}</span>
       <button
         class="tts-notice-dismiss"
@@ -425,6 +429,12 @@
     flex-shrink: 0;
   }
 
+  .tts-notice-banner--info {
+    background: #123524;
+    border-bottom-color: rgba(74,222,128,0.32);
+    color: #d8f7e3;
+  }
+
   .tts-notice-banner__text {
     flex: 1;
     min-width: 0;
@@ -443,6 +453,10 @@
     cursor: pointer;
     flex-shrink: 0;
     line-height: 1;
+  }
+
+  .tts-notice-banner--info .tts-notice-dismiss {
+    color: #b8e7c7;
   }
 
   .tts-notice-dismiss:hover {

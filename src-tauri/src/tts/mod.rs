@@ -37,9 +37,9 @@ struct WebSpeechPayload {
 }
 
 #[derive(Clone, Serialize)]
-struct TtsNoticePayload {
-    level: &'static str,
-    message: String,
+pub struct TtsNoticePayload {
+    pub level: &'static str,
+    pub message: String,
 }
 
 /// 読み上げバックエンドの共通インタフェース。
