@@ -90,6 +90,24 @@ export async function startTtsSpeakListener(): Promise<() => void> {
   return unlisten;
 }
 
+/**
+ * Start listening to the 'tts-cancel' event from Tauri and stop WebSpeech.
+ * Returns an unlisten function; call it on component destroy.
+ */
+export async function startTtsCancelListener(): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  if (typeof window === 'undefined' || !('speechSynthesis' in window)) return () => {};
+  const { listen } = await import('@tauri-apps/api/event');
+  const unlisten = await listen('tts-cancel', () => {
+    try {
+      window.speechSynthesis.cancel();
+    } catch (e) {
+      console.warn('[ipc] speechSynthesis.cancel failed', e);
+    }
+  });
+  return unlisten;
+}
+
 interface TtsSpeakPayload {
   text: string;
   rate: number;
@@ -245,6 +263,18 @@ export async function setConfig(config: AppConfig): Promise<void> {
   // Rust command is `update_config(new_config)`; Tauri maps the snake_case
   // param `new_config` to the JS key `newConfig`.
   await invoke<void>('update_config', { newConfig: config });
+}
+
+export async function setTtsPaused(paused: boolean): Promise<void> {
+  await invoke<void>('set_tts_paused', { paused });
+}
+
+export async function clearTtsQueue(): Promise<void> {
+  await invoke<void>('clear_tts_queue');
+}
+
+export async function skipCurrentTts(): Promise<void> {
+  await invoke<void>('skip_current_tts');
 }
 
 export async function addChannel(channel: ChannelConfig): Promise<void> {

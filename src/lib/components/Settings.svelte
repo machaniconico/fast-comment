@@ -4,7 +4,8 @@
     AppConfig, EffectRule, EffectsConfig, GoalsConfig, InjectTestCommentOptions, TtsDictEntry, TtsOptions
   } from '../ipc';
   import {
-    getConfig, setConfig, getObsUrl, getObsGoalsUrl, exportCommentsCsv, injectTestComment
+    getConfig, setConfig, getObsUrl, getObsGoalsUrl, exportCommentsCsv, injectTestComment,
+    setTtsPaused, clearTtsQueue, skipCurrentTts
   } from '../ipc';
   import { ui, SETTINGS_ANCHOR_IDS } from '../ui.svelte';
   import { buildCsv, setNotify, store } from '../stores.svelte';
@@ -73,6 +74,7 @@
   let copiedGoalsObsTimer: ReturnType<typeof setTimeout> | null = null;
   let copiedCsvPathTimer: ReturnType<typeof setTimeout> | null = null;
   let testCommentMsgTimer: ReturnType<typeof setTimeout> | null = null;
+  let ttsControlMsgTimer: ReturnType<typeof setTimeout> | null = null;
 
   // ── TTS options accessors (config.tts.options mirrors Rust TtsOptions) ──
   // Keys are partitioned by value type so reads/writes stay type-checked
@@ -115,6 +117,9 @@
   let webSpeechVolume: number = $state(1);
   let webSpeechVoice: string = $state('');
   let ttsDictionary: TtsDictEntry[] = $state([]);
+  let ttsPaused: boolean = $state(false);
+  let ttsControlBusy: boolean = $state(false);
+  let ttsControlMsg: string = $state('');
   let speechVoices: SpeechSynthesisVoice[] = $state([]);
   let speechVoicesListenerAttached: boolean = false;
   let obsTtlSeconds: number = $state(12);
@@ -160,6 +165,7 @@
     if (copiedGoalsObsTimer !== null) clearTimeout(copiedGoalsObsTimer);
     if (copiedCsvPathTimer !== null) clearTimeout(copiedCsvPathTimer);
     if (testCommentMsgTimer !== null) clearTimeout(testCommentMsgTimer);
+    if (ttsControlMsgTimer !== null) clearTimeout(ttsControlMsgTimer);
     if (speechVoicesListenerAttached && typeof window !== 'undefined' && 'speechSynthesis' in window) {
       window.speechSynthesis.removeEventListener('voiceschanged', refreshSpeechVoices);
       speechVoicesListenerAttached = false;
@@ -388,6 +394,61 @@
     }
   }
 
+  function clearTtsControlMsgSoon() {
+    if (ttsControlMsgTimer !== null) clearTimeout(ttsControlMsgTimer);
+    ttsControlMsgTimer = setTimeout(() => {
+      ttsControlMsg = '';
+      ttsControlMsgTimer = null;
+    }, 3000);
+  }
+
+  async function onToggleTtsPaused() {
+    if (ttsControlBusy) return;
+    const nextPaused = !ttsPaused;
+    ttsControlBusy = true;
+    ttsControlMsg = '';
+    try {
+      await setTtsPaused(nextPaused);
+      ttsPaused = nextPaused;
+      ttsControlMsg = nextPaused ? '読み上げを一時停止しました' : '読み上げを再開しました';
+    } catch (e) {
+      ttsControlMsg = `操作に失敗しました: ${e instanceof Error ? e.message : String(e)}`;
+    } finally {
+      ttsControlBusy = false;
+      clearTtsControlMsgSoon();
+    }
+  }
+
+  async function onClearTtsQueue() {
+    if (ttsControlBusy) return;
+    ttsControlBusy = true;
+    ttsControlMsg = '';
+    try {
+      await clearTtsQueue();
+      ttsControlMsg = '読み上げキューを全消ししました';
+    } catch (e) {
+      ttsControlMsg = `全消しに失敗しました: ${e instanceof Error ? e.message : String(e)}`;
+    } finally {
+      ttsControlBusy = false;
+      clearTtsControlMsgSoon();
+    }
+  }
+
+  async function onSkipCurrentTts() {
+    if (ttsControlBusy) return;
+    ttsControlBusy = true;
+    ttsControlMsg = '';
+    try {
+      await skipCurrentTts();
+      ttsControlMsg = '現在の読み上げをスキップしました';
+    } catch (e) {
+      ttsControlMsg = `スキップに失敗しました: ${e instanceof Error ? e.message : String(e)}`;
+    } finally {
+      ttsControlBusy = false;
+      clearTtsControlMsgSoon();
+    }
+  }
+
   async function onSave() {
     if (!config) return;
     saving = true;
@@ -569,6 +630,30 @@
         <option value="bouyomi">棒読みちゃん</option>
         <option value="voicevox">VOICEVOX</option>
       </select>
+    </div>
+
+    <div class="tts-control-panel">
+      <div class="field-row tts-control-row">
+        <button
+          type="button"
+          class="export-btn"
+          class:tts-paused={ttsPaused}
+          onclick={onToggleTtsPaused}
+          disabled={ttsControlBusy}
+        >
+          {ttsPaused ? '再開' : '一時停止'}
+        </button>
+        <button type="button" class="copy-btn" onclick={onClearTtsQueue} disabled={ttsControlBusy}>
+          キュー全消し
+        </button>
+        <button type="button" class="copy-btn" onclick={onSkipCurrentTts} disabled={ttsControlBusy}>
+          今のをスキップ
+        </button>
+        {#if ttsControlMsg}<span class="hint-inline">{ttsControlMsg}</span>{/if}
+      </div>
+      <p class="hint">
+        一時停止中に届いたコメントは読み上げず破棄します。キュー全消し/スキップは未送出キューとWeb Speechの現在発話を止めます。棒読みちゃん/VOICEVOXは送信済みの1件をアプリ側からキャンセルできません。
+      </p>
     </div>
 
     {#if config.tts.backend === 'bouyomi'}
@@ -1088,7 +1173,16 @@
   .copy-btn.copied { background: #2e7d32; }
   .save-btn { background: #1976d2; color: #fff; padding: 7px 18px; }
   .export-btn { background: #1976d2; color: #fff; padding: 7px 14px; }
-  .save-btn:disabled, .export-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .save-btn:disabled, .export-btn:disabled, .copy-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .tts-paused { background: #2e7d32; }
+
+  .tts-control-panel {
+    margin-top: 8px;
+  }
+
+  .tts-control-row {
+    align-items: flex-start;
+  }
 
   .dict-editor {
     margin-top: 10px;

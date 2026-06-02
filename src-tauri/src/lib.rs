@@ -23,7 +23,8 @@ mod update;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -65,6 +66,10 @@ pub struct AppState {
     moderator: Mutex<Moderator>,
     /// 長命 TTS ワーカーへの bounded 送信端(溢れたら drop)。
     tts_tx: mpsc::Sender<ChatMessage>,
+    /// TTS 一時停止中はワーカーが受信したメッセージを読み上げずに破棄する。
+    tts_paused: Arc<AtomicBool>,
+    /// TTS キュー全消し要求。rx はワーカー所有のためワーカー内で drain する。
+    tts_clear: Arc<AtomicBool>,
     /// YouTube メタデータ poller → stats 集約への bounded 送信端。
     metadata_tx: mpsc::Sender<YoutubeMetadataUpdate>,
     /// 参加型配信の参加者一覧。
@@ -94,6 +99,27 @@ impl AppState {
 #[tauri::command]
 fn get_config(state: State<'_, AppState>) -> Result<AppConfig, String> {
     Ok(state.config.lock().unwrap().clone())
+}
+
+/// TTS 読み上げを一時停止/再開する。paused 中に届いたメッセージは保持せず破棄する。
+#[tauri::command]
+fn set_tts_paused(state: State<'_, AppState>, paused: bool) {
+    state.tts_paused.store(paused, Ordering::Relaxed);
+}
+
+/// 未送出の TTS キューを全消しし、WebSpeech の現在発話も即時停止させる。
+#[tauri::command]
+fn clear_tts_queue(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    state.tts_clear.store(true, Ordering::Relaxed);
+    app.emit("tts-cancel", ())
+        .map_err(|e| format!("TTSキャンセルイベント送信失敗: {e}"))
+}
+
+/// 現在の WebSpeech 発話を停止する。外部バックエンドの送信済み発話は停止できない。
+#[tauri::command]
+fn skip_current_tts(app: AppHandle) -> Result<(), String> {
+    app.emit("tts-cancel", ())
+        .map_err(|e| format!("TTSキャンセルイベント送信失敗: {e}"))
 }
 
 /// 現在のコメントログ CSV を config dir 配下 `exports/` に書き出す。
@@ -638,6 +664,18 @@ fn spawn_tts_worker(app: AppHandle, mut rx: mpsc::Receiver<ChatMessage>, cancel:
                         Some(m) => m,
                         None => break,
                     };
+                    {
+                        let state = app.state::<AppState>();
+                        if state.tts_clear.swap(false, Ordering::Relaxed) {
+                            while rx.try_recv().is_ok() {}
+                            tracing::debug!("TTS キュー全消し要求につき読み上げを drop");
+                            continue;
+                        }
+                        if state.tts_paused.load(Ordering::Relaxed) {
+                            tracing::debug!("TTS 一時停止中につき読み上げを drop");
+                            continue;
+                        }
+                    }
                     // 最新設定を反映してから読み上げる。
                     let cfg = {
                         let state = app.state::<AppState>();
@@ -744,6 +782,8 @@ pub fn run() {
                 channels: Mutex::new(HashMap::new()),
                 moderator: Mutex::new(moderator),
                 tts_tx,
+                tts_paused: Arc::new(AtomicBool::new(false)),
+                tts_clear: Arc::new(AtomicBool::new(false)),
                 metadata_tx,
                 participants: Mutex::new(Vec::new()),
             };
@@ -794,6 +834,9 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_config,
+            set_tts_paused,
+            clear_tts_queue,
+            skip_current_tts,
             export_comments_csv,
             update_config,
             add_channel,

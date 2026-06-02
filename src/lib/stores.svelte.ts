@@ -7,11 +7,11 @@
  *
  * - Ring buffer: keeps at most `maxBuffer` messages; oldest are evicted.
  * - Platform filter, text search, and individual hide state.
- * - Wired to ipc.ts via onChatBatch + startChatListener (+ startTtsSpeakListener).
+ * - Wired to ipc.ts via onChatBatch + startChatListener (+ startTtsSpeakListener/startTtsCancelListener).
  */
 
 import type { ChatMessage, Platform, UiChatMessage } from './types';
-import { onChatBatch, startChatListener, startTtsSpeakListener, getConfig } from './ipc';
+import { onChatBatch, startChatListener, startTtsSpeakListener, startTtsCancelListener, getConfig } from './ipc';
 
 const DEFAULT_MAX_BUFFER = 2000;
 /** Max pinned comments kept in the pinned strip (oldest dropped on overflow). */
@@ -360,13 +360,15 @@ class CommentStore {
     if (config) {
       this.setNotify(config.ui.notifySound ?? false, config.ui.notifyVolume ?? 0.5);
     }
-    const [unlistenChat, unlistenTts] = await Promise.all([
+    const [unlistenChat, unlistenTts, unlistenTtsCancel] = await Promise.all([
       startChatListener(),
       startTtsSpeakListener(),
+      startTtsCancelListener(),
     ]);
     return () => {
       unlistenChat();
       unlistenTts();
+      unlistenTtsCancel();
     };
   }
 }
