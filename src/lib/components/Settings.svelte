@@ -1,8 +1,10 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
-  import type { AppConfig, EffectRule, EffectsConfig, GoalsConfig, TtsDictEntry, TtsOptions } from '../ipc';
+  import type {
+    AppConfig, EffectRule, EffectsConfig, GoalsConfig, InjectTestCommentOptions, TtsDictEntry, TtsOptions
+  } from '../ipc';
   import {
-    getConfig, setConfig, getObsUrl, getObsGoalsUrl, exportCommentsCsv
+    getConfig, setConfig, getObsUrl, getObsGoalsUrl, exportCommentsCsv, injectTestComment
   } from '../ipc';
   import { ui, SETTINGS_ANCHOR_IDS } from '../ui.svelte';
   import { buildCsv, setNotify, store } from '../stores.svelte';
@@ -34,6 +36,18 @@
   let exportingCsv: boolean = $state(false);
   let csvExportPath: string = $state('');
   let csvExportMsg: string = $state('');
+  let injectingTestComment: boolean = $state(false);
+  let testCommentMsg: string = $state('');
+
+  type TestPlatform = InjectTestCommentOptions['platform'];
+  type TestKind = NonNullable<InjectTestCommentOptions['kind']>;
+
+  let testPlatform: TestPlatform = $state('youtube');
+  let testName: string = $state('テスト太郎');
+  let testText: string = $state('配信準備テストです');
+  let testKind: TestKind = $state('normal');
+  let testAmount: string = $state('500');
+  let testCount: number = $state(1);
 
   // Scroll to settings section when the command palette sets a settingsAnchor.
   // Gate on `config`: the tts/obs/moderation sections live inside {#if config},
@@ -58,6 +72,7 @@
   let copiedGiftObsTimer: ReturnType<typeof setTimeout> | null = null;
   let copiedGoalsObsTimer: ReturnType<typeof setTimeout> | null = null;
   let copiedCsvPathTimer: ReturnType<typeof setTimeout> | null = null;
+  let testCommentMsgTimer: ReturnType<typeof setTimeout> | null = null;
 
   // ── TTS options accessors (config.tts.options mirrors Rust TtsOptions) ──
   // Keys are partitioned by value type so reads/writes stay type-checked
@@ -144,6 +159,7 @@
     if (copiedGiftObsTimer !== null) clearTimeout(copiedGiftObsTimer);
     if (copiedGoalsObsTimer !== null) clearTimeout(copiedGoalsObsTimer);
     if (copiedCsvPathTimer !== null) clearTimeout(copiedCsvPathTimer);
+    if (testCommentMsgTimer !== null) clearTimeout(testCommentMsgTimer);
     if (speechVoicesListenerAttached && typeof window !== 'undefined' && 'speechSynthesis' in window) {
       window.speechSynthesis.removeEventListener('voiceschanged', refreshSpeechVoices);
       speechVoicesListenerAttached = false;
@@ -323,6 +339,55 @@
     config.tts.options.dictionary = normalizeTtsDictionary(ttsDictionary);
   }
 
+  function fillRandomTestComment() {
+    const samples = [
+      { name: '初見です', text: '初見です、よろしくお願いします！' },
+      { name: 'テスト花子', text: '目標ゲージとエフェクト確認中です' },
+      { name: '配信チェック', text: '音声読み上げのテストコメントです' },
+      { name: 'ナイス応援', text: 'いい感じ！そのままお願いします' }
+    ];
+    const index = Math.floor(Math.random() * samples.length);
+    testName = samples[index].name;
+    testText = samples[index].text;
+  }
+
+  function clearTestCommentMsgSoon() {
+    if (testCommentMsgTimer !== null) clearTimeout(testCommentMsgTimer);
+    testCommentMsgTimer = setTimeout(() => {
+      testCommentMsg = '';
+      testCommentMsgTimer = null;
+    }, 3000);
+  }
+
+  async function onInjectTestComment() {
+    if (injectingTestComment) return;
+    injectingTestComment = true;
+    testCommentMsg = '';
+    const amountText = testAmount.trim();
+    const parsedAmount = amountText === '' ? undefined : Number(amountText);
+    const includeAmount =
+      (testKind === 'superChat' || testKind === 'bits') &&
+      typeof parsedAmount === 'number' &&
+      Number.isFinite(parsedAmount);
+
+    try {
+      await injectTestComment({
+        platform: testPlatform,
+        name: testName,
+        text: testText,
+        kind: testKind,
+        amount: includeAmount ? parsedAmount : undefined,
+        count: clampInt(testCount, 1, 1, 20)
+      });
+      testCommentMsg = 'テストコメントを送信しました';
+    } catch (e) {
+      testCommentMsg = `送信に失敗しました: ${e instanceof Error ? e.message : String(e)}`;
+    } finally {
+      injectingTestComment = false;
+      clearTestCommentMsgSoon();
+    }
+  }
+
   async function onSave() {
     if (!config) return;
     saving = true;
@@ -427,6 +492,73 @@
 
   <!-- ── TTS ── -->
   {#if config}
+  <section id="settings-test">
+    <h3>テスト</h3>
+    <div class="field-row">
+      <label for="test-platform">プラットフォーム</label>
+      <select id="test-platform" bind:value={testPlatform} class="platform-select">
+        <option value="twitch">Twitch</option>
+        <option value="youtube">YouTube</option>
+      </select>
+      <button type="button" class="copy-btn" onclick={fillRandomTestComment}>ランダム</button>
+    </div>
+    <div class="field-row">
+      <label for="test-name">名前</label>
+      <input
+        id="test-name"
+        type="text"
+        bind:value={testName}
+        class="id-input"
+        placeholder="テスト太郎"
+      />
+    </div>
+    <div class="field-row">
+      <label for="test-text">本文</label>
+      <input
+        id="test-text"
+        type="text"
+        bind:value={testText}
+        class="id-input"
+        placeholder="テストコメントです"
+      />
+    </div>
+    <div class="field-row">
+      <label for="test-kind">種類</label>
+      <select id="test-kind" bind:value={testKind} class="platform-select">
+        <option value="normal">通常</option>
+        <option value="superChat">Super Chat</option>
+        <option value="membership">メンバーシップ</option>
+        <option value="bits">Bits</option>
+      </select>
+      <label for="test-amount" class="compact-label">金額</label>
+      <input
+        id="test-amount"
+        type="number"
+        min="0"
+        step="1"
+        bind:value={testAmount}
+        class="num-input"
+        disabled={testKind !== 'superChat' && testKind !== 'bits'}
+      />
+      <label for="test-count" class="compact-label">連投数</label>
+      <input
+        id="test-count"
+        type="number"
+        min="1"
+        max="20"
+        step="1"
+        bind:value={testCount}
+        class="num-input"
+      />
+    </div>
+    <div class="field-row">
+      <button class="export-btn" onclick={onInjectTestComment} disabled={injectingTestComment}>
+        {injectingTestComment ? '送信中...' : 'テストコメント送信'}
+      </button>
+      {#if testCommentMsg}<span class="hint-inline">{testCommentMsg}</span>{/if}
+    </div>
+  </section>
+
   <section id="settings-tts">
     <h3>TTS（読み上げ）</h3>
     <div class="field-row">
@@ -1048,6 +1180,10 @@
     font-size: 13px;
     color: #ccc;
     min-width: 90px;
+  }
+
+  .field-row label.compact-label {
+    min-width: auto;
   }
 
   .bouyomi-path-row {

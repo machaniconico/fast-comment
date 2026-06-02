@@ -32,7 +32,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::bus::{is_valid_template_name, Bus};
 use crate::config::{AppConfig, ChannelConfig, ChannelPlatform};
-use crate::model::{Badge, ChatMessage, Participant, Platform};
+use crate::model::{
+    Amount, Author, Badge, ChatMessage, Fragment, MessageKind, Participant, Platform, Roles,
+};
 use crate::moderation::{Moderator, Verdict};
 use crate::sources::SourceManager;
 use crate::stats::{spawn_stats_aggregator, StatsSnapshot, YoutubeMetadataUpdate};
@@ -335,6 +337,78 @@ fn clear_participants(app: AppHandle, state: State<'_, AppState>) {
         participants.clone()
     };
     emit_participants(&app, &snapshot);
+}
+
+/// 配信前確認用の合成コメントを通常の Source → pipeline 経路へ注入する。
+#[tauri::command]
+fn inject_test_comment(
+    state: State<'_, AppState>,
+    platform: String,
+    name: String,
+    text: String,
+    kind: Option<String>,
+    amount: Option<f64>,
+    count: Option<u32>,
+) -> Result<(), String> {
+    let platform = match platform.as_str() {
+        "twitch" => Platform::Twitch,
+        "youtube" => Platform::Youtube,
+        other => return Err(format!("不正な platform です: {other}")),
+    };
+    let kind = match kind.as_deref().unwrap_or("normal") {
+        "normal" => MessageKind::Normal,
+        "superChat" => MessageKind::SuperChat,
+        "membership" => MessageKind::Membership,
+        "bits" => MessageKind::Bits,
+        other => return Err(format!("不正な kind です: {other}")),
+    };
+    let count = count.unwrap_or(1).clamp(1, 20);
+    let epoch_millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| format!("現在時刻取得失敗: {e}"))?
+        .as_millis();
+    let timestamp_ms = i64::try_from(epoch_millis).unwrap_or(i64::MAX);
+    let author_name = name.trim();
+    let author_name = if author_name.is_empty() {
+        "テストユーザー"
+    } else {
+        author_name
+    };
+    let body = text.trim();
+    let body = if body.is_empty() {
+        "テストコメントです"
+    } else {
+        body
+    };
+
+    for i in 0..count {
+        let value = amount.filter(|_| matches!(kind, MessageKind::SuperChat | MessageKind::Bits));
+        let msg = ChatMessage {
+            id: format!("test-{epoch_millis}-{i}"),
+            platform,
+            channel: "test".to_string(),
+            author: Author {
+                id: format!("test{i}"),
+                name: author_name.to_string(),
+                display_color: None,
+                badges: Vec::new(),
+                roles: Roles::default(),
+            },
+            fragments: vec![Fragment::text(body.to_string())],
+            kind,
+            amount: value.map(|value| Amount {
+                value,
+                currency: "JPY".to_string(),
+                raw_text: format!("¥{value}"),
+            }),
+            timestamp_ms: timestamp_ms.saturating_add(i64::from(i)),
+            raw: None,
+            skip_tts: false,
+        };
+        let _ = state.source_tx.send(msg);
+    }
+
+    Ok(())
 }
 
 // ============ 内部ヘルパ ============
@@ -733,6 +807,7 @@ pub fn run() {
             pick_random_participant,
             remove_participant,
             clear_participants,
+            inject_test_comment,
             check_for_update,
             open_url,
         ])

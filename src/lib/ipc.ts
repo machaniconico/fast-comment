@@ -217,6 +217,15 @@ export interface ChannelConfig {
   enabled: boolean; // Rust ChannelConfig.enabled (serde default true)
 }
 
+export interface InjectTestCommentOptions {
+  platform: 'twitch' | 'youtube';
+  name: string;
+  text: string;
+  kind?: 'normal' | 'superChat' | 'membership' | 'bits';
+  amount?: number;
+  count?: number;
+}
+
 export interface UpdateStatus {
   updateAvailable: boolean;
   currentVersion: string;
@@ -276,6 +285,10 @@ export async function removeParticipant(platform: string, userId: string): Promi
 
 export async function clearParticipants(): Promise<void> {
   await invoke<void>('clear_participants');
+}
+
+export async function injectTestComment(opts: InjectTestCommentOptions): Promise<void> {
+  await invoke<void>('inject_test_comment', { ...opts });
 }
 
 export async function checkForUpdate(): Promise<UpdateStatus | null> {
