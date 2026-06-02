@@ -108,6 +108,20 @@ export async function startTtsCancelListener(): Promise<() => void> {
   return unlisten;
 }
 
+export interface TtsNotice {
+  level: 'warn' | string;
+  message: string;
+}
+
+export async function onTtsNotice(cb: (notice: TtsNotice) => void): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  const { listen } = await import('@tauri-apps/api/event');
+  const unlisten = await listen<TtsNotice>('tts-notice', (event) => {
+    cb(event.payload);
+  });
+  return unlisten;
+}
+
 interface TtsSpeakPayload {
   text: string;
   rate: number;
@@ -288,6 +302,10 @@ export async function skipCurrentTts(): Promise<void> {
 
 export async function ttsSpeakText(text: string): Promise<void> {
   await invoke<void>('tts_speak_text', { text });
+}
+
+export async function testTts(): Promise<string> {
+  return (await invoke<string>('test_tts')) ?? 'Tauri環境でのみテストできます';
 }
 
 export async function addChannel(channel: ChannelConfig): Promise<void> {

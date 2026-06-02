@@ -17,8 +17,10 @@ pub mod voicevox;
 /// この定数は使用しない。長文 SuperChat 連発などで巨大ペイロードが IPC に
 /// 流れるのを防ぐバックストップとしてのみ機能する。
 const TTS_UNLIMITED_HARD_CAP: usize = 500;
+const TTS_NOTICE_THROTTLE: std::time::Duration = std::time::Duration::from_secs(30);
 
 use serde::Serialize;
+use std::time::Instant;
 use tauri::{AppHandle, Emitter};
 
 use crate::config::{TtsBackendKind, TtsConfig, TtsOptions};
@@ -32,6 +34,12 @@ struct WebSpeechPayload {
     pitch: f32,
     volume: f32,
     voice: String,
+}
+
+#[derive(Clone, Serialize)]
+struct TtsNoticePayload {
+    level: &'static str,
+    message: String,
 }
 
 /// 読み上げバックエンドの共通インタフェース。
@@ -55,6 +63,8 @@ pub struct TtsDispatcher {
     app: AppHandle,
     bouyomi: bouyomi::BouyomiBackend,
     voicevox: voicevox::VoicevoxBackend,
+    last_bouyomi_notice: Option<Instant>,
+    last_voicevox_notice: Option<Instant>,
 }
 
 impl TtsDispatcher {
@@ -66,6 +76,8 @@ impl TtsDispatcher {
             app,
             bouyomi,
             voicevox,
+            last_bouyomi_notice: None,
+            last_voicevox_notice: None,
         }
     }
 
@@ -123,7 +135,7 @@ impl TtsDispatcher {
     }
 
     /// 1メッセージを読み上げる。整形 → 優先バックエンド → 失敗時フォールバック。
-    pub async fn speak_message(&self, msg: &ChatMessage) {
+    pub async fn speak_message(&mut self, msg: &ChatMessage) {
         let text = self.format_for_speech(msg);
         if text.trim().is_empty() {
             return;
@@ -137,15 +149,55 @@ impl TtsDispatcher {
             TtsBackendKind::Bouyomi => {
                 if let Err(e) = self.bouyomi.speak(text.clone()).await {
                     tracing::warn!("bouyomi 読み上げ失敗→Web Speech へ: {e}");
+                    self.emit_backend_notice(
+                        TtsBackendKind::Bouyomi,
+                        format!("棒読みちゃんで読み上げできないため Web Speech に切り替えました: {e}"),
+                    );
                     self.emit_webspeech(&text);
                 }
             }
             TtsBackendKind::Voicevox => {
                 if let Err(e) = self.voicevox.speak(text.clone()).await {
                     tracing::warn!("voicevox 読み上げ失敗→Web Speech へ: {e}");
+                    self.emit_backend_notice(
+                        TtsBackendKind::Voicevox,
+                        format!("VOICEVOXで読み上げできないため Web Speech に切り替えました: {e}"),
+                    );
                     self.emit_webspeech(&text);
                 }
             }
+        }
+    }
+
+    fn emit_backend_notice(&mut self, backend: TtsBackendKind, message: String) {
+        let now = Instant::now();
+        let should_emit = {
+            let last_notice = match backend {
+                TtsBackendKind::Bouyomi => &mut self.last_bouyomi_notice,
+                TtsBackendKind::Voicevox => &mut self.last_voicevox_notice,
+                TtsBackendKind::None | TtsBackendKind::WebSpeech => return,
+            };
+            if last_notice
+                .map(|last| now.duration_since(last) <= TTS_NOTICE_THROTTLE)
+                .unwrap_or(false)
+            {
+                false
+            } else {
+                *last_notice = Some(now);
+                true
+            }
+        };
+
+        if !should_emit {
+            return;
+        }
+
+        let payload = TtsNoticePayload {
+            level: "warn",
+            message,
+        };
+        if let Err(e) = self.app.emit("tts-notice", payload) {
+            tracing::warn!("tts-notice emit 失敗: {e}");
         }
     }
 

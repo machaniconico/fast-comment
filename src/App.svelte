@@ -14,13 +14,16 @@
   import Notifier from './lib/components/Notifier.svelte';
   import { store, initStore, clearMessages } from './lib/stores.svelte';
   import { ui } from './lib/ui.svelte';
-  import { checkForUpdate, openReleaseUrl, getConfig } from './lib/ipc';
-  import type { AppConfig, UpdateStatus } from './lib/ipc';
+  import { checkForUpdate, openReleaseUrl, getConfig, onTtsNotice } from './lib/ipc';
+  import type { AppConfig, TtsNotice, UpdateStatus } from './lib/ipc';
 
   let unlisten: (() => void) | null = null;
+  let unlistenTtsNotice: (() => void) | null = null;
   let config: AppConfig | null = $state(null);
   let updateStatus = $state<UpdateStatus | null>(null);
   let updateDismissed = $state(false);
+  let ttsNotice = $state<TtsNotice | null>(null);
+  let ttsNoticeTimer: ReturnType<typeof setTimeout> | null = null;
 
   // ── Donation summary helpers ──────────────────────────────────────────────
 
@@ -74,11 +77,14 @@
     void loadUpdateStatus();
     void loadConfig();
     unlisten = await initStore();
+    unlistenTtsNotice = await onTtsNotice(showTtsNotice);
   });
 
   onDestroy(() => {
     unlisten?.();
+    unlistenTtsNotice?.();
     if (searchDebounce) clearTimeout(searchDebounce);
+    if (ttsNoticeTimer) clearTimeout(ttsNoticeTimer);
   });
 
   function onFilterClick(p: Platform | 'all') {
@@ -119,6 +125,23 @@
       if (loaded) config = loaded;
     } catch (e) {
       console.warn('[config] load failed', e);
+    }
+  }
+
+  function showTtsNotice(notice: TtsNotice) {
+    ttsNotice = notice;
+    if (ttsNoticeTimer) clearTimeout(ttsNoticeTimer);
+    ttsNoticeTimer = setTimeout(() => {
+      ttsNotice = null;
+      ttsNoticeTimer = null;
+    }, 8000);
+  }
+
+  function dismissTtsNotice() {
+    ttsNotice = null;
+    if (ttsNoticeTimer) {
+      clearTimeout(ttsNoticeTimer);
+      ttsNoticeTimer = null;
     }
   }
 
@@ -167,6 +190,18 @@
         onclick={() => (updateDismissed = true)}
         title="閉じる"
         aria-label="更新通知を閉じる"
+      >×</button>
+    </div>
+  {/if}
+
+  {#if ttsNotice}
+    <div class="tts-notice-banner" role="status" aria-live="polite">
+      <span class="tts-notice-banner__text">{ttsNotice.message}</span>
+      <button
+        class="tts-notice-dismiss"
+        onclick={dismissTtsNotice}
+        title="閉じる"
+        aria-label="TTS通知を閉じる"
       >×</button>
     </div>
   {/if}
@@ -373,6 +408,44 @@
   }
 
   .update-dismiss:hover {
+    background: rgba(255,255,255,0.14);
+    color: #fff;
+  }
+
+  .tts-notice-banner {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-height: 32px;
+    padding: 5px 10px;
+    background: #3a2c10;
+    border-bottom: 1px solid rgba(251,191,36,0.38);
+    color: #fdecc8;
+    font-size: 12px;
+    flex-shrink: 0;
+  }
+
+  .tts-notice-banner__text {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .tts-notice-dismiss {
+    width: 22px;
+    height: 22px;
+    border: none;
+    border-radius: 4px;
+    background: rgba(255,255,255,0.08);
+    color: #f6d994;
+    cursor: pointer;
+    flex-shrink: 0;
+    line-height: 1;
+  }
+
+  .tts-notice-dismiss:hover {
     background: rgba(255,255,255,0.14);
     color: #fff;
   }

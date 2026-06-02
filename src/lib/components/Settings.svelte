@@ -6,7 +6,7 @@
   } from '../ipc';
   import {
     getConfig, setConfig, getObsUrl, getObsGoalsUrl, exportCommentsCsv, injectTestComment,
-    setTtsPaused, clearTtsQueue, skipCurrentTts
+    setTtsPaused, clearTtsQueue, skipCurrentTts, testTts
   } from '../ipc';
   import { ui, SETTINGS_ANCHOR_IDS } from '../ui.svelte';
   import { buildCsv, setNotify, store } from '../stores.svelte';
@@ -121,6 +121,9 @@
   let ttsPaused: boolean = $state(false);
   let ttsControlBusy: boolean = $state(false);
   let ttsControlMsg: string = $state('');
+  let testingTts: boolean = $state(false);
+  let testTtsMsg: string = $state('');
+  let testTtsOk: boolean | null = $state(null);
   let speechVoices: SpeechSynthesisVoice[] = $state([]);
   let speechVoicesListenerAttached: boolean = false;
   let obsTtlSeconds: number = $state(12);
@@ -478,6 +481,22 @@
     }
   }
 
+  async function onTestTts() {
+    if (testingTts) return;
+    testingTts = true;
+    testTtsMsg = '';
+    testTtsOk = null;
+    try {
+      testTtsMsg = await testTts();
+      testTtsOk = true;
+    } catch (e) {
+      testTtsMsg = e instanceof Error ? e.message : String(e);
+      testTtsOk = false;
+    } finally {
+      testingTts = false;
+    }
+  }
+
   async function onSave() {
     if (!config) return;
     saving = true;
@@ -697,6 +716,20 @@
       />
     </div>
     <p class="hint">指定すると起動時に未起動なら自動で立ち上げます（空欄なら手動起動）</p>
+    <div class="field-row">
+      <button type="button" class="export-btn" onclick={onTestTts} disabled={testingTts}>
+        {testingTts ? 'テスト中...' : 'テスト読み上げ'}
+      </button>
+    </div>
+    {#if testTtsMsg}
+      <p
+        class="tts-test-result"
+        class:tts-test-result--ok={testTtsOk === true}
+        class:tts-test-result--error={testTtsOk === false}
+      >
+        {testTtsMsg}
+      </p>
+    {/if}
     {/if}
 
     {#if config.tts.backend === 'voicevox'}
@@ -1370,6 +1403,9 @@
 
   .hint { font-size: 11px; color: #757575; margin: 4px 0 0; }
   .hint-inline { font-size: 11px; color: #757575; font-weight: 400; text-transform: none; letter-spacing: 0; }
+  .tts-test-result { font-size: 12px; margin: 4px 0 0; }
+  .tts-test-result--ok { color: #81c784; }
+  .tts-test-result--error { color: #ef9a9a; }
 
   .save-row {
     display: flex;

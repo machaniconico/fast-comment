@@ -14,13 +14,12 @@
 //! | 11     | 4    | 本文バイト長(i32)                 |
 //! | 15     | n    | 本文(UTF-8)                       |
 
+use std::fmt;
+use std::io::Write as _;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::process::Command;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-
-use tokio::io::AsyncWriteExt;
-use tokio::net::TcpStream as TokioTcpStream;
 
 use super::TtsBackend;
 
@@ -38,6 +37,52 @@ const LAUNCH_COOLDOWN: Duration = Duration::from_secs(15);
 
 /// 最後に起動を試みた時刻(プロセス全体で共有)。重複起動防止に用いる。
 static LAST_LAUNCH_ATTEMPT: Mutex<Option<Instant>> = Mutex::new(None);
+
+#[derive(Debug)]
+pub struct BouyomiConnectError {
+    detail: String,
+}
+
+impl BouyomiConnectError {
+    fn new(detail: impl Into<String>) -> Self {
+        BouyomiConnectError {
+            detail: detail.into(),
+        }
+    }
+
+    pub fn detail(&self) -> &str {
+        &self.detail
+    }
+}
+
+impl fmt::Display for BouyomiConnectError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "棒読みちゃんに接続できません: {}", self.detail)
+    }
+}
+
+impl std::error::Error for BouyomiConnectError {}
+
+pub fn connect_error_detail(error: &anyhow::Error) -> Option<String> {
+    error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<BouyomiConnectError>()
+            .map(|e| e.detail().to_string())
+    })
+}
+
+fn resolve_first_addr(addr_text: &str) -> Result<SocketAddr, BouyomiConnectError> {
+    if let Ok(addr) = addr_text.parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+
+    let mut addrs = addr_text
+        .to_socket_addrs()
+        .map_err(|e| BouyomiConnectError::new(format!("{addr_text}: {e}")))?;
+    addrs
+        .next()
+        .ok_or_else(|| BouyomiConnectError::new(format!("{addr_text}: 接続先アドレスを解決できません")))
+}
 
 /// 棒読みちゃんが未起動なら、指定された exe を起動する。
 pub fn ensure_launched(path: String, host: String, port: u16) {
@@ -144,24 +189,60 @@ impl BouyomiBackend {
 impl TtsBackend for BouyomiBackend {
     async fn speak(&self, text: String) -> anyhow::Result<()> {
         let packet = self.build_packet(&text);
-        let addr = self.addr();
-        tokio::time::timeout(SPEAK_TIMEOUT, async {
-            let mut stream = TokioTcpStream::connect(&addr).await?;
-            stream.write_all(&packet).await?;
-            stream.flush().await?;
+        let addr_text = self.addr();
+        tokio::task::spawn_blocking(move || {
+            let addr = match resolve_first_addr(&addr_text) {
+                Ok(addr) => {
+                    tracing::debug!("棒読みちゃん接続先を解決: {addr_text} -> {addr}");
+                    addr
+                }
+                Err(e) => {
+                    tracing::debug!("棒読みちゃん接続先の解決に失敗: {addr_text}: {e}");
+                    return Err(anyhow::Error::from(e));
+                }
+            };
+
+            let mut stream = match TcpStream::connect_timeout(&addr, SPEAK_TIMEOUT) {
+                Ok(stream) => {
+                    tracing::info!("棒読みちゃん接続成功: {addr}");
+                    stream
+                }
+                Err(e) => {
+                    tracing::debug!("棒読みちゃん接続失敗: {addr}: {e}");
+                    tracing::warn!("棒読みちゃん接続失敗: {addr}: {e}");
+                    return Err(BouyomiConnectError::new(format!("{addr}: {e}")).into());
+                }
+            };
+
+            if let Err(e) = stream.set_write_timeout(Some(SPEAK_TIMEOUT)) {
+                tracing::debug!("棒読みちゃん書込タイムアウト設定失敗: {addr}: {e}");
+            }
+            stream
+                .write_all(&packet)
+                .map_err(|e| anyhow::anyhow!("棒読みちゃんへの書き込みに失敗({addr}): {e}"))?;
+            stream
+                .flush()
+                .map_err(|e| anyhow::anyhow!("棒読みちゃんへの送出 flush に失敗({addr}): {e}"))?;
+            tracing::debug!("棒読みちゃんへ {} bytes 送出: {addr}", packet.len());
             Ok::<(), anyhow::Error>(())
         })
         .await
-        .map_err(|_| anyhow::anyhow!("棒読みちゃん送出がタイムアウト({}秒)", SPEAK_TIMEOUT.as_secs()))??;
+        .map_err(|e| anyhow::anyhow!("棒読みちゃん送出タスク失敗: {e}"))??;
         Ok(())
     }
 
     async fn available(&self) -> bool {
         // ポートへ接続できるかで簡易判定(短いタイムアウト)。
-        let connect = TokioTcpStream::connect(self.addr());
+        let addr_text = self.addr();
         matches!(
-            tokio::time::timeout(std::time::Duration::from_millis(500), connect).await,
-            Ok(Ok(_))
+            tokio::task::spawn_blocking(move || {
+                let Ok(addr) = resolve_first_addr(&addr_text) else {
+                    return false;
+                };
+                TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok()
+            })
+            .await,
+            Ok(true)
         )
     }
 }

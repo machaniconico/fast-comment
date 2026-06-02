@@ -32,14 +32,14 @@ use tokio::sync::{broadcast, mpsc, watch, Notify};
 use tokio_util::sync::CancellationToken;
 
 use crate::bus::{is_valid_template_name, Bus};
-use crate::config::{AppConfig, ChannelConfig, ChannelPlatform};
+use crate::config::{AppConfig, ChannelConfig, ChannelPlatform, TtsBackendKind};
 use crate::model::{
     Amount, Author, Badge, ChatMessage, Fragment, MessageKind, Participant, Platform, Roles,
 };
 use crate::moderation::{Moderator, Verdict};
 use crate::sources::SourceManager;
 use crate::stats::{spawn_stats_aggregator, StatsSnapshot, YoutubeMetadataUpdate};
-use crate::tts::{bouyomi, TtsDispatcher};
+use crate::tts::{bouyomi, TtsBackend, TtsDispatcher};
 use crate::update::{check_for_update, open_url};
 
 /// アプリ全体で共有する実行時状態。
@@ -162,6 +162,54 @@ fn tts_speak_text(state: State<'_, AppState>, text: String) -> Result<(), String
             Ok(())
         }
         Err(mpsc::error::TrySendError::Closed(_)) => Err("TTS キューが閉じています".to_string()),
+    }
+}
+
+/// 現在の TTS 設定で棒読みちゃんへ疎通テストの読み上げを送る。
+#[tauri::command]
+async fn test_tts(state: State<'_, AppState>) -> Result<String, String> {
+    let tts = {
+        let cfg = state.config.lock().unwrap();
+        cfg.tts.clone()
+    };
+
+    let backend_kind = tts.backend;
+    let opt = tts.options;
+    match backend_kind {
+        TtsBackendKind::Bouyomi => {
+            let host = opt.bouyomi_host.clone();
+            let port = opt.bouyomi_port;
+            let backend = bouyomi::BouyomiBackend::new(
+                host.clone(),
+                port,
+                opt.bouyomi_speed,
+                opt.bouyomi_tone,
+                opt.bouyomi_volume,
+                opt.bouyomi_voice,
+            );
+
+            match backend.speak("読み上げテストです".to_string()).await {
+                Ok(()) => Ok(format!("棒読みちゃんへ送出しました ({host}:{port})")),
+                Err(e) => {
+                    if let Some(detail) = bouyomi::connect_error_detail(&e) {
+                        Err(format!(
+                            "棒読みちゃんに接続できません: {detail}。BouyomiChan を起動し『プログラム連携 → ソケット通信を許可』を ON に、ポートが {port} か確認してください"
+                        ))
+                    } else {
+                        Err(format!("棒読みちゃんへの送出に失敗しました: {e}"))
+                    }
+                }
+            }
+        }
+        TtsBackendKind::Voicevox => {
+            Ok("現在のバックエンドは VOICEVOX です。棒読みちゃんを選択するとテストできます".to_string())
+        }
+        TtsBackendKind::WebSpeech => {
+            Ok("現在のバックエンドは Web Speech です。棒読みちゃんを選択するとテストできます".to_string())
+        }
+        TtsBackendKind::None => {
+            Ok("現在、読み上げはOFFです。棒読みちゃんを選択するとテストできます".to_string())
+        }
     }
 }
 
@@ -892,6 +940,7 @@ pub fn run() {
             clear_tts_queue,
             skip_current_tts,
             tts_speak_text,
+            test_tts,
             export_comments_csv,
             update_config,
             add_channel,
