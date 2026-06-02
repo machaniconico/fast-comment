@@ -33,7 +33,7 @@
 
   $effect(() => {
     const receivedCount = store.receivedCount;
-    const messages = store.visibleMessages;
+    const messages = store.allMessages;
     const enabled = config.enabled;
     const rules = normalizeRules(config.rules);
 

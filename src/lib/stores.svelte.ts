@@ -142,6 +142,9 @@ class CommentStore {
   // Capped FIFO (oldest dropped) so the pinned strip never grows unbounded.
   private _pinned: UiChatMessage[] = $state([]);
 
+  // Derived: full unfiltered list
+  readonly allMessages: UiChatMessage[] = $derived(this._msgs);
+
   // Derived: filtered list
   readonly visibleMessages: UiChatMessage[] = $derived.by(() => {
     const hidden = this.hiddenIds;

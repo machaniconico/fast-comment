@@ -46,7 +46,7 @@
 
   $effect(() => {
     const receivedCount = store.receivedCount;
-    const messages = store.visibleMessages;
+    const messages = store.allMessages;
     const welcome = normalizeWelcome(config);
 
     if (!initialized) {
