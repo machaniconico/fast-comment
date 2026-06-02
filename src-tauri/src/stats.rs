@@ -272,6 +272,7 @@ fn platform_key(platform: Platform) -> &'static str {
     match platform {
         Platform::Twitch => "twitch",
         Platform::Youtube => "youtube",
+        Platform::Niconico => "niconico",
     }
 }
 
@@ -283,6 +284,7 @@ fn enabled_scope_keys(config: &AppConfig) -> HashSet<String> {
         .map(|ch| match ch.platform {
             ChannelPlatform::Twitch => format!("twitch:{}", ch.identifier),
             ChannelPlatform::Youtube => format!("youtube:{}", extract_video_id(&ch.identifier)),
+            ChannelPlatform::Niconico => format!("niconico:{}", ch.identifier),
         })
         .collect()
 }

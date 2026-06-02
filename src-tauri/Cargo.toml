@@ -27,7 +27,8 @@ futures-util = "0.3"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 
 # YouTube InnerTube HTTP
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "stream"] }
+prost = "0.13"
 
 # OBS overlay server
 axum = { version = "0.7", features = ["ws"] }
