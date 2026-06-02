@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tauri::{AppHandle, Emitter, Manager, State};
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{broadcast, mpsc, watch, Notify};
 use tokio_util::sync::CancellationToken;
 
 use crate::bus::{is_valid_template_name, Bus};
@@ -70,6 +70,8 @@ pub struct AppState {
     tts_paused: Arc<AtomicBool>,
     /// TTS キュー全消し要求。rx はワーカー所有のためワーカー内で drain する。
     tts_clear: Arc<AtomicBool>,
+    /// 空キュー時でも TTS 全消し要求をワーカーへ通知して clear flag を reset する。
+    tts_clear_notify: Arc<tokio::sync::Notify>,
     /// YouTube メタデータ poller → stats 集約への bounded 送信端。
     metadata_tx: mpsc::Sender<YoutubeMetadataUpdate>,
     /// 参加型配信の参加者一覧。
@@ -111,6 +113,7 @@ fn set_tts_paused(state: State<'_, AppState>, paused: bool) {
 #[tauri::command]
 fn clear_tts_queue(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     state.tts_clear.store(true, Ordering::Relaxed);
+    state.tts_clear_notify.notify_one();
     app.emit("tts-cancel", ())
         .map_err(|e| format!("TTSキャンセルイベント送信失敗: {e}"))
 }
@@ -697,8 +700,18 @@ fn spawn_tts_worker(app: AppHandle, mut rx: mpsc::Receiver<ChatMessage>, cancel:
         let mut dispatcher = TtsDispatcher::new(initial_cfg, app.clone());
 
         loop {
+            let notify = {
+                let state = app.state::<AppState>();
+                state.tts_clear_notify.clone()
+            };
             tokio::select! {
                 _ = cancel.cancelled() => break,
+                _ = notify.notified() => {
+                    while rx.try_recv().is_ok() {}
+                    let state = app.state::<AppState>();
+                    state.tts_clear.store(false, Ordering::Relaxed);
+                    continue;
+                }
                 recv = rx.recv() => {
                     let msg = match recv {
                         Some(m) => m,
@@ -824,6 +837,7 @@ pub fn run() {
                 tts_tx,
                 tts_paused: Arc::new(AtomicBool::new(false)),
                 tts_clear: Arc::new(AtomicBool::new(false)),
+                tts_clear_notify: Arc::new(Notify::new()),
                 metadata_tx,
                 participants: Mutex::new(Vec::new()),
             };
