@@ -10,6 +10,7 @@
   } from '../ipc';
   import { ui, SETTINGS_ANCHOR_IDS } from '../ui.svelte';
   import { buildCsv, setNotify, store } from '../stores.svelte';
+  import TemplateEditor from './TemplateEditor.svelte';
 
   interface Props {
     onConfigSaved?: (config: AppConfig) => void;
@@ -957,6 +958,10 @@
       </button>
     </div>
     <p class="hint">OBSのブラウザソースにこのURLを貼り付けてください。</p>
+    <div id="settings-obs-template-editor" class="template-editor-wrap">
+      <h3>OBSテンプレート編集</h3>
+      <TemplateEditor obsPort={config.obs.port} currentTemplate={config.obs.template} />
+    </div>
   </section>
 
   <!-- ── Goals ── -->

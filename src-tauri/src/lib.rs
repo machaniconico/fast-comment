@@ -43,6 +43,9 @@ use crate::stats::{spawn_stats_aggregator, StatsSnapshot, YoutubeMetadataUpdate}
 use crate::tts::{bouyomi, TtsBackend, TtsDispatcher, TtsNoticePayload};
 use crate::update::{check_for_update, open_url};
 
+const EDITABLE_TEMPLATE_FILES: &[&str] = &["style.css", "index.html", "app.js"];
+const MAX_TEMPLATE_FILE_BYTES: usize = 1024 * 1024;
+
 /// アプリ全体で共有する実行時状態。
 pub struct AppState {
     /// 現在の設定。
@@ -470,6 +473,85 @@ fn get_obs_goals_url(state: State<'_, AppState>) -> Result<String, String> {
     Ok(format!(
         "http://127.0.0.1:{port}/?template=goals&ws=ws://127.0.0.1:{port}/stats"
     ))
+}
+
+/// OBS テンプレートディレクトリ一覧を返す。
+#[tauri::command]
+fn list_templates(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    let mut names = Vec::new();
+    let entries = fs::read_dir(&state.templates_dir).map_err(|e| {
+        format!(
+            "テンプレートディレクトリ読み込み失敗 {}: {e}",
+            state.templates_dir.display()
+        )
+    })?;
+
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("テンプレート一覧取得失敗: {e}"))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|e| format!("テンプレート種別取得失敗: {e}"))?;
+        if !file_type.is_dir() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if is_valid_template_name(&name) {
+            names.push(name);
+        }
+    }
+    names.sort();
+    Ok(names)
+}
+
+/// OBS テンプレート内の編集可能ファイルを読み込む。
+#[tauri::command]
+fn read_template_file(
+    state: State<'_, AppState>,
+    name: String,
+    file: String,
+) -> Result<String, String> {
+    let path = template_file_path(&state, &name, &file)?;
+    fs::read_to_string(&path)
+        .map_err(|e| format!("テンプレートファイル読み込み失敗 {}: {e}", path.display()))
+}
+
+/// OBS テンプレート内の編集可能ファイルを書き込む。
+#[tauri::command]
+fn write_template_file(
+    state: State<'_, AppState>,
+    name: String,
+    file: String,
+    contents: String,
+) -> Result<(), String> {
+    if contents.len() > MAX_TEMPLATE_FILE_BYTES {
+        return Err("テンプレートファイルは1MiB以下にしてください".to_string());
+    }
+
+    let path = template_file_path(&state, &name, &file)?;
+    fs::write(&path, contents.as_bytes())
+        .map_err(|e| format!("テンプレートファイル書き込み失敗 {}: {e}", path.display()))
+}
+
+fn validate_template_file_name(file: &str) -> Result<&str, String> {
+    EDITABLE_TEMPLATE_FILES
+        .iter()
+        .copied()
+        .find(|allowed| *allowed == file)
+        .ok_or_else(|| "編集できるファイルは style.css / index.html / app.js のみです".to_string())
+}
+
+fn template_file_path(state: &AppState, name: &str, file: &str) -> Result<PathBuf, String> {
+    if !is_valid_template_name(name) {
+        return Err("テンプレート名は半角英数字、'-'、'_' のみ使用できます".to_string());
+    }
+    let file = validate_template_file_name(file)?;
+    let dir = state.templates_dir.join(name);
+    if !dir.is_dir() {
+        return Err(format!("テンプレートディレクトリが見つかりません: {name}"));
+    }
+    Ok(dir.join(file))
 }
 
 /// 参加者一覧を取得する。
@@ -1043,6 +1125,9 @@ pub fn run() {
             unhide_message,
             get_obs_url,
             get_obs_goals_url,
+            list_templates,
+            read_template_file,
+            write_template_file,
             get_participants,
             pick_next_participant,
             pick_random_participant,

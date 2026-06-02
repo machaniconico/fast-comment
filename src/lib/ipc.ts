@@ -329,6 +329,18 @@ export async function getObsGoalsUrl(): Promise<string> {
   return (await invoke<string>('get_obs_goals_url')) ?? 'http://127.0.0.1:11180/?template=goals&ws=ws://127.0.0.1:11180/stats';
 }
 
+export async function listTemplates(): Promise<string[]> {
+  return (await invoke<string[]>('list_templates')) ?? [];
+}
+
+export async function readTemplateFile(name: string, file: string): Promise<string> {
+  return (await invoke<string>('read_template_file', { name, file })) ?? '';
+}
+
+export async function writeTemplateFile(name: string, file: string, contents: string): Promise<void> {
+  await invoke<void>('write_template_file', { name, file, contents });
+}
+
 export async function getParticipants(): Promise<Participant[] | null> {
   return invoke<Participant[]>('get_participants');
 }
