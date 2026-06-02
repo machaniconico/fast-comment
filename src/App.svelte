@@ -13,6 +13,7 @@
   import ChannelAdd from './lib/components/ChannelAdd.svelte';
   import CommandPalette from './lib/components/CommandPalette.svelte';
   import Notifier from './lib/components/Notifier.svelte';
+  import TtsQueuePanel from './lib/components/TtsQueuePanel.svelte';
   import { store, initStore, clearMessages } from './lib/stores.svelte';
   import { ui } from './lib/ui.svelte';
   import { checkForUpdate, openReleaseUrl, getConfig, onTtsNotice } from './lib/ipc';
@@ -334,6 +335,7 @@
         ✕
       </button>
     </div>
+    <TtsQueuePanel />
   {/if}
 
   <!-- ── Main content ── -->

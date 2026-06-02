@@ -113,10 +113,30 @@ export interface TtsNotice {
   message: string;
 }
 
+export interface TtsQueueItem {
+  id: string;
+  preview: string;
+}
+
+export interface TtsQueueState {
+  depth: number;
+  paused: boolean;
+  items: TtsQueueItem[];
+}
+
 export async function onTtsNotice(cb: (notice: TtsNotice) => void): Promise<() => void> {
   if (!isTauri()) return () => {};
   const { listen } = await import('@tauri-apps/api/event');
   const unlisten = await listen<TtsNotice>('tts-notice', (event) => {
+    cb(event.payload);
+  });
+  return unlisten;
+}
+
+export async function onTtsQueueState(cb: (state: TtsQueueState) => void): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  const { listen } = await import('@tauri-apps/api/event');
+  const unlisten = await listen<TtsQueueState>('tts-queue-state', (event) => {
     cb(event.payload);
   });
   return unlisten;
@@ -291,6 +311,10 @@ export async function setConfig(config: AppConfig): Promise<void> {
 
 export async function setTtsPaused(paused: boolean): Promise<void> {
   await invoke<void>('set_tts_paused', { paused });
+}
+
+export async function getTtsQueueState(): Promise<TtsQueueState | null> {
+  return invoke<TtsQueueState>('get_tts_queue_state');
 }
 
 export async function clearTtsQueue(): Promise<void> {

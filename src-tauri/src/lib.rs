@@ -20,7 +20,7 @@ pub mod stats;
 pub mod tts;
 mod update;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::net::TcpStream;
 use std::path::PathBuf;
@@ -40,7 +40,10 @@ use crate::model::{
 use crate::moderation::{Moderator, Verdict};
 use crate::sources::SourceManager;
 use crate::stats::{spawn_stats_aggregator, StatsSnapshot, YoutubeMetadataUpdate};
-use crate::tts::{bouyomi, TtsBackend, TtsDispatcher, TtsNoticePayload};
+use crate::tts::{
+    bouyomi, emit_tts_queue_state, tts_queue_state, TtsBackend, TtsDispatcher, TtsNoticePayload,
+    TtsQueueItem, TtsQueueStatePayload,
+};
 use crate::update::{check_for_update, open_url};
 
 const EDITABLE_TEMPLATE_FILES: &[&str] = &["style.css", "index.html", "app.js"];
@@ -70,6 +73,8 @@ pub struct AppState {
     moderator: Mutex<Moderator>,
     /// 長命 TTS ワーカーへの bounded 送信端(溢れたら drop)。
     tts_tx: mpsc::Sender<ChatMessage>,
+    /// UI 表示用の TTS 待ちキュースナップショット。
+    tts_queue: Mutex<VecDeque<TtsQueueItem>>,
     /// TTS 一時停止中はワーカーが受信したメッセージを読み上げずに破棄する。
     tts_paused: Arc<AtomicBool>,
     /// TTS キュー全消し要求。rx はワーカー所有のためワーカー内で drain する。
@@ -104,6 +109,54 @@ fn emit_tts_notice(app: &AppHandle, level: &'static str, message: String) {
     if let Err(e) = app.emit("tts-notice", payload) {
         tracing::warn!("tts-notice emit 失敗: {e}");
     }
+}
+
+fn current_tts_queue_state(state: &AppState) -> TtsQueueStatePayload {
+    let paused = state.tts_paused.load(Ordering::Relaxed);
+    let queue = state.tts_queue.lock().unwrap();
+    tts_queue_state(paused, &queue)
+}
+
+fn emit_current_tts_queue_state(app: &AppHandle, state: &AppState) {
+    emit_tts_queue_state(app, current_tts_queue_state(state));
+}
+
+fn remove_tts_queue_item(state: &AppState, id: &str) -> bool {
+    let mut queue = state.tts_queue.lock().unwrap();
+    if let Some(index) = queue.iter().position(|item| item.id == id) {
+        queue.remove(index);
+        true
+    } else {
+        false
+    }
+}
+
+fn try_enqueue_tts_message(
+    app: &AppHandle,
+    state: &AppState,
+    msg: ChatMessage,
+) -> Result<(), mpsc::error::TrySendError<ChatMessage>> {
+    let item = TtsQueueItem::from_message(&msg);
+    {
+        let mut queue = state.tts_queue.lock().unwrap();
+        queue.push_back(item.clone());
+    }
+
+    match state.tts_tx.try_send(msg) {
+        Ok(()) => {
+            emit_current_tts_queue_state(app, state);
+            Ok(())
+        }
+        Err(e) => {
+            remove_tts_queue_item(state, &item.id);
+            Err(e)
+        }
+    }
+}
+
+fn clear_tts_queue_snapshot(app: &AppHandle, state: &AppState) {
+    state.tts_queue.lock().unwrap().clear();
+    emit_current_tts_queue_state(app, state);
 }
 
 fn emit_bouyomi_launch_notice(app: &AppHandle, outcome: bouyomi::LaunchOutcome) {
@@ -167,8 +220,15 @@ fn get_config(state: State<'_, AppState>) -> Result<AppConfig, String> {
 
 /// TTS 読み上げを一時停止/再開する。paused 中に届いたメッセージは保持せず破棄する。
 #[tauri::command]
-fn set_tts_paused(state: State<'_, AppState>, paused: bool) {
+fn set_tts_paused(app: AppHandle, state: State<'_, AppState>, paused: bool) {
     state.tts_paused.store(paused, Ordering::Relaxed);
+    emit_current_tts_queue_state(&app, &state);
+}
+
+/// 現在の TTS 待ちキュー状態を取得する。
+#[tauri::command]
+fn get_tts_queue_state(state: State<'_, AppState>) -> TtsQueueStatePayload {
+    current_tts_queue_state(&state)
 }
 
 /// 未送出の TTS キューを全消しし、WebSpeech の現在発話も即時停止させる。
@@ -176,20 +236,22 @@ fn set_tts_paused(state: State<'_, AppState>, paused: bool) {
 fn clear_tts_queue(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     state.tts_clear.store(true, Ordering::Relaxed);
     state.tts_clear_notify.notify_one();
+    clear_tts_queue_snapshot(&app, &state);
     app.emit("tts-cancel", ())
         .map_err(|e| format!("TTSキャンセルイベント送信失敗: {e}"))
 }
 
 /// 現在の WebSpeech 発話を停止する。外部バックエンドの送信済み発話は停止できない。
 #[tauri::command]
-fn skip_current_tts(app: AppHandle) -> Result<(), String> {
+fn skip_current_tts(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    emit_current_tts_queue_state(&app, &state);
     app.emit("tts-cancel", ())
         .map_err(|e| format!("TTSキャンセルイベント送信失敗: {e}"))
 }
 
 /// 任意テキストを TTS キューへ直接投入する。UI/OBS には流さない。
 #[tauri::command]
-fn tts_speak_text(state: State<'_, AppState>, text: String) -> Result<(), String> {
+fn tts_speak_text(app: AppHandle, state: State<'_, AppState>, text: String) -> Result<(), String> {
     if text.trim().is_empty() {
         return Ok(());
     }
@@ -217,7 +279,7 @@ fn tts_speak_text(state: State<'_, AppState>, text: String) -> Result<(), String
         skip_tts: false,
     };
 
-    match state.tts_tx.try_send(msg) {
+    match try_enqueue_tts_message(&app, &state, msg) {
         Ok(()) => Ok(()),
         Err(mpsc::error::TrySendError::Full(_)) => {
             tracing::debug!("TTS キュー満杯につき任意テキスト読み上げを drop");
@@ -888,7 +950,7 @@ fn spawn_pipeline(app: AppHandle, cancel: CancellationToken) {
                     // (背圧/有界・SPEC 設計原則2)。
                     if !msg.skip_tts {
                         if let Err(mpsc::error::TrySendError::Full(_)) =
-                            state.tts_tx.try_send(msg.clone())
+                            try_enqueue_tts_message(&app, &state, msg.clone())
                         {
                             tracing::debug!("TTS キュー満杯につき読み上げを drop");
                         }
@@ -931,6 +993,7 @@ fn spawn_tts_worker(app: AppHandle, mut rx: mpsc::Receiver<ChatMessage>, cancel:
                     while rx.try_recv().is_ok() {}
                     let state = app.state::<AppState>();
                     state.tts_clear.store(false, Ordering::Relaxed);
+                    clear_tts_queue_snapshot(&app, &state);
                     continue;
                 }
                 recv = rx.recv() => {
@@ -940,8 +1003,15 @@ fn spawn_tts_worker(app: AppHandle, mut rx: mpsc::Receiver<ChatMessage>, cancel:
                     };
                     {
                         let state = app.state::<AppState>();
+                        if remove_tts_queue_item(&state, &msg.id) {
+                            emit_current_tts_queue_state(&app, &state);
+                        }
+                    }
+                    {
+                        let state = app.state::<AppState>();
                         if state.tts_clear.swap(false, Ordering::Relaxed) {
                             while rx.try_recv().is_ok() {}
+                            clear_tts_queue_snapshot(&app, &state);
                             tracing::debug!("TTS キュー全消し要求につき読み上げを drop");
                             continue;
                         }
@@ -1056,6 +1126,7 @@ pub fn run() {
                 channels: Mutex::new(HashMap::new()),
                 moderator: Mutex::new(moderator),
                 tts_tx,
+                tts_queue: Mutex::new(VecDeque::new()),
                 tts_paused: Arc::new(AtomicBool::new(false)),
                 tts_clear: Arc::new(AtomicBool::new(false)),
                 tts_clear_notify: Arc::new(Notify::new()),
@@ -1112,6 +1183,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_config,
+            get_tts_queue_state,
             set_tts_paused,
             clear_tts_queue,
             skip_current_tts,

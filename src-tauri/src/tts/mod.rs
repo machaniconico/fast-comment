@@ -20,6 +20,7 @@ const TTS_UNLIMITED_HARD_CAP: usize = 500;
 const TTS_NOTICE_THROTTLE: std::time::Duration = std::time::Duration::from_secs(30);
 
 use serde::Serialize;
+use std::collections::VecDeque;
 use std::time::Instant;
 use tauri::{AppHandle, Emitter};
 
@@ -40,6 +41,42 @@ struct WebSpeechPayload {
 pub struct TtsNoticePayload {
     pub level: &'static str,
     pub message: String,
+}
+
+#[derive(Clone, Serialize)]
+pub struct TtsQueueItem {
+    pub id: String,
+    pub preview: String,
+}
+
+#[derive(Clone, Serialize)]
+pub struct TtsQueueStatePayload {
+    pub depth: u32,
+    pub paused: bool,
+    pub items: Vec<TtsQueueItem>,
+}
+
+impl TtsQueueItem {
+    pub fn from_message(msg: &ChatMessage) -> Self {
+        Self {
+            id: msg.id.clone(),
+            preview: truncate_preview(&message_body_preview(msg), 40),
+        }
+    }
+}
+
+pub fn tts_queue_state(paused: bool, items: &VecDeque<TtsQueueItem>) -> TtsQueueStatePayload {
+    TtsQueueStatePayload {
+        depth: u32::try_from(items.len()).unwrap_or(u32::MAX),
+        paused,
+        items: items.iter().cloned().collect(),
+    }
+}
+
+pub fn emit_tts_queue_state(app: &AppHandle, payload: TtsQueueStatePayload) {
+    if let Err(e) = app.emit("tts-queue-state", payload) {
+        tracing::warn!("tts-queue-state emit 失敗: {e}");
+    }
 }
 
 /// 読み上げバックエンドの共通インタフェース。
@@ -286,6 +323,33 @@ fn omit_urls(s: &str) -> String {
         } else {
             out.push_str(token);
         }
+    }
+    out
+}
+
+fn message_body_preview(msg: &ChatMessage) -> String {
+    let mut body = String::new();
+    for frag in &msg.fragments {
+        match frag {
+            Fragment::Text { text } => body.push_str(text),
+            Fragment::Emote { name, .. } => body.push_str(name),
+        }
+    }
+    if body.trim().is_empty() {
+        msg.author.name.clone()
+    } else {
+        body
+    }
+}
+
+fn truncate_preview(s: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for (idx, ch) in s.chars().enumerate() {
+        if idx >= max_chars {
+            out.push_str("...");
+            return out;
+        }
+        out.push(ch);
     }
     out
 }
