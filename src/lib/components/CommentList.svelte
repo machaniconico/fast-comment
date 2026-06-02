@@ -7,11 +7,17 @@
    * Auto-scroll to bottom when new messages arrive, unless the user has scrolled up.
    */
   import { onMount, untrack } from 'svelte';
-  import type { ChatMessage } from '../types';
+  import type { ChatMessage, Platform } from '../types';
   import ContextMenu from './ContextMenu.svelte';
   import type { ContextMenuItem } from './ContextMenu.svelte';
   import CommentItem from './CommentItem.svelte';
   import { store } from '../stores.svelte';
+
+  interface Props {
+    platformFilter?: Platform;
+  }
+
+  let { platformFilter }: Props = $props();
 
   // Row height in px — fixed height keeps virtual math simple.
   const ROW_HEIGHT = 28;
@@ -28,7 +34,20 @@
   let isAtBottom = $state(true);
   let menu: { x: number; y: number; items: ContextMenuItem[] } | null = $state(null);
 
-  let messages: ChatMessage[] = $derived(store.visibleMessages);
+  let messages: ChatMessage[] = $derived.by(() => {
+    if (!platformFilter) return store.visibleMessages;
+
+    const hidden = store.hiddenIds;
+    const q = store.searchQuery.trim().toLowerCase();
+    const out: ChatMessage[] = [];
+    for (const msg of store.allMessages) {
+      if (hidden.has(msg.id)) continue;
+      if (msg.platform !== platformFilter) continue;
+      if (q !== '' && !messageSearchText(msg).includes(q)) continue;
+      out.push(msg);
+    }
+    return out;
+  });
   let totalCount = $derived(messages.length);
   let totalHeight = $derived(totalCount * ROW_HEIGHT);
 
@@ -89,6 +108,11 @@
     menu = null;
   }
 
+  function messageSearchText(msg: ChatMessage): string {
+    const body = msg.fragments.map((frag) => frag.type === 'text' ? frag.text : frag.name).join('');
+    return `${msg.author.name} ${body}`.toLowerCase();
+  }
+
   onMount(() => {
     clientHeight = containerEl.clientHeight;
     measured = true;
@@ -105,7 +129,7 @@
   bind:this={containerEl}
   onscroll={onScroll}
   role="list"
-  aria-label="コメント一覧"
+  aria-label={platformFilter ? `${platformFilter} コメント一覧` : 'コメント一覧'}
 >
   <!-- Total height spacer -->
   <div class="inner" style:height="{totalHeight}px">

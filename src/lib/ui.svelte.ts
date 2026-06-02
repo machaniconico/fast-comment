@@ -11,6 +11,7 @@
  */
 
 export type Tab = 'comments' | 'donations' | 'participation' | 'settings';
+export type ViewMode = 'unified' | 'columns';
 
 /** Settings sections that the command palette can jump to. */
 export type SettingsAnchor = 'tts' | 'obs' | 'moderation' | 'notify';
@@ -25,6 +26,7 @@ export const SETTINGS_ANCHOR_IDS: Record<SettingsAnchor, string> = {
 
 class UiStore {
   activeTab: Tab = $state('comments');
+  viewMode: ViewMode = $state('unified');
   paletteOpen: boolean = $state(false);
   // One-shot scroll target. Set when navigating from the command palette;
   // Settings consumes it (scrolls, then clears) so reopening the tab later
@@ -33,6 +35,14 @@ class UiStore {
 
   setTab(tab: Tab): void {
     this.activeTab = tab;
+  }
+
+  setViewMode(mode: ViewMode): void {
+    this.viewMode = mode;
+  }
+
+  toggleViewMode(): void {
+    this.viewMode = this.viewMode === 'unified' ? 'columns' : 'unified';
   }
 
   openPalette(): void {

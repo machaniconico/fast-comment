@@ -2,6 +2,7 @@
   import { onMount, onDestroy } from 'svelte';
   import type { Platform } from './lib/types';
   import CommentList from './lib/components/CommentList.svelte';
+  import MultiColumnView from './lib/components/MultiColumnView.svelte';
   import DonationPanel from './lib/components/DonationPanel.svelte';
   import Effects from './lib/components/Effects.svelte';
   import GoalsBar from './lib/components/GoalsBar.svelte';
@@ -299,6 +300,22 @@
         >YouTube</button>
       </div>
 
+      <!-- View mode -->
+      <div class="view-mode-group" role="group" aria-label="コメント表示モード">
+        <button
+          class="view-mode-btn"
+          class:active={ui.viewMode === 'unified'}
+          aria-pressed={ui.viewMode === 'unified'}
+          onclick={() => ui.setViewMode('unified')}
+        >統合</button>
+        <button
+          class="view-mode-btn"
+          class:active={ui.viewMode === 'columns'}
+          aria-pressed={ui.viewMode === 'columns'}
+          onclick={() => ui.setViewMode('columns')}
+        >カラム</button>
+      </div>
+
       <!-- Search -->
       <input
         type="search"
@@ -323,7 +340,11 @@
   <div class="main-content" role="tabpanel">
     {#if ui.activeTab === 'comments'}
       <PinnedStrip />
-      <CommentList />
+      {#if ui.viewMode === 'columns'}
+        <MultiColumnView />
+      {:else}
+        <CommentList />
+      {/if}
     {:else if ui.activeTab === 'donations' && showDonationPanel}
       <DonationPanel />
     {:else if ui.activeTab === 'participation'}
@@ -561,6 +582,15 @@
     flex-shrink: 0;
   }
 
+  .view-mode-group {
+    display: flex;
+    gap: 2px;
+    flex-shrink: 0;
+    padding-left: 6px;
+    margin-left: 2px;
+    border-left: 1px solid rgba(255,255,255,0.1);
+  }
+
   .filter-btn {
     background: rgba(255,255,255,0.06);
     border: 1px solid rgba(255,255,255,0.1);
@@ -582,6 +612,25 @@
 
   .filter-btn.twitch.active { background: rgba(145,70,255,0.3); border-color: #9146ff; color: #d4aaff; }
   .filter-btn.youtube.active { background: rgba(255,0,0,0.2); border-color: #ff4444; color: #ff9999; }
+
+  .view-mode-btn {
+    background: rgba(255,255,255,0.06);
+    border: 1px solid rgba(255,255,255,0.1);
+    color: #9e9e9e;
+    padding: 3px 8px;
+    font-size: 11px;
+    font-weight: 600;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: all 0.15s;
+    white-space: nowrap;
+  }
+
+  .view-mode-btn.active {
+    color: #fff;
+    background: rgba(255,255,255,0.16);
+    border-color: rgba(255,255,255,0.25);
+  }
 
   .search-input {
     flex: 1;
