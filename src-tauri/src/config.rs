@@ -13,13 +13,14 @@ use serde::{Deserialize, Serialize};
 
 /// 監視対象チャンネル1件。
 ///
-/// Twitch はチャンネル名(`#` 抜き)、YouTube は videoId か配信URL を `identifier` に入れる。
+/// Twitch はチャンネル名(`#` 抜き)、YouTube は videoId か配信URL、
+/// Niconico は lv ID を `identifier` に入れる。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChannelConfig {
     /// 接続元プラットフォーム。
     pub platform: ChannelPlatform,
-    /// Twitch: チャンネル名 / YouTube: videoId or 配信URL。
+    /// Twitch: チャンネル名 / YouTube: videoId or 配信URL / Niconico: lv ID。
     pub identifier: String,
     /// この行を有効にするか(false なら接続しない)。
     #[serde(default = "default_true")]
@@ -33,6 +34,7 @@ pub struct ChannelConfig {
 pub enum ChannelPlatform {
     Twitch,
     Youtube,
+    Niconico,
 }
 
 /// OBS overlay サーバ設定。
