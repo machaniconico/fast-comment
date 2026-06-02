@@ -113,6 +113,7 @@
   let stripEmoji: boolean = $state(true);
   let readName: boolean = $state(true);
   let bouyomiPath: string = $state('');
+  let bouyomiLaunchElevated: boolean = $state(false);
   let webSpeechRate: number = $state(1);
   let webSpeechPitch: number = $state(1);
   let webSpeechVolume: number = $state(1);
@@ -139,6 +140,7 @@
       stripEmoji = ttsBool('stripEmoji', true);
       readName = ttsBool('readName', true);
       bouyomiPath = config.tts.options.bouyomiPath ?? '';
+      bouyomiLaunchElevated = ttsBool('bouyomiLaunchElevated', false);
       webSpeechRate = ttsNum('webSpeechRate', 1);
       webSpeechPitch = ttsNum('webSpeechPitch', 1);
       webSpeechVolume = ttsNum('webSpeechVolume', 1);
@@ -509,6 +511,7 @@
     setTtsBool('stripEmoji', stripEmoji);
     setTtsBool('readName', readName);
     config.tts.options.bouyomiPath = bouyomiPath.trim();
+    setTtsBool('bouyomiLaunchElevated', bouyomiLaunchElevated);
     normalizeWebSpeechSettings();
     setTtsNum('webSpeechRate', webSpeechRate);
     setTtsNum('webSpeechPitch', webSpeechPitch);
@@ -716,6 +719,17 @@
       />
     </div>
     <p class="hint">指定すると起動時に未起動なら自動で立ち上げます（空欄なら手動起動）</p>
+    <div class="field-row">
+      <label for="tts-bouyomi-elevated">管理者として起動する</label>
+      <input
+        id="tts-bouyomi-elevated"
+        type="checkbox"
+        bind:checked={bouyomiLaunchElevated}
+        class="chk"
+      />
+      <span class="hint-inline">UAC確認が出ます</span>
+    </div>
+    <p class="hint">環境によっては棒読みちゃんの自動起動に管理者権限が必要です。</p>
     <div class="field-row">
       <button type="button" class="export-btn" onclick={onTestTts} disabled={testingTts}>
         {testingTts ? 'テスト中...' : 'テスト読み上げ'}

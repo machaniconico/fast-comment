@@ -231,6 +231,9 @@ pub struct TtsOptions {
     /// 棒読み: 自動起動する実行ファイルパス(空なら手動起動)。
     #[serde(default)]
     pub bouyomi_path: String,
+    /// 棒読み: 自動起動時に UAC 昇格を要求するか。既定 false。
+    #[serde(default)]
+    pub bouyomi_launch_elevated: bool,
 
     /// VOICEVOX: ベースURL。
     #[serde(default = "default_voicevox_url")]
@@ -279,6 +282,7 @@ impl Default for TtsOptions {
             bouyomi_tone: -1,
             bouyomi_voice: 0,
             bouyomi_path: String::new(),
+            bouyomi_launch_elevated: false,
             voicevox_url: default_voicevox_url(),
             voicevox_speaker: default_voicevox_speaker(),
             web_speech_rate: default_web_speech_rate(),

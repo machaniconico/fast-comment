@@ -161,6 +161,7 @@ export interface TtsOptions {
   bouyomiTone?: number;
   bouyomiVoice?: number;
   bouyomiPath?: string;
+  bouyomiLaunchElevated?: boolean;
   voicevoxUrl?: string;
   voicevoxSpeaker?: number;
   webSpeechRate?: number;

@@ -43,6 +43,7 @@ pub enum LaunchOutcome {
     AlreadyRunning,
     CooldownSkip,
     Launched,
+    NeedsElevation,
     Failed(String),
 }
 
@@ -92,8 +93,16 @@ fn resolve_first_addr(addr_text: &str) -> Result<SocketAddr, BouyomiConnectError
         .ok_or_else(|| BouyomiConnectError::new(format!("{addr_text}: 接続先アドレスを解決できません")))
 }
 
+fn clear_launch_attempt() {
+    *LAST_LAUNCH_ATTEMPT.lock().unwrap() = None;
+}
+
+fn powershell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
 /// 棒読みちゃんが未起動なら、指定された exe を起動する。
-pub fn ensure_launched(path: String, host: String, port: u16) -> LaunchOutcome {
+pub fn ensure_launched(path: String, host: String, port: u16, elevated: bool) -> LaunchOutcome {
     let path = path.trim().to_string();
     if path.is_empty() {
         tracing::info!("棒読みちゃん: パス未設定のため自動起動しません");
@@ -133,15 +142,38 @@ pub fn ensure_launched(path: String, host: String, port: u16) -> LaunchOutcome {
         *last = Some(Instant::now());
     }
 
-    let mut cmd = Command::new(&path);
     // BouyomiChan は自身のフォルダを基準に設定/辞書を読むため、作業ディレクトリを
     // exe のあるフォルダに合わせる(別 cwd から起動すると初期化に失敗し即終了することがある)。
-    if let Some(dir) = std::path::Path::new(&path).parent() {
-        if !dir.as_os_str().is_empty() && dir.exists() {
+    let workdir = std::path::Path::new(&path)
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty() && dir.exists());
+
+    let spawn_result = if elevated {
+        let workdir_arg = workdir
+            .map(|dir| {
+                format!(
+                    "-WorkingDirectory {}",
+                    powershell_single_quote(&dir.to_string_lossy())
+                )
+            })
+            .unwrap_or_default();
+        let ps = format!(
+            "Start-Process -FilePath {} {} -Verb RunAs",
+            powershell_single_quote(&path),
+            workdir_arg
+        );
+        Command::new("powershell")
+            .args(["-NoProfile", "-Command", ps.as_str()])
+            .spawn()
+    } else {
+        let mut cmd = Command::new(&path);
+        if let Some(dir) = workdir {
             cmd.current_dir(dir);
         }
-    }
-    match cmd.spawn() {
+        cmd.spawn()
+    };
+
+    match spawn_result {
         Ok(_) => {
             tracing::info!("棒読みちゃんを自動起動しました: {path}");
             LaunchOutcome::Launched
@@ -150,8 +182,12 @@ pub fn ensure_launched(path: String, host: String, port: u16) -> LaunchOutcome {
             tracing::warn!("棒読みちゃんの自動起動に失敗: {path}: {e}");
             // 起動に失敗した場合はクールダウンを解除し、次回(パス修正後など)に
             // 即座に再試行できるようにする。失敗試行で 15 秒ブロックしない。
-            *LAST_LAUNCH_ATTEMPT.lock().unwrap() = None;
-            LaunchOutcome::Failed(format!("{e}"))
+            clear_launch_attempt();
+            if !elevated && e.raw_os_error() == Some(740) {
+                LaunchOutcome::NeedsElevation
+            } else {
+                LaunchOutcome::Failed(format!("{e}"))
+            }
         }
     }
 }

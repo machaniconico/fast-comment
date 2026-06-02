@@ -110,6 +110,11 @@ fn emit_bouyomi_launch_notice(app: &AppHandle, outcome: bouyomi::LaunchOutcome) 
             "info",
             "棒読みちゃんを自動起動しました".to_string(),
         ),
+        bouyomi::LaunchOutcome::NeedsElevation => emit_tts_notice(
+            app,
+            "error",
+            "棒読みちゃんの自動起動には管理者権限が必要です。棒読みちゃんを手動で管理者として起動するか、設定で「管理者として起動する」を有効化してください（有効化時はUAC確認が出ます）".to_string(),
+        ),
         bouyomi::LaunchOutcome::Failed(e) => emit_tts_notice(
             app,
             "warn",
@@ -126,9 +131,10 @@ async fn ensure_bouyomi_launched_and_emit_notice(
     path: String,
     host: String,
     port: u16,
+    elevated: bool,
 ) {
     let launch = tauri::async_runtime::spawn_blocking(move || {
-        let outcome = bouyomi::ensure_launched(path, host, port);
+        let outcome = bouyomi::ensure_launched(path, host, port, elevated);
         (app, outcome)
     });
 
@@ -233,12 +239,19 @@ async fn test_tts(state: State<'_, AppState>) -> Result<String, String> {
             let host = opt.bouyomi_host.clone();
             let port = opt.bouyomi_port;
             let path = opt.bouyomi_path.clone();
+            let elevated = opt.bouyomi_launch_elevated;
             let launch_host = host.clone();
             let launch_outcome = tauri::async_runtime::spawn_blocking(move || {
-                bouyomi::ensure_launched(path, launch_host, port)
+                bouyomi::ensure_launched(path, launch_host, port, elevated)
             })
             .await
             .map_err(|e| format!("棒読みちゃんの自動起動処理に失敗しました: {e}"))?;
+
+            if matches!(launch_outcome, bouyomi::LaunchOutcome::NeedsElevation) {
+                return Err(
+                    "棒読みちゃんの自動起動には管理者権限が必要です。棒読みちゃんを手動で管理者として起動するか、設定で「管理者として起動する」を有効化してください（有効化時はUAC確認が出ます）".to_string()
+                );
+            }
 
             if let bouyomi::LaunchOutcome::Failed(e) = &launch_outcome {
                 return Err(format!(
@@ -362,7 +375,8 @@ async fn update_config(
         let path = committed_config.tts.options.bouyomi_path.trim().to_string();
         let host = committed_config.tts.options.bouyomi_host.clone();
         let port = committed_config.tts.options.bouyomi_port;
-        ensure_bouyomi_launched_and_emit_notice(app.clone(), path, host, port).await;
+        let elevated = committed_config.tts.options.bouyomi_launch_elevated;
+        ensure_bouyomi_launched_and_emit_notice(app.clone(), path, host, port, elevated).await;
     }
 
     Ok(())
@@ -972,11 +986,13 @@ pub fn run() {
                 let path = config.tts.options.bouyomi_path.trim().to_string();
                 let host = config.tts.options.bouyomi_host.clone();
                 let port = config.tts.options.bouyomi_port;
+                let elevated = config.tts.options.bouyomi_launch_elevated;
                 tauri::async_runtime::spawn(ensure_bouyomi_launched_and_emit_notice(
                     handle.clone(),
                     path,
                     host,
                     port,
+                    elevated,
                 ));
             }
 

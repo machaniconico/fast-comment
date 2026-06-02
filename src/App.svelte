@@ -196,7 +196,7 @@
 
   {#if ttsNotice}
     <div
-      class={`tts-notice-banner${ttsNotice.level === 'info' ? ' tts-notice-banner--info' : ''}`}
+      class={`tts-notice-banner${ttsNotice.level === 'info' ? ' tts-notice-banner--info' : ''}${ttsNotice.level === 'warn' || ttsNotice.level === 'error' ? ' tts-notice-banner--error' : ''}`}
       role="status"
       aria-live="polite"
     >
@@ -435,6 +435,12 @@
     color: #d8f7e3;
   }
 
+  .tts-notice-banner--error {
+    background: #3f1619;
+    border-bottom-color: rgba(248,113,113,0.42);
+    color: #ffd7d7;
+  }
+
   .tts-notice-banner__text {
     flex: 1;
     min-width: 0;
@@ -457,6 +463,10 @@
 
   .tts-notice-banner--info .tts-notice-dismiss {
     color: #b8e7c7;
+  }
+
+  .tts-notice-banner--error .tts-notice-dismiss {
+    color: #ffb4b4;
   }
 
   .tts-notice-dismiss:hover {
