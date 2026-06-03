@@ -11,6 +11,7 @@
   import GoalsBar from './lib/components/GoalsBar.svelte';
   import PinnedStrip from './lib/components/PinnedStrip.svelte';
   import Participation from './lib/components/Participation.svelte';
+  import Milestone from './lib/components/Milestone.svelte';
   import Welcome from './lib/components/Welcome.svelte';
   import Settings from './lib/components/Settings.svelte';
   import ChannelAdd from './lib/components/ChannelAdd.svelte';
@@ -224,6 +225,8 @@
 {#if showWelcome && config?.welcome}
   <Welcome config={config.welcome} />
 {/if}
+
+<Milestone />
 
 <div
   class="app"
