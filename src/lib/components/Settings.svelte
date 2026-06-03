@@ -26,10 +26,13 @@
   let copiedGoalsObs: boolean = $state(false);
   let copiedCsvPath: boolean = $state(false);
 
-  // NG / highlight edit buffers
-  let ngWordsText: string = $state('');
-  let ngUsersText: string = $state('');
-  let highlightsText: string = $state('');
+  // NG / highlight lists
+  let ngWords: string[] = $state([]);
+  let ngUsers: string[] = $state([]);
+  let highlights: string[] = $state([]);
+  let ngWordDraft: string = $state('');
+  let ngUserDraft: string = $state('');
+  let highlightDraft: string = $state('');
 
   // Template selection is persisted in config (config.obs.template); SPEC §10
   // mandates config as the single persistence source (no localStorage).
@@ -133,9 +136,9 @@
   onMount(async () => {
     config = await getConfig();
     if (config) {
-      ngWordsText = config.moderation.ngWords.join('\n');
-      ngUsersText = config.moderation.ngUsers.join('\n');
-      highlightsText = config.moderation.highlights.join('\n');
+      ngWords = normalizeModerationEntries(config.moderation.ngWords);
+      ngUsers = normalizeModerationEntries(config.moderation.ngUsers);
+      highlights = normalizeModerationEntries(config.moderation.highlights);
       voicevoxSpeaker = ttsNum('voicevoxSpeaker', 1);
       maxLength = ttsNum('maxLength', MAX_LENGTH_DEFAULT);
       stripEmoji = ttsBool('stripEmoji', true);
@@ -380,6 +383,86 @@
     config.tts.options.dictionary = normalizeTtsDictionary(ttsDictionary);
   }
 
+  function parseModerationText(value: string): string[] {
+    return [...new Set(value.split('\n').map((s) => s.trim()).filter(Boolean))];
+  }
+
+  function normalizeModerationEntries(entries: string[]): string[] {
+    return parseModerationText(entries.join('\n'));
+  }
+
+  function isValidRegex(entry: string): boolean {
+    try {
+      new RegExp(entry);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function addNgWord() {
+    const entry = ngWordDraft.trim();
+    if (!entry || ngWords.includes(entry)) return;
+    ngWords = [...ngWords, entry];
+    ngWordDraft = '';
+  }
+
+  function addNgUser() {
+    const entry = ngUserDraft.trim();
+    if (!entry || ngUsers.includes(entry)) return;
+    ngUsers = [...ngUsers, entry];
+    ngUserDraft = '';
+  }
+
+  function addHighlight() {
+    const entry = highlightDraft.trim();
+    if (!entry || highlights.includes(entry)) return;
+    highlights = [...highlights, entry];
+    highlightDraft = '';
+  }
+
+  function removeNgWord(index: number) {
+    ngWords = ngWords.filter((_, i) => i !== index);
+  }
+
+  function removeNgUser(index: number) {
+    ngUsers = ngUsers.filter((_, i) => i !== index);
+  }
+
+  function removeHighlight(index: number) {
+    highlights = highlights.filter((_, i) => i !== index);
+  }
+
+  function addNgWordOnEnter(event: KeyboardEvent) {
+    if (event.key !== 'Enter') return;
+    event.preventDefault();
+    addNgWord();
+  }
+
+  function addNgUserOnEnter(event: KeyboardEvent) {
+    if (event.key !== 'Enter') return;
+    event.preventDefault();
+    addNgUser();
+  }
+
+  function addHighlightOnEnter(event: KeyboardEvent) {
+    if (event.key !== 'Enter') return;
+    event.preventDefault();
+    addHighlight();
+  }
+
+  function syncNgWordsFromTextarea(event: Event) {
+    ngWords = parseModerationText((event.currentTarget as HTMLTextAreaElement).value);
+  }
+
+  function syncNgUsersFromTextarea(event: Event) {
+    ngUsers = parseModerationText((event.currentTarget as HTMLTextAreaElement).value);
+  }
+
+  function syncHighlightsFromTextarea(event: Event) {
+    highlights = parseModerationText((event.currentTarget as HTMLTextAreaElement).value);
+  }
+
   function fillRandomTestComment() {
     const samples = [
       { name: '初見です', text: '初見です、よろしくお願いします！' },
@@ -504,9 +587,9 @@
     if (!config) return;
     saving = true;
     saveMsg = '';
-    config.moderation.ngWords = ngWordsText.split('\n').map(s => s.trim()).filter(Boolean);
-    config.moderation.ngUsers = ngUsersText.split('\n').map(s => s.trim()).filter(Boolean);
-    config.moderation.highlights = highlightsText.split('\n').map(s => s.trim()).filter(Boolean);
+    config.moderation.ngWords = [...ngWords];
+    config.moderation.ngUsers = [...ngUsers];
+    config.moderation.highlights = [...highlights];
     setTtsNum('voicevoxSpeaker', Number.isFinite(voicevoxSpeaker) ? Math.trunc(voicevoxSpeaker) : 1);
     setTtsNum('maxLength', Number.isFinite(maxLength) && maxLength >= 0 ? Math.trunc(maxLength) : MAX_LENGTH_DEFAULT);
     setTtsBool('stripEmoji', stripEmoji);
@@ -1157,14 +1240,131 @@
 
   <!-- ── Moderation ── -->
   <section id="settings-moderation">
-    <h3>NGワード <span class="hint-inline">（1行1語、正規表現可）</span></h3>
-    <textarea bind:value={ngWordsText} rows={4} class="mod-area" placeholder="NG word&#10;bad_word"></textarea>
+    <h3>モデレーション</h3>
 
-    <h3>NGユーザー <span class="hint-inline">（1行1ID）</span></h3>
-    <textarea bind:value={ngUsersText} rows={3} class="mod-area" placeholder="username123"></textarea>
+    <div class="mod-list">
+      <div class="mod-list-header">
+        <span>NGワード（{ngWords.length}）</span>
+        <span class="hint-inline">正規表現可</span>
+      </div>
+      {#if ngWords.length === 0}
+        <p class="mod-empty">未登録</p>
+      {/if}
+      {#each ngWords as entry, index (entry)}
+        <div class="mod-entry-row">
+          <span class="mod-entry-text">{entry}</span>
+          {#if !isValidRegex(entry)}
+            <span class="mod-regex-warning" title="正規表現として無効" aria-label="正規表現として無効" role="img">⚠</span>
+          {/if}
+          <button type="button" class="copy-btn mod-delete" aria-label={`NGワード「${entry}」を削除`} onclick={() => removeNgWord(index)}>削除</button>
+        </div>
+      {/each}
+      <div class="mod-add-row">
+        <input
+          type="text"
+          bind:value={ngWordDraft}
+          class="id-input mod-add-input"
+          aria-label="NGワードを追加"
+          placeholder="NG word"
+          onkeydown={addNgWordOnEnter}
+        />
+        <button type="button" class="export-btn" onclick={addNgWord}>追加</button>
+      </div>
+    </div>
 
-    <h3>ハイライト <span class="hint-inline">（ユーザー名またはキーワード）</span></h3>
-    <textarea bind:value={highlightsText} rows={3} class="mod-area" placeholder="!command&#10;favorite_user"></textarea>
+    <div class="mod-list">
+      <div class="mod-list-header">
+        <span>NGユーザー（{ngUsers.length}）</span>
+        <span class="hint-inline">1行1ID</span>
+      </div>
+      {#if ngUsers.length === 0}
+        <p class="mod-empty">未登録</p>
+      {/if}
+      {#each ngUsers as entry, index (entry)}
+        <div class="mod-entry-row">
+          <span class="mod-entry-text">{entry}</span>
+          {#if !isValidRegex(entry)}
+            <span class="mod-regex-warning" title="正規表現として無効" aria-label="正規表現として無効" role="img">⚠</span>
+          {/if}
+          <button type="button" class="copy-btn mod-delete" aria-label={`NGユーザー「${entry}」を削除`} onclick={() => removeNgUser(index)}>削除</button>
+        </div>
+      {/each}
+      <div class="mod-add-row">
+        <input
+          type="text"
+          bind:value={ngUserDraft}
+          class="id-input mod-add-input"
+          aria-label="NGユーザーを追加"
+          placeholder="username123"
+          onkeydown={addNgUserOnEnter}
+        />
+        <button type="button" class="export-btn" onclick={addNgUser}>追加</button>
+      </div>
+    </div>
+
+    <div class="mod-list">
+      <div class="mod-list-header">
+        <span>ハイライト（{highlights.length}）</span>
+        <span class="hint-inline">ユーザー名またはキーワード</span>
+      </div>
+      {#if highlights.length === 0}
+        <p class="mod-empty">未登録</p>
+      {/if}
+      {#each highlights as entry, index (entry)}
+        <div class="mod-entry-row">
+          <span class="mod-entry-text">{entry}</span>
+          {#if !isValidRegex(entry)}
+            <span class="mod-regex-warning" title="正規表現として無効" aria-label="正規表現として無効" role="img">⚠</span>
+          {/if}
+          <button type="button" class="copy-btn mod-delete" aria-label={`ハイライト「${entry}」を削除`} onclick={() => removeHighlight(index)}>削除</button>
+        </div>
+      {/each}
+      <div class="mod-add-row">
+        <input
+          type="text"
+          bind:value={highlightDraft}
+          class="id-input mod-add-input"
+          aria-label="ハイライトを追加"
+          placeholder="!command"
+          onkeydown={addHighlightOnEnter}
+        />
+        <button type="button" class="export-btn" onclick={addHighlight}>追加</button>
+      </div>
+    </div>
+
+    <details class="mod-bulk-editor">
+      <summary>一括編集（上級者向け）</summary>
+
+      <h3>NGワード <span class="hint-inline">（1行1語、正規表現可）</span></h3>
+      <textarea
+        value={ngWords.join('\n')}
+        rows={4}
+        class="mod-area"
+        placeholder="NG word&#10;bad_word"
+        aria-label="NGワードを一括編集"
+        onblur={syncNgWordsFromTextarea}
+      ></textarea>
+
+      <h3>NGユーザー <span class="hint-inline">（1行1ID）</span></h3>
+      <textarea
+        value={ngUsers.join('\n')}
+        rows={3}
+        class="mod-area"
+        placeholder="username123"
+        aria-label="NGユーザーを一括編集"
+        onblur={syncNgUsersFromTextarea}
+      ></textarea>
+
+      <h3>ハイライト <span class="hint-inline">（ユーザー名またはキーワード）</span></h3>
+      <textarea
+        value={highlights.join('\n')}
+        rows={3}
+        class="mod-area"
+        placeholder="!command&#10;favorite_user"
+        aria-label="ハイライトを一括編集"
+        onblur={syncHighlightsFromTextarea}
+      ></textarea>
+    </details>
   </section>
 
   <!-- ── Notification ── -->
@@ -1391,6 +1591,74 @@
     resize: vertical;
     box-sizing: border-box;
     font-family: monospace;
+  }
+
+  .mod-list {
+    margin-top: 10px;
+  }
+
+  .mod-list-header {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 10px;
+    color: #ccc;
+    font-size: 13px;
+    font-weight: 600;
+  }
+
+  .mod-empty {
+    color: #757575;
+    font-size: 12px;
+    margin: 6px 0 0;
+  }
+
+  .mod-entry-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto auto;
+    gap: 6px;
+    align-items: center;
+    margin-top: 6px;
+  }
+
+  .mod-entry-text {
+    min-width: 0;
+    overflow-wrap: anywhere;
+    color: #e0e0e0;
+    font-family: monospace;
+    font-size: 12px;
+  }
+
+  .mod-regex-warning {
+    color: #ffca28;
+    font-size: 13px;
+    line-height: 1;
+  }
+
+  .mod-delete {
+    background: #4e342e;
+  }
+
+  .mod-add-row {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+    margin-top: 6px;
+  }
+
+  .mod-add-input {
+    min-width: 0;
+  }
+
+  .mod-bulk-editor {
+    margin-top: 12px;
+  }
+
+  .mod-bulk-editor summary {
+    color: #bdbdbd;
+    cursor: pointer;
+    font-size: 12px;
+    font-weight: 600;
   }
 
 	  .field-row {
