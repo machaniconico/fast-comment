@@ -3,6 +3,7 @@
   import type { Platform } from './lib/types';
   import CommentList from './lib/components/CommentList.svelte';
   import Dashboard from './lib/components/Dashboard.svelte';
+  import Raffle from './lib/components/Raffle.svelte';
   import MultiColumnView from './lib/components/MultiColumnView.svelte';
   import DonationPanel from './lib/components/DonationPanel.svelte';
   import Effects from './lib/components/Effects.svelte';
@@ -240,34 +241,40 @@
         <button
           role="tab"
           class="tab-btn"
-          class:active={ui.activeTab === 'comments' && !ui.showDashboard}
-          aria-selected={ui.activeTab === 'comments' && !ui.showDashboard}
+          class:active={ui.activeTab === 'comments' && !ui.showDashboard && !ui.showRaffle}
+          aria-selected={ui.activeTab === 'comments' && !ui.showDashboard && !ui.showRaffle}
           onclick={() => ui.setTab('comments')}
         >コメント</button>
         {#if showDonationPanel}
           <button
             role="tab"
             class="tab-btn"
-            class:active={ui.activeTab === 'donations' && !ui.showDashboard}
-            aria-selected={ui.activeTab === 'donations' && !ui.showDashboard}
+            class:active={ui.activeTab === 'donations' && !ui.showDashboard && !ui.showRaffle}
+            aria-selected={ui.activeTab === 'donations' && !ui.showDashboard && !ui.showRaffle}
             onclick={() => ui.setTab('donations')}
           >投げ銭</button>
         {/if}
         <button
           role="tab"
           class="tab-btn"
-          class:active={ui.activeTab === 'participation' && !ui.showDashboard}
-          aria-selected={ui.activeTab === 'participation' && !ui.showDashboard}
+          class:active={ui.activeTab === 'participation' && !ui.showDashboard && !ui.showRaffle}
+          aria-selected={ui.activeTab === 'participation' && !ui.showDashboard && !ui.showRaffle}
           onclick={() => ui.setTab('participation')}
         >参加</button>
         <button
           role="tab"
           class="tab-btn"
-          class:active={ui.activeTab === 'settings' && !ui.showDashboard}
-          aria-selected={ui.activeTab === 'settings' && !ui.showDashboard}
+          class:active={ui.activeTab === 'settings' && !ui.showDashboard && !ui.showRaffle}
+          aria-selected={ui.activeTab === 'settings' && !ui.showDashboard && !ui.showRaffle}
           onclick={() => ui.setTab('settings')}
         >設定</button>
       </div>
+      <button
+        class="dashboard-toggle raffle-toggle"
+        class:active={ui.showRaffle}
+        aria-pressed={ui.showRaffle}
+        onclick={() => ui.toggleRaffle()}
+      >抽選</button>
       <button
         class="dashboard-toggle"
         class:active={ui.showDashboard}
@@ -282,14 +289,14 @@
   {/if}
 
   <!-- ── Channel add bar (URL paste → auto-detect) ── -->
-  {#if ui.activeTab === 'comments' && !ui.showDashboard}
+  {#if ui.activeTab === 'comments' && !ui.showDashboard && !ui.showRaffle}
     <div class="channel-bar">
       <ChannelAdd />
     </div>
   {/if}
 
   <!-- ── Comment tab toolbar ── -->
-  {#if ui.activeTab === 'comments' && !ui.showDashboard}
+  {#if ui.activeTab === 'comments' && !ui.showDashboard && !ui.showRaffle}
     <div class="toolbar">
       <!-- Platform filter -->
       <div class="filter-group" role="group" aria-label="プラットフォームフィルタ">
@@ -351,6 +358,8 @@
   <div class="main-content" role="tabpanel">
     {#if ui.showDashboard}
       <Dashboard />
+    {:else if ui.showRaffle}
+      <Raffle />
     {:else if ui.activeTab === 'comments'}
       <PinnedStrip />
       {#if ui.viewMode === 'columns'}

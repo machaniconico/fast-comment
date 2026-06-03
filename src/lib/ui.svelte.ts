@@ -28,6 +28,7 @@ class UiStore {
   activeTab: Tab = $state('comments');
   viewMode: ViewMode = $state('unified');
   showDashboard: boolean = $state(false);
+  showRaffle: boolean = $state(false);
   paletteOpen: boolean = $state(false);
   // One-shot scroll target. Set when navigating from the command palette;
   // Settings consumes it (scrolls, then clears) so reopening the tab later
@@ -37,6 +38,7 @@ class UiStore {
   setTab(tab: Tab): void {
     this.activeTab = tab;
     this.showDashboard = false;
+    this.showRaffle = false;
   }
 
   setViewMode(mode: ViewMode): void {
@@ -49,10 +51,17 @@ class UiStore {
 
   setShowDashboard(show: boolean): void {
     this.showDashboard = show;
+    if (this.showDashboard) this.showRaffle = false;
   }
 
   toggleDashboard(): void {
     this.showDashboard = !this.showDashboard;
+    if (this.showDashboard) this.showRaffle = false;
+  }
+
+  toggleRaffle(): void {
+    this.showRaffle = !this.showRaffle;
+    if (this.showRaffle) this.showDashboard = false;
   }
 
   openPalette(): void {
@@ -71,6 +80,7 @@ class UiStore {
   gotoSetting(anchor: SettingsAnchor): void {
     this.activeTab = 'settings';
     this.showDashboard = false;
+    this.showRaffle = false;
     this.settingsAnchor = anchor;
   }
 
