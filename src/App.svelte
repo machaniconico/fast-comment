@@ -19,6 +19,7 @@
   import TtsQueuePanel from './lib/components/TtsQueuePanel.svelte';
   import { store, initStore, clearMessages } from './lib/stores.svelte';
   import { ui } from './lib/ui.svelte';
+  import { theme } from './lib/theme.svelte';
   import { checkForUpdate, openReleaseUrl, getConfig, onTtsNotice } from './lib/ipc';
   import type { AppConfig, TtsNotice, UpdateStatus } from './lib/ipc';
 
@@ -82,6 +83,7 @@
   });
 
   onMount(async () => {
+    theme.load();
     window.addEventListener('click', onWindowClick);
     window.addEventListener('keydown', onWindowKey);
     void loadUpdateStatus();
@@ -91,6 +93,7 @@
   });
 
   onDestroy(() => {
+    theme.destroy();
     window.removeEventListener('click', onWindowClick);
     window.removeEventListener('keydown', onWindowKey);
     unlisten?.();
@@ -222,7 +225,12 @@
   <Welcome config={config.welcome} />
 {/if}
 
-<div class="app">
+<div
+  class="app"
+  data-theme={theme.resolved}
+  data-font-size={theme.fontSize}
+  data-density={theme.density}
+>
   {#if updateStatus?.updateAvailable && !updateDismissed}
     <div class="update-banner" role="status" aria-live="polite">
       <span class="update-banner__text">
@@ -467,10 +475,42 @@
   }
 
   .app {
+    --fc-comment-font-size: 13px;
+    --fc-comment-line-height: 1.4;
+    --fc-comment-padding-x: 6px;
     display: flex;
     flex-direction: column;
     height: 100vh;
     overflow: hidden;
+    background: #121212;
+    color: #e0e0e0;
+  }
+
+  .app[data-theme='light'] {
+    background: #f5f7fa;
+    color: #20242a;
+  }
+
+  .app[data-font-size='s'] {
+    --fc-comment-font-size: 12px;
+  }
+
+  .app[data-font-size='m'] {
+    --fc-comment-font-size: 13px;
+  }
+
+  .app[data-font-size='l'] {
+    --fc-comment-font-size: 15px;
+  }
+
+  .app[data-density='comfortable'] {
+    --fc-comment-line-height: 1.4;
+    --fc-comment-padding-x: 6px;
+  }
+
+  .app[data-density='compact'] {
+    --fc-comment-line-height: 1.2;
+    --fc-comment-padding-x: 4px;
   }
 
   .update-banner {
@@ -592,6 +632,11 @@
     border-bottom: 1px solid rgba(255,255,255,0.08);
     flex-shrink: 0;
     gap: 8px;
+  }
+
+  .app[data-theme='light'] .app-header {
+    background: #ffffff;
+    border-bottom-color: rgba(15,23,42,0.12);
   }
 
   .header-left {
@@ -721,6 +766,46 @@
     flex-shrink: 0;
   }
 
+  .app[data-theme='light'] .channel-bar,
+  .app[data-theme='light'] .toolbar {
+    background: #eef2f6;
+    border-bottom-color: rgba(15,23,42,0.1);
+  }
+
+  .app[data-theme='light'] .tab-btn {
+    color: #52606d;
+  }
+
+  .app[data-theme='light'] .tab-btn.active {
+    color: #111827;
+    background: rgba(15,23,42,0.08);
+  }
+
+  .app[data-theme='light'] .tab-btn:hover:not(.active) {
+    color: #1f2937;
+    background: rgba(15,23,42,0.05);
+  }
+
+  .app[data-theme='light'] .tools-dropdown {
+    background: #ffffff;
+    border-color: rgba(15,23,42,0.14);
+    box-shadow: 0 8px 20px rgba(15,23,42,0.16);
+  }
+
+  .app[data-theme='light'] .tools-menu-item {
+    color: #52606d;
+  }
+
+  .app[data-theme='light'] .tools-menu-item.active {
+    color: #111827;
+    background: rgba(25,118,210,0.13);
+  }
+
+  .app[data-theme='light'] .tools-menu-item:hover:not(.active) {
+    color: #111827;
+    background: rgba(15,23,42,0.06);
+  }
+
   .filter-group {
     display: flex;
     gap: 2px;
@@ -791,6 +876,20 @@
   .search-input::placeholder { color: #555; }
   .search-input:focus { outline: none; border-color: rgba(255,255,255,0.25); }
 
+  .app[data-theme='light'] .search-input {
+    background: #ffffff;
+    border-color: rgba(15,23,42,0.16);
+    color: #20242a;
+  }
+
+  .app[data-theme='light'] .search-input::placeholder {
+    color: #7b8794;
+  }
+
+  .app[data-theme='light'] .search-input:focus {
+    border-color: rgba(25,118,210,0.45);
+  }
+
   .search-count {
     background: rgba(255,255,255,0.12);
     color: #9e9e9e;
@@ -845,5 +944,57 @@
 
   .donation-badge--member {
     color: #9e9e9e;
+  }
+
+  .app[data-font-size] :global(.comment-item) {
+    font-size: var(--fc-comment-font-size);
+  }
+
+  .app[data-density] :global(.comment-item) {
+    line-height: var(--fc-comment-line-height);
+    padding-left: var(--fc-comment-padding-x);
+    padding-right: var(--fc-comment-padding-x);
+  }
+
+  .app[data-density='compact'] :global(.badge-img),
+  .app[data-density='compact'] :global(.emote) {
+    height: 18px;
+  }
+
+  .app[data-theme='light'] :global(.comment-item) {
+    border-bottom-color: rgba(15,23,42,0.08);
+  }
+
+  .app[data-theme='light'] :global(.comment-list-container) {
+    scrollbar-color: rgba(15,23,42,0.22) transparent;
+  }
+
+  .app[data-theme='light'] :global(.settings h2),
+  .app[data-theme='light'] :global(.settings h3),
+  .app[data-theme='light'] :global(.field-row label),
+  .app[data-theme='light'] :global(.dict-header),
+  .app[data-theme='light'] :global(.mod-list-header),
+  .app[data-theme='light'] :global(.obs-label) {
+    color: #20242a;
+  }
+
+  .app[data-theme='light'] :global(.hint),
+  .app[data-theme='light'] :global(.hint-inline),
+  .app[data-theme='light'] :global(.mod-empty) {
+    color: #64748b;
+  }
+
+  .app[data-theme='light'] :global(.platform-select),
+  .app[data-theme='light'] :global(.id-input),
+  .app[data-theme='light'] :global(.obs-input),
+  .app[data-theme='light'] :global(.num-input),
+  .app[data-theme='light'] :global(.mod-area) {
+    background: #ffffff;
+    border-color: rgba(15,23,42,0.16);
+    color: #20242a;
+  }
+
+  .app[data-theme='light'] :global(section) {
+    border-bottom-color: rgba(15,23,42,0.1);
   }
 </style>

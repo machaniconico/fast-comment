@@ -9,6 +9,7 @@
     setTtsPaused, clearTtsQueue, skipCurrentTts, testTts
   } from '../ipc';
   import { ui, SETTINGS_ANCHOR_IDS } from '../ui.svelte';
+  import { theme, type AppearanceDensity, type AppearanceFontSize, type AppearanceTheme } from '../theme.svelte';
   import { buildCsv, setNotify, store } from '../stores.svelte';
   import TemplateEditor from './TemplateEditor.svelte';
 
@@ -17,6 +18,18 @@
   }
 
   let { onConfigSaved }: Props = $props();
+
+  function onThemeChange(event: Event) {
+    theme.setTheme((event.currentTarget as HTMLSelectElement).value as AppearanceTheme);
+  }
+
+  function onFontSizeChange(event: Event) {
+    theme.setFontSize((event.currentTarget as HTMLSelectElement).value as AppearanceFontSize);
+  }
+
+  function onDensityChange(event: Event) {
+    theme.setDensity((event.currentTarget as HTMLSelectElement).value as AppearanceDensity);
+  }
 
   let config: AppConfig | null = $state(null);
   let obsBaseUrl: string = $state('');
@@ -754,6 +767,33 @@
 
 <div class="settings">
   <h2>設定</h2>
+
+  <section id="settings-appearance">
+    <h3>外観</h3>
+    <div class="field-row">
+      <label for="appearance-theme">テーマ</label>
+      <select id="appearance-theme" value={theme.theme} class="platform-select" onchange={onThemeChange}>
+        <option value="dark">ダーク</option>
+        <option value="light">ライト</option>
+        <option value="auto">自動</option>
+      </select>
+    </div>
+    <div class="field-row">
+      <label for="appearance-font-size">文字サイズ</label>
+      <select id="appearance-font-size" value={theme.fontSize} class="platform-select" onchange={onFontSizeChange}>
+        <option value="s">小</option>
+        <option value="m">中</option>
+        <option value="l">大</option>
+      </select>
+    </div>
+    <div class="field-row">
+      <label for="appearance-density">表示密度</label>
+      <select id="appearance-density" value={theme.density} class="platform-select" onchange={onDensityChange}>
+        <option value="comfortable">標準</option>
+        <option value="compact">コンパクト</option>
+      </select>
+    </div>
+  </section>
 
   <!-- ── TTS ── -->
   {#if config}
