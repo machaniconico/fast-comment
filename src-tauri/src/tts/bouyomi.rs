@@ -170,6 +170,15 @@ pub fn ensure_launched(path: String, host: String, port: u16, elevated: bool) ->
         if let Some(dir) = workdir {
             cmd.current_dir(dir);
         }
+        // 棒読みちゃん.exe が「管理者として実行」フラグ(互換性設定やマニフェスト)で
+        // 昇格を要求していると、非昇格プロセスからの spawn は OS error 740
+        // (ERROR_ELEVATION_REQUIRED)で失敗する。__COMPAT_LAYER=RunAsInvoker を
+        // 子プロセスの環境に与えると、Windows は EXE の昇格要求を無視し、呼び出し元
+        // (非昇格)の権限でそのまま起動する。棒読みちゃんは本来管理者権限を必要と
+        // しないため、これで UAC も管理者権限も無しに自動起動できる。
+        // 昇格要求のない通常の exe では no-op(影響なし)。真に管理者必須のアプリでは
+        // 起動はするが機能不全になり得るが、その場合は昇格オプトイン(elevated=true)で対応。
+        cmd.env("__COMPAT_LAYER", "RunAsInvoker");
         cmd.spawn()
     };
 
