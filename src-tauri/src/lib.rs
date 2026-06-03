@@ -39,7 +39,7 @@ use crate::model::{
 };
 use crate::moderation::{Moderator, Verdict};
 use crate::sources::SourceManager;
-use crate::stats::{spawn_stats_aggregator, StatsSnapshot, YoutubeMetadataUpdate};
+use crate::stats::{spawn_stats_aggregator, StatsSnapshot, TimerSnapshot, YoutubeMetadataUpdate};
 use crate::tts::{
     bouyomi, emit_tts_queue_state, tts_queue_state, TtsBackend, TtsDispatcher, TtsNoticePayload,
     TtsQueueItem, TtsQueueStatePayload,
@@ -55,6 +55,8 @@ pub struct AppState {
     config: Mutex<AppConfig>,
     /// stats 集約などへ設定変更を伝える watch 送信端。
     config_tx: watch::Sender<AppConfig>,
+    /// Timer overlay へ基準スナップショットを配る watch 送信端。
+    timer_tx: watch::Sender<TimerSnapshot>,
     /// 設定の保存先ディレクトリ(app config dir)。
     config_dir: PathBuf,
     /// Source → パイプラインへ流す内部 broadcast 送信端。
@@ -535,6 +537,90 @@ fn get_obs_goals_url(state: State<'_, AppState>) -> Result<String, String> {
     Ok(format!(
         "http://127.0.0.1:{port}/?template=goals&ws=ws://127.0.0.1:{port}/stats"
     ))
+}
+
+/// Timer overlay の基準スナップショットを更新する。
+#[tauri::command]
+fn control_timer(
+    state: State<'_, AppState>,
+    action: String,
+    duration_sec: Option<u32>,
+) -> Result<(), String> {
+    let timer_config = {
+        let cfg = state.config.lock().unwrap();
+        cfg.timer.clone()
+    };
+    let now_ms = timer_now_ms();
+    let timer_rx = state.timer_tx.subscribe();
+    let mut next = timer_rx.borrow().clone();
+
+    match action.as_str() {
+        "start" => {
+            let dur = duration_sec.unwrap_or(timer_config.default_duration_sec);
+            next = TimerSnapshot {
+                state: "running".to_string(),
+                mode: normalize_timer_mode(&timer_config.mode),
+                duration_sec: dur,
+                base_elapsed_sec: 0,
+                running_since_ms: now_ms,
+                updated_at: now_ms,
+            };
+        }
+        "pause" => {
+            if next.state == "running" {
+                let elapsed_sec = now_ms.saturating_sub(next.running_since_ms) / 1000;
+                let elapsed_sec = u32::try_from(elapsed_sec).unwrap_or(u32::MAX);
+                next.base_elapsed_sec = next.base_elapsed_sec.saturating_add(elapsed_sec);
+            }
+            next.state = "paused".to_string();
+            next.running_since_ms = 0;
+            next.updated_at = now_ms;
+        }
+        "resume" => {
+            next.state = "running".to_string();
+            next.running_since_ms = now_ms;
+            next.updated_at = now_ms;
+        }
+        "reset" => {
+            next.state = "idle".to_string();
+            next.base_elapsed_sec = 0;
+            next.running_since_ms = 0;
+            next.updated_at = now_ms;
+        }
+        other => {
+            return Err(format!(
+                "不正な timer action です: {other} (start/pause/resume/reset)"
+            ));
+        }
+    }
+
+    let _ = state.timer_tx.send_replace(next);
+    Ok(())
+}
+
+/// OBS Timer overlay 用 URL を返す。
+#[tauri::command]
+fn get_obs_timer_url(state: State<'_, AppState>) -> Result<String, String> {
+    let port = state.obs_server.lock().unwrap().port;
+    Ok(format!(
+        "http://127.0.0.1:{port}/?template=timer&ws=ws://127.0.0.1:{port}/timer"
+    ))
+}
+
+fn normalize_timer_mode(mode: &str) -> String {
+    if mode == "elapsed" {
+        "elapsed".to_string()
+    } else {
+        "countdown".to_string()
+    }
+}
+
+fn timer_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
 }
 
 /// OBS テンプレートディレクトリ一覧を返す。
@@ -1097,11 +1183,12 @@ pub fn run() {
 
             // Goals stats 用 channel。
             let (stats_tx, _stats_rx) = watch::channel::<StatsSnapshot>(StatsSnapshot::default());
+            let (timer_tx, _timer_rx) = watch::channel::<TimerSnapshot>(TimerSnapshot::default());
             let (config_tx, config_rx) = watch::channel::<AppConfig>(config.clone());
             let (metadata_tx, metadata_rx) = mpsc::channel::<YoutubeMetadataUpdate>(64);
 
             // 下流 Bus(パイプライン → UI/OBS)。
-            let bus = Bus::new(obs_port, stats_tx.clone());
+            let bus = Bus::new(obs_port, stats_tx.clone(), timer_tx.clone());
 
             // モデレータ。
             let moderator = Moderator::new(&config.moderation);
@@ -1114,6 +1201,7 @@ pub fn run() {
             let state = AppState {
                 config: Mutex::new(config.clone()),
                 config_tx,
+                timer_tx,
                 config_dir,
                 source_tx: source_tx.clone(),
                 bus: bus.clone(),
@@ -1197,6 +1285,8 @@ pub fn run() {
             unhide_message,
             get_obs_url,
             get_obs_goals_url,
+            get_obs_timer_url,
+            control_timer,
             list_templates,
             read_template_file,
             write_template_file,

@@ -2,10 +2,10 @@
   import { onMount, onDestroy } from 'svelte';
   import type {
     AppConfig, EffectRule, EffectsConfig, GoalsConfig, InjectTestCommentOptions, TtsDictEntry, TtsOptions,
-    WelcomeConfig
+    TimerConfig, WelcomeConfig
   } from '../ipc';
   import {
-    getConfig, setConfig, getObsUrl, getObsGoalsUrl, exportCommentsCsv, injectTestComment,
+    getConfig, setConfig, getObsUrl, getObsGoalsUrl, getObsTimerUrl, exportCommentsCsv, injectTestComment,
     setTtsPaused, clearTtsQueue, skipCurrentTts, testTts
   } from '../ipc';
   import { ui, SETTINGS_ANCHOR_IDS } from '../ui.svelte';
@@ -21,9 +21,11 @@
   let config: AppConfig | null = $state(null);
   let obsBaseUrl: string = $state('');
   let obsGoalsBaseUrl: string = $state('');
+  let obsTimerBaseUrl: string = $state('');
   let copiedObs: boolean = $state(false);
   let copiedGiftObs: boolean = $state(false);
   let copiedGoalsObs: boolean = $state(false);
+  let copiedTimerObs: boolean = $state(false);
   let copiedCsvPath: boolean = $state(false);
 
   // NG / highlight lists
@@ -77,6 +79,7 @@
   let copiedObsTimer: ReturnType<typeof setTimeout> | null = null;
   let copiedGiftObsTimer: ReturnType<typeof setTimeout> | null = null;
   let copiedGoalsObsTimer: ReturnType<typeof setTimeout> | null = null;
+  let copiedTimerObsTimer: ReturnType<typeof setTimeout> | null = null;
   let copiedCsvPathTimer: ReturnType<typeof setTimeout> | null = null;
   let testCommentMsgTimer: ReturnType<typeof setTimeout> | null = null;
   let ttsControlMsgTimer: ReturnType<typeof setTimeout> | null = null;
@@ -153,6 +156,7 @@
       config.tts.options.dictionary = ttsDictionary;
       normalizeObsConfig(true);
       normalizeGoalsConfig();
+      normalizeTimerConfig();
       normalizeEffectsConfig();
       normalizeWelcomeConfig();
       normalizeParticipationConfig();
@@ -161,6 +165,7 @@
     const url = await getObsUrl();
     obsBaseUrl = url ?? 'http://127.0.0.1:11180/?template=default';
     obsGoalsBaseUrl = await getObsGoalsUrl();
+    obsTimerBaseUrl = await getObsTimerUrl();
 
     refreshSpeechVoices();
     if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
@@ -174,6 +179,7 @@
     if (copiedObsTimer !== null) clearTimeout(copiedObsTimer);
     if (copiedGiftObsTimer !== null) clearTimeout(copiedGiftObsTimer);
     if (copiedGoalsObsTimer !== null) clearTimeout(copiedGoalsObsTimer);
+    if (copiedTimerObsTimer !== null) clearTimeout(copiedTimerObsTimer);
     if (copiedCsvPathTimer !== null) clearTimeout(copiedCsvPathTimer);
     if (testCommentMsgTimer !== null) clearTimeout(testCommentMsgTimer);
     if (ttsControlMsgTimer !== null) clearTimeout(ttsControlMsgTimer);
@@ -194,6 +200,10 @@
 
   const goalsObsUrl = $derived.by(() => {
     return withGoalsParams(obsGoalsBaseUrl, config?.obs ?? null);
+  });
+
+  const timerObsUrl = $derived.by(() => {
+    return withTimerParams(obsTimerBaseUrl, config?.obs ?? null);
   });
 
   function withTemplate(url: string, obs: AppConfig['obs'] | null): string {
@@ -227,6 +237,19 @@
     try {
       const u = new URL(url);
       u.searchParams.set('template', 'goals');
+      u.searchParams.set('font', String(clampInt(obs?.fontScalePct, 100, 50, 200)));
+      u.searchParams.set('bg', String(clampInt(obs?.bgOpacityPct, 0, 0, 100)));
+      u.searchParams.set('pos', obs?.position === 'top' ? 'top' : 'bottom');
+      return u.toString();
+    } catch {
+      return url;
+    }
+  }
+
+  function withTimerParams(url: string, obs: AppConfig['obs'] | null): string {
+    try {
+      const u = new URL(url);
+      u.searchParams.set('template', 'timer');
       u.searchParams.set('font', String(clampInt(obs?.fontScalePct, 100, 50, 200)));
       u.searchParams.set('bg', String(clampInt(obs?.bgOpacityPct, 0, 0, 100)));
       u.searchParams.set('pos', obs?.position === 'top' ? 'top' : 'bottom');
@@ -296,6 +319,42 @@
     editable.goals.comments = clampInt(editable.goals.comments, 0, 0, 4294967295);
     editable.goals.viewers = clampInt(editable.goals.viewers, 0, 0, 4294967295);
     editable.goals.likes = clampInt(editable.goals.likes, 0, 0, 4294967295);
+  }
+
+  function defaultTimer(): TimerConfig {
+    return { enabled: false, defaultDurationSec: 300, mode: 'countdown' };
+  }
+
+  function normalizeTimerConfig() {
+    if (!config) return;
+    const editable = config as AppConfig & { timer?: Partial<TimerConfig> };
+    if (!editable.timer) editable.timer = defaultTimer();
+    editable.timer.enabled = editable.timer.enabled === true;
+    editable.timer.defaultDurationSec = clampInt(editable.timer.defaultDurationSec, 300, 1, 4294967295);
+    editable.timer.mode = editable.timer.mode === 'elapsed' ? 'elapsed' : 'countdown';
+  }
+
+  function timerDefaultMinutes(): number {
+    return Math.floor((config?.timer.defaultDurationSec ?? 300) / 60);
+  }
+
+  function timerDefaultSeconds(): number {
+    return (config?.timer.defaultDurationSec ?? 300) % 60;
+  }
+
+  function setTimerDefaultDuration(minutes: number, seconds: number) {
+    if (!config) return;
+    const mins = clampInt(minutes, 5, 0, Math.floor(4294967295 / 60));
+    const secs = clampInt(seconds, 0, 0, 59);
+    config.timer.defaultDurationSec = Math.max(1, mins * 60 + secs);
+  }
+
+  function onTimerMinutesInput(event: Event) {
+    setTimerDefaultDuration(Number((event.currentTarget as HTMLInputElement).value), timerDefaultSeconds());
+  }
+
+  function onTimerSecondsInput(event: Event) {
+    setTimerDefaultDuration(timerDefaultMinutes(), Number((event.currentTarget as HTMLInputElement).value));
   }
 
   function defaultEffects(): EffectsConfig {
@@ -605,6 +664,7 @@
     config.obs.ttlMs = ttlMsFromSeconds(obsTtlSeconds);
     normalizeObsConfig(false);
     normalizeGoalsConfig();
+    normalizeTimerConfig();
     normalizeEffectsConfig();
     normalizeWelcomeConfig();
     normalizeParticipationConfig();
@@ -651,6 +711,14 @@
       copiedGoalsObs = true;
       if (copiedGoalsObsTimer !== null) clearTimeout(copiedGoalsObsTimer);
       copiedGoalsObsTimer = setTimeout(() => { copiedGoalsObs = false; copiedGoalsObsTimer = null; }, 1500);
+    });
+  }
+
+  function onCopyTimerObs() {
+    copyText(timerObsUrl, () => {
+      copiedTimerObs = true;
+      if (copiedTimerObsTimer !== null) clearTimeout(copiedTimerObsTimer);
+      copiedTimerObsTimer = setTimeout(() => { copiedTimerObs = false; copiedTimerObsTimer = null; }, 1500);
     });
   }
 
@@ -1105,6 +1173,54 @@
       </button>
     </div>
     <p class="hint">コメント・視聴者・高評価の目標ゲージをOBSに表示します。</p>
+  </section>
+
+  <!-- ── Timer ── -->
+  <section id="settings-timer">
+    <h3>タイマー</h3>
+    <div class="field-row">
+      <label for="timer-enabled">タイマーを有効化</label>
+      <input id="timer-enabled" type="checkbox" bind:checked={config.timer.enabled} class="chk" />
+    </div>
+    <div class="field-row">
+      <label for="timer-default-minutes">既定時間</label>
+      <input
+        id="timer-default-minutes"
+        type="number"
+        min="0"
+        step="1"
+        value={timerDefaultMinutes()}
+        class="num-input"
+        oninput={onTimerMinutesInput}
+      />
+      <span class="hint-inline">分</span>
+      <input
+        id="timer-default-seconds"
+        type="number"
+        min="0"
+        max="59"
+        step="1"
+        value={timerDefaultSeconds()}
+        class="num-input"
+        oninput={onTimerSecondsInput}
+      />
+      <span class="hint-inline">秒</span>
+    </div>
+    <div class="field-row">
+      <label for="timer-mode">表示モード</label>
+      <select id="timer-mode" bind:value={config.timer.mode} class="platform-select">
+        <option value="countdown">カウントダウン</option>
+        <option value="elapsed">経過時間</option>
+      </select>
+    </div>
+    <div class="obs-label">TimerオーバーレイURL</div>
+    <div class="obs-row">
+      <input type="text" value={timerObsUrl} readonly class="obs-input" />
+      <button class="copy-btn" class:copied={copiedTimerObs} onclick={onCopyTimerObs}>
+        {copiedTimerObs ? 'コピー済' : 'コピー'}
+      </button>
+    </div>
+    <p class="hint">タイマー/カウントダウンをOBSに表示します。</p>
   </section>
 
   <!-- ── Effects ── -->

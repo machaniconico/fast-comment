@@ -56,6 +56,13 @@
       run: () => { ui.setTab('settings'); },
     },
     {
+      id: 'open-timer',
+      title: 'タイマーを開く',
+      keywords: ['timer', 'タイマー', 'countdown', 'カウントダウン'],
+      icon: '⏱',
+      run: () => { ui.setShowTimer(true); },
+    },
+    {
       id: 'goto-tts',
       title: 'TTS(読み上げ)設定へ',
       keywords: ['tts', '読み上げ', 'voicevox', 'voice', 'speech', 'setting', '設定'],
@@ -68,6 +75,13 @@
       keywords: ['obs', 'overlay', 'オーバーレイ', 'setting', '設定'],
       icon: '📺',
       run: () => { ui.gotoSetting('obs'); },
+    },
+    {
+      id: 'goto-timer',
+      title: 'タイマー設定へ',
+      keywords: ['timer', 'タイマー', 'countdown', 'カウントダウン', 'setting', '設定'],
+      icon: '⏱',
+      run: () => { ui.gotoSetting('timer'); },
     },
     {
       id: 'goto-moderation',

@@ -4,6 +4,7 @@
   import CommentList from './lib/components/CommentList.svelte';
   import Dashboard from './lib/components/Dashboard.svelte';
   import Raffle from './lib/components/Raffle.svelte';
+  import Timer from './lib/components/Timer.svelte';
   import MultiColumnView from './lib/components/MultiColumnView.svelte';
   import DonationPanel from './lib/components/DonationPanel.svelte';
   import Effects from './lib/components/Effects.svelte';
@@ -72,6 +73,7 @@
   const showGoalsBar = $derived(isGoalsBarEnabled(config));
   const showEffects = $derived(isEffectsEnabled(config));
   const showWelcome = $derived(isWelcomeEnabled(config));
+  const standaloneOpen = $derived(ui.showDashboard || ui.showRaffle || ui.showTimer);
 
   $effect(() => {
     if (!showDonationPanel && ui.activeTab === 'donations') ui.setTab('comments');
@@ -154,7 +156,8 @@
       ...nextConfig,
       ui: { ...nextConfig.ui },
       effects: { ...nextConfig.effects },
-      welcome: { ...nextConfig.welcome }
+      welcome: { ...nextConfig.welcome },
+      timer: { ...nextConfig.timer },
     };
   }
 
@@ -241,34 +244,40 @@
         <button
           role="tab"
           class="tab-btn"
-          class:active={ui.activeTab === 'comments' && !ui.showDashboard && !ui.showRaffle}
-          aria-selected={ui.activeTab === 'comments' && !ui.showDashboard && !ui.showRaffle}
+          class:active={ui.activeTab === 'comments' && !standaloneOpen}
+          aria-selected={ui.activeTab === 'comments' && !standaloneOpen}
           onclick={() => ui.setTab('comments')}
         >コメント</button>
         {#if showDonationPanel}
           <button
             role="tab"
             class="tab-btn"
-            class:active={ui.activeTab === 'donations' && !ui.showDashboard && !ui.showRaffle}
-            aria-selected={ui.activeTab === 'donations' && !ui.showDashboard && !ui.showRaffle}
+            class:active={ui.activeTab === 'donations' && !standaloneOpen}
+            aria-selected={ui.activeTab === 'donations' && !standaloneOpen}
             onclick={() => ui.setTab('donations')}
           >投げ銭</button>
         {/if}
         <button
           role="tab"
           class="tab-btn"
-          class:active={ui.activeTab === 'participation' && !ui.showDashboard && !ui.showRaffle}
-          aria-selected={ui.activeTab === 'participation' && !ui.showDashboard && !ui.showRaffle}
+          class:active={ui.activeTab === 'participation' && !standaloneOpen}
+          aria-selected={ui.activeTab === 'participation' && !standaloneOpen}
           onclick={() => ui.setTab('participation')}
         >参加</button>
         <button
           role="tab"
           class="tab-btn"
-          class:active={ui.activeTab === 'settings' && !ui.showDashboard && !ui.showRaffle}
-          aria-selected={ui.activeTab === 'settings' && !ui.showDashboard && !ui.showRaffle}
+          class:active={ui.activeTab === 'settings' && !standaloneOpen}
+          aria-selected={ui.activeTab === 'settings' && !standaloneOpen}
           onclick={() => ui.setTab('settings')}
         >設定</button>
       </div>
+      <button
+        class="dashboard-toggle"
+        class:active={ui.showTimer}
+        aria-pressed={ui.showTimer}
+        onclick={() => ui.toggleTimer()}
+      >タイマー</button>
       <button
         class="dashboard-toggle raffle-toggle"
         class:active={ui.showRaffle}
@@ -289,14 +298,14 @@
   {/if}
 
   <!-- ── Channel add bar (URL paste → auto-detect) ── -->
-  {#if ui.activeTab === 'comments' && !ui.showDashboard && !ui.showRaffle}
+  {#if ui.activeTab === 'comments' && !standaloneOpen}
     <div class="channel-bar">
       <ChannelAdd />
     </div>
   {/if}
 
   <!-- ── Comment tab toolbar ── -->
-  {#if ui.activeTab === 'comments' && !ui.showDashboard && !ui.showRaffle}
+  {#if ui.activeTab === 'comments' && !standaloneOpen}
     <div class="toolbar">
       <!-- Platform filter -->
       <div class="filter-group" role="group" aria-label="プラットフォームフィルタ">
@@ -356,7 +365,9 @@
 
   <!-- ── Main content ── -->
   <div class="main-content" role="tabpanel">
-    {#if ui.showDashboard}
+    {#if ui.showTimer}
+      <Timer />
+    {:else if ui.showDashboard}
       <Dashboard />
     {:else if ui.showRaffle}
       <Raffle />

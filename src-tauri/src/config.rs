@@ -98,6 +98,31 @@ pub struct GoalsConfig {
     pub likes: u32,
 }
 
+/// OBS タイマー/カウントダウン overlay 設定。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimerConfig {
+    /// Timer overlay を有効にするか。既定 false。
+    #[serde(default)]
+    pub enabled: bool,
+    /// 開始時の既定時間(秒)。既定 300 秒。
+    #[serde(default = "default_timer_duration_sec")]
+    pub default_duration_sec: u32,
+    /// 表示モード("countdown" / "elapsed")。既定 "countdown"。
+    #[serde(default = "default_timer_mode")]
+    pub mode: String,
+}
+
+impl Default for TimerConfig {
+    fn default() -> Self {
+        TimerConfig {
+            enabled: false,
+            default_duration_sec: default_timer_duration_sec(),
+            mode: default_timer_mode(),
+        }
+    }
+}
+
 /// コメント本文に反応してアプリ内エフェクトを表示するルール。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -393,6 +418,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub goals: GoalsConfig,
     #[serde(default)]
+    pub timer: TimerConfig,
+    #[serde(default)]
     pub effects: EffectsConfig,
     #[serde(default)]
     pub welcome: WelcomeConfig,
@@ -414,6 +441,7 @@ impl Default for AppConfig {
             channels: Vec::new(),
             obs: ObsConfig::default(),
             goals: GoalsConfig::default(),
+            timer: TimerConfig::default(),
             effects: EffectsConfig::default(),
             welcome: WelcomeConfig::default(),
             tts: TtsConfig::default(),
@@ -498,6 +526,12 @@ fn default_obs_bg_opacity_pct() -> u16 {
 }
 fn default_obs_position() -> String {
     "bottom".to_string()
+}
+fn default_timer_duration_sec() -> u32 {
+    300
+}
+fn default_timer_mode() -> String {
+    "countdown".to_string()
 }
 fn default_bouyomi_host() -> String {
     "127.0.0.1".to_string()
@@ -586,6 +620,11 @@ mod tests {
                 viewers: 50,
                 likes: 25,
             },
+            timer: TimerConfig {
+                enabled: true,
+                default_duration_sec: 900,
+                mode: "elapsed".to_string(),
+            },
             effects: EffectsConfig {
                 enabled: true,
                 rules: vec![EffectRule {
@@ -672,6 +711,9 @@ mod tests {
         assert_eq!(json["goals"]["comments"].as_u64(), Some(100));
         assert_eq!(json["goals"]["viewers"].as_u64(), Some(50));
         assert_eq!(json["goals"]["likes"].as_u64(), Some(25));
+        assert_eq!(json["timer"]["enabled"].as_bool(), Some(true));
+        assert_eq!(json["timer"]["defaultDurationSec"].as_u64(), Some(900));
+        assert_eq!(json["timer"]["mode"].as_str(), Some("elapsed"));
         assert_eq!(json["effects"]["enabled"].as_bool(), Some(true));
         assert_eq!(json["effects"]["rules"][0]["keyword"].as_str(), Some("party"));
         assert_eq!(json["effects"]["rules"][0]["emoji"].as_str(), Some("🎉"));
@@ -808,6 +850,12 @@ mod tests {
         assert_eq!(cfg.goals.comments, 0);
         assert_eq!(cfg.goals.viewers, 0);
         assert_eq!(cfg.goals.likes, 0);
+        assert_eq!(cfg.timer, TimerConfig::default());
+        assert!(!cfg.timer.enabled);
+        assert_eq!(cfg.timer.default_duration_sec, default_timer_duration_sec());
+        assert_eq!(cfg.timer.default_duration_sec, 300);
+        assert_eq!(cfg.timer.mode, default_timer_mode());
+        assert_eq!(cfg.timer.mode, "countdown");
         assert_eq!(cfg.effects, EffectsConfig::default());
         assert!(!cfg.effects.enabled);
         assert!(cfg.effects.rules.is_empty());
@@ -904,6 +952,7 @@ mod tests {
         assert_eq!(cfg.obs.position, default_obs_position());
         assert_eq!(cfg.obs.show_platform, default_true());
         assert_eq!(cfg.goals, GoalsConfig::default());
+        assert_eq!(cfg.timer, TimerConfig::default());
         assert_eq!(cfg.effects, EffectsConfig::default());
         assert_eq!(cfg.welcome, WelcomeConfig::default());
         assert_eq!(cfg.tts.backend, TtsBackendKind::Bouyomi);

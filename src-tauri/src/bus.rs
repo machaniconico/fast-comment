@@ -32,7 +32,7 @@ use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 
 use crate::model::ChatMessage;
-use crate::stats::StatsSnapshot;
+use crate::stats::{StatsSnapshot, TimerSnapshot};
 
 /// broadcast チャネルの容量。UI/OBS の購読者が遅れても最新が優先される。
 const BROADCAST_CAPACITY: usize = 4096;
@@ -46,16 +46,22 @@ const WS_CLIENT_QUEUE: usize = 256;
 pub struct Bus {
     tx: broadcast::Sender<ChatMessage>,
     stats_tx: watch::Sender<StatsSnapshot>,
+    timer_tx: watch::Sender<TimerSnapshot>,
     obs_port: u16,
 }
 
 impl Bus {
     /// 新しい Bus を生成する。`obs_port` は OBS overlay サーバの待受ポート。
-    pub fn new(obs_port: u16, stats_tx: watch::Sender<StatsSnapshot>) -> Self {
+    pub fn new(
+        obs_port: u16,
+        stats_tx: watch::Sender<StatsSnapshot>,
+        timer_tx: watch::Sender<TimerSnapshot>,
+    ) -> Self {
         let (tx, _rx) = broadcast::channel(BROADCAST_CAPACITY);
         Bus {
             tx,
             stats_tx,
+            timer_tx,
             obs_port,
         }
     }
@@ -150,6 +156,7 @@ impl Bus {
         let state = ObsState {
             tx: Arc::new(tx),
             stats_tx: Arc::new(self.stats_tx.clone()),
+            timer_tx: Arc::new(self.timer_tx.clone()),
             templates_dir: Arc::new(templates_dir.clone()),
         };
 
@@ -169,6 +176,7 @@ impl Bus {
             let app = Router::new()
                 .route("/ws", get(ws_handler))
                 .route("/stats", get(stats_ws_handler))
+                .route("/timer", get(timer_ws_handler))
                 .route("/", get(template_index_handler))
                 .fallback_service(serve_dir)
                 .layer(CorsLayer::permissive())
@@ -201,6 +209,7 @@ impl Bus {
 struct ObsState {
     tx: Arc<broadcast::Sender<ChatMessage>>,
     stats_tx: Arc<watch::Sender<StatsSnapshot>>,
+    timer_tx: Arc<watch::Sender<TimerSnapshot>>,
     templates_dir: Arc<PathBuf>,
 }
 
@@ -293,6 +302,15 @@ async fn stats_ws_handler(
 ) -> impl IntoResponse {
     let rx = state.stats_tx.subscribe();
     ws.on_upgrade(move |socket| handle_stats_ws_client(socket, rx))
+}
+
+/// `/timer` のアップグレードハンドラ。
+async fn timer_ws_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<ObsState>,
+) -> impl IntoResponse {
+    let rx = state.timer_tx.subscribe();
+    ws.on_upgrade(move |socket| handle_timer_ws_client(socket, rx))
 }
 
 /// 1 WS クライアントの送信ループ。
@@ -402,6 +420,53 @@ async fn send_stats_snapshot(
         Ok(json) => socket.send(WsMessage::Text(json.into())).await,
         Err(e) => {
             tracing::warn!("stats WS 向け JSON 化失敗: {e}");
+            Ok(())
+        }
+    }
+}
+
+/// `/timer` WS クライアントの送信ループ。
+///
+/// 接続直後に現在値を1回送り、以後 watch の変更ごとに JSON オブジェクトを push する。
+async fn handle_timer_ws_client(
+    mut socket: WebSocket,
+    mut rx: watch::Receiver<TimerSnapshot>,
+) {
+    let initial = rx.borrow().clone();
+    if send_timer_snapshot(&mut socket, &initial).await.is_err() {
+        return;
+    }
+
+    loop {
+        tokio::select! {
+            changed = rx.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                let snapshot = rx.borrow_and_update().clone();
+                if send_timer_snapshot(&mut socket, &snapshot).await.is_err() {
+                    break;
+                }
+            }
+            incoming = socket.recv() => {
+                match incoming {
+                    Some(Ok(WsMessage::Close(_))) | None => break,
+                    Some(Ok(_)) => {}
+                    Some(Err(_)) => break,
+                }
+            }
+        }
+    }
+}
+
+async fn send_timer_snapshot(
+    socket: &mut WebSocket,
+    snapshot: &TimerSnapshot,
+) -> Result<(), axum::Error> {
+    match serde_json::to_string(snapshot) {
+        Ok(json) => socket.send(WsMessage::Text(json.into())).await,
+        Err(e) => {
+            tracing::warn!("timer WS 向け JSON 化失敗: {e}");
             Ok(())
         }
     }

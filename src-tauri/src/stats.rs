@@ -29,6 +29,31 @@ pub struct StatsSnapshot {
     pub updated_at: u64,
 }
 
+/// OBS Timer overlay へ送るタイマー基準スナップショット。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimerSnapshot {
+    pub state: String,
+    pub mode: String,
+    pub duration_sec: u32,
+    pub base_elapsed_sec: u32,
+    pub running_since_ms: u64,
+    pub updated_at: u64,
+}
+
+impl Default for TimerSnapshot {
+    fn default() -> Self {
+        TimerSnapshot {
+            state: "idle".to_string(),
+            mode: "countdown".to_string(),
+            duration_sec: 0,
+            base_elapsed_sec: 0,
+            running_since_ms: 0,
+            updated_at: 0,
+        }
+    }
+}
+
 /// 設定由来の目標値。0 は該当ゲージ非表示。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]

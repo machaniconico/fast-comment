@@ -208,6 +208,7 @@ export interface AppConfig {
     showPlatform: boolean;
   };
   goals: GoalsConfig;
+  timer: TimerConfig;
   effects: EffectsConfig;
   welcome: WelcomeConfig;
   tts: { backend: 'bouyomi' | 'voicevox' | 'webSpeech' | 'none'; options: TtsOptions };
@@ -223,6 +224,12 @@ export interface GoalsConfig {
   comments: number;
   viewers: number;
   likes: number;
+}
+
+export interface TimerConfig {
+  enabled: boolean;
+  defaultDurationSec: number;
+  mode: string;
 }
 
 export interface EffectRule {
@@ -257,6 +264,15 @@ export interface StatsSnapshot {
   likes: number;
   likesAvailable: boolean;
   goals: GoalsSnapshot;
+  updatedAt: number;
+}
+
+export interface TimerSnapshot {
+  state: string;
+  mode: string;
+  durationSec: number;
+  baseElapsedSec: number;
+  runningSinceMs: number;
   updatedAt: number;
 }
 
@@ -351,6 +367,14 @@ export async function getObsUrl(): Promise<string | null> {
 
 export async function getObsGoalsUrl(): Promise<string> {
   return (await invoke<string>('get_obs_goals_url')) ?? 'http://127.0.0.1:11180/?template=goals&ws=ws://127.0.0.1:11180/stats';
+}
+
+export async function getObsTimerUrl(): Promise<string> {
+  return (await invoke<string>('get_obs_timer_url')) ?? 'http://127.0.0.1:11180/?template=timer&ws=ws://127.0.0.1:11180/timer';
+}
+
+export async function controlTimer(action: string, durationSec?: number): Promise<void> {
+  await invoke<void>('control_timer', { action, durationSec });
 }
 
 export async function listTemplates(): Promise<string[]> {
