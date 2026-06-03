@@ -31,6 +31,13 @@
     count: number;
   }
 
+  interface SpeakerRankingEntry {
+    key: string;
+    name: string;
+    platform: string;
+    count: number;
+  }
+
   interface PlatformStat {
     platform: string;
     label: string;
@@ -72,6 +79,7 @@
 
   const timeline: TimelineData = $derived.by(() => buildTimeline(store.allMessages));
   const topWords: WordCount[] = $derived.by(() => buildTopWords(store.allMessages));
+  const speakerRanking: SpeakerRankingEntry[] = $derived.by(() => buildSpeakerRanking(store.allMessages));
   const platformBreakdown: PlatformBreakdown = $derived.by(() => buildPlatformBreakdown(store.allMessages));
 
   async function onExportCommentsCsv() {
@@ -162,6 +170,32 @@
       .slice(0, 20);
   }
 
+  function buildSpeakerRanking(messages: UiChatMessage[]): SpeakerRankingEntry[] {
+    const counts = new Map<string, SpeakerRankingEntry & { order: number }>();
+
+    for (const msg of messages) {
+      const key = `${msg.platform}:${msg.author.id || msg.author.name}`;
+      const existing = counts.get(key);
+      if (existing) {
+        existing.count += 1;
+        continue;
+      }
+
+      counts.set(key, {
+        key,
+        name: msg.author.name.trim() === '' ? '(名無し)' : msg.author.name,
+        platform: msg.platform,
+        count: 1,
+        order: counts.size,
+      });
+    }
+
+    return Array.from(counts.values())
+      .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name, 'ja-JP') || a.order - b.order)
+      .slice(0, 15)
+      .map(({ order: _order, ...entry }) => entry);
+  }
+
   function tokenizeMessage(msg: UiChatMessage): string[] {
     const text = msg.fragments
       .filter((fragment) => fragment.type === 'text')
@@ -249,6 +283,11 @@
 
   function pad2(value: number): string {
     return String(value).padStart(2, '0');
+  }
+
+  function rankingBarWidth(count: number, maxCount: number): number {
+    if (maxCount <= 0) return 0;
+    return (count / maxCount) * 100;
   }
 </script>
 
@@ -386,6 +425,37 @@
       {/if}
     </section>
   </div>
+
+  <section class="dashboard-section speaker-ranking-section">
+    <div class="section-head">
+      <div>
+        <h3>発言者ランキング</h3>
+        <p>上位15名</p>
+      </div>
+    </div>
+
+    {#if speakerRanking.length > 0}
+      <div class="speaker-ranking-list" aria-label="発言者ランキング">
+        {#each speakerRanking as speaker, index (speaker.key)}
+          <div class="speaker-ranking-row">
+            <span class="speaker-rank">{index + 1}</span>
+            <div class="speaker-main">
+              <div class="speaker-row-head">
+                <span class="speaker-name">{speaker.name}</span>
+                <span class="speaker-count">{formatCount(speaker.count)}件</span>
+              </div>
+              <div class="platform-track speaker-track">
+                <div
+                  class="platform-fill speaker-fill"
+                  style={`width: ${rankingBarWidth(speaker.count, speakerRanking[0]?.count ?? 0)}%`}
+                ></div>
+              </div>
+            </div>
+          </div>
+        {/each}
+      </div>
+    {/if}
+  </section>
 </section>
 
 <style>
@@ -687,6 +757,74 @@
   .platform-fill.youtube { background: #ff5555; }
   .platform-fill.twitch { background: #9146ff; }
   .platform-fill.other { background: #8b949e; }
+
+  .speaker-ranking-section {
+    background: #121212;
+  }
+
+  .speaker-ranking-list {
+    display: flex;
+    flex-direction: column;
+    gap: 9px;
+  }
+
+  .speaker-ranking-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-width: 0;
+  }
+
+  .speaker-rank {
+    flex: 0 0 26px;
+    color: #8b949e;
+    font-size: 12px;
+    font-weight: 800;
+    text-align: right;
+  }
+
+  .speaker-main {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .speaker-row-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    color: #c9d1d9;
+    font-size: 12px;
+    font-weight: 700;
+  }
+
+  .speaker-name {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .speaker-count {
+    flex-shrink: 0;
+    min-width: 44px;
+    padding: 1px 6px;
+    border-radius: 10px;
+    background: rgba(86,211,100,0.14);
+    color: #9be9a8;
+    font-size: 11px;
+    font-weight: 700;
+    text-align: center;
+    white-space: nowrap;
+  }
+
+  .speaker-track {
+    margin-top: 5px;
+  }
+
+  .speaker-fill {
+    background: #56d364;
+  }
 
   .empty-state {
     display: flex;
