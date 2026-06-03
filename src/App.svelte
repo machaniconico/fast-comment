@@ -29,6 +29,8 @@
   let updateDismissed = $state(false);
   let ttsNotice = $state<TtsNotice | null>(null);
   let ttsNoticeTimer: ReturnType<typeof setTimeout> | null = null;
+  let toolsOpen = $state(false);
+  let toolsMenuEl: HTMLDivElement | null = null;
 
   // ── Donation summary helpers ──────────────────────────────────────────────
 
@@ -80,6 +82,8 @@
   });
 
   onMount(async () => {
+    window.addEventListener('click', onWindowClick);
+    window.addEventListener('keydown', onWindowKey);
     void loadUpdateStatus();
     void loadConfig();
     unlisten = await initStore();
@@ -87,6 +91,8 @@
   });
 
   onDestroy(() => {
+    window.removeEventListener('click', onWindowClick);
+    window.removeEventListener('keydown', onWindowKey);
     unlisten?.();
     unlistenTtsNotice?.();
     if (searchDebounce) clearTimeout(searchDebounce);
@@ -107,10 +113,45 @@
   }
 
   function onWindowKey(e: KeyboardEvent) {
+    if (e.key === 'Escape' && toolsOpen) {
+      closeToolsMenu();
+      return;
+    }
     if (e.key === 'k' && (e.ctrlKey || e.metaKey)) {
       e.preventDefault();
       ui.togglePalette();
     }
+  }
+
+  function onWindowClick(e: MouseEvent) {
+    if (!toolsOpen) return;
+    const target = e.target;
+    if (target instanceof Node && toolsMenuEl?.contains(target)) return;
+    closeToolsMenu();
+  }
+
+  function toggleToolsMenu(e: MouseEvent) {
+    e.stopPropagation();
+    toolsOpen = !toolsOpen;
+  }
+
+  function closeToolsMenu() {
+    toolsOpen = false;
+  }
+
+  function selectTimer() {
+    ui.toggleTimer();
+    closeToolsMenu();
+  }
+
+  function selectRaffle() {
+    ui.toggleRaffle();
+    closeToolsMenu();
+  }
+
+  function selectDashboard() {
+    ui.toggleDashboard();
+    closeToolsMenu();
   }
 
   async function loadUpdateStatus() {
@@ -173,8 +214,6 @@
   }
 </script>
 
-<svelte:window onkeydown={onWindowKey} />
-
 {#if showEffects && config?.effects}
   <Effects config={config.effects} />
 {/if}
@@ -220,7 +259,6 @@
   <!-- ── Header ── -->
   <header class="app-header">
     <div class="header-left">
-      <span class="app-title">fast-comment</span>
       <span class="msg-count">{store.totalCount}</span>
       {#if hasDonations}
         <div class="donation-summary">
@@ -240,7 +278,7 @@
 
     <div class="header-actions">
       <!-- Tab switcher -->
-      <div class="tabs" role="tablist">
+      <div class="tabs tabs-primary" role="tablist" aria-label="メイン表示">
         <button
           role="tab"
           class="tab-btn"
@@ -264,6 +302,39 @@
           aria-selected={ui.activeTab === 'participation' && !standaloneOpen}
           onclick={() => ui.setTab('participation')}
         >参加</button>
+      </div>
+      <div class="tools-menu" bind:this={toolsMenuEl}>
+        <button
+          class="tab-btn tools-trigger"
+          class:active={standaloneOpen}
+          aria-haspopup="menu"
+          aria-expanded={toolsOpen}
+          onclick={toggleToolsMenu}
+        >ツール ▾</button>
+        {#if toolsOpen}
+          <div class="tools-dropdown" role="menu" aria-label="ツール">
+            <button
+              role="menuitem"
+              class="tools-menu-item"
+              class:active={ui.showTimer}
+              onclick={selectTimer}
+            >タイマー</button>
+            <button
+              role="menuitem"
+              class="tools-menu-item"
+              class:active={ui.showRaffle}
+              onclick={selectRaffle}
+            >抽選</button>
+            <button
+              role="menuitem"
+              class="tools-menu-item"
+              class:active={ui.showDashboard}
+              onclick={selectDashboard}
+            >振り返り</button>
+          </div>
+        {/if}
+      </div>
+      <div class="tabs tabs-settings" role="tablist" aria-label="設定">
         <button
           role="tab"
           class="tab-btn"
@@ -272,24 +343,6 @@
           onclick={() => ui.setTab('settings')}
         >設定</button>
       </div>
-      <button
-        class="dashboard-toggle"
-        class:active={ui.showTimer}
-        aria-pressed={ui.showTimer}
-        onclick={() => ui.toggleTimer()}
-      >タイマー</button>
-      <button
-        class="dashboard-toggle raffle-toggle"
-        class:active={ui.showRaffle}
-        aria-pressed={ui.showRaffle}
-        onclick={() => ui.toggleRaffle()}
-      >抽選</button>
-      <button
-        class="dashboard-toggle"
-        class:active={ui.showDashboard}
-        aria-pressed={ui.showDashboard}
-        onclick={() => ui.toggleDashboard()}
-      >振り返り</button>
     </div>
   </header>
 
@@ -548,13 +601,6 @@
     min-width: 0;
   }
 
-  .app-title {
-    font-weight: 700;
-    font-size: 13px;
-    color: #fff;
-    letter-spacing: 0.02em;
-  }
-
   .msg-count {
     background: rgba(255,255,255,0.12);
     color: #9e9e9e;
@@ -575,6 +621,20 @@
   .tabs {
     display: flex;
     gap: 2px;
+  }
+
+  .tabs-primary {
+    order: 1;
+  }
+
+  .tools-menu {
+    position: relative;
+    order: 2;
+    flex-shrink: 0;
+  }
+
+  .tabs-settings {
+    order: 3;
   }
 
   .tab-btn {
@@ -598,28 +658,48 @@
     background: rgba(255,255,255,0.05);
   }
 
-  .dashboard-toggle {
-    background: rgba(88,166,255,0.08);
-    border: 1px solid rgba(88,166,255,0.22);
-    color: #9ecbff;
-    padding: 5px 10px;
-    font-size: 12px;
-    font-weight: 700;
-    cursor: pointer;
-    border-radius: 4px;
-    transition: color 0.15s, background 0.15s, border-color 0.15s;
+  .tools-trigger {
     white-space: nowrap;
   }
 
-  .dashboard-toggle.active {
-    color: #fff;
-    background: rgba(88,166,255,0.2);
-    border-color: rgba(88,166,255,0.5);
+  .tools-dropdown {
+    position: absolute;
+    top: calc(100% + 6px);
+    right: 0;
+    z-index: 30;
+    min-width: 112px;
+    padding: 4px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    background: #222;
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 4px;
+    box-shadow: 0 8px 20px rgba(0,0,0,0.35);
   }
 
-  .dashboard-toggle:hover:not(.active) {
-    color: #d7ebff;
-    background: rgba(88,166,255,0.14);
+  .tools-menu-item {
+    width: 100%;
+    background: none;
+    border: none;
+    color: #bdbdbd;
+    padding: 6px 10px;
+    font-size: 12px;
+    text-align: left;
+    cursor: pointer;
+    border-radius: 3px;
+    transition: color 0.15s, background 0.15s;
+    white-space: nowrap;
+  }
+
+  .tools-menu-item.active {
+    color: #fff;
+    background: rgba(88,166,255,0.22);
+  }
+
+  .tools-menu-item:hover:not(.active) {
+    color: #fff;
+    background: rgba(255,255,255,0.08);
   }
 
   /* Channel add bar */
