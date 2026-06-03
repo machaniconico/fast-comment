@@ -1,0 +1,43 @@
+/* OBS Browser Source overlay - transparent background */
+
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body {
+  width: 100%;
+  height: 100%;
+  background: transparent;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Hiragino Sans', 'Yu Gothic UI', sans-serif;
+  overflow: hidden;
+}
+
+#ticker {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 2.5rem;
+  display: flex;
+  align-items: center;
+  overflow: hidden;
+  padding: 0 1rem;
+  background: rgba(10, 12, 16, 0.78);
+  color: #fff;
+  pointer-events: none;
+}
+
+#ticker-text {
+  width: 100%;
+  overflow: hidden;
+  color: #fff;
+  font-size: 1.15rem;
+  font-weight: 700;
+  line-height: 2.5rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-shadow: 0 2px 8px rgba(0, 0, 0, 0.5);
+}
