@@ -27,6 +27,7 @@ export const SETTINGS_ANCHOR_IDS: Record<SettingsAnchor, string> = {
 class UiStore {
   activeTab: Tab = $state('comments');
   viewMode: ViewMode = $state('unified');
+  showDashboard: boolean = $state(false);
   paletteOpen: boolean = $state(false);
   // One-shot scroll target. Set when navigating from the command palette;
   // Settings consumes it (scrolls, then clears) so reopening the tab later
@@ -35,6 +36,7 @@ class UiStore {
 
   setTab(tab: Tab): void {
     this.activeTab = tab;
+    this.showDashboard = false;
   }
 
   setViewMode(mode: ViewMode): void {
@@ -43,6 +45,14 @@ class UiStore {
 
   toggleViewMode(): void {
     this.viewMode = this.viewMode === 'unified' ? 'columns' : 'unified';
+  }
+
+  setShowDashboard(show: boolean): void {
+    this.showDashboard = show;
+  }
+
+  toggleDashboard(): void {
+    this.showDashboard = !this.showDashboard;
   }
 
   openPalette(): void {
@@ -60,6 +70,7 @@ class UiStore {
   /** Switch to the settings tab and request a scroll to the given section. */
   gotoSetting(anchor: SettingsAnchor): void {
     this.activeTab = 'settings';
+    this.showDashboard = false;
     this.settingsAnchor = anchor;
   }
 

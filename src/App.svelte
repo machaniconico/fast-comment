@@ -2,6 +2,7 @@
   import { onMount, onDestroy } from 'svelte';
   import type { Platform } from './lib/types';
   import CommentList from './lib/components/CommentList.svelte';
+  import Dashboard from './lib/components/Dashboard.svelte';
   import MultiColumnView from './lib/components/MultiColumnView.svelte';
   import DonationPanel from './lib/components/DonationPanel.svelte';
   import Effects from './lib/components/Effects.svelte';
@@ -233,38 +234,46 @@
       {/if}
     </div>
 
-    <!-- Tab switcher -->
-    <div class="tabs" role="tablist">
-      <button
-        role="tab"
-        class="tab-btn"
-        class:active={ui.activeTab === 'comments'}
-        aria-selected={ui.activeTab === 'comments'}
-        onclick={() => ui.setTab('comments')}
-      >コメント</button>
-      {#if showDonationPanel}
+    <div class="header-actions">
+      <!-- Tab switcher -->
+      <div class="tabs" role="tablist">
         <button
           role="tab"
           class="tab-btn"
-          class:active={ui.activeTab === 'donations'}
-          aria-selected={ui.activeTab === 'donations'}
-          onclick={() => ui.setTab('donations')}
-        >投げ銭</button>
-      {/if}
+          class:active={ui.activeTab === 'comments' && !ui.showDashboard}
+          aria-selected={ui.activeTab === 'comments' && !ui.showDashboard}
+          onclick={() => ui.setTab('comments')}
+        >コメント</button>
+        {#if showDonationPanel}
+          <button
+            role="tab"
+            class="tab-btn"
+            class:active={ui.activeTab === 'donations' && !ui.showDashboard}
+            aria-selected={ui.activeTab === 'donations' && !ui.showDashboard}
+            onclick={() => ui.setTab('donations')}
+          >投げ銭</button>
+        {/if}
+        <button
+          role="tab"
+          class="tab-btn"
+          class:active={ui.activeTab === 'participation' && !ui.showDashboard}
+          aria-selected={ui.activeTab === 'participation' && !ui.showDashboard}
+          onclick={() => ui.setTab('participation')}
+        >参加</button>
+        <button
+          role="tab"
+          class="tab-btn"
+          class:active={ui.activeTab === 'settings' && !ui.showDashboard}
+          aria-selected={ui.activeTab === 'settings' && !ui.showDashboard}
+          onclick={() => ui.setTab('settings')}
+        >設定</button>
+      </div>
       <button
-        role="tab"
-        class="tab-btn"
-        class:active={ui.activeTab === 'participation'}
-        aria-selected={ui.activeTab === 'participation'}
-        onclick={() => ui.setTab('participation')}
-      >参加</button>
-      <button
-        role="tab"
-        class="tab-btn"
-        class:active={ui.activeTab === 'settings'}
-        aria-selected={ui.activeTab === 'settings'}
-        onclick={() => ui.setTab('settings')}
-      >設定</button>
+        class="dashboard-toggle"
+        class:active={ui.showDashboard}
+        aria-pressed={ui.showDashboard}
+        onclick={() => ui.toggleDashboard()}
+      >振り返り</button>
     </div>
   </header>
 
@@ -273,14 +282,14 @@
   {/if}
 
   <!-- ── Channel add bar (URL paste → auto-detect) ── -->
-  {#if ui.activeTab === 'comments'}
+  {#if ui.activeTab === 'comments' && !ui.showDashboard}
     <div class="channel-bar">
       <ChannelAdd />
     </div>
   {/if}
 
   <!-- ── Comment tab toolbar ── -->
-  {#if ui.activeTab === 'comments'}
+  {#if ui.activeTab === 'comments' && !ui.showDashboard}
     <div class="toolbar">
       <!-- Platform filter -->
       <div class="filter-group" role="group" aria-label="プラットフォームフィルタ">
@@ -340,7 +349,9 @@
 
   <!-- ── Main content ── -->
   <div class="main-content" role="tabpanel">
-    {#if ui.activeTab === 'comments'}
+    {#if ui.showDashboard}
+      <Dashboard />
+    {:else if ui.activeTab === 'comments'}
       <PinnedStrip />
       {#if ui.viewMode === 'columns'}
         <MultiColumnView />
@@ -514,6 +525,7 @@
     display: flex;
     align-items: center;
     gap: 8px;
+    min-width: 0;
   }
 
   .app-title {
@@ -531,6 +543,13 @@
     border-radius: 10px;
     min-width: 24px;
     text-align: center;
+  }
+
+  .header-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
   }
 
   .tabs {
@@ -557,6 +576,30 @@
   .tab-btn:hover:not(.active) {
     color: #bbb;
     background: rgba(255,255,255,0.05);
+  }
+
+  .dashboard-toggle {
+    background: rgba(88,166,255,0.08);
+    border: 1px solid rgba(88,166,255,0.22);
+    color: #9ecbff;
+    padding: 5px 10px;
+    font-size: 12px;
+    font-weight: 700;
+    cursor: pointer;
+    border-radius: 4px;
+    transition: color 0.15s, background 0.15s, border-color 0.15s;
+    white-space: nowrap;
+  }
+
+  .dashboard-toggle.active {
+    color: #fff;
+    background: rgba(88,166,255,0.2);
+    border-color: rgba(88,166,255,0.5);
+  }
+
+  .dashboard-toggle:hover:not(.active) {
+    color: #d7ebff;
+    background: rgba(88,166,255,0.14);
   }
 
   /* Channel add bar */
