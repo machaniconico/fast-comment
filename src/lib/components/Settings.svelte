@@ -12,6 +12,7 @@
   import { theme, type AppearanceDensity, type AppearanceFontSize, type AppearanceTheme } from '../theme.svelte';
   import { buildCsv, setNotify, store } from '../stores.svelte';
   import ConfigPortability from './ConfigPortability.svelte';
+  import ModerationPortability from './ModerationPortability.svelte';
   import ModerationTester from './ModerationTester.svelte';
   import TemplateEditor from './TemplateEditor.svelte';
 
@@ -182,6 +183,15 @@
     hydrateConfig(importedConfig);
     setNotify(importedConfig.ui.notifySound, importedConfig.ui.notifyVolume);
     onConfigSaved?.(importedConfig);
+  }
+
+  async function onModerationImported() {
+    const importedConfig = await getConfig();
+    hydrateConfig(importedConfig);
+    if (importedConfig) {
+      setNotify(importedConfig.ui.notifySound, importedConfig.ui.notifyVolume);
+      onConfigSaved?.(importedConfig);
+    }
   }
 
   onMount(async () => {
@@ -1540,6 +1550,8 @@
     </details>
 
     <ModerationTester {ngWords} {ngUsers} {highlights} />
+
+    <ModerationPortability onImported={onModerationImported} />
   </section>
 
   <!-- ── Notification ── -->
