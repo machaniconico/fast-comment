@@ -16,6 +16,7 @@ import { onChatBatch, startChatListener, startTtsSpeakListener, startTtsCancelLi
 const DEFAULT_MAX_BUFFER = 2000;
 /** Max pinned comments kept in the pinned strip (oldest dropped on overflow). */
 const MAX_PINNED = 5;
+export type SearchMode = 'text' | 'regex';
 
 /** Buffer entry: the message plus a once-computed lowercase search haystack. */
 interface BufEntry {
@@ -136,6 +137,7 @@ class CommentStore {
   // Public filter state
   filterPlatform: Platform | 'all' = $state('all');
   searchQuery: string = $state('');
+  searchMode: SearchMode = $state('text');
   hiddenIds: Set<string> = $state(new Set());
   // Pinned comments: full ChatMessage objects (NOT ids) so a pinned comment
   // survives ring-buffer eviction and stays visible after it scrolls out.
@@ -145,11 +147,30 @@ class CommentStore {
   // Derived: full unfiltered list
   readonly allMessages: UiChatMessage[] = $derived(this._msgs);
 
+  // Derived: compiled search regex. Empty text queries and invalid patterns
+  // intentionally resolve to null so partial regex input never throws.
+  readonly searchRegex: RegExp | null = $derived.by(() => {
+    const q = this.searchQuery.trim();
+    if (this.searchMode !== 'regex' || q === '') return null;
+    try {
+      return new RegExp(q, 'i');
+    } catch {
+      return null;
+    }
+  });
+
+  // Derived: UI-facing invalid flag for regex mode.
+  readonly searchRegexInvalid: boolean = $derived.by(() => {
+    const q = this.searchQuery.trim();
+    if (this.searchMode !== 'regex' || q === '') return false;
+    return this.searchRegex === null;
+  });
+
   // Derived: filtered list
   readonly visibleMessages: UiChatMessage[] = $derived.by(() => {
     const hidden = this.hiddenIds;
     const platform = this.filterPlatform;
-    const q = this.searchQuery.trim().toLowerCase();
+    const q = this.searchQuery.trim();
 
     // Fast path: no platform filter and no search — only strip hidden.
     if (platform === 'all' && q === '') {
@@ -162,7 +183,7 @@ class CommentStore {
     for (const e of this._buf) {
       if (hidden.has(e.msg.id)) continue;
       if (platform !== 'all' && e.msg.platform !== platform) continue;
-      if (q !== '' && !e.search.includes(q)) continue;
+      if (q !== '' && !this.matchesSearch(e.search)) continue;
       out.push(e.msg);
     }
     return out;
@@ -312,6 +333,28 @@ class CommentStore {
     this.searchQuery = q;
   }
 
+  setSearchMode(m: SearchMode): void {
+    this.searchMode = m;
+  }
+
+  /**
+   * Whether an already-lowercased search haystack matches the current query and
+   * mode. Single source of truth for both `visibleMessages` and the per-platform
+   * CommentList path, so text/regex behavior is identical everywhere (the
+   * multi-column view used to silently fall back to substring matching).
+   * Empty query → always true. Invalid regex → filter not applied (true) so a
+   * partially typed pattern never makes the list vanish.
+   */
+  matchesSearch(haystackLower: string): boolean {
+    const q = this.searchQuery.trim();
+    if (q === '') return true;
+    if (this.searchMode === 'regex') {
+      const regex = this.searchRegex;
+      return regex ? regex.test(haystackLower) : true;
+    }
+    return haystackLower.includes(q.toLowerCase());
+  }
+
   setMaxBuffer(n: number): void {
     if (!Number.isFinite(n) || n < 1) return;
     this._maxBuffer = Math.trunc(n);
@@ -390,6 +433,7 @@ export function togglePin(msg: UiChatMessage): void { store.togglePin(msg); }
 export function setNotify(sound: boolean, volume: number): void { store.setNotify(sound, volume); }
 export function setFilterPlatform(p: Platform | 'all'): void { store.setFilterPlatform(p); }
 export function setSearchQuery(q: string): void { store.setSearchQuery(q); }
+export function setSearchMode(m: SearchMode): void { store.setSearchMode(m); }
 export function setMaxBuffer(n: number): void { store.setMaxBuffer(n); }
 export function clearMessages(): void { store.clearMessages(); }
 export function buildCsv(): string { return store.buildCsv(); }

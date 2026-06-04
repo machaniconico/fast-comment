@@ -16,6 +16,7 @@
   import Settings from './lib/components/Settings.svelte';
   import ChannelAdd from './lib/components/ChannelAdd.svelte';
   import CommandPalette from './lib/components/CommandPalette.svelte';
+  import ShortcutHelp from './lib/components/ShortcutHelp.svelte';
   import Notifier from './lib/components/Notifier.svelte';
   import TtsQueuePanel from './lib/components/TtsQueuePanel.svelte';
   import { store, initStore, clearMessages } from './lib/stores.svelte';
@@ -116,15 +117,42 @@
     searchDebounce = setTimeout(() => store.setSearchQuery(val), 120);
   }
 
+  function setSearchMode(mode: 'text' | 'regex') {
+    store.setSearchMode(mode);
+  }
+
   function onWindowKey(e: KeyboardEvent) {
-    if (e.key === 'Escape' && toolsOpen) {
-      closeToolsMenu();
-      return;
+    if (e.key === 'Escape') {
+      if (ui.showShortcuts) {
+        ui.closeShortcuts();
+        return;
+      }
+      if (toolsOpen) {
+        closeToolsMenu();
+        return;
+      }
     }
     if (e.key === 'k' && (e.ctrlKey || e.metaKey)) {
       e.preventDefault();
       ui.togglePalette();
+      return;
     }
+    if (e.key === '?' && !isEditableKeyTarget(e.target)) {
+      e.preventDefault();
+      if (!ui.showShortcuts) closeToolsMenu();
+      ui.toggleShortcuts();
+    }
+  }
+
+  function isEditableKeyTarget(target: EventTarget | null): boolean {
+    if (!(target instanceof Element)) return false;
+    const tagName = target.tagName.toLowerCase();
+    return (
+      tagName === 'input' ||
+      tagName === 'textarea' ||
+      (target instanceof HTMLElement && target.isContentEditable) ||
+      target.closest('[contenteditable="true"]') !== null
+    );
   }
 
   function onWindowClick(e: MouseEvent) {
@@ -413,8 +441,28 @@
         placeholder="検索..."
         value={store.searchQuery}
         oninput={onSearchInput}
-        aria-label="コメント検索"
+        aria-label={store.searchMode === 'regex' ? 'コメント検索（正規表現）' : 'コメント検索'}
+        aria-invalid={store.searchRegexInvalid}
       />
+      <div class="search-mode-group" role="group" aria-label="検索モード">
+        <button
+          class="search-mode-btn"
+          class:active={store.searchMode === 'text'}
+          aria-pressed={store.searchMode === 'text'}
+          aria-label="テキスト検索モード"
+          onclick={() => setSearchMode('text')}
+        >text</button>
+        <button
+          class="search-mode-btn"
+          class:active={store.searchMode === 'regex'}
+          aria-pressed={store.searchMode === 'regex'}
+          aria-label="正規表現検索モード"
+          onclick={() => setSearchMode('regex')}
+        >.*</button>
+      </div>
+      {#if store.searchRegexInvalid}
+        <span class="search-error" aria-live="polite">無効な正規表現</span>
+      {/if}
       {#if store.searchQuery.trim() !== ''}
         <span class="search-count" aria-live="polite">{store.visibleMessages.length}件</span>
       {/if}
@@ -452,6 +500,7 @@
   </div>
 
   <CommandPalette />
+  <ShortcutHelp />
   <Notifier />
 </div>
 
@@ -879,6 +928,10 @@
   .search-input::placeholder { color: #555; }
   .search-input:focus { outline: none; border-color: rgba(255,255,255,0.25); }
 
+  .search-input[aria-invalid='true'] {
+    border-color: rgba(248,113,113,0.55);
+  }
+
   .app[data-theme='light'] .search-input {
     background: #ffffff;
     border-color: rgba(15,23,42,0.16);
@@ -891,6 +944,61 @@
 
   .app[data-theme='light'] .search-input:focus {
     border-color: rgba(25,118,210,0.45);
+  }
+
+  .app[data-theme='light'] .search-input[aria-invalid='true'] {
+    border-color: rgba(220,38,38,0.52);
+  }
+
+  .search-mode-group {
+    display: flex;
+    gap: 2px;
+    flex-shrink: 0;
+    padding-left: 4px;
+  }
+
+  .search-mode-btn {
+    min-width: 28px;
+    height: 22px;
+    background: rgba(255,255,255,0.06);
+    border: 1px solid rgba(255,255,255,0.1);
+    color: #9e9e9e;
+    padding: 0 6px;
+    font-size: 11px;
+    font-weight: 700;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: all 0.15s;
+    white-space: nowrap;
+  }
+
+  .search-mode-btn.active {
+    color: #fff;
+    background: rgba(88,166,255,0.22);
+    border-color: rgba(88,166,255,0.55);
+  }
+
+  .app[data-theme='light'] .search-mode-btn {
+    background: #ffffff;
+    border-color: rgba(15,23,42,0.16);
+    color: #52606d;
+  }
+
+  .app[data-theme='light'] .search-mode-btn.active {
+    color: #0f172a;
+    background: rgba(25,118,210,0.13);
+    border-color: rgba(25,118,210,0.38);
+  }
+
+  .search-error {
+    color: #fca5a5;
+    font-size: 11px;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+
+  .app[data-theme='light'] .search-error {
+    color: #b91c1c;
   }
 
   .search-count {

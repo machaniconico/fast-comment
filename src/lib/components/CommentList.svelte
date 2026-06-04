@@ -38,12 +38,13 @@
     if (!platformFilter) return store.visibleMessages;
 
     const hidden = store.hiddenIds;
-    const q = store.searchQuery.trim().toLowerCase();
     const out: ChatMessage[] = [];
     for (const msg of store.allMessages) {
       if (hidden.has(msg.id)) continue;
       if (msg.platform !== platformFilter) continue;
-      if (q !== '' && !messageSearchText(msg).includes(q)) continue;
+      // Use the store's shared matcher so regex/text mode behaves identically
+      // here as in the single-column visibleMessages path.
+      if (!store.matchesSearch(messageSearchText(msg))) continue;
       out.push(msg);
     }
     return out;

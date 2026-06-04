@@ -32,6 +32,7 @@ class UiStore {
   showRaffle: boolean = $state(false);
   showTimer: boolean = $state(false);
   paletteOpen: boolean = $state(false);
+  showShortcuts: boolean = $state(false);
   // One-shot scroll target. Set when navigating from the command palette;
   // Settings consumes it (scrolls, then clears) so reopening the tab later
   // does not re-scroll.
@@ -94,6 +95,7 @@ class UiStore {
 
   openPalette(): void {
     this.paletteOpen = true;
+    this.showShortcuts = false;
   }
 
   closePalette(): void {
@@ -102,6 +104,20 @@ class UiStore {
 
   togglePalette(): void {
     this.paletteOpen = !this.paletteOpen;
+    if (this.paletteOpen) {
+      this.showShortcuts = false;
+    }
+  }
+
+  closeShortcuts(): void {
+    this.showShortcuts = false;
+  }
+
+  toggleShortcuts(): void {
+    this.showShortcuts = !this.showShortcuts;
+    if (this.showShortcuts) {
+      this.paletteOpen = false;
+    }
   }
 
   /** Switch to the settings tab and request a scroll to the given section. */
