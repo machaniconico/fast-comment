@@ -11,6 +11,7 @@
   import { ui, SETTINGS_ANCHOR_IDS } from '../ui.svelte';
   import { theme, type AppearanceDensity, type AppearanceFontSize, type AppearanceTheme } from '../theme.svelte';
   import { buildCsv, setNotify, store } from '../stores.svelte';
+  import ConfigPortability from './ConfigPortability.svelte';
   import TemplateEditor from './TemplateEditor.svelte';
 
   interface Props {
@@ -149,8 +150,8 @@
   let speechVoicesListenerAttached: boolean = false;
   let obsTtlSeconds: number = $state(12);
 
-  onMount(async () => {
-    config = await getConfig();
+  function hydrateConfig(nextConfig: AppConfig | null) {
+    config = nextConfig;
     if (config) {
       ngWords = normalizeModerationEntries(config.moderation.ngWords);
       ngUsers = normalizeModerationEntries(config.moderation.ngUsers);
@@ -174,6 +175,16 @@
       normalizeWelcomeConfig();
       normalizeParticipationConfig();
     }
+  }
+
+  function onConfigImported(importedConfig: AppConfig) {
+    hydrateConfig(importedConfig);
+    setNotify(importedConfig.ui.notifySound, importedConfig.ui.notifyVolume);
+    onConfigSaved?.(importedConfig);
+  }
+
+  onMount(async () => {
+    hydrateConfig(await getConfig());
 
     const url = await getObsUrl();
     obsBaseUrl = url ?? 'http://127.0.0.1:11180/?template=default';
@@ -793,6 +804,11 @@
         <option value="compact">コンパクト</option>
       </select>
     </div>
+  </section>
+
+  <section id="settings-portability">
+    <h3>設定のバックアップ/移行</h3>
+    <ConfigPortability onImported={onConfigImported} />
   </section>
 
   <!-- ── TTS ── -->

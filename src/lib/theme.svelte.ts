@@ -10,14 +10,14 @@ export type ResolvedTheme = 'dark' | 'light';
 export type AppearanceFontSize = 's' | 'm' | 'l';
 export type AppearanceDensity = 'comfortable' | 'compact';
 
-interface AppearanceState {
+export interface AppearanceSnapshot {
   theme: AppearanceTheme;
   fontSize: AppearanceFontSize;
   density: AppearanceDensity;
 }
 
 const STORAGE_KEY = 'fc.appearance';
-const DEFAULT_APPEARANCE: AppearanceState = {
+const DEFAULT_APPEARANCE: AppearanceSnapshot = {
   theme: 'dark',
   fontSize: 'm',
   density: 'comfortable',
@@ -110,7 +110,34 @@ class ThemeStore {
     this.save();
   }
 
-  private apply(next: AppearanceState): void {
+  getSnapshot(): AppearanceSnapshot {
+    return {
+      theme: this.theme,
+      fontSize: this.fontSize,
+      density: this.density,
+    };
+  }
+
+  applySnapshot(next: unknown): boolean {
+    if (
+      !isRecord(next) ||
+      !isTheme(next.theme) ||
+      !isFontSize(next.fontSize) ||
+      !isDensity(next.density)
+    ) {
+      return false;
+    }
+
+    this.apply({
+      theme: next.theme,
+      fontSize: next.fontSize,
+      density: next.density,
+    });
+    this.save();
+    return true;
+  }
+
+  private apply(next: AppearanceSnapshot): void {
     this.theme = next.theme;
     this.fontSize = next.fontSize;
     this.density = next.density;
