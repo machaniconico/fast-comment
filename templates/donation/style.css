@@ -1,0 +1,222 @@
+/* OBS Browser Source donation overlay - transparent background */
+
+:root {
+  --leave-ms: 350ms;
+  --font-scale: 1;
+  --overlay-bg-opacity: 0;
+}
+
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body {
+  width: 100%;
+  height: 100%;
+  background: transparent;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Hiragino Sans', 'Yu Gothic UI', sans-serif;
+  overflow: hidden;
+}
+
+#overlay {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 18px;
+  pointer-events: none;
+  background: rgba(0, 0, 0, var(--overlay-bg-opacity, 0));
+}
+
+#overlay.pos-top {
+  justify-content: flex-start;
+}
+
+#overlay.pos-bottom {
+  justify-content: flex-end;
+}
+
+#toast-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: min(560px, 100%);
+}
+
+.donation-card {
+  width: 100%;
+  padding: 14px 16px;
+  border-radius: 8px;
+  color: #fff;
+  background: rgba(24, 28, 34, 0.9);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  box-shadow: 0 14px 36px rgba(0, 0, 0, 0.36);
+  backdrop-filter: blur(8px);
+  animation: card-in 260ms ease-out both;
+}
+
+.donation-card.leaving {
+  animation: card-out var(--leave-ms) ease-in forwards;
+}
+
+.card-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.platform-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+  background: rgba(255, 255, 255, 0.64);
+}
+
+.platform-dot.twitch { background: #9146ff; }
+.platform-dot.youtube { background: #ff0000; }
+
+.author {
+  min-width: 0;
+  color: #fff;
+  font-size: calc(17px * var(--font-scale, 1));
+  font-weight: 800;
+  line-height: 1.25;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.kind,
+.amount {
+  flex: 0 0 auto;
+  border-radius: 999px;
+  padding: 3px 8px;
+  font-size: calc(12px * var(--font-scale, 1));
+  font-weight: 800;
+  line-height: 1.2;
+}
+
+.kind {
+  background: rgba(255, 255, 255, 0.14);
+  color: rgba(255, 255, 255, 0.9);
+}
+
+.amount {
+  margin-left: auto;
+  background: rgba(0, 0, 0, 0.24);
+  color: #fff;
+}
+
+.message {
+  margin-top: 8px;
+  color: rgba(255, 255, 255, 0.96);
+  font-size: calc(18px * var(--font-scale, 1));
+  font-weight: 700;
+  line-height: 1.35;
+  word-break: break-word;
+}
+
+.message:empty {
+  display: none;
+}
+
+.donation-card.superchat {
+  background: linear-gradient(135deg, rgba(255, 198, 41, 0.96), rgba(255, 112, 67, 0.94));
+  color: #141414;
+}
+
+.donation-card.superchat .author,
+.donation-card.superchat .message,
+.donation-card.superchat .amount {
+  color: #141414;
+}
+
+.donation-card.superchat .kind {
+  color: #141414;
+  background: rgba(255, 255, 255, 0.35);
+}
+
+.donation-card.membership {
+  background: linear-gradient(135deg, rgba(0, 160, 112, 0.94), rgba(28, 196, 123, 0.9));
+}
+
+.donation-card.bits {
+  background: linear-gradient(135deg, rgba(108, 43, 217, 0.94), rgba(183, 76, 237, 0.9));
+}
+
+#totals {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  min-width: 150px;
+  max-width: 260px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  color: #fff;
+  background: rgba(10, 12, 16, 0.74);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  backdrop-filter: blur(8px);
+}
+
+.totals-title {
+  color: rgba(255, 255, 255, 0.64);
+  font-size: 10px;
+  font-weight: 900;
+  line-height: 1.2;
+}
+
+.totals-empty {
+  margin-top: 5px;
+  color: rgba(255, 255, 255, 0.7);
+  font-size: 16px;
+  font-weight: 800;
+}
+
+.total-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 14px;
+  margin-top: 5px;
+  font-size: 13px;
+  font-weight: 800;
+  line-height: 1.25;
+}
+
+.total-label {
+  color: rgba(255, 255, 255, 0.72);
+}
+
+.total-value {
+  color: #fff;
+  text-align: right;
+}
+
+@keyframes card-in {
+  from {
+    opacity: 0;
+    transform: translateY(14px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes card-out {
+  from {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: translateY(-8px) scale(0.98);
+  }
+}
