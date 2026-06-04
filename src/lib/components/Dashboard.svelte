@@ -65,7 +65,14 @@
   ]);
 
   const nf = new Intl.NumberFormat('ja-JP', { maximumFractionDigits: 0 });
+  const PERIOD_OPTIONS = [
+    { minutes: 0, label: '全期間' },
+    { minutes: 5, label: '直近5分' },
+    { minutes: 15, label: '直近15分' },
+    { minutes: 60, label: '直近60分' },
+  ] as const;
 
+  let periodMinutes: number = $state(0);
   let exportingCsv = $state(false);
   let csvExportMsg = $state('');
   let csvExportPath = $state('');
@@ -78,10 +85,12 @@
       .sort((a, b) => a.currency.localeCompare(b.currency))
   ));
 
-  const timeline: TimelineData = $derived.by(() => buildTimeline(store.allMessages));
-  const topWords: WordCount[] = $derived.by(() => buildTopWords(store.allMessages));
-  const speakerRanking: SpeakerRankingEntry[] = $derived.by(() => buildSpeakerRanking(store.allMessages));
-  const platformBreakdown: PlatformBreakdown = $derived.by(() => buildPlatformBreakdown(store.allMessages));
+  const filteredMessages: UiChatMessage[] = $derived.by(() => filterMessagesByPeriod(store.allMessages, periodMinutes));
+  const periodSummaryText: string = $derived.by(() => formatPeriodSummary(periodMinutes, filteredMessages.length));
+  const timeline: TimelineData = $derived.by(() => buildTimeline(filteredMessages));
+  const topWords: WordCount[] = $derived.by(() => buildTopWords(filteredMessages));
+  const speakerRanking: SpeakerRankingEntry[] = $derived.by(() => buildSpeakerRanking(filteredMessages));
+  const platformBreakdown: PlatformBreakdown = $derived.by(() => buildPlatformBreakdown(filteredMessages));
 
   async function onExportCommentsCsv() {
     if (store.totalCount === 0 || exportingCsv || exportingReport) return;
@@ -180,6 +189,40 @@
     ];
 
     return `${lines.join('\n')}\n`;
+  }
+
+  function filterMessagesByPeriod(messages: UiChatMessage[], minutes: number): UiChatMessage[] {
+    if (minutes <= 0) {
+      return messages;
+    }
+
+    if (messages.length === 0) {
+      return [];
+    }
+
+    let latestTimestamp = Number.NEGATIVE_INFINITY;
+    for (const msg of messages) {
+      if (Number.isFinite(msg.timestampMs) && msg.timestampMs > latestTimestamp) {
+        latestTimestamp = msg.timestampMs;
+      }
+    }
+
+    if (!Number.isFinite(latestTimestamp)) {
+      return [];
+    }
+
+    const windowMs = minutes * 60 * 1000;
+    return messages.filter((msg) => (
+      Number.isFinite(msg.timestampMs) && latestTimestamp - msg.timestampMs <= windowMs
+    ));
+  }
+
+  function formatPeriodSummary(minutes: number, count: number): string {
+    if (minutes <= 0) {
+      return `全${formatCount(count)}件から集計中`;
+    }
+
+    return `直近${minutes}分の${formatCount(count)}件から集計中`;
   }
 
   function formatDonationMarkdownLines(): string[] {
@@ -548,38 +591,60 @@
 
 <section class="dashboard" aria-label="配信振り返りダッシュボード">
   <header class="dashboard-header">
-    <div>
+    <div class="dashboard-title">
       <h2>配信振り返り</h2>
-      <p>{formatCount(store.allMessages.length)}件のバッファから集計中</p>
+      <p>{periodSummaryText}</p>
+      <p class="period-note">期間フィルタは下のコメント集計のみ適用。総数・投げ銭カードは全期間です。</p>
     </div>
-    <div class="export-area">
-      <button
-        class="export-btn"
-        onclick={onExportCommentsCsv}
-        disabled={store.totalCount === 0 || exportingCsv || exportingReport !== null}
-        aria-label="コメントCSVを出力"
-      >
-        {exportingCsv ? '出力中...' : 'CSV出力'}
-      </button>
-      <button
-        class="export-btn"
-        onclick={() => onExportReport('markdown')}
-        disabled={store.totalCount === 0 || exportingCsv || exportingReport !== null}
-        aria-label="振り返りMarkdownを出力"
-      >
-        {exportingReport === 'markdown' ? '出力中...' : 'Markdown出力'}
-      </button>
-      <button
-        class="export-btn"
-        onclick={() => onExportReport('text')}
-        disabled={store.totalCount === 0 || exportingCsv || exportingReport !== null}
-        aria-label="振り返りテキストを出力"
-      >
-        {exportingReport === 'text' ? '出力中...' : 'テキスト出力'}
-      </button>
-      {#if csvExportMsg}
-        <span class="export-msg" title={csvExportPath}>{csvExportMsg}</span>
-      {/if}
+    <div class="header-tools">
+      <div class="period-control" aria-label="コメント集計期間">
+        <span id="dashboard-period-label" class="period-label">集計期間</span>
+        <div class="period-buttons" role="group" aria-labelledby="dashboard-period-label">
+          {#each PERIOD_OPTIONS as option (option.minutes)}
+            <button
+              type="button"
+              class="period-button"
+              class:active={periodMinutes === option.minutes}
+              aria-pressed={periodMinutes === option.minutes}
+              aria-label={`${option.label}でコメント集計`}
+              onclick={() => {
+                periodMinutes = option.minutes;
+              }}
+            >
+              {option.label}
+            </button>
+          {/each}
+        </div>
+      </div>
+      <div class="export-area">
+        <button
+          class="export-btn"
+          onclick={onExportCommentsCsv}
+          disabled={store.totalCount === 0 || exportingCsv || exportingReport !== null}
+          aria-label="コメントCSVを出力"
+        >
+          {exportingCsv ? '出力中...' : 'CSV出力'}
+        </button>
+        <button
+          class="export-btn"
+          onclick={() => onExportReport('markdown')}
+          disabled={store.totalCount === 0 || exportingCsv || exportingReport !== null}
+          aria-label="振り返りMarkdownを出力"
+        >
+          {exportingReport === 'markdown' ? '出力中...' : 'Markdown出力'}
+        </button>
+        <button
+          class="export-btn"
+          onclick={() => onExportReport('text')}
+          disabled={store.totalCount === 0 || exportingCsv || exportingReport !== null}
+          aria-label="振り返りテキストを出力"
+        >
+          {exportingReport === 'text' ? '出力中...' : 'テキスト出力'}
+        </button>
+        {#if csvExportMsg}
+          <span class="export-msg" title={csvExportPath}>{csvExportMsg}</span>
+        {/if}
+      </div>
     </div>
   </header>
 
@@ -725,6 +790,8 @@
           </div>
         {/each}
       </div>
+    {:else}
+      <div class="empty-state compact">まだコメントがありません</div>
     {/if}
   </section>
 </section>
@@ -748,6 +815,10 @@
     border-bottom: 1px solid rgba(255,255,255,0.08);
   }
 
+  .dashboard-title {
+    min-width: 220px;
+  }
+
   .dashboard-header h2,
   .section-head h3 {
     margin: 0;
@@ -763,6 +834,68 @@
     color: #8b949e;
     font-size: 11px;
     line-height: 1.35;
+  }
+
+  .period-note {
+    max-width: 440px;
+    color: #6f7782;
+    overflow-wrap: anywhere;
+  }
+
+  .header-tools {
+    display: flex;
+    align-items: flex-end;
+    justify-content: flex-end;
+    flex-wrap: wrap;
+    gap: 8px 12px;
+    min-width: 0;
+  }
+
+  .period-control {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 4px;
+    min-width: 0;
+  }
+
+  .period-label {
+    color: #aeb6c2;
+    font-size: 11px;
+    font-weight: 700;
+    line-height: 1.2;
+  }
+
+  .period-buttons {
+    display: flex;
+    justify-content: flex-end;
+    flex-wrap: wrap;
+    gap: 4px;
+    min-width: 0;
+  }
+
+  .period-button {
+    flex-shrink: 0;
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 4px;
+    background: rgba(255,255,255,0.055);
+    color: #c9d1d9;
+    padding: 5px 8px;
+    font-size: 11px;
+    font-weight: 700;
+    line-height: 1.2;
+    cursor: pointer;
+  }
+
+  .period-button:hover {
+    background: rgba(255,255,255,0.09);
+    border-color: rgba(255,255,255,0.2);
+  }
+
+  .period-button.active {
+    border-color: rgba(88,166,255,0.55);
+    background: rgba(88,166,255,0.2);
+    color: #d7ebff;
   }
 
   .export-area {
@@ -1136,6 +1269,17 @@
     }
 
     .export-area {
+      justify-content: flex-start;
+    }
+
+    .dashboard-title {
+      min-width: 0;
+    }
+
+    .header-tools,
+    .period-control,
+    .period-buttons {
+      align-items: flex-start;
       justify-content: flex-start;
     }
   }
