@@ -69,6 +69,7 @@
   let exportingCsv = $state(false);
   let csvExportMsg = $state('');
   let csvExportPath = $state('');
+  let exportingReport = $state<'markdown' | 'text' | null>(null);
 
   const donationEntries: DonationEntry[] = $derived.by(() => (
     Object.entries(store.donationSummary.byCurrency)
@@ -83,8 +84,9 @@
   const platformBreakdown: PlatformBreakdown = $derived.by(() => buildPlatformBreakdown(store.allMessages));
 
   async function onExportCommentsCsv() {
-    if (store.totalCount === 0 || exportingCsv) return;
+    if (store.totalCount === 0 || exportingCsv || exportingReport) return;
     exportingCsv = true;
+    exportingReport = null;
     csvExportMsg = '';
     csvExportPath = '';
     try {
@@ -100,6 +102,195 @@
     } finally {
       exportingCsv = false;
     }
+  }
+
+  async function onExportReport(format: 'markdown' | 'text') {
+    if (store.totalCount === 0 || exportingReport || exportingCsv) return;
+    exportingReport = format;
+    csvExportMsg = '';
+    csvExportPath = '';
+
+    const content = format === 'markdown' ? buildReportMarkdown() : buildReportText();
+    const extension = format === 'markdown' ? 'md' : 'txt';
+    const filename = `fast-comment-振り返り-${formatFileDate(new Date())}.${extension}`;
+
+    try {
+      const clipboardCopied = await copyTextToClipboard(content);
+      downloadTextFile(filename, content, format === 'markdown' ? 'text/markdown;charset=utf-8' : 'text/plain;charset=utf-8');
+      csvExportPath = filename;
+      csvExportMsg = clipboardCopied
+        ? `${format === 'markdown' ? 'Markdown' : 'テキスト'}をコピーしてダウンロードしました`
+        : `${format === 'markdown' ? 'Markdown' : 'テキスト'}をダウンロードしました（コピー失敗）`;
+    } catch (e) {
+      csvExportMsg = `${format === 'markdown' ? 'Markdown' : 'テキスト'}出力に失敗しました: ${e instanceof Error ? e.message : String(e)}`;
+    } finally {
+      exportingReport = null;
+    }
+  }
+
+  function buildReportMarkdown(): string {
+    const lines: string[] = [
+      '# 配信振り返り',
+      '',
+      '## 概要',
+      `- 総コメント数: ${formatCount(store.totalCount)}件`,
+      `- ユニーク視聴者: ${formatCount(store.uniqueViewers)}人`,
+      `- ハイライト数: ${formatCount(store.highlightCount)}件`,
+      '- 投げ銭:',
+      ...formatDonationMarkdownLines(),
+      '',
+      '## コメント量タイムライン',
+      ...formatTimelineMarkdownLines(),
+      '',
+      '## よく出た言葉',
+      ...formatTopWordsMarkdownLines(),
+      '',
+      '## 発言者ランキング',
+      ...formatSpeakerRankingMarkdownLines(),
+      '',
+      '## プラットフォーム内訳',
+      ...formatPlatformMarkdownLines(),
+    ];
+
+    return `${lines.join('\n')}\n`;
+  }
+
+  function buildReportText(): string {
+    const lines: string[] = [
+      '配信振り返り',
+      '',
+      '概要',
+      `総コメント数: ${formatCount(store.totalCount)}件`,
+      `ユニーク視聴者: ${formatCount(store.uniqueViewers)}人`,
+      `ハイライト数: ${formatCount(store.highlightCount)}件`,
+      '投げ銭:',
+      ...formatDonationTextLines(),
+      '',
+      'コメント量タイムライン',
+      ...formatTimelineTextLines(),
+      '',
+      'よく出た言葉',
+      ...formatTopWordsTextLines(),
+      '',
+      '発言者ランキング',
+      ...formatSpeakerRankingTextLines(),
+      '',
+      'プラットフォーム内訳',
+      ...formatPlatformTextLines(),
+    ];
+
+    return `${lines.join('\n')}\n`;
+  }
+
+  function formatDonationMarkdownLines(): string[] {
+    if (donationEntries.length === 0 && store.donationSummary.memberships === 0) {
+      return ['  - データなし'];
+    }
+
+    return [
+      ...donationEntries.map((entry) => (
+        `  - ${safeMarkdownCode(entry.currency)}: ${formatDonationAmount(entry.currency, entry.total)} / ${formatCount(entry.count)}件`
+      )),
+      `  - メンバーシップ: ${formatCount(store.donationSummary.memberships)}件`,
+    ];
+  }
+
+  function formatDonationTextLines(): string[] {
+    if (donationEntries.length === 0 && store.donationSummary.memberships === 0) {
+      return ['  データなし'];
+    }
+
+    return [
+      ...donationEntries.map((entry) => (
+        `  ${safeText(entry.currency)}: ${formatDonationAmount(entry.currency, entry.total)} / ${formatCount(entry.count)}件`
+      )),
+      `  メンバーシップ: ${formatCount(store.donationSummary.memberships)}件`,
+    ];
+  }
+
+  function formatTimelineMarkdownLines(): string[] {
+    if (timeline.buckets.length === 0) {
+      return ['データなし'];
+    }
+
+    return [
+      `集計単位: ${formatCount(timeline.binSeconds)}秒`,
+      '',
+      '| 時間 | 件数 |',
+      '| --- | ---: |',
+      ...timeline.buckets.map((bucket) => `| ${bucket.label} | ${formatCount(bucket.count)} |`),
+    ];
+  }
+
+  function formatTimelineTextLines(): string[] {
+    if (timeline.buckets.length === 0) {
+      return ['データなし'];
+    }
+
+    return [
+      `集計単位: ${formatCount(timeline.binSeconds)}秒`,
+      ...timeline.buckets.map((bucket) => `${bucket.label}: ${formatCount(bucket.count)}件`),
+    ];
+  }
+
+  function formatTopWordsMarkdownLines(): string[] {
+    if (topWords.length === 0) {
+      return ['データなし'];
+    }
+
+    return topWords.map((word) => `- ${safeMarkdownCode(word.text)}: ${formatCount(word.count)}回`);
+  }
+
+  function formatTopWordsTextLines(): string[] {
+    if (topWords.length === 0) {
+      return ['データなし'];
+    }
+
+    return topWords.map((word) => `${safeText(word.text)}: ${formatCount(word.count)}回`);
+  }
+
+  function formatSpeakerRankingMarkdownLines(): string[] {
+    if (speakerRanking.length === 0) {
+      return ['データなし'];
+    }
+
+    return speakerRanking.map((speaker, index) => (
+      `${index + 1}. ${safeMarkdownCode(speaker.name)} (${safeMarkdownCode(platformLabel(speaker.platform))}) — ${formatCount(speaker.count)}件`
+    ));
+  }
+
+  function formatSpeakerRankingTextLines(): string[] {
+    if (speakerRanking.length === 0) {
+      return ['データなし'];
+    }
+
+    return speakerRanking.map((speaker, index) => (
+      `${index + 1}. ${safeText(speaker.name)} (${safeText(platformLabel(speaker.platform))}) - ${formatCount(speaker.count)}件`
+    ));
+  }
+
+  function formatPlatformMarkdownLines(): string[] {
+    if (platformBreakdown.entries.length === 0) {
+      return ['データなし'];
+    }
+
+    return [
+      '| プラットフォーム | 件数 | 割合 |',
+      '| --- | ---: | ---: |',
+      ...platformBreakdown.entries.map((item) => (
+        `| ${safeMarkdownTableCell(item.label)} | ${formatCount(item.count)} | ${item.percent}% |`
+      )),
+    ];
+  }
+
+  function formatPlatformTextLines(): string[] {
+    if (platformBreakdown.entries.length === 0) {
+      return ['データなし'];
+    }
+
+    return platformBreakdown.entries.map((item) => (
+      `${safeText(item.label)}: ${formatCount(item.count)}件 / ${item.percent}%`
+    ));
   }
 
   function buildTimeline(messages: UiChatMessage[]): TimelineData {
@@ -260,7 +451,7 @@
     if (currency.toLowerCase() === 'bits') {
       return `${nf.format(total)} bits`;
     }
-    const symbol = CURRENCY_SYMBOL[currency] ?? `${currency} `;
+    const symbol = CURRENCY_SYMBOL[currency] ?? `${safeText(currency)} `;
     return `${symbol}${nf.format(total)}`;
   }
 
@@ -289,6 +480,70 @@
     if (maxCount <= 0) return 0;
     return (count / maxCount) * 100;
   }
+
+  function safeText(value: string): string {
+    return value.replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim() || '未設定';
+  }
+
+  function safeMarkdownCode(value: string): string {
+    return `\`${safeText(value).replace(/`/g, "'").replace(/\|/g, '&#124;')}\``;
+  }
+
+  function safeMarkdownTableCell(value: string): string {
+    return safeText(value).replace(/`/g, "'").replace(/\|/g, '&#124;');
+  }
+
+  function formatFileDate(date: Date): string {
+    const year = date.getFullYear();
+    const month = pad2(date.getMonth() + 1);
+    const day = pad2(date.getDate());
+    return `${year}-${month}-${day}`;
+  }
+
+  async function copyTextToClipboard(text: string): Promise<boolean> {
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+        return true;
+      }
+    } catch {
+      return false;
+    }
+
+    return copyTextWithTextarea(text);
+  }
+
+  function copyTextWithTextarea(text: string): boolean {
+    const textarea = document.createElement('textarea');
+    textarea.value = text;
+    textarea.setAttribute('readonly', '');
+    textarea.style.position = 'fixed';
+    textarea.style.left = '-9999px';
+    textarea.style.top = '0';
+    document.body.appendChild(textarea);
+    textarea.select();
+
+    try {
+      return document.execCommand('copy');
+    } catch {
+      return false;
+    } finally {
+      document.body.removeChild(textarea);
+    }
+  }
+
+  function downloadTextFile(filename: string, content: string, type: string) {
+    const blob = new Blob([content], { type });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    link.rel = 'noopener';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  }
 </script>
 
 <section class="dashboard" aria-label="配信振り返りダッシュボード">
@@ -301,10 +556,26 @@
       <button
         class="export-btn"
         onclick={onExportCommentsCsv}
-        disabled={store.totalCount === 0 || exportingCsv}
+        disabled={store.totalCount === 0 || exportingCsv || exportingReport !== null}
         aria-label="コメントCSVを出力"
       >
         {exportingCsv ? '出力中...' : 'CSV出力'}
+      </button>
+      <button
+        class="export-btn"
+        onclick={() => onExportReport('markdown')}
+        disabled={store.totalCount === 0 || exportingCsv || exportingReport !== null}
+        aria-label="振り返りMarkdownを出力"
+      >
+        {exportingReport === 'markdown' ? '出力中...' : 'Markdown出力'}
+      </button>
+      <button
+        class="export-btn"
+        onclick={() => onExportReport('text')}
+        disabled={store.totalCount === 0 || exportingCsv || exportingReport !== null}
+        aria-label="振り返りテキストを出力"
+      >
+        {exportingReport === 'text' ? '出力中...' : 'テキスト出力'}
       </button>
       {#if csvExportMsg}
         <span class="export-msg" title={csvExportPath}>{csvExportMsg}</span>
@@ -498,6 +769,7 @@
     display: flex;
     align-items: center;
     justify-content: flex-end;
+    flex-wrap: wrap;
     gap: 8px;
     min-width: 0;
   }
