@@ -15,6 +15,16 @@
     onOpenContextMenu: (request: CommentContextMenuRequest) => void;
   }
 
+  interface HighlightPart {
+    text: string;
+    hit: boolean;
+  }
+
+  interface HighlightRange {
+    start: number;
+    end: number;
+  }
+
   let { message, onOpenContextMenu }: Props = $props();
 
   const PLATFORM_COLORS: Record<string, string> = {
@@ -62,6 +72,71 @@
 
   function getMessageText(): string {
     return message.fragments.map((frag) => frag.type === 'text' ? frag.text : frag.name).join('');
+  }
+
+  function splitHighlight(text: string): HighlightPart[] {
+    const query = store.searchQuery.trim();
+    if (query === '' || store.searchRegexInvalid) return [{ text, hit: false }];
+
+    if (store.searchMode === 'regex') {
+      return splitRegexHighlight(text);
+    }
+
+    const lowerText = text.toLowerCase();
+    const lowerQuery = query.toLowerCase();
+    const ranges: HighlightRange[] = [];
+    let from = 0;
+
+    while (from <= lowerText.length) {
+      const start = lowerText.indexOf(lowerQuery, from);
+      if (start === -1) break;
+      const end = start + lowerQuery.length;
+      ranges.push({ start, end });
+      from = end;
+    }
+
+    return splitByHighlightRanges(text, ranges);
+  }
+
+  function splitRegexHighlight(text: string): HighlightPart[] {
+    const sourceRegex = store.searchRegex;
+    if (!sourceRegex) return [{ text, hit: false }];
+
+    const flags = sourceRegex.flags.includes('g') ? sourceRegex.flags : `${sourceRegex.flags}g`;
+    const regex = new RegExp(sourceRegex.source, flags);
+    const ranges: HighlightRange[] = [];
+
+    for (const match of text.matchAll(regex)) {
+      const hitText = match[0] ?? '';
+      const start = match.index;
+      if (hitText === '' || typeof start !== 'number') continue;
+      const end = start + hitText.length;
+      if (end <= start) continue;
+      ranges.push({ start, end });
+    }
+
+    return splitByHighlightRanges(text, ranges);
+  }
+
+  function splitByHighlightRanges(text: string, ranges: HighlightRange[]): HighlightPart[] {
+    if (ranges.length === 0) return [{ text, hit: false }];
+
+    const parts: HighlightPart[] = [];
+    let cursor = 0;
+
+    for (const range of ranges) {
+      if (range.start > cursor) {
+        parts.push({ text: text.slice(cursor, range.start), hit: false });
+      }
+      parts.push({ text: text.slice(range.start, range.end), hit: true });
+      cursor = range.end;
+    }
+
+    if (cursor < text.length) {
+      parts.push({ text: text.slice(cursor), hit: false });
+    }
+
+    return parts;
   }
 
   function getNgWordCandidate(): string {
@@ -230,7 +305,7 @@
   <span class="fragments">
     {#each message.fragments as frag}
       {#if frag.type === 'text'}
-        <span>{frag.text}</span>
+        {#each splitHighlight(frag.text) as part}{#if part.hit}<mark>{part.text}</mark>{:else}{part.text}{/if}{/each}
       {:else if frag.type === 'emote'}
         <img class="emote" src={frag.url} alt={frag.name} title={frag.name} />
       {/if}
@@ -390,6 +465,18 @@
     align-items: center;
     gap: 2px;
     flex-wrap: nowrap;
+  }
+
+  .fragments mark {
+    padding: 0 1px;
+    border-radius: 2px;
+    background: rgba(255, 214, 64, 0.88);
+    color: #171717;
+  }
+
+  :global(.app[data-theme='light']) .fragments mark {
+    background: rgba(255, 202, 40, 0.55);
+    color: #1f2937;
   }
 
   .emote {
