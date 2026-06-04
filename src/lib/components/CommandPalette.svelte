@@ -56,6 +56,13 @@
       run: () => { ui.setTab('settings'); },
     },
     {
+      id: 'goto-appearance',
+      title: '外観設定へ',
+      keywords: ['テーマ', '文字サイズ', 'theme', 'appearance', '外観', 'setting', '設定'],
+      icon: '🎨',
+      run: () => { ui.gotoSetting('appearance'); },
+    },
+    {
       id: 'open-timer',
       title: 'タイマーを開く',
       keywords: ['timer', 'タイマー', 'countdown', 'カウントダウン'],
@@ -96,6 +103,23 @@
       keywords: ['notify', 'notification', '通知', 'sound', '効果音', 'audio', '音', 'setting', '設定'],
       icon: '🔔',
       run: () => { ui.gotoSetting('notify'); },
+    },
+    {
+      id: 'goto-portability',
+      title: '設定のバックアップ/移行へ',
+      keywords: ['エクスポート', 'インポート', 'バックアップ', 'export', 'import', 'portability', 'setting', '設定'],
+      icon: '💾',
+      run: () => { ui.gotoSetting('portability'); },
+    },
+    {
+      id: 'open-shortcuts',
+      title: 'ショートカット一覧を開く',
+      keywords: ['ショートカット', 'ヘルプ', 'shortcut', 'help', 'キー'],
+      icon: '⌨️',
+      run: () => {
+        ui.closePalette();
+        ui.toggleShortcuts();
+      },
     },
   ];
 
@@ -179,20 +203,21 @@
 </script>
 
 {#if ui.paletteOpen}
-  <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-  <div
-    class="palette-overlay"
-    onclick={() => ui.closePalette()}
-    aria-hidden="true"
-  >
-    <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+  <div class="palette-overlay">
+    <button
+      class="palette-backdrop"
+      type="button"
+      aria-label="閉じる"
+      tabindex="-1"
+      onclick={() => ui.closePalette()}
+    ></button>
+
     <div
       class="palette-panel"
       role="dialog"
       aria-modal="true"
       aria-label="コマンドパレット"
       tabindex="-1"
-      onclick={(e) => e.stopPropagation()}
     >
       <input
         bind:this={inputEl}
@@ -251,14 +276,26 @@
     position: fixed;
     inset: 0;
     z-index: 1000;
-    background: rgba(0, 0, 0, 0.55);
     display: flex;
     justify-content: center;
     align-items: flex-start;
     padding-top: 80px;
   }
 
+  .palette-backdrop {
+    position: absolute;
+    inset: 0;
+    z-index: 0;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    background: rgba(0, 0, 0, 0.55);
+    cursor: default;
+  }
+
   .palette-panel {
+    position: relative;
+    z-index: 1;
     width: 480px;
     max-width: calc(100vw - 32px);
     background: #1e1e1e;
