@@ -9,6 +9,7 @@
   import DonationPanel from './lib/components/DonationPanel.svelte';
   import Effects from './lib/components/Effects.svelte';
   import GoalsBar from './lib/components/GoalsBar.svelte';
+  import Sparkline from './lib/components/Sparkline.svelte';
   import PinnedStrip from './lib/components/PinnedStrip.svelte';
   import Participation from './lib/components/Participation.svelte';
   import Milestone from './lib/components/Milestone.svelte';
@@ -299,6 +300,9 @@
   <header class="app-header">
     <div class="header-left">
       <span class="msg-count">{store.totalCount}</span>
+      {#if store.allMessages.length > 0}
+        <Sparkline />
+      {/if}
       {#if hasDonations}
         <div class="donation-summary">
           {#each donationEntries as [currency, tally]}
