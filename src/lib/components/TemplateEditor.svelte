@@ -4,6 +4,16 @@
 
   const FILES = ['style.css', 'index.html', 'app.js'] as const;
   type TemplateFile = (typeof FILES)[number];
+  const PREVIEW_WIDTH_PRESETS = [
+    { value: '1920', label: '1920' },
+    { value: '1280', label: '1280' },
+    { value: '720', label: '720' },
+    { value: 'custom', label: 'Custom' }
+  ] as const;
+  type PreviewWidthPreset = (typeof PREVIEW_WIDTH_PRESETS)[number]['value'];
+
+  const MIN_PREVIEW_WIDTH = 320;
+  const MAX_PREVIEW_WIDTH = 3840;
 
   interface Props {
     obsPort: number;
@@ -22,6 +32,10 @@
   let errorMsg: string = $state('');
   let saveMsg: string = $state('');
   let previewNonce: number = $state(Date.now());
+  let previewWidth: number = $state(1280);
+  let previewWidthPreset: PreviewWidthPreset = $state('1280');
+  let checkerBg: boolean = $state(false);
+  let frameWidth: number = $state(0);
 
   let loadSeq = 0;
   let saveMsgTimer: ReturnType<typeof setTimeout> | null = null;
@@ -42,6 +56,22 @@
     url.searchParams.set('t', String(previewNonce));
     return url.toString();
   });
+
+  const obsTemplateUrl = $derived.by(() => {
+    const port = Number.isFinite(obsPort) && obsPort > 0 ? obsPort : 11180;
+    const template = selectedTemplate || 'default';
+    const url = new URL(`http://127.0.0.1:${port}/`);
+    url.searchParams.set('template', template);
+    url.searchParams.set('ws', `ws://127.0.0.1:${port}/ws`);
+    return url.toString();
+  });
+
+  const previewHeight = $derived(Math.round((previewWidth * 9) / 16));
+  const previewScale = $derived.by(() => {
+    if (frameWidth === 0) return 1;
+    return Math.min(1, frameWidth / previewWidth);
+  });
+  const previewFrameHeight = $derived(previewHeight * previewScale);
 
   onMount(async () => {
     selectedTemplate = currentTemplate || 'default';
@@ -114,16 +144,56 @@
       originalContents = contents;
       previewNonce = Date.now();
       saveMsg = '保存しました';
-      if (saveMsgTimer !== null) clearTimeout(saveMsgTimer);
-      saveMsgTimer = setTimeout(() => {
-        saveMsg = '';
-        saveMsgTimer = null;
-      }, 2500);
+      scheduleSaveMessageClear();
     } catch (e) {
       errorMsg = `保存に失敗しました: ${errorText(e)}`;
     } finally {
       saving = false;
     }
+  }
+
+  async function copyObsTemplateUrl() {
+    errorMsg = '';
+    saveMsg = '';
+    try {
+      await navigator.clipboard.writeText(obsTemplateUrl);
+      saveMsg = 'URLをコピーしました';
+      scheduleSaveMessageClear();
+    } catch (e) {
+      errorMsg = `URLのコピーに失敗しました: ${errorText(e)}`;
+    }
+  }
+
+  function reloadPreview() {
+    previewNonce = Date.now();
+  }
+
+  function onPreviewWidthPresetChange(event: Event) {
+    const value = (event.currentTarget as HTMLSelectElement).value as PreviewWidthPreset;
+    previewWidthPreset = value;
+    if (value !== 'custom') {
+      previewWidth = Number(value);
+    } else {
+      previewWidth = clampPreviewWidth(previewWidth);
+    }
+  }
+
+  function onCustomPreviewWidthInput(event: Event) {
+    const value = Number((event.currentTarget as HTMLInputElement).value);
+    previewWidth = clampPreviewWidth(value);
+  }
+
+  function clampPreviewWidth(value: number): number {
+    if (!Number.isFinite(value)) return MIN_PREVIEW_WIDTH;
+    return Math.min(MAX_PREVIEW_WIDTH, Math.max(MIN_PREVIEW_WIDTH, Math.round(value)));
+  }
+
+  function scheduleSaveMessageClear() {
+    if (saveMsgTimer !== null) clearTimeout(saveMsgTimer);
+    saveMsgTimer = setTimeout(() => {
+      saveMsg = '';
+      saveMsgTimer = null;
+    }, 2500);
   }
 
   function errorText(e: unknown): string {
@@ -189,7 +259,88 @@
   </div>
 
   <div class="preview-pane">
-    <iframe title="OBSテンプレートプレビュー" src={previewUrl}></iframe>
+    <div class="preview-controls">
+      <button
+        type="button"
+        class="preview-action-btn"
+        onclick={copyObsTemplateUrl}
+        disabled={!selectedTemplate}
+        aria-label="OBSテンプレートURLをコピー"
+      >
+        URLをコピー
+      </button>
+      <button
+        type="button"
+        class="preview-action-btn"
+        onclick={reloadPreview}
+        disabled={!selectedTemplate}
+        aria-label="OBSテンプレートプレビューを再読み込み"
+      >
+        再読み込み
+      </button>
+
+      <div class="preview-width-control">
+        <label for="preview-width-preset">幅</label>
+        <select
+          id="preview-width-preset"
+          class="preview-select"
+          bind:value={previewWidthPreset}
+          onchange={onPreviewWidthPresetChange}
+          aria-label="プレビュー幅プリセット"
+        >
+          {#each PREVIEW_WIDTH_PRESETS as preset}
+            <option value={preset.value}>{preset.label}</option>
+          {/each}
+        </select>
+      </div>
+
+      {#if previewWidthPreset === 'custom'}
+        <div class="preview-width-control custom-width">
+          <label for="preview-custom-width">px</label>
+          <input
+            id="preview-custom-width"
+            type="number"
+            min={MIN_PREVIEW_WIDTH}
+            max={MAX_PREVIEW_WIDTH}
+            step="1"
+            value={previewWidth}
+            oninput={onCustomPreviewWidthInput}
+            onchange={onCustomPreviewWidthInput}
+            aria-label="カスタムプレビュー幅"
+          />
+        </div>
+      {/if}
+
+      <label class="checker-toggle">
+        <input
+          type="checkbox"
+          bind:checked={checkerBg}
+          aria-label="透明背景チェッカーを表示"
+        />
+        <span>透過背景</span>
+      </label>
+    </div>
+
+    <div
+      class="preview-frame"
+      class:checker={checkerBg}
+      bind:clientWidth={frameWidth}
+      style:height={`${previewFrameHeight}px`}
+    >
+      <div
+        class="preview-scale"
+        style:width={`${previewWidth}px`}
+        style:height={`${previewHeight}px`}
+        style:transform={`scale(${previewScale})`}
+      >
+        <iframe
+          title="OBSテンプレートプレビュー"
+          src={previewUrl}
+          style:width={`${previewWidth}px`}
+          style:height={`${previewHeight}px`}
+        ></iframe>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -272,6 +423,70 @@
     cursor: not-allowed;
   }
 
+  .preview-pane {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .preview-controls {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
+  .preview-action-btn {
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 12px;
+    padding: 6px 10px;
+    font-weight: 600;
+    background: rgba(255,255,255,0.12);
+    color: #f0f0f0;
+  }
+
+  .preview-action-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  .preview-width-control {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .preview-width-control label,
+  .checker-toggle {
+    font-size: 12px;
+    color: #ccc;
+  }
+
+  .preview-select,
+  .preview-width-control input {
+    background: rgba(255,255,255,0.07);
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 4px;
+    color: #e0e0e0;
+    padding: 5px 8px;
+    font-size: 12px;
+  }
+
+  .preview-width-control input {
+    width: 86px;
+    box-sizing: border-box;
+  }
+
+  .checker-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    cursor: pointer;
+    user-select: none;
+  }
+
   .status {
     font-size: 12px;
     color: #9e9e9e;
@@ -291,12 +506,30 @@
     font-size: 12px;
   }
 
-  .preview-pane iframe {
+  .preview-frame {
+    position: relative;
     width: 100%;
-    min-height: 420px;
+    overflow: hidden;
     border: 1px solid rgba(255,255,255,0.12);
     border-radius: 4px;
     background: rgba(0,0,0,0.28);
+    box-sizing: border-box;
+  }
+
+  .preview-frame.checker {
+    background-color: #d8d8d8;
+    background-image: conic-gradient(#d8d8d8 25%, #a8a8a8 0 50%, #d8d8d8 0 75%, #a8a8a8 0);
+    background-size: 32px 32px;
+  }
+
+  .preview-scale {
+    transform-origin: top left;
+  }
+
+  .preview-scale iframe {
+    display: block;
+    border: 0;
+    background: transparent;
   }
 
   @media (max-width: 920px) {
