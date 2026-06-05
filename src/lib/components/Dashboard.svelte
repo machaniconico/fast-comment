@@ -31,6 +31,12 @@
     count: number;
   }
 
+  interface EmoteCount {
+    name: string;
+    url: string;
+    count: number;
+  }
+
   interface SpeakerRankingEntry {
     key: string;
     name: string;
@@ -89,6 +95,7 @@
   const periodSummaryText: string = $derived.by(() => formatPeriodSummary(periodMinutes, filteredMessages.length));
   const timeline: TimelineData = $derived.by(() => buildTimeline(filteredMessages));
   const topWords: WordCount[] = $derived.by(() => buildTopWords(filteredMessages));
+  const emoteRanking: EmoteCount[] = $derived.by(() => buildEmoteRanking(filteredMessages));
   const speakerRanking: SpeakerRankingEntry[] = $derived.by(() => buildSpeakerRanking(filteredMessages));
   const platformBreakdown: PlatformBreakdown = $derived.by(() => buildPlatformBreakdown(filteredMessages));
 
@@ -402,6 +409,40 @@
     return Array.from(counts, ([text, count]) => ({ text, count }))
       .sort((a, b) => b.count - a.count || a.text.localeCompare(b.text, 'ja-JP'))
       .slice(0, 20);
+  }
+
+  function buildEmoteRanking(messages: UiChatMessage[]): EmoteCount[] {
+    const counts = new Map<string, EmoteCount & { order: number }>();
+
+    for (const msg of messages) {
+      for (const frag of msg.fragments) {
+        if (frag.type !== 'emote') {
+          continue;
+        }
+
+        const url = frag.url?.trim() ?? '';
+        const existing = counts.get(frag.name);
+        if (existing) {
+          existing.count += 1;
+          if (existing.url === '' && url !== '') {
+            existing.url = url;
+          }
+          continue;
+        }
+
+        counts.set(frag.name, {
+          name: frag.name,
+          url,
+          count: 1,
+          order: counts.size,
+        });
+      }
+    }
+
+    return Array.from(counts.values())
+      .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name, 'ja-JP') || a.order - b.order)
+      .slice(0, 15)
+      .map(({ order: _order, ...entry }) => entry);
   }
 
   function buildSpeakerRanking(messages: UiChatMessage[]): SpeakerRankingEntry[] {
@@ -761,6 +802,32 @@
       {/if}
     </section>
   </div>
+
+  <section class="dashboard-section emote-ranking-section">
+    <div class="section-head">
+      <div>
+        <h3>エモートランキング</h3>
+        <p>上位15件</p>
+      </div>
+    </div>
+
+    {#if emoteRanking.length === 0}
+      <div class="empty-state compact">まだエモートがありません</div>
+    {:else}
+      <div class="emote-ranking-list" aria-label="エモート頻度ランキング">
+        {#each emoteRanking as entry, index (entry.name)}
+          <div class="emote-ranking-row">
+            <span class="emote-rank">{index + 1}</span>
+            {#if entry.url}
+              <img class="emote-thumb" src={entry.url} alt={entry.name} loading="lazy" decoding="async" />
+            {/if}
+            <span class="emote-name">{entry.name}</span>
+            <span class="emote-count">{formatCount(entry.count)}回</span>
+          </div>
+        {/each}
+      </div>
+    {/if}
+  </section>
 
   <section class="dashboard-section speaker-ranking-section">
     <div class="section-head">
@@ -1162,6 +1229,63 @@
   .platform-fill.youtube { background: #ff5555; }
   .platform-fill.twitch { background: #9146ff; }
   .platform-fill.other { background: #8b949e; }
+
+  .emote-ranking-section {
+    background: #121212;
+  }
+
+  .emote-ranking-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .emote-ranking-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+  }
+
+  .emote-rank {
+    flex: 0 0 26px;
+    color: #8b949e;
+    font-size: 12px;
+    font-weight: 800;
+    text-align: right;
+  }
+
+  .emote-thumb {
+    flex: 0 0 22px;
+    width: 22px;
+    height: 22px;
+    object-fit: contain;
+    vertical-align: middle;
+  }
+
+  .emote-name {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: #c9d1d9;
+    font-size: 12px;
+    font-weight: 700;
+  }
+
+  .emote-count {
+    flex-shrink: 0;
+    min-width: 44px;
+    padding: 1px 6px;
+    border-radius: 10px;
+    background: rgba(88,166,255,0.14);
+    color: #9ecbff;
+    font-size: 11px;
+    font-weight: 700;
+    text-align: center;
+    white-space: nowrap;
+  }
 
   .speaker-ranking-section {
     background: #121212;
