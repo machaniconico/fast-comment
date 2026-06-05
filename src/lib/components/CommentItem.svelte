@@ -2,6 +2,7 @@
   import type { UiChatMessage } from '../types';
   import { store, togglePin } from '../stores.svelte';
   import { getConfig, hideMessage as ipcHideMessage, setConfig, ttsSpeakText } from '../ipc';
+  import { theme, type AppearanceTimeDisplay } from '../theme.svelte';
   import type { ContextMenuItem } from './ContextMenu.svelte';
 
   interface CommentContextMenuRequest {
@@ -62,6 +63,7 @@
   let viewerSeq = $derived(message.viewerSeq);
   let viewerBadgeText = $derived(formatViewerBadgeText(viewerSeq));
   let viewerBadgeLabel = $derived(formatViewerBadgeLabel(viewerSeq));
+  let displayedTime = $derived(formatTime(message.timestampMs, theme.timeDisplay));
 
   let pinned = $derived(store.isPinned(message.id));
 
@@ -227,10 +229,14 @@
     openContextMenu(rect.right, rect.bottom);
   }
 
-  function formatTime(ms: number): string {
+  function formatTime(ms: number, mode: AppearanceTimeDisplay): string {
+    if (mode === 'off') return '';
+
     const d = new Date(ms);
     const h = d.getHours().toString().padStart(2, '0');
     const m = d.getMinutes().toString().padStart(2, '0');
+    if (mode === 'minutes') return `${h}:${m}`;
+
     const s = d.getSeconds().toString().padStart(2, '0');
     return `${h}:${m}:${s}`;
   }
@@ -314,7 +320,9 @@
 
   <!-- Time + hide button -->
   <span class="meta">
-    <span class="time">{formatTime(message.timestampMs)}</span>
+    {#if displayedTime}
+      <span class="time">{displayedTime}</span>
+    {/if}
     <button
       class="pin-btn"
       class:pinned

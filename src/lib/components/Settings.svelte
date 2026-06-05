@@ -9,7 +9,13 @@
     setTtsPaused, clearTtsQueue, skipCurrentTts, testTts
   } from '../ipc';
   import { ui, SETTINGS_ANCHOR_IDS } from '../ui.svelte';
-  import { theme, type AppearanceDensity, type AppearanceFontSize, type AppearanceTheme } from '../theme.svelte';
+  import {
+    theme,
+    type AppearanceDensity,
+    type AppearanceFontSize,
+    type AppearanceTheme,
+    type AppearanceTimeDisplay
+  } from '../theme.svelte';
   import { buildCsv, setNotify, store } from '../stores.svelte';
   import ConfigPortability from './ConfigPortability.svelte';
   import ModerationPortability from './ModerationPortability.svelte';
@@ -32,6 +38,10 @@
 
   function onDensityChange(event: Event) {
     theme.setDensity((event.currentTarget as HTMLSelectElement).value as AppearanceDensity);
+  }
+
+  function onTimeDisplayChange(event: Event) {
+    theme.setTimeDisplay((event.currentTarget as HTMLSelectElement).value as AppearanceTimeDisplay);
   }
 
   let config: AppConfig | null = $state(null);
@@ -813,6 +823,19 @@
       <select id="appearance-density" value={theme.density} class="platform-select" onchange={onDensityChange}>
         <option value="comfortable">標準</option>
         <option value="compact">コンパクト</option>
+      </select>
+    </div>
+    <div class="field-row">
+      <label for="appearance-time-display">時刻表示</label>
+      <select
+        id="appearance-time-display"
+        value={theme.timeDisplay}
+        class="platform-select"
+        onchange={onTimeDisplayChange}
+      >
+        <option value="off">なし</option>
+        <option value="minutes">時:分</option>
+        <option value="seconds">時:分:秒</option>
       </select>
     </div>
   </section>
