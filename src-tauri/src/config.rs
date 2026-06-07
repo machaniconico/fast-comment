@@ -407,6 +407,18 @@ pub struct YoutubeOverrides {
     pub paths: std::collections::HashMap<String, String>,
 }
 
+/// チャット送信用の認証情報。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialsConfig {
+    /// Twitch 投稿用 OAuth token。`oauth:` prefix は送信時に正規化する。
+    #[serde(default)]
+    pub twitch_oauth: String,
+    /// Twitch 投稿用ユーザー名。
+    #[serde(default)]
+    pub twitch_username: String,
+}
+
 /// アプリ全体設定のルート。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -433,6 +445,8 @@ pub struct AppConfig {
     pub participation: ParticipationConfig,
     #[serde(default)]
     pub youtube_overrides: YoutubeOverrides,
+    #[serde(default)]
+    pub credentials: CredentialsConfig,
 }
 
 impl Default for AppConfig {
@@ -449,6 +463,7 @@ impl Default for AppConfig {
             ui: UiConfig::default(),
             participation: ParticipationConfig::default(),
             youtube_overrides: YoutubeOverrides::default(),
+            credentials: CredentialsConfig::default(),
         }
     }
 }
@@ -689,6 +704,10 @@ mod tests {
                 keyword: "join".to_string(),
                 max: 32,
             },
+            credentials: CredentialsConfig {
+                twitch_oauth: "oauth:test-token".to_string(),
+                twitch_username: "FastCommentBot".to_string(),
+            },
             youtube_overrides: YoutubeOverrides {
                 api_key: Some("test-api-key".to_string()),
                 client_version: Some("1.20240501.00.00".to_string()),
@@ -734,6 +753,14 @@ mod tests {
         assert_eq!(json["participation"]["enabled"].as_bool(), Some(true));
         assert_eq!(json["participation"]["keyword"].as_str(), Some("join"));
         assert_eq!(json["participation"]["max"].as_u64(), Some(32));
+        assert_eq!(
+            json["credentials"]["twitchOauth"].as_str(),
+            Some("oauth:test-token")
+        );
+        assert_eq!(
+            json["credentials"]["twitchUsername"].as_str(),
+            Some("FastCommentBot")
+        );
         assert_eq!(
             json["tts"]["options"]["bouyomiHost"].as_str(),
             Some("192.0.2.10")
@@ -909,6 +936,9 @@ mod tests {
         assert!(!cfg.participation.enabled);
         assert_eq!(cfg.participation.keyword, default_participation_keyword());
         assert_eq!(cfg.participation.max, 0);
+        assert_eq!(cfg.credentials, CredentialsConfig::default());
+        assert_eq!(cfg.credentials.twitch_oauth, "");
+        assert_eq!(cfg.credentials.twitch_username, "");
         assert_eq!(cfg.youtube_overrides, YoutubeOverrides::default());
     }
 
@@ -977,6 +1007,7 @@ mod tests {
         assert_eq!(cfg.ui.max_buffer, 321);
         assert!(!cfg.ui.show_donation_panel);
         assert_eq!(cfg.participation, ParticipationConfig::default());
+        assert_eq!(cfg.credentials, CredentialsConfig::default());
         assert_eq!(cfg.youtube_overrides, YoutubeOverrides::default());
     }
 

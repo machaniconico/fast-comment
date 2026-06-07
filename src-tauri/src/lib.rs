@@ -399,6 +399,58 @@ fn export_comments_csv(app: AppHandle, csv: String) -> Result<String, String> {
     Ok(path.to_string_lossy().into_owned())
 }
 
+/// チャットへコメントを投稿する。
+// TODO(YouTube投稿): liveChatId 解決 → liveChatMessages.insert → quota 管理と
+// Google OAuth 設定を次フェーズで実装する。
+#[tauri::command]
+async fn send_chat_message(
+    state: State<'_, AppState>,
+    platform: String,
+    channel: String,
+    text: String,
+) -> Result<(), String> {
+    match platform.trim().to_lowercase().as_str() {
+        "twitch" => {
+            let (oauth, username, target_channel) = {
+                let cfg = state.config.lock().unwrap();
+                let target_channel = if channel.trim().is_empty() {
+                    cfg.channels
+                        .iter()
+                        .find(|ch| ch.platform == ChannelPlatform::Twitch && ch.enabled)
+                        .or_else(|| {
+                            cfg.channels
+                                .iter()
+                                .find(|ch| ch.platform == ChannelPlatform::Twitch)
+                        })
+                        .map(|ch| ch.identifier.clone())
+                        .unwrap_or_default()
+                } else {
+                    channel.trim().to_string()
+                };
+                (
+                    cfg.credentials.twitch_oauth.clone(),
+                    cfg.credentials.twitch_username.clone(),
+                    target_channel,
+                )
+            };
+
+            crate::sources::twitch_send::send_twitch_message(
+                &target_channel,
+                &text,
+                &oauth,
+                &username,
+            )
+            .await
+            .map_err(|e| e.to_string())
+        }
+        "youtube" => Err(
+            "YouTube投稿は未対応です(YouTube Data API v3 + Google OAuth の設定が必要・次フェーズ)"
+                .into(),
+        ),
+        other => Err(format!("不明なplatformです: {other}")),
+    }
+}
+
 /// 設定全体を更新して保存する。moderation/tts/obs などの実行時状態も反映する。
 ///
 /// チャンネル一覧の差分適用(追加/削除)も行う。
@@ -1278,6 +1330,7 @@ pub fn run() {
             tts_speak_text,
             test_tts,
             export_comments_csv,
+            send_chat_message,
             update_config,
             add_channel,
             remove_channel,
