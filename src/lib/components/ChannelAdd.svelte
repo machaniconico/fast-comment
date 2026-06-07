@@ -1,7 +1,7 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, onDestroy } from 'svelte';
   import type { ChannelConfig } from '../ipc';
-  import { addChannel, removeChannel, getConfig } from '../ipc';
+  import { addChannel, removeChannel, getConfig, onStats } from '../ipc';
 
   // 追加成功時に親へ通知(任意)。
   let { onAdded }: { onAdded?: (ch: ChannelConfig) => void } = $props();
@@ -9,9 +9,36 @@
   // 接続中チャンネル一覧(このコンポーネントがチャンネル管理を一手に担う)。
   let channels: ChannelConfig[] = $state([]);
 
+  // 配信タイトル(key=`${platform}:${identifier}`)。stats イベントで更新され、
+  // チップ本文を識別子からタイトルへ差し替える。未取得のチャンネルは identifier 表示。
+  let titles: Map<string, string> = $state(new Map());
+  let unlistenStats: (() => void) | null = null;
+
+  function chipKey(platform: string, identifier: string): string {
+    return `${platform}:${identifier}`;
+  }
+
   onMount(async () => {
     const cfg = await getConfig();
     if (cfg) channels = cfg.channels;
+    unlistenStats = await onStats((s) => {
+      if (!s.channelTitles || s.channelTitles.length === 0) return;
+      const next = new Map(titles);
+      let changed = false;
+      for (const ct of s.channelTitles) {
+        if (!ct || !ct.title) continue;
+        const key = chipKey(ct.platform, ct.identifier);
+        if (next.get(key) !== ct.title) {
+          next.set(key, ct.title);
+          changed = true;
+        }
+      }
+      if (changed) titles = next;
+    });
+  });
+
+  onDestroy(() => {
+    unlistenStats?.();
   });
 
   function sameChannel(a: ChannelConfig, b: ChannelConfig): boolean {
@@ -227,10 +254,11 @@
   {#if channels.length > 0}
     <div class="channel-chips" role="list" aria-label="接続中チャンネル">
       {#each channels as ch (ch.platform + ':' + ch.identifier)}
-        <span class="chip" class:twitch={ch.platform === 'twitch'} class:youtube={ch.platform === 'youtube'} role="listitem">
+        {@const display = titles.get(chipKey(ch.platform, ch.identifier)) ?? ch.identifier}
+        <span class="chip" class:twitch={ch.platform === 'twitch'} class:youtube={ch.platform === 'youtube'} role="listitem" title={ch.identifier}>
           <span class="chip-dot" aria-hidden="true"></span>
-          <span class="chip-id">{ch.identifier}</span>
-          <button class="chip-x" title="削除" aria-label="{ch.identifier} を削除" onclick={() => onRemove(ch)}>×</button>
+          <span class="chip-id">{display}</span>
+          <button class="chip-x" title="削除" aria-label="{display} を削除" onclick={() => onRemove(ch)}>×</button>
         </span>
       {/each}
     </div>

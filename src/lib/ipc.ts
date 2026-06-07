@@ -142,6 +142,19 @@ export async function onTtsQueueState(cb: (state: TtsQueueState) => void): Promi
   return unlisten;
 }
 
+/**
+ * Listen to the 'stats' event from Tauri (StatsSnapshot, emitted ~1/s).
+ * Returns an unlisten function; no-op in browser-only mode.
+ */
+export async function onStats(cb: (snapshot: StatsSnapshot) => void): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  const { listen } = await import('@tauri-apps/api/event');
+  const unlisten = await listen<StatsSnapshot>('stats', (event) => {
+    cb(event.payload);
+  });
+  return unlisten;
+}
+
 interface TtsSpeakPayload {
   text: string;
   rate: number;
@@ -260,6 +273,12 @@ export interface GoalsSnapshot {
   likes: number;
 }
 
+export interface ChannelTitle {
+  platform: string;
+  identifier: string;
+  title: string;
+}
+
 export interface StatsSnapshot {
   comments: number;
   viewers: number;
@@ -268,6 +287,9 @@ export interface StatsSnapshot {
   likesAvailable: boolean;
   goals: GoalsSnapshot;
   updatedAt: number;
+  // Per-channel stream titles (currently YouTube only). Optional for backward
+  // compatibility with older snapshots that don't carry it.
+  channelTitles?: ChannelTitle[];
 }
 
 export interface TimerSnapshot {
