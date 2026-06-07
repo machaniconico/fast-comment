@@ -24,6 +24,7 @@ const KEY_PLAYER_RESPONSE_MARKERS: &str = "metadataPlayerResponseMarkers";
 const KEY_INITIAL_DATA_MARKERS: &str = "metadataInitialDataMarkers";
 const KEY_CONCURRENT_PATHS: &str = "metadataConcurrentViewersPaths";
 const KEY_LIKES_PATHS: &str = "metadataLikesPaths";
+const KEY_TITLE_PATHS: &str = "metadataTitlePaths";
 const KEY_CONCURRENT_MARKER: &str = "metadataConcurrentViewersMarker";
 const KEY_LIKES_MARKER: &str = "metadataLikesMarker";
 
@@ -45,6 +46,7 @@ const DEFAULT_LIKES_PATHS: &[&str] = &[
     "contents>twoColumnWatchNextResults>results>results>contents>0>videoPrimaryInfoRenderer>videoActions>menuRenderer>topLevelButtons>0>segmentedLikeDislikeButtonRenderer>likeButton>toggleButtonRenderer>defaultText",
     "contents>twoColumnWatchNextResults>results>results>contents>0>videoPrimaryInfoRenderer>videoActions>menuRenderer>topLevelButtons>0>toggleButtonRenderer>defaultText",
 ];
+const DEFAULT_TITLE_PATHS: &[&str] = &["videoDetails>title"];
 const DEFAULT_CONCURRENT_MARKER: &str = "\"concurrentViewers\":\"";
 const DEFAULT_LIKES_MARKER: &str = "\"likeCount\":\"";
 
@@ -52,6 +54,7 @@ const DEFAULT_LIKES_MARKER: &str = "\"likeCount\":\"";
 struct MetadataValues {
     concurrent_viewers: Option<u32>,
     likes: Option<u32>,
+    title: Option<String>,
 }
 
 pub fn spawn_metadata_poller(
@@ -88,11 +91,15 @@ pub fn spawn_metadata_poller(
                     if values.likes.is_some() {
                         last.likes = values.likes;
                     }
+                    if values.title.is_some() {
+                        last.title = values.title;
+                    }
 
                     let update = YoutubeMetadataUpdate {
                         channel: video_id.clone(),
                         concurrent_viewers: last.concurrent_viewers,
                         likes: last.likes,
+                        title: last.title.clone(),
                     };
                     tokio::select! {
                         _ = cancel.cancelled() => break,
@@ -167,10 +174,17 @@ fn extract_metadata_from_html(html: &str, paths: &HashMap<String, String>) -> Me
                 .and_then(|s| parse_count_text(&s))
         })
         .or_else(|| roots.iter().find_map(|v| find_like_count(v, false)));
+    let title = extract_string_by_paths(
+        &roots,
+        &split_lines(paths, KEY_TITLE_PATHS, DEFAULT_TITLE_PATHS),
+    )
+    .or_else(|| extract_og_title(html))
+    .or_else(|| extract_html_title(html));
 
     MetadataValues {
         concurrent_viewers: concurrent,
         likes,
+        title,
     }
 }
 
@@ -178,6 +192,20 @@ fn extract_by_paths(roots: &[Value], paths: &[&str]) -> Option<u32> {
     for root in roots {
         for path in paths {
             if let Some(value) = dig_path(root, path).and_then(parse_count_value) {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
+fn extract_string_by_paths(roots: &[Value], paths: &[&str]) -> Option<String> {
+    for root in roots {
+        for path in paths {
+            if let Some(value) = dig_path(root, path)
+                .and_then(|value| value.as_str())
+                .and_then(normalize_title)
+            {
                 return Some(value);
             }
         }
@@ -375,6 +403,77 @@ fn extract_json_string_field(html: &str, marker: &str) -> Option<String> {
     Some(tail[..end].to_string())
 }
 
+fn extract_og_title(html: &str) -> Option<String> {
+    extract_meta_content(html, "property=\"og:title\"")
+        .or_else(|| extract_meta_content(html, "property='og:title'"))
+        .or_else(|| extract_meta_content(html, "name=\"og:title\""))
+        .or_else(|| extract_meta_content(html, "name='og:title'"))
+        .and_then(|s| normalize_title(&s))
+}
+
+fn extract_meta_content(html: &str, needle: &str) -> Option<String> {
+    let tag_start = html.find(needle)?;
+    let tag_prefix = html[..tag_start].rfind('<')?;
+    let tag_tail = &html[tag_prefix..];
+    let tag_end = tag_tail.find('>')?;
+    let tag = &tag_tail[..tag_end];
+    extract_attr_value(tag, "content")
+}
+
+fn extract_html_title(html: &str) -> Option<String> {
+    let start = find_ascii_case_insensitive(html, "<title")?;
+    let open_end = html[start..].find('>')? + start + 1;
+    let close = find_ascii_case_insensitive(&html[open_end..], "</title>")? + open_end;
+    let title = decode_html_entities(&html[open_end..close]);
+    normalize_title(strip_youtube_suffix(&title))
+}
+
+fn extract_attr_value(tag: &str, attr: &str) -> Option<String> {
+    let lower = tag.to_lowercase();
+    let attr_pos = lower.find(attr)?;
+    let after_attr = &tag[attr_pos + attr.len()..];
+    let equals_pos = after_attr.find('=')?;
+    let mut value = after_attr[equals_pos + 1..].trim_start();
+    let quote = value.chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    value = &value[quote.len_utf8()..];
+    let end = value.find(quote)?;
+    Some(decode_html_entities(&value[..end]))
+}
+
+fn strip_youtube_suffix(title: &str) -> &str {
+    title
+        .trim()
+        .strip_suffix("- YouTube")
+        .map(str::trim_end)
+        .unwrap_or_else(|| title.trim())
+}
+
+fn normalize_title(title: &str) -> Option<String> {
+    let title = title.trim();
+    if title.is_empty() || title.eq_ignore_ascii_case("YouTube") {
+        return None;
+    }
+    Some(title.to_string())
+}
+
+fn decode_html_entities(text: &str) -> String {
+    text.replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+}
+
+fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .position(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
 fn path_or<'a>(paths: &'a HashMap<String, String>, key: &str, default: &'a str) -> &'a str {
     paths
         .get(key)
@@ -401,6 +500,7 @@ fn split_lines<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn empty_paths() -> HashMap<String, String> {
         HashMap::new()
@@ -436,5 +536,30 @@ mod tests {
         let values = extract_metadata_from_html(html, &paths);
         assert_eq!(values.concurrent_viewers, Some(44));
         assert_eq!(values.likes, Some(88));
+    }
+
+    #[test]
+    fn extracts_title_from_video_details_path() {
+        let roots = vec![json!({
+            "videoDetails": {
+                "title": "US-1301 live stream"
+            }
+        })];
+
+        assert_eq!(
+            extract_string_by_paths(&roots, DEFAULT_TITLE_PATHS),
+            Some("US-1301 live stream".to_string())
+        );
+    }
+
+    #[test]
+    fn missing_title_path_returns_none() {
+        let roots = vec![json!({
+            "videoDetails": {
+                "videoId": "abc123"
+            }
+        })];
+
+        assert_eq!(extract_string_by_paths(&roots, DEFAULT_TITLE_PATHS), None);
     }
 }

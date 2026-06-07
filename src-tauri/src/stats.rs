@@ -16,6 +16,15 @@ use crate::config::{AppConfig, ChannelPlatform};
 use crate::model::{ChatMessage, Platform};
 use crate::sources::youtube::extract_video_id;
 
+/// 接続中チャンネルに表示する補助タイトル。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelTitle {
+    pub platform: String,
+    pub identifier: String,
+    pub title: String,
+}
+
 /// OBS Goals overlay へ送る最新統計。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -25,6 +34,8 @@ pub struct StatsSnapshot {
     pub viewers_max: u32,
     pub likes: u32,
     pub likes_available: bool,
+    #[serde(default)]
+    pub channel_titles: Vec<ChannelTitle>,
     pub goals: GoalsSnapshot,
     pub updated_at: u64,
 }
@@ -69,12 +80,14 @@ pub struct YoutubeMetadataUpdate {
     pub channel: String,
     pub concurrent_viewers: Option<u32>,
     pub likes: Option<u32>,
+    pub title: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
 struct YoutubeMetadataState {
     concurrent_viewers: Option<u32>,
     likes: Option<u32>,
+    title: Option<String>,
 }
 
 /// watch::Sender を使う統計集約タスクを起動する。
@@ -145,6 +158,9 @@ pub fn spawn_stats_aggregator(
                     }
                     if let Some(v) = update.likes {
                         entry.likes = Some(v);
+                    }
+                    if let Some(title) = update.title {
+                        entry.title = Some(title);
                     }
                     retain_enabled_youtube_metadata(&mut youtube_metadata, &config);
                     snapshot = build_snapshot(
@@ -227,6 +243,17 @@ fn build_snapshot(
         .values()
         .filter_map(|m| m.likes)
         .fold(0u32, u32::saturating_add);
+    let mut channel_titles = youtube_metadata
+        .iter()
+        .filter_map(|(channel, metadata)| {
+            metadata.title.as_ref().map(|title| ChannelTitle {
+                platform: "youtube".to_string(),
+                identifier: channel.clone(),
+                title: title.clone(),
+            })
+        })
+        .collect::<Vec<_>>();
+    channel_titles.sort_by(|a, b| a.identifier.cmp(&b.identifier));
 
     StatsSnapshot {
         comments,
@@ -234,6 +261,7 @@ fn build_snapshot(
         viewers_max: viewers_max.max(viewers),
         likes,
         likes_available: has_enabled_youtube(config),
+        channel_titles,
         goals: goals_from_config(config),
         updated_at: 0,
     }
