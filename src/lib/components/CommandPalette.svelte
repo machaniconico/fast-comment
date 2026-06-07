@@ -123,14 +123,34 @@
     },
   ];
 
+  /** Lookup map: id → Command. Used to resolve recent command ids. */
+  const COMMANDS_BY_ID: Map<string, Command> = new Map(COMMANDS.map((c) => [c.id, c]));
+
   // ── Local state ──────────────────────────────────────────────────────────
 
   let query: string = $state('');
   let selectedIndex: number = $state(0);
   let inputEl: HTMLInputElement | null = $state(null);
 
-  // ── Filtered commands ────────────────────────────────────────────────────
+  // ── Derived display lists ────────────────────────────────────────────────
 
+  const isEmptyQuery: boolean = $derived(query.trim().length === 0);
+
+  /**
+   * Recent commands resolved to Command objects (exists in COMMANDS only).
+   * Only meaningful when query is empty.
+   */
+  const recentItems: Command[] = $derived.by(() => {
+    if (!isEmptyQuery) return [];
+    return ui.recentCommandIds
+      .map((id) => COMMANDS_BY_ID.get(id))
+      .filter((c): c is Command => c !== undefined);
+  });
+
+  /**
+   * Filtered command list for non-empty query.
+   * When query is empty, shows all COMMANDS (the "all commands" section).
+   */
   const filteredCommands: Command[] = $derived.by(() => {
     const q = query.trim().toLowerCase();
     if (q === '') return COMMANDS;
@@ -143,8 +163,18 @@
   // Dynamic search fallback row — shown only when query is non-empty
   const showSearchFallback: boolean = $derived(query.trim().length > 0);
 
-  // Total navigable rows
-  const totalRows: number = $derived(filteredCommands.length + (showSearchFallback ? 1 : 0));
+  /**
+   * When query is empty and there are recent items, the navigable list is:
+   *   [recentItems..., allCommands...]
+   * The group heading elements are aria-hidden and NOT counted in totalRows.
+   * When query is non-empty: [filteredCommands..., (optional fallback)]
+   */
+  const totalRows: number = $derived.by(() => {
+    if (isEmptyQuery) {
+      return recentItems.length + filteredCommands.length;
+    }
+    return filteredCommands.length + (showSearchFallback ? 1 : 0);
+  });
 
   // Clamp selectedIndex when filtered list length changes
   $effect(() => {
@@ -164,6 +194,7 @@
   // ── Helpers ───────────────────────────────────────────────────────────────
 
   function runCommand(cmd: Command) {
+    ui.recordCommand(cmd.id);
     cmd.run();
     ui.closePalette();
   }
@@ -172,6 +203,25 @@
     store.setSearchQuery(query.trim());
     ui.setTab('comments');
     ui.closePalette();
+  }
+
+  /**
+   * Resolve a navigable row index to either a Command or the search fallback.
+   * Row layout when query is empty:
+   *   0..(recentItems.length-1)         → recentItems
+   *   recentItems.length..totalRows-1   → filteredCommands (all)
+   * Row layout when query is non-empty:
+   *   0..(filteredCommands.length-1)    → filteredCommands
+   *   filteredCommands.length           → search fallback (if shown)
+   */
+  function resolveRow(index: number): Command | 'fallback' | null {
+    if (isEmptyQuery) {
+      if (index < recentItems.length) return recentItems[index] ?? null;
+      const allIdx = index - recentItems.length;
+      return filteredCommands[allIdx] ?? null;
+    }
+    if (showSearchFallback && index === filteredCommands.length) return 'fallback';
+    return filteredCommands[index] ?? null;
   }
 
   function onKeydown(e: KeyboardEvent) {
@@ -192,11 +242,11 @@
     }
     if (e.key === 'Enter') {
       e.preventDefault();
-      const fallbackIdx = filteredCommands.length;
-      if (showSearchFallback && selectedIndex === fallbackIdx) {
+      const resolved = resolveRow(selectedIndex);
+      if (resolved === 'fallback') {
         runSearchFallback();
-      } else if (filteredCommands[selectedIndex]) {
-        runCommand(filteredCommands[selectedIndex]);
+      } else if (resolved !== null) {
+        runCommand(resolved);
       }
     }
   }
@@ -232,15 +282,38 @@
       />
 
       <ul class="palette-list" role="listbox" aria-label="コマンド一覧">
+        {#if isEmptyQuery && recentItems.length > 0}
+          <!-- Group heading: aria-hidden so listbox option count is not disrupted -->
+          <li class="palette-group-heading" aria-hidden="true">最近使ったコマンド</li>
+          {#each recentItems as cmd, i (cmd.id + '-recent')}
+            <!-- svelte-ignore a11y_click_events_have_key_events -->
+            <li
+              class="palette-item"
+              class:selected={selectedIndex === i}
+              role="option"
+              aria-selected={selectedIndex === i}
+              onclick={() => runCommand(cmd)}
+              onmousemove={() => { selectedIndex = i; }}
+            >
+              <span class="item-icon" aria-hidden="true">{cmd.icon}</span>
+              <span class="item-title">{cmd.title}</span>
+            </li>
+          {/each}
+
+          <!-- Separator + all commands heading -->
+          <li class="palette-group-heading palette-group-heading--all" aria-hidden="true">すべてのコマンド</li>
+        {/if}
+
         {#each filteredCommands as cmd, i (cmd.id)}
+          {@const rowIndex = isEmptyQuery ? recentItems.length + i : i}
           <!-- svelte-ignore a11y_click_events_have_key_events -->
           <li
             class="palette-item"
-            class:selected={selectedIndex === i}
+            class:selected={selectedIndex === rowIndex}
             role="option"
-            aria-selected={selectedIndex === i}
+            aria-selected={selectedIndex === rowIndex}
             onclick={() => runCommand(cmd)}
-            onmousemove={() => { selectedIndex = i; }}
+            onmousemove={() => { selectedIndex = rowIndex; }}
           >
             <span class="item-icon" aria-hidden="true">{cmd.icon}</span>
             <span class="item-title">{cmd.title}</span>
@@ -330,6 +403,22 @@
     padding: 4px 0;
     max-height: 320px;
     overflow-y: auto;
+  }
+
+  .palette-group-heading {
+    padding: 6px 14px 3px;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: #666;
+    user-select: none;
+  }
+
+  .palette-group-heading--all {
+    margin-top: 4px;
+    border-top: 1px solid rgba(255, 255, 255, 0.06);
+    padding-top: 8px;
   }
 
   .palette-item {

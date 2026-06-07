@@ -34,6 +34,29 @@ export const SETTINGS_ANCHOR_IDS: Record<SettingsAnchor, string> = {
   portability: 'settings-portability',
 };
 
+/** localStorage key for persisting recent command ids. */
+const RECENT_COMMANDS_KEY = 'fc.recentCommands';
+/** Maximum number of recent command entries to retain. */
+const RECENT_COMMANDS_MAX = 5;
+
+/**
+ * Load recent command ids from localStorage.
+ * Returns [] on SSR, missing key, or any parse/validation error.
+ */
+function loadRecentCommandIds(): string[] {
+  if (typeof window === 'undefined') return [];
+  try {
+    const raw = localStorage.getItem(RECENT_COMMANDS_KEY);
+    if (raw === null) return [];
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    const ids = parsed.filter((v): v is string => typeof v === 'string');
+    return ids.slice(0, RECENT_COMMANDS_MAX);
+  } catch {
+    return [];
+  }
+}
+
 class UiStore {
   activeTab: Tab = $state('comments');
   viewMode: ViewMode = $state('unified');
@@ -46,6 +69,8 @@ class UiStore {
   // Settings consumes it (scrolls, then clears) so reopening the tab later
   // does not re-scroll.
   settingsAnchor: SettingsAnchor | null = $state(null);
+  // Recently used command ids — newest first, max RECENT_COMMANDS_MAX entries.
+  recentCommandIds: string[] = $state(loadRecentCommandIds());
 
   setTab(tab: Tab): void {
     this.activeTab = tab;
@@ -141,6 +166,24 @@ class UiStore {
   /** Clear the pending settings anchor (called by Settings after scrolling). */
   clearSettingsAnchor(): void {
     this.settingsAnchor = null;
+  }
+
+  /**
+   * Record a command execution in the recent-commands list.
+   * Deduplicates, prepends the id, and caps at RECENT_COMMANDS_MAX.
+   * Persists to localStorage with try/catch so storage errors are silent.
+   */
+  recordCommand(id: string): void {
+    const next = [id, ...this.recentCommandIds.filter((v) => v !== id)].slice(
+      0,
+      RECENT_COMMANDS_MAX,
+    );
+    this.recentCommandIds = next;
+    try {
+      localStorage.setItem(RECENT_COMMANDS_KEY, JSON.stringify(next));
+    } catch {
+      // Storage quota or private-mode errors are non-fatal.
+    }
   }
 }
 
