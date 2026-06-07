@@ -216,6 +216,9 @@ export interface AppConfig {
   ui: { maxBuffer: number; showDonationPanel: boolean; notifySound: boolean; notifyVolume: number };
   participation: ParticipationConfig;
   youtubeOverrides?: { apiKey?: string; clientVersion?: string; paths?: Record<string, string> };
+  // Credentials for self-posting to chat (Rust `CredentialsConfig`, serde camelCase).
+  // Optional so older config.json without the field still deserializes cleanly.
+  credentials?: { twitchOauth?: string; twitchUsername?: string };
 }
 
 export interface GoalsConfig {
@@ -411,6 +414,20 @@ export async function clearParticipants(): Promise<void> {
 
 export async function injectTestComment(opts: InjectTestCommentOptions): Promise<void> {
   await invoke<void>('inject_test_comment', { ...opts });
+}
+
+/**
+ * Post a message to the live chat as the configured account.
+ * Twitch sends via an authenticated one-shot IRC connection (Rust side).
+ * YouTube is not yet supported (returns an error from the backend).
+ * No-op in browser-only mode (Tauri absent).
+ */
+export async function sendChatMessage(
+  platform: 'twitch' | 'youtube',
+  channel: string,
+  text: string,
+): Promise<void> {
+  await invoke<void>('send_chat_message', { platform, channel, text });
 }
 
 export async function checkForUpdate(): Promise<UpdateStatus | null> {

@@ -83,6 +83,10 @@
   let testAmount: string = $state('500');
   let testCount: number = $state(1);
 
+  // Self-post (chat send) credentials.
+  let credTwitchOauth: string = $state('');
+  let credTwitchUsername: string = $state('');
+
   // Scroll to settings section when the command palette sets a settingsAnchor.
   // Gate on `config`: the tts/obs/moderation sections live inside {#if config},
   // so a cold navigation from the comments tab mounts Settings while config is
@@ -168,6 +172,8 @@
       ngWords = normalizeModerationEntries(config.moderation.ngWords);
       ngUsers = normalizeModerationEntries(config.moderation.ngUsers);
       highlights = normalizeModerationEntries(config.moderation.highlights);
+      credTwitchOauth = config.credentials?.twitchOauth ?? '';
+      credTwitchUsername = config.credentials?.twitchUsername ?? '';
       voicevoxSpeaker = ttsNum('voicevoxSpeaker', 1);
       maxLength = ttsNum('maxLength', MAX_LENGTH_DEFAULT);
       stripEmoji = ttsBool('stripEmoji', true);
@@ -713,6 +719,10 @@
     normalizeEffectsConfig();
     normalizeWelcomeConfig();
     normalizeParticipationConfig();
+    config.credentials = {
+      twitchOauth: credTwitchOauth.trim(),
+      twitchUsername: credTwitchUsername.trim(),
+    };
     try {
       await setConfig(config);
       setNotify(config.ui.notifySound, config.ui.notifyVolume);
@@ -912,6 +922,44 @@
       </button>
       {#if testCommentMsg}<span class="hint-inline">{testCommentMsg}</span>{/if}
     </div>
+  </section>
+
+  <section id="settings-posting">
+    <h3>コメント投稿（送信）</h3>
+    <p class="hint">
+      コメント一覧の下にある「✍ 自分でコメントを投稿」から、配信チャットへ自分でコメントを送れます。
+      Twitch へ送るには chat:edit 権限付きの OAuth トークンと送信に使うユーザー名が必要です。
+      トークンは https://twitchtokengenerator.com などで取得できます。
+      （YouTube への投稿は未対応です。）
+    </p>
+    <div class="field-row">
+      <label for="cred-twitch-username">Twitch ユーザー名</label>
+      <input
+        id="cred-twitch-username"
+        type="text"
+        bind:value={credTwitchUsername}
+        class="id-input"
+        placeholder="送信に使うアカウント名"
+        autocomplete="off"
+        autocapitalize="off"
+        spellcheck="false"
+      />
+    </div>
+    <div class="field-row">
+      <label for="cred-twitch-oauth">Twitch OAuth トークン</label>
+      <input
+        id="cred-twitch-oauth"
+        type="password"
+        bind:value={credTwitchOauth}
+        class="id-input"
+        placeholder="oauth:xxxxxxxx"
+        autocomplete="off"
+        spellcheck="false"
+      />
+    </div>
+    <p class="hint">
+      ⚠ トークンはこの PC の config.json に平文で保存されます。共有 PC では取り扱いに注意してください。
+    </p>
   </section>
 
   <section id="settings-tts">

@@ -17,6 +17,7 @@
   import Settings from './lib/components/Settings.svelte';
   import ChannelAdd from './lib/components/ChannelAdd.svelte';
   import CommandPalette from './lib/components/CommandPalette.svelte';
+  import CommentComposer from './lib/components/CommentComposer.svelte';
   import ShortcutHelp from './lib/components/ShortcutHelp.svelte';
   import Notifier from './lib/components/Notifier.svelte';
   import TtsQueuePanel from './lib/components/TtsQueuePanel.svelte';
@@ -502,6 +503,21 @@
       <Settings onConfigSaved={onSettingsSaved} />
     {/if}
   </div>
+
+  <!-- ── Self-post composer (toggle, pinned to the bottom in the comments tab) ── -->
+  {#if ui.activeTab === 'comments' && !standaloneOpen}
+    <div class="composer-toggle-bar">
+      <button
+        class="composer-toggle"
+        class:active={ui.composerOpen}
+        aria-expanded={ui.composerOpen}
+        onclick={() => ui.toggleComposer()}
+      >{ui.composerOpen ? '▼ コメント投稿を閉じる' : '✍ 自分でコメントを投稿'}</button>
+    </div>
+    {#if ui.composerOpen}
+      <CommentComposer {config} />
+    {/if}
+  {/if}
 
   <CommandPalette />
   <ShortcutHelp />
@@ -1035,6 +1051,50 @@
     overflow: hidden;
     display: flex;
     flex-direction: column;
+  }
+
+  /* Self-post composer toggle */
+  .composer-toggle-bar {
+    display: flex;
+    justify-content: flex-end;
+    padding: 3px 8px;
+    background: #161616;
+    border-top: 1px solid rgba(255, 255, 255, 0.06);
+    flex-shrink: 0;
+  }
+
+  .composer-toggle {
+    background: none;
+    border: none;
+    color: #9e9e9e;
+    font-size: 12px;
+    padding: 2px 8px;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: color 0.15s, background 0.15s;
+  }
+
+  .composer-toggle:hover {
+    color: #fff;
+    background: rgba(255, 255, 255, 0.06);
+  }
+
+  .composer-toggle.active {
+    color: #cfe4ff;
+  }
+
+  .app[data-theme='light'] .composer-toggle-bar {
+    background: #e6ebf1;
+    border-top-color: rgba(15, 23, 42, 0.1);
+  }
+
+  .app[data-theme='light'] .composer-toggle {
+    color: #52606d;
+  }
+
+  .app[data-theme='light'] .composer-toggle:hover {
+    color: #111827;
+    background: rgba(15, 23, 42, 0.06);
   }
 
   /* Donation summary badges in header */

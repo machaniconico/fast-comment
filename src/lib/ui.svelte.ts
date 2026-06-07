@@ -63,6 +63,8 @@ class UiStore {
   showDashboard: boolean = $state(false);
   showRaffle: boolean = $state(false);
   showTimer: boolean = $state(false);
+  // Comment composer (self-post to chat) open flag — toggled below the comment list.
+  composerOpen: boolean = $state(false);
   paletteOpen: boolean = $state(false);
   showShortcuts: boolean = $state(false);
   // One-shot scroll target. Set when navigating from the command palette;
@@ -125,6 +127,10 @@ class UiStore {
       this.showDashboard = false;
       this.showRaffle = false;
     }
+  }
+
+  toggleComposer(): void {
+    this.composerOpen = !this.composerOpen;
   }
 
   openPalette(): void {
