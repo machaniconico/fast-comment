@@ -228,6 +228,7 @@
     <div class="channel-chips" role="list" aria-label="接続中チャンネル">
       {#each channels as ch (ch.platform + ':' + ch.identifier)}
         <span class="chip" class:twitch={ch.platform === 'twitch'} class:youtube={ch.platform === 'youtube'} role="listitem">
+          <span class="chip-dot" aria-hidden="true"></span>
           <span class="chip-id">{ch.identifier}</span>
           <button class="chip-x" title="削除" aria-label="{ch.identifier} を削除" onclick={() => onRemove(ch)}>×</button>
         </span>
@@ -296,7 +297,7 @@
   .chip {
     display: inline-flex;
     align-items: center;
-    gap: 4px;
+    gap: 5px;
     background: rgba(255,255,255,0.08);
     border: 1px solid rgba(255,255,255,0.12);
     border-radius: 12px;
@@ -305,8 +306,27 @@
     color: #ccc;
     max-width: 220px;
   }
-  .chip.twitch { border-color: rgba(145,70,255,0.5); }
-  .chip.youtube { border-color: rgba(255,0,0,0.4); }
+
+  /* Per-platform brand coloring: border + faint background tint + accent dot. */
+  .chip-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    background: #9e9e9e;
+  }
+
+  .chip.twitch {
+    border-color: rgba(145,70,255,0.65);
+    background: rgba(145,70,255,0.14);
+  }
+  .chip.twitch .chip-dot { background: #9146ff; }
+
+  .chip.youtube {
+    border-color: rgba(255,0,0,0.55);
+    background: rgba(255,0,0,0.12);
+  }
+  .chip.youtube .chip-dot { background: #ff0000; }
 
   .chip-id {
     overflow: hidden;
