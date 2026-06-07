@@ -91,6 +91,22 @@
       .sort((a, b) => a.currency.localeCompare(b.currency))
   ));
 
+  // 時間帯ヒートマップ: 全期間 allMessages を 0〜23 時でバケット集計
+  const hourBuckets: number[] = $derived.by(() => {
+    const buckets = Array.from({ length: 24 }, () => 0);
+    for (const msg of store.allMessages) {
+      if (typeof msg.timestampMs !== 'number' || !Number.isFinite(msg.timestampMs)) continue;
+      const hour = new Date(msg.timestampMs).getHours();
+      if (hour >= 0 && hour <= 23) {
+        buckets[hour] += 1;
+      }
+    }
+    return buckets;
+  });
+
+  // ヒートマップ最大値 (0除算防止)
+  const hourBucketsMax: number = $derived(Math.max(...hourBuckets, 0));
+
   const filteredMessages: UiChatMessage[] = $derived.by(() => filterMessagesByPeriod(store.allMessages, periodMinutes));
   const periodSummaryText: string = $derived.by(() => formatPeriodSummary(periodMinutes, filteredMessages.length));
   const timeline: TimelineData = $derived.by(() => buildTimeline(filteredMessages));
@@ -861,6 +877,38 @@
       <div class="empty-state compact">まだコメントがありません</div>
     {/if}
   </section>
+
+  <!-- 時間帯アクティビティ・ヒートマップ (全期間) -->
+  <section class="dashboard-section heatmap-section">
+    <div class="section-head">
+      <div>
+        <h3>時間帯アクティビティ</h3>
+        <p>全期間 / ローカル時刻 0〜23 時の分布</p>
+      </div>
+    </div>
+
+    <div class="heatmap-grid" aria-label="時間帯アクティビティ・ヒートマップ">
+      {#each hourBuckets as count, hour (hour)}
+        {@const opacity = hourBucketsMax === 0 ? 0.08 : Math.max(0.08, count / hourBucketsMax)}
+        <div
+          class="heatmap-cell"
+          style={`background: rgba(88,166,255,${opacity.toFixed(3)})`}
+          title={`${hour}時台: ${formatCount(count)}件`}
+          aria-label={`${hour}時台: ${formatCount(count)}件`}
+          role="img"
+        >
+          <span class="heatmap-hour">
+            {#if hour % 3 === 0}{hour}{/if}
+          </span>
+        </div>
+      {/each}
+    </div>
+    <div class="heatmap-axis" aria-hidden="true">
+      {#each [0, 3, 6, 9, 12, 15, 18, 21] as tick (tick)}
+        <span>{tick}</span>
+      {/each}
+    </div>
+  </section>
 </section>
 
 <style>
@@ -1353,6 +1401,54 @@
 
   .speaker-fill {
     background: #56d364;
+  }
+
+  /* 時間帯ヒートマップ */
+  .heatmap-section {
+    background: #121212;
+  }
+
+  .heatmap-grid {
+    display: grid;
+    grid-template-columns: repeat(24, 1fr);
+    gap: 3px;
+    border-radius: 6px;
+    overflow: hidden;
+  }
+
+  .heatmap-cell {
+    height: 48px;
+    border-radius: 3px;
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-end;
+    align-items: center;
+    padding-bottom: 4px;
+    transition: opacity 0.15s ease;
+    cursor: default;
+  }
+
+  .heatmap-cell:hover {
+    outline: 1px solid rgba(88,166,255,0.6);
+    outline-offset: -1px;
+  }
+
+  .heatmap-hour {
+    color: rgba(255,255,255,0.55);
+    font-size: 9px;
+    font-weight: 700;
+    line-height: 1;
+    pointer-events: none;
+    min-height: 1em;
+  }
+
+  .heatmap-axis {
+    display: flex;
+    justify-content: space-between;
+    margin-top: 5px;
+    color: #8b949e;
+    font-size: 11px;
+    padding: 0 1px;
   }
 
   .empty-state {
