@@ -74,6 +74,10 @@
   // prevReceived is tracked via untrack() so it does not become a reactive dep
   // of this effect (reading/writing a plain reactive would be fragile in Svelte 5).
   let prevReceived = $state(0);
+  // Counts new messages received while not at the bottom.
+  // Reset to 0 when the user returns to the bottom (onScroll or button click).
+  let unreadCount = $state(0);
+
   $effect(() => {
     const received = store.receivedCount;
     const last = untrack(() => prevReceived);
@@ -84,6 +88,9 @@
         requestAnimationFrame(() => {
           containerEl.scrollTop = containerEl.scrollHeight;
         });
+      } else {
+        // Not at bottom — accumulate unread count instead of auto-scrolling.
+        untrack(() => { unreadCount += (received - last); });
       }
     } else if (received !== last) {
       // received < last should not occur (monotonic), but sync on mismatch
@@ -98,7 +105,12 @@
     scrollTop = containerEl.scrollTop;
     clientHeight = containerEl.clientHeight;
     const distFromBottom = containerEl.scrollHeight - containerEl.scrollTop - containerEl.clientHeight;
+    const wasAtBottom = isAtBottom;
     isAtBottom = distFromBottom < ROW_HEIGHT * 2;
+    // Reset unread count when user scrolls back to the bottom.
+    if (!wasAtBottom && isAtBottom) {
+      unreadCount = 0;
+    }
   }
 
   function openContextMenu(request: { x: number; y: number; items: ContextMenuItem[] }) {
@@ -150,10 +162,18 @@
   {#if !isAtBottom && totalCount > 0}
     <button
       class="scroll-bottom-btn"
-      onclick={() => { containerEl.scrollTop = containerEl.scrollHeight; isAtBottom = true; }}
-      aria-label="最新コメントへ"
+      onclick={() => {
+        containerEl.scrollTop = containerEl.scrollHeight;
+        isAtBottom = true;
+        unreadCount = 0;
+      }}
+      aria-label={unreadCount > 0 ? `新着${unreadCount}件。最新コメントへ` : '最新コメントへ'}
     >
-      ▼ 最新
+      {#if unreadCount > 0}
+        ▼ 新着 {unreadCount}件
+      {:else}
+        ▼ 最新
+      {/if}
     </button>
   {/if}
 </div>
