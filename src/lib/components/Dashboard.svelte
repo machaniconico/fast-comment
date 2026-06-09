@@ -1,6 +1,7 @@
 <script lang="ts">
+  import { onDestroy, onMount } from 'svelte';
   import { buildCsv, store } from '../stores.svelte';
-  import { exportCommentsCsv } from '../ipc';
+  import { exportCommentsCsv, onStats } from '../ipc';
   import type { UiChatMessage } from '../types';
 
   interface DonationEntry {
@@ -83,6 +84,20 @@
   let csvExportMsg = $state('');
   let csvExportPath = $state('');
   let exportingReport = $state<'markdown' | 'text' | null>(null);
+  let liveViewers = $state(0);
+  let peakViewers = $state(0);
+  let unlistenStats: (() => void) | null = null;
+
+  onMount(async () => {
+    unlistenStats = await onStats((s) => {
+      liveViewers = s.viewers;
+      peakViewers = s.viewersMax;
+    });
+  });
+
+  onDestroy(() => {
+    unlistenStats?.();
+  });
 
   const donationEntries: DonationEntry[] = $derived.by(() => (
     Object.entries(store.donationSummary.byCurrency)
@@ -166,7 +181,7 @@
       '',
       '## 概要',
       `- 総コメント数: ${formatCount(store.totalCount)}件`,
-      `- ユニーク視聴者: ${formatCount(store.uniqueViewers)}人`,
+      `- 最大同接: ${formatCount(peakViewers)}人`,
       `- ハイライト数: ${formatCount(store.highlightCount)}件`,
       '- 投げ銭:',
       ...formatDonationMarkdownLines(),
@@ -193,7 +208,7 @@
       '',
       '概要',
       `総コメント数: ${formatCount(store.totalCount)}件`,
-      `ユニーク視聴者: ${formatCount(store.uniqueViewers)}人`,
+      `最大同接: ${formatCount(peakViewers)}人`,
       `ハイライト数: ${formatCount(store.highlightCount)}件`,
       '投げ銭:',
       ...formatDonationTextLines(),
@@ -711,8 +726,9 @@
       <strong>{formatCount(store.receivedCount)}</strong>
     </section>
     <section class="summary-card viewers">
-      <span class="card-label">ユニーク視聴者</span>
-      <strong>{formatCount(store.uniqueViewers)}</strong>
+      <span class="card-label">同時接続</span>
+      <strong>{formatCount(liveViewers)}</strong>
+      <span class="card-sub">最大 {formatCount(peakViewers)}</span>
     </section>
     <section class="summary-card highlights">
       <span class="card-label">ハイライト</span>
@@ -1090,6 +1106,12 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  .card-sub {
+    font-size: 11px;
+    color: #888;
+    margin-top: 2px;
   }
 
   .summary-card.comments { border-top: 2px solid #58a6ff; }
