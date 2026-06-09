@@ -1034,6 +1034,17 @@ fn spawn_one_channel(_app: &AppHandle, state: &AppState, ch: &ChannelConfig) {
             token.clone(),
         );
     }
+    if ch.platform == ChannelPlatform::Twitch {
+        let oauth = state.config.lock().unwrap().credentials.twitch_oauth.clone();
+        if !oauth.trim().is_empty() {
+            sources::twitch_helix::spawn_twitch_viewer_poller(
+                ch.identifier.clone(),
+                oauth,
+                state.metadata_tx.clone(),
+                token.clone(),
+            );
+        }
+    }
     let mut map = state.channels.lock().unwrap();
     // 同一キーの旧タスクが残っていれば確実にキャンセルしてからリーク無く差し替える(#18)。
     if let Some(old) = map.insert(key, token) {

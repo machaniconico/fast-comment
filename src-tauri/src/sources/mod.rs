@@ -5,6 +5,7 @@
 //! 正規化済み `ChatMessage` を `broadcast::Sender` へ流す。
 
 pub mod twitch;
+pub mod twitch_helix;
 pub mod twitch_send;
 pub mod youtube;
 

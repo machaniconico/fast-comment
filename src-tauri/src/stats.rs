@@ -74,9 +74,10 @@ pub struct GoalsSnapshot {
     pub likes: u32,
 }
 
-/// YouTube メタデータ poller から集約タスクへ渡す更新。
-#[derive(Debug, Clone, Default)]
+/// メタデータ poller から集約タスクへ渡す更新。
+#[derive(Debug, Clone)]
 pub struct YoutubeMetadataUpdate {
+    pub platform: Platform,
     pub channel: String,
     pub concurrent_viewers: Option<u32>,
     pub likes: Option<u32>,
@@ -84,10 +85,24 @@ pub struct YoutubeMetadataUpdate {
 }
 
 #[derive(Debug, Clone, Default)]
-struct YoutubeMetadataState {
+struct MetadataState {
+    platform: Option<Platform>,
+    channel: String,
     concurrent_viewers: Option<u32>,
     likes: Option<u32>,
     title: Option<String>,
+}
+
+impl Default for YoutubeMetadataUpdate {
+    fn default() -> Self {
+        YoutubeMetadataUpdate {
+            platform: Platform::Youtube,
+            channel: String::new(),
+            concurrent_viewers: None,
+            likes: None,
+            title: None,
+        }
+    }
 }
 
 /// watch::Sender を使う統計集約タスクを起動する。
@@ -106,7 +121,7 @@ pub fn spawn_stats_aggregator(
         let mut comments = 0u32;
         let mut viewers_max = 0u32;
         let mut viewer_scopes: HashMap<String, HashSet<String>> = HashMap::new();
-        let mut youtube_metadata: HashMap<String, YoutubeMetadataState> = HashMap::new();
+        let mut metadata: HashMap<String, MetadataState> = HashMap::new();
         let mut config = config_rx.borrow().clone();
 
         let mut ticker = interval(Duration::from_secs(1));
@@ -116,7 +131,7 @@ pub fn spawn_stats_aggregator(
             comments,
             viewers_max,
             &viewer_scopes,
-            &youtube_metadata,
+            &metadata,
             &config,
         );
         publish_snapshot(&stats_tx, &app, &snapshot);
@@ -133,7 +148,7 @@ pub fn spawn_stats_aggregator(
                                 comments,
                                 viewers_max,
                                 &viewer_scopes,
-                                &youtube_metadata,
+                                &metadata,
                                 &config,
                             );
                             viewers_max = viewers_max.max(snapshot.viewers);
@@ -150,24 +165,25 @@ pub fn spawn_stats_aggregator(
                     let Some(update) = update else {
                         break;
                     };
-                    let entry = youtube_metadata
-                        .entry(update.channel)
-                        .or_insert_with(YoutubeMetadataState::default);
-                    if let Some(v) = update.concurrent_viewers {
-                        entry.concurrent_viewers = Some(v);
-                    }
+                    let key = metadata_key(update.platform, &update.channel);
+                    let entry = metadata
+                        .entry(key)
+                        .or_insert_with(MetadataState::default);
+                    entry.platform = Some(update.platform);
+                    entry.channel = update.channel;
+                    entry.concurrent_viewers = update.concurrent_viewers;
                     if let Some(v) = update.likes {
                         entry.likes = Some(v);
                     }
                     if let Some(title) = update.title {
                         entry.title = Some(title);
                     }
-                    retain_enabled_youtube_metadata(&mut youtube_metadata, &config);
+                    retain_enabled_metadata(&mut metadata, &config);
                     snapshot = build_snapshot(
                         comments,
                         viewers_max,
                         &viewer_scopes,
-                        &youtube_metadata,
+                        &metadata,
                         &config,
                     );
                     viewers_max = viewers_max.max(snapshot.viewers);
@@ -180,12 +196,12 @@ pub fn spawn_stats_aggregator(
                     }
                     config = config_rx.borrow_and_update().clone();
                     retain_enabled_scopes(&mut viewer_scopes, &config);
-                    retain_enabled_youtube_metadata(&mut youtube_metadata, &config);
+                    retain_enabled_metadata(&mut metadata, &config);
                     snapshot = build_snapshot(
                         comments,
                         viewers_max,
                         &viewer_scopes,
-                        &youtube_metadata,
+                        &metadata,
                         &config,
                     );
                     viewers_max = viewers_max.max(snapshot.viewers);
@@ -197,7 +213,7 @@ pub fn spawn_stats_aggregator(
                         comments,
                         viewers_max,
                         &viewer_scopes,
-                        &youtube_metadata,
+                        &metadata,
                         &config,
                     );
                     viewers_max = viewers_max.max(snapshot.viewers);
@@ -227,33 +243,41 @@ fn build_snapshot(
     comments: u32,
     viewers_max: u32,
     viewer_scopes: &HashMap<String, HashSet<String>>,
-    youtube_metadata: &HashMap<String, YoutubeMetadataState>,
+    metadata: &HashMap<String, MetadataState>,
     config: &AppConfig,
 ) -> StatsSnapshot {
     let unique_count = viewer_scopes
         .values()
         .map(|set| set.len() as u32)
         .fold(0u32, u32::saturating_add);
-    let concurrent_total = youtube_metadata
+    let concurrent_total = metadata
         .values()
         .filter_map(|m| m.concurrent_viewers)
         .fold(0u32, u32::saturating_add);
     let viewers = resolve_viewers(concurrent_total, unique_count);
-    let likes = youtube_metadata
+    let likes = metadata
         .values()
         .filter_map(|m| m.likes)
         .fold(0u32, u32::saturating_add);
-    let mut channel_titles = youtube_metadata
+    let mut channel_titles = metadata
         .iter()
-        .filter_map(|(channel, metadata)| {
+        .filter_map(|(_key, metadata)| {
             metadata.title.as_ref().map(|title| ChannelTitle {
-                platform: "youtube".to_string(),
-                identifier: channel.clone(),
+                platform: metadata
+                    .platform
+                    .map(platform_key)
+                    .unwrap_or("youtube")
+                    .to_string(),
+                identifier: metadata.channel.clone(),
                 title: title.clone(),
             })
         })
         .collect::<Vec<_>>();
-    channel_titles.sort_by(|a, b| a.identifier.cmp(&b.identifier));
+    channel_titles.sort_by(|a, b| {
+        a.platform
+            .cmp(&b.platform)
+            .then_with(|| a.identifier.cmp(&b.identifier))
+    });
 
     StatsSnapshot {
         comments,
@@ -296,6 +320,10 @@ fn scope_key(platform: Platform, channel: &str) -> String {
     format!("{}:{channel}", platform_key(platform))
 }
 
+fn metadata_key(platform: Platform, channel: &str) -> String {
+    format!("{}:{channel}", platform_key(platform))
+}
+
 fn platform_key(platform: Platform) -> &'static str {
     match platform {
         Platform::Twitch => "twitch",
@@ -327,25 +355,27 @@ fn retain_enabled_scopes(
     viewer_scopes.retain(|scope, _| enabled.contains(scope));
 }
 
-fn enabled_youtube_channels(config: &AppConfig) -> HashSet<String> {
+fn enabled_metadata_keys(config: &AppConfig) -> HashSet<String> {
     config
         .channels
         .iter()
-        .filter(|ch| ch.enabled && ch.platform == ChannelPlatform::Youtube)
-        .map(|ch| extract_video_id(&ch.identifier))
+        .filter(|ch| ch.enabled)
+        .map(|ch| match ch.platform {
+            ChannelPlatform::Twitch => metadata_key(Platform::Twitch, &ch.identifier),
+            ChannelPlatform::Youtube => {
+                metadata_key(Platform::Youtube, &extract_video_id(&ch.identifier))
+            }
+        })
         .collect()
 }
 
-fn retain_enabled_youtube_metadata(
-    metadata: &mut HashMap<String, YoutubeMetadataState>,
-    config: &AppConfig,
-) {
-    let enabled = enabled_youtube_channels(config);
+fn retain_enabled_metadata(metadata: &mut HashMap<String, MetadataState>, config: &AppConfig) {
+    let enabled = enabled_metadata_keys(config);
     if enabled.is_empty() {
         metadata.clear();
         return;
     }
-    metadata.retain(|channel, _| enabled.contains(channel));
+    metadata.retain(|key, _| enabled.contains(key));
 }
 
 fn has_enabled_youtube(config: &AppConfig) -> bool {
@@ -392,6 +422,7 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ChannelConfig;
     use crate::model::{Author, Fragment, MessageKind, Roles};
 
     fn msg(platform: Platform, channel: &str, id: &str, name: &str) -> ChatMessage {
@@ -439,5 +470,52 @@ mod tests {
 
         let count: u32 = scopes.values().map(|set| set.len() as u32).sum();
         assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn concurrent_viewers_sum_across_platform_metadata() {
+        let config = AppConfig {
+            channels: vec![
+                ChannelConfig {
+                    platform: ChannelPlatform::Youtube,
+                    identifier: "yt123".to_string(),
+                    enabled: true,
+                },
+                ChannelConfig {
+                    platform: ChannelPlatform::Twitch,
+                    identifier: "twlogin".to_string(),
+                    enabled: true,
+                },
+            ],
+            ..AppConfig::default()
+        };
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            metadata_key(Platform::Youtube, "yt123"),
+            MetadataState {
+                platform: Some(Platform::Youtube),
+                channel: "yt123".to_string(),
+                concurrent_viewers: Some(10),
+                likes: Some(3),
+                title: Some("YouTube Live".to_string()),
+            },
+        );
+        metadata.insert(
+            metadata_key(Platform::Twitch, "twlogin"),
+            MetadataState {
+                platform: Some(Platform::Twitch),
+                channel: "twlogin".to_string(),
+                concurrent_viewers: Some(7),
+                likes: None,
+                title: None,
+            },
+        );
+
+        let snapshot = build_snapshot(0, 0, &HashMap::new(), &metadata, &config);
+
+        assert_eq!(snapshot.viewers, 17);
+        assert_eq!(snapshot.likes, 3);
+        assert_eq!(snapshot.channel_titles.len(), 1);
+        assert_eq!(snapshot.channel_titles[0].platform, "youtube");
     }
 }

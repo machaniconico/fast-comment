@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::YoutubeOverrides;
+use crate::model::Platform;
 use crate::stats::YoutubeMetadataUpdate;
 
 use super::extract_video_id;
@@ -96,6 +97,7 @@ pub fn spawn_metadata_poller(
                     }
 
                     let update = YoutubeMetadataUpdate {
+                        platform: Platform::Youtube,
                         channel: video_id.clone(),
                         concurrent_viewers: last.concurrent_viewers,
                         likes: last.likes,
