@@ -58,7 +58,12 @@
   // 入力(配信URL or 生ID/名)から配信プラットフォームと識別子を判別する。
   // URL でない生入力は manual として扱い、手動選択へフォールバックする。
   type ChannelPlatform = ChannelConfig['platform'];
-  type DetectedChannel = { kind: 'detected'; platform: ChannelPlatform; identifier: string };
+  type DetectedChannel = {
+    kind: 'detected';
+    platform: ChannelPlatform;
+    identifier: string;
+    youtubeKind?: 'video' | 'channel';
+  };
   type ChannelDetection =
     | DetectedChannel
     | { kind: 'manual' }
@@ -70,6 +75,8 @@
   const YOUTUBE_HOSTS = new Set(['youtube.com', 'm.youtube.com', 'music.youtube.com', 'youtu.be']);
   const YOUTUBE_PATH_ID_PREFIXES = new Set(['live', 'embed', 'shorts', 'v']);
   const YOUTUBE_VIDEO_ID_RE = /^[A-Za-z0-9_-]{11}$/;
+  const YOUTUBE_CHANNEL_ID_RE = /^UC[A-Za-z0-9_-]{22}$/;
+  const YOUTUBE_HANDLE_RE = /^@[A-Za-z0-9._-]+$/;
   const TWITCH_LOGIN_RE = /^[a-z0-9_]{2,25}$/;
   const TWITCH_RESERVED_PATHS = new Set([
     'about', 'admin', 'bits', 'broadcast', 'clip', 'clips', 'creatorcamp',
@@ -117,6 +124,18 @@
     return YOUTUBE_VIDEO_ID_RE.test(trimmed) ? trimmed : null;
   }
 
+  function validYoutubeChannelId(id: string | null): string | null {
+    if (!id) return null;
+    const trimmed = id.trim();
+    return YOUTUBE_CHANNEL_ID_RE.test(trimmed) ? trimmed : null;
+  }
+
+  function validYoutubeHandle(handle: string | null): string | null {
+    if (!handle) return null;
+    const trimmed = handle.trim();
+    return YOUTUBE_HANDLE_RE.test(trimmed) ? trimmed : null;
+  }
+
   // YouTube URL から videoId を抽出する(watch?v= / youtu.be / live / embed / shorts)。
   function extractYoutubeId(url: URL): string | null {
     const host = normalizedHost(url);
@@ -136,9 +155,40 @@
     return validYoutubeVideoId(candidate);
   }
 
+  // YouTube URL からチャンネル指定を抽出する(/@handle[/live] / /channel/UC...[/live])。
+  function extractYoutubeChannelId(url: URL): string | null {
+    const segments = url.pathname.split('/').filter(Boolean);
+    if (segments.length < 1 || segments.length > 3) return null;
+    const trailingLive = segments[segments.length - 1]?.toLowerCase() === 'live';
+    const coreSegments = trailingLive ? segments.slice(0, -1) : segments;
+
+    if (coreSegments.length === 1) {
+      return validYoutubeHandle(coreSegments[0]);
+    }
+
+    if (coreSegments.length === 2 && coreSegments[0]?.toLowerCase() === 'channel') {
+      return validYoutubeChannelId(coreSegments[1]);
+    }
+
+    return null;
+  }
+
   function detectChannel(input: string): ChannelDetection {
-    const url = parseUrlLoose(input.trim());
-    if (!url) return { kind: 'manual' };
+    const raw = input.trim();
+    const url = parseUrlLoose(raw);
+    if (!url) {
+      const youtubeChannelIdentifier =
+        validYoutubeHandle(raw) ?? validYoutubeChannelId(raw);
+      if (youtubeChannelIdentifier) {
+        return {
+          kind: 'detected',
+          platform: 'youtube',
+          identifier: youtubeChannelIdentifier,
+          youtubeKind: 'channel'
+        };
+      }
+      return { kind: 'manual' };
+    }
 
     const host = normalizedHost(url);
     if (TWITCH_HOSTS.has(host)) {
@@ -156,12 +206,21 @@
     if (YOUTUBE_HOSTS.has(host)) {
       const id = extractYoutubeId(url);
       if (id) {
-        return { kind: 'detected', platform: 'youtube', identifier: id };
+        return { kind: 'detected', platform: 'youtube', identifier: id, youtubeKind: 'video' };
+      }
+      const channelIdentifier = extractYoutubeChannelId(url);
+      if (channelIdentifier) {
+        return {
+          kind: 'detected',
+          platform: 'youtube',
+          identifier: channelIdentifier,
+          youtubeKind: 'channel'
+        };
       }
       return {
         kind: 'known-url',
         platform: 'youtube',
-        message: 'YouTubeのライブ配信IDが見つかりません。動画IDを手動入力してください。'
+        message: 'YouTubeの動画IDまたはチャンネル指定が見つかりません。動画ID / チャンネルID / @handle を手動入力してください。'
       };
     }
 
@@ -182,7 +241,11 @@
   const effectivePlatform = $derived(detected?.platform ?? newPlatform);
   const detectHint = $derived.by((): DetectHint | null => {
     if (detection.kind === 'detected') {
-      const label = detection.platform === 'twitch' ? 'Twitch' : 'YouTube';
+      const label = detection.platform === 'twitch'
+        ? 'Twitch'
+        : detection.youtubeKind === 'channel'
+          ? 'YouTubeチャンネル'
+          : 'YouTube動画';
       return { tone: 'ok', message: `${label} として自動判別:`, identifier: detection.identifier };
     }
     if (detection.kind === 'known-url' || detection.kind === 'unsupported-url') {
@@ -194,7 +257,7 @@
   async function onAddChannel() {
     addError = '';
     const raw = newIdentifier.trim();
-    if (!raw) { addError = 'URL か Twitchチャンネル名 / YouTube動画ID を入力してください'; return; }
+    if (!raw) { addError = 'URL か Twitchチャンネル名 / YouTube動画ID / YouTubeチャンネル指定を入力してください'; return; }
 
     // URL から判別できればそれを優先。生入力は手動選択 + 生ID/名として追加する。
     const det = detectChannel(raw);
@@ -237,9 +300,9 @@
     <input
       type="text"
       bind:value={newIdentifier}
-      placeholder="配信URLを貼り付け（または Twitchチャンネル名 / YouTube動画ID）"
+      placeholder="配信URLを貼り付け（または Twitchチャンネル名 / YouTube動画ID / @handle / チャンネルURL）"
       class="id-input"
-      aria-label="配信URL または チャンネル名 / 動画ID"
+      aria-label="配信URL または チャンネル名 / 動画ID / YouTubeチャンネル指定"
       onkeydown={(e) => e.key === 'Enter' && onAddChannel()}
     />
     <button class="add-btn" onclick={onAddChannel}>追加</button>
