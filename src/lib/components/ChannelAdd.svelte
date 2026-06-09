@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
-  import type { ChannelConfig } from '../ipc';
+  import type { ChannelConfig, ChannelStatus } from '../ipc';
   import { addChannel, removeChannel, getConfig, onStats } from '../ipc';
 
   // 追加成功時に親へ通知(任意)。
@@ -12,28 +12,78 @@
   // 配信タイトル(key=`${platform}:${identifier}`)。stats イベントで更新され、
   // チップ本文を識別子からタイトルへ差し替える。未取得のチャンネルは identifier 表示。
   let titles: Map<string, string> = $state(new Map());
+  let channelStatus: Map<string, ChannelStatus> = $state(new Map());
   let unlistenStats: (() => void) | null = null;
 
   function chipKey(platform: string, identifier: string): string {
     return `${platform}:${identifier}`;
   }
 
+  function sameChannelStatus(a: ChannelStatus | undefined, b: ChannelStatus): boolean {
+    return !!a
+      && (a.title ?? null) === (b.title ?? null)
+      && (a.viewers ?? null) === (b.viewers ?? null)
+      && (a.live ?? null) === (b.live ?? null);
+  }
+
+  function updateChannelStatus(statuses: ChannelStatus[] | undefined) {
+    if (!statuses) return;
+    const next = new Map(channelStatus);
+    const seen = new Set<string>();
+    let changed = false;
+
+    for (const status of statuses) {
+      const key = chipKey(status.platform, status.identifier);
+      seen.add(key);
+      if (!sameChannelStatus(next.get(key), status)) {
+        next.set(key, status);
+        changed = true;
+      }
+    }
+
+    for (const key of next.keys()) {
+      if (!seen.has(key)) {
+        next.delete(key);
+        changed = true;
+      }
+    }
+
+    if (changed) channelStatus = next;
+  }
+
+  function statusTitle(status: ChannelStatus | undefined): string | undefined {
+    const title = status?.title?.trim();
+    return title ? title : undefined;
+  }
+
+  function chipTooltip(ch: ChannelConfig, status: ChannelStatus | undefined, display: string): string {
+    if (status?.live === true) {
+      return display === ch.identifier ? ch.identifier : `${display}\n${ch.identifier}`;
+    }
+    if (status?.live === false) {
+      return `${ch.identifier}\n待機中（配信開始を検知すると自動接続）`;
+    }
+    return ch.identifier;
+  }
+
   onMount(async () => {
     const cfg = await getConfig();
     if (cfg) channels = cfg.channels;
     unlistenStats = await onStats((s) => {
-      if (!s.channelTitles || s.channelTitles.length === 0) return;
-      const next = new Map(titles);
-      let changed = false;
-      for (const ct of s.channelTitles) {
-        if (!ct || !ct.title) continue;
-        const key = chipKey(ct.platform, ct.identifier);
-        if (next.get(key) !== ct.title) {
-          next.set(key, ct.title);
-          changed = true;
+      if (s.channelTitles && s.channelTitles.length > 0) {
+        const next = new Map(titles);
+        let changed = false;
+        for (const ct of s.channelTitles) {
+          if (!ct || !ct.title) continue;
+          const key = chipKey(ct.platform, ct.identifier);
+          if (next.get(key) !== ct.title) {
+            next.set(key, ct.title);
+            changed = true;
+          }
         }
+        if (changed) titles = next;
       }
-      if (changed) titles = next;
+      updateChannelStatus(s.channelStatus);
     });
   });
 
@@ -329,11 +379,25 @@
   {#if channels.length > 0}
     <div class="channel-chips" role="list" aria-label="接続中チャンネル">
       {#each channels as ch (ch.platform + ':' + ch.identifier)}
-        {@const display = titles.get(chipKey(ch.platform, ch.identifier)) ?? ch.identifier}
-        <span class="chip" class:twitch={ch.platform === 'twitch'} class:youtube={ch.platform === 'youtube'} role="listitem" title={ch.identifier}>
+        {@const key = chipKey(ch.platform, ch.identifier)}
+        {@const status = channelStatus.get(key)}
+        {@const display = statusTitle(status) ?? titles.get(key) ?? ch.identifier}
+        {@const isLive = status?.live === true}
+        {@const isIdle = status?.live === false}
+        {@const bodyText = isIdle ? ch.identifier : display}
+        <span
+          class="chip"
+          class:twitch={ch.platform === 'twitch'}
+          class:youtube={ch.platform === 'youtube'}
+          class:live={isLive}
+          class:idle={isIdle}
+          role="listitem"
+          title={chipTooltip(ch, status, bodyText)}
+        >
           <span class="chip-dot" aria-hidden="true"></span>
-          <span class="chip-id">{display}</span>
-          <button class="chip-x" title="削除" aria-label="{display} を削除" onclick={() => onRemove(ch)}>×</button>
+          {#if isLive}<span class="live-badge">LIVE</span>{/if}
+          <span class="chip-id">{bodyText}</span>
+          <button class="chip-x" title="削除" aria-label="{bodyText} を削除" onclick={() => onRemove(ch)}>×</button>
         </span>
       {/each}
     </div>
@@ -430,6 +494,35 @@
     background: rgba(255,0,0,0.12);
   }
   .chip.youtube .chip-dot { background: #ff0000; }
+
+  .chip.live .chip-dot {
+    animation: live-pulse 1.3s ease-in-out infinite;
+    box-shadow: 0 0 0 0 rgba(255, 0, 0, 0.6);
+  }
+
+  .chip.idle {
+    opacity: 0.6;
+  }
+
+  .chip.idle .chip-dot {
+    background: #9e9e9e;
+  }
+
+  .live-badge {
+    background: #e53935;
+    color: #fff;
+    border-radius: 3px;
+    font-size: 9px;
+    font-weight: 700;
+    line-height: 1;
+    padding: 2px 3px;
+  }
+
+  @keyframes live-pulse {
+    0% { box-shadow: 0 0 0 0 rgba(255, 0, 0, 0.55); opacity: 1; }
+    70% { box-shadow: 0 0 0 5px rgba(255, 0, 0, 0); opacity: 0.72; }
+    100% { box-shadow: 0 0 0 0 rgba(255, 0, 0, 0); opacity: 1; }
+  }
 
   .chip-id {
     overflow: hidden;

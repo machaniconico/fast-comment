@@ -60,6 +60,7 @@ struct MetadataValues {
 
 pub fn spawn_metadata_poller(
     video_input: String,
+    status_channel: String,
     overrides: YoutubeOverrides,
     tx: mpsc::Sender<YoutubeMetadataUpdate>,
     cancel: CancellationToken,
@@ -98,10 +99,11 @@ pub fn spawn_metadata_poller(
 
                     let update = YoutubeMetadataUpdate {
                         platform: Platform::Youtube,
-                        channel: video_id.clone(),
+                        channel: status_channel.clone(),
                         concurrent_viewers: last.concurrent_viewers,
                         likes: last.likes,
                         title: last.title.clone(),
+                        live: None,
                     };
                     tokio::select! {
                         _ = cancel.cancelled() => break,

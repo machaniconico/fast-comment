@@ -279,6 +279,14 @@ export interface ChannelTitle {
   title: string;
 }
 
+export interface ChannelStatus {
+  platform: string;
+  identifier: string;
+  title?: string | null;
+  viewers?: number | null;
+  live?: boolean | null;
+}
+
 export interface StatsSnapshot {
   comments: number;
   viewers: number;
@@ -290,6 +298,7 @@ export interface StatsSnapshot {
   // Per-channel stream titles (currently YouTube only). Optional for backward
   // compatibility with older snapshots that don't carry it.
   channelTitles?: ChannelTitle[];
+  channelStatus?: ChannelStatus[];
 }
 
 export interface TimerSnapshot {

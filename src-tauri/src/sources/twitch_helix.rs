@@ -17,6 +17,12 @@ const POLL_INTERVAL: Duration = Duration::from_secs(20);
 const VALIDATE_URL: &str = "https://id.twitch.tv/oauth2/validate";
 const STREAMS_URL: &str = "https://api.twitch.tv/helix/streams";
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct TwitchStreamMetadata {
+    viewer_count: Option<u32>,
+    live: Option<bool>,
+}
+
 pub fn spawn_twitch_viewer_poller(
     login: String,
     oauth: String,
@@ -58,14 +64,15 @@ pub fn spawn_twitch_viewer_poller(
             }
 
             if let Some(id) = client_id.as_deref() {
-                match fetch_viewer_count(&http, &login, &token, id).await {
-                    Ok(viewers) => {
+                match fetch_stream_metadata(&http, &login, &token, id).await {
+                    Ok(values) => {
                         let update = YoutubeMetadataUpdate {
                             platform: Platform::Twitch,
                             channel: login.clone(),
-                            concurrent_viewers: viewers,
+                            concurrent_viewers: values.viewer_count,
                             likes: None,
                             title: None,
+                            live: values.live,
                         };
                         tokio::select! {
                             _ = cancel.cancelled() => break,
@@ -105,12 +112,12 @@ async fn fetch_client_id(http: &Client, token: &str) -> anyhow::Result<String> {
     extract_client_id(&value).ok_or_else(|| anyhow::anyhow!("validate response missing client_id"))
 }
 
-async fn fetch_viewer_count(
+async fn fetch_stream_metadata(
     http: &Client,
     login: &str,
     token: &str,
     client_id: &str,
-) -> anyhow::Result<Option<u32>> {
+) -> anyhow::Result<TwitchStreamMetadata> {
     let value = http
         .get(STREAMS_URL)
         .query(&[("user_login", login)])
@@ -122,7 +129,7 @@ async fn fetch_viewer_count(
         .json::<Value>()
         .await?;
 
-    Ok(extract_viewer_count(&value))
+    Ok(extract_stream_metadata(&value))
 }
 
 fn oauth_token_without_prefix(oauth: &str) -> Option<String> {
@@ -144,11 +151,7 @@ fn extract_client_id(value: &Value) -> Option<String> {
 }
 
 fn extract_viewer_count(value: &Value) -> Option<u32> {
-    let count = value
-        .get("data")
-        .and_then(Value::as_array)?
-        .first()?
-        .get("viewer_count")?;
+    let count = value.get("viewer_count")?;
 
     count
         .as_u64()
@@ -158,6 +161,22 @@ fn extract_viewer_count(value: &Value) -> Option<u32> {
                 .as_str()
                 .and_then(|s| s.trim().parse::<u32>().ok())
         })
+}
+
+fn extract_stream_metadata(value: &Value) -> TwitchStreamMetadata {
+    let Some(streams) = value.get("data").and_then(Value::as_array) else {
+        return TwitchStreamMetadata::default();
+    };
+    let Some(stream) = streams.first() else {
+        return TwitchStreamMetadata {
+            viewer_count: None,
+            live: Some(false),
+        };
+    };
+    TwitchStreamMetadata {
+        viewer_count: extract_viewer_count(stream),
+        live: Some(true),
+    }
 }
 
 #[cfg(test)]
@@ -174,12 +193,24 @@ mod tests {
     #[test]
     fn extracts_viewer_count_from_first_stream() {
         let value = json!({ "data": [{ "viewer_count": 1234 }] });
-        assert_eq!(extract_viewer_count(&value), Some(1234));
+        assert_eq!(
+            extract_stream_metadata(&value),
+            TwitchStreamMetadata {
+                viewer_count: Some(1234),
+                live: Some(true),
+            }
+        );
     }
 
     #[test]
     fn missing_stream_data_means_not_live() {
         let value = json!({ "data": [] });
-        assert_eq!(extract_viewer_count(&value), None);
+        assert_eq!(
+            extract_stream_metadata(&value),
+            TwitchStreamMetadata {
+                viewer_count: None,
+                live: Some(false),
+            }
+        );
     }
 }

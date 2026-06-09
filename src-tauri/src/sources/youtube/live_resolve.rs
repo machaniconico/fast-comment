@@ -12,7 +12,7 @@ use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{ChannelConfig, ChannelPlatform, YoutubeOverrides};
-use crate::model::ChatMessage;
+use crate::model::{ChatMessage, Platform};
 use crate::sources::SourceManager;
 use crate::stats::YoutubeMetadataUpdate;
 
@@ -118,6 +118,7 @@ pub fn spawn_live_resolve_poller(
         let manager = SourceManager::new(source_tx, overrides.clone());
         let mut active_video_id: Option<String> = None;
         let mut active_cancel: Option<CancellationToken> = None;
+        let mut live_state: Option<bool> = None;
 
         loop {
             if cancel.is_cancelled() {
@@ -145,6 +146,7 @@ pub fn spawn_live_resolve_poller(
                         let child = manager.spawn_channel(&child_config);
                         super::metadata::spawn_metadata_poller(
                             video_id.clone(),
+                            identifier.clone(),
                             overrides.clone(),
                             metadata_tx.clone(),
                             child.clone(),
@@ -154,6 +156,12 @@ pub fn spawn_live_resolve_poller(
                         );
                         active_video_id = Some(video_id);
                         active_cancel = Some(child);
+                    }
+                    if live_state != Some(true) {
+                        if !send_live_status(&metadata_tx, &identifier, true, &cancel).await {
+                            break;
+                        }
+                        live_state = Some(true);
                     }
                 }
                 Ok(Some(video_id)) => {
@@ -169,6 +177,12 @@ pub fn spawn_live_resolve_poller(
                         child.cancel();
                     }
                     active_video_id = None;
+                    if live_state != Some(false) {
+                        if !send_live_status(&metadata_tx, &identifier, false, &cancel).await {
+                            break;
+                        }
+                        live_state = Some(false);
+                    }
                 }
                 Err(e) => {
                     tracing::debug!("youtube:{identifier} live resolve 取得失敗: {e:#}");
@@ -186,6 +200,26 @@ pub fn spawn_live_resolve_poller(
         }
         tracing::info!("youtube:{identifier} live resolve poller 終了");
     });
+}
+
+async fn send_live_status(
+    tx: &mpsc::Sender<YoutubeMetadataUpdate>,
+    identifier: &str,
+    live: bool,
+    cancel: &CancellationToken,
+) -> bool {
+    let update = YoutubeMetadataUpdate {
+        platform: Platform::Youtube,
+        channel: identifier.to_string(),
+        concurrent_viewers: None,
+        likes: None,
+        title: None,
+        live: Some(live),
+    };
+    tokio::select! {
+        _ = cancel.cancelled() => false,
+        sent = tx.send(update) => sent.is_ok(),
+    }
 }
 
 pub async fn resolve_live_video_id(

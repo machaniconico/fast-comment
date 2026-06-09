@@ -1045,6 +1045,7 @@ fn spawn_one_channel(_app: &AppHandle, state: &AppState, ch: &ChannelConfig) {
     {
         sources::youtube::metadata::spawn_metadata_poller(
             ch.identifier.clone(),
+            sources::youtube::extract_video_id(&ch.identifier),
             overrides,
             state.metadata_tx.clone(),
             token.clone(),
