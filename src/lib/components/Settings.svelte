@@ -44,6 +44,10 @@
     theme.setTimeDisplay((event.currentTarget as HTMLSelectElement).value as AppearanceTimeDisplay);
   }
 
+  function onWrapCommentsChange(event: Event) {
+    theme.setWrapComments((event.currentTarget as HTMLInputElement).checked);
+  }
+
   let config: AppConfig | null = $state(null);
   let obsBaseUrl: string = $state('');
   let obsGoalsBaseUrl: string = $state('');
@@ -847,6 +851,10 @@
         <option value="minutes">時:分</option>
         <option value="seconds">時:分:秒</option>
       </select>
+    </div>
+    <div class="field-row">
+      <label for="appearance-wrap-comments">コメントを折り返す</label>
+      <input id="appearance-wrap-comments" type="checkbox" checked={theme.wrapComments} onchange={onWrapCommentsChange} />
     </div>
   </section>
 

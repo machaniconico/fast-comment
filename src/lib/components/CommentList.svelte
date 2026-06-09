@@ -12,6 +12,7 @@
   import type { ContextMenuItem } from './ContextMenu.svelte';
   import CommentItem from './CommentItem.svelte';
   import { store } from '../stores.svelte';
+  import { theme } from '../theme.svelte';
 
   interface Props {
     platformFilter?: Platform;
@@ -33,6 +34,8 @@
   let measured = $state(false);
   let isAtBottom = $state(true);
   let menu: { x: number; y: number; items: ContextMenuItem[] } | null = $state(null);
+  let wrap = $derived(theme.wrapComments);
+  let heights = $state(new Map<string, number>());
 
   let messages: ChatMessage[] = $derived.by(() => {
     if (!platformFilter) return store.visibleMessages;
@@ -50,10 +53,22 @@
     return out;
   });
   let totalCount = $derived(messages.length);
-  let totalHeight = $derived(totalCount * ROW_HEIGHT);
+  let offsets = $derived.by(() => {
+    const n = messages.length;
+    const arr = new Array<number>(n + 1);
+    arr[0] = 0;
+    for (let i = 0; i < n; i++) {
+      const h = wrap ? (heights.get(messages[i].id) ?? ROW_HEIGHT) : ROW_HEIGHT;
+      arr[i + 1] = arr[i] + h;
+    }
+    return arr;
+  });
+  let totalHeight = $derived(wrap ? offsets[messages.length] : totalCount * ROW_HEIGHT);
 
   let startIdx = $derived(
-    Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - OVERSCAN)
+    wrap
+      ? Math.max(0, bisectRight(offsets, scrollTop) - OVERSCAN)
+      : Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - OVERSCAN)
   );
   // Until the container is measured (post-mount), do NOT guess a viewport
   // height — gate the visible window on `measured` so the first paint never
@@ -62,10 +77,12 @@
   let endIdx = $derived(
     !measured
       ? 0
-      : Math.min(totalCount, Math.ceil((scrollTop + clientHeight) / ROW_HEIGHT) + OVERSCAN)
+      : wrap
+        ? Math.min(messages.length, bisectLeft(offsets, scrollTop + clientHeight) + OVERSCAN)
+        : Math.min(totalCount, Math.ceil((scrollTop + clientHeight) / ROW_HEIGHT) + OVERSCAN)
   );
   let visibleSlice = $derived(messages.slice(startIdx, endIdx));
-  let paddingTop = $derived(startIdx * ROW_HEIGHT);
+  let paddingTop = $derived(wrap ? offsets[startIdx] : startIdx * ROW_HEIGHT);
 
   // Scroll to bottom when new messages arrive and the user is at the bottom.
   // Monitors store.receivedCount (monotonically increasing) instead of
@@ -77,6 +94,19 @@
   // Counts new messages received while not at the bottom.
   // Reset to 0 when the user returns to the bottom (onScroll or button click).
   let unreadCount = $state(0);
+
+  $effect(() => {
+    const ids = new Set(messages.map(m => m.id));
+    let changed = false;
+    const next = new Map(heights);
+    for (const k of next.keys()) {
+      if (!ids.has(k)) {
+        next.delete(k);
+        changed = true;
+      }
+    }
+    if (changed) heights = next;
+  });
 
   $effect(() => {
     const received = store.receivedCount;
@@ -121,9 +151,51 @@
     menu = null;
   }
 
+  // last index where offsets[i] <= target
+  function bisectRight(arr: number[], target: number): number {
+    let lo = 0, hi = arr.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1;
+      if (arr[mid] <= target) lo = mid; else hi = mid - 1;
+    }
+    return lo;
+  }
+
+  // first index where offsets[i] >= target
+  function bisectLeft(arr: number[], target: number): number {
+    let lo = 0, hi = arr.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (arr[mid] >= target) hi = mid; else lo = mid + 1;
+    }
+    return lo;
+  }
+
   function messageSearchText(msg: ChatMessage): string {
     const body = msg.fragments.map((frag) => frag.type === 'text' ? frag.text : frag.name).join('');
     return `${msg.author.name} ${body}`.toLowerCase();
+  }
+
+  function measure(node: HTMLElement, id: string) {
+    if (!wrap) return {};
+
+    const target = node.querySelector<HTMLElement>('.comment-item') ?? node;
+    const ro = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        const h = entry.target instanceof HTMLElement ? entry.target.offsetHeight : entry.contentRect.height;
+        const prev = heights.get(id) ?? ROW_HEIGHT;
+        if (Math.abs(h - prev) > 0.5) {
+          heights = new Map(heights).set(id, h);
+        }
+      }
+    });
+    ro.observe(target);
+
+    return {
+      destroy() {
+        ro.disconnect();
+      },
+    };
   }
 
   onMount(() => {
@@ -148,9 +220,13 @@
   <div class="inner" style:height="{totalHeight}px">
     <!-- Rendered window -->
     <div class="window" style:transform="translateY({paddingTop}px)">
-      {#each visibleSlice as msg (msg.id)}
-        <CommentItem message={msg} onOpenContextMenu={openContextMenu} />
-      {/each}
+      {#key wrap}
+        {#each visibleSlice as msg (msg.id)}
+          <div class="measure-row" use:measure={msg.id} role="presentation">
+            <CommentItem message={msg} onOpenContextMenu={openContextMenu} />
+          </div>
+        {/each}
+      {/key}
     </div>
   </div>
 
@@ -206,6 +282,12 @@
     top: 0;
     left: 0;
     right: 0;
+  }
+
+  .measure-row {
+    margin: 0;
+    border: 0;
+    padding: 0;
   }
 
   .scroll-bottom-btn {

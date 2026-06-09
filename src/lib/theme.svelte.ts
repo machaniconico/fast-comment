@@ -16,6 +16,7 @@ export interface AppearanceSnapshot {
   fontSize: AppearanceFontSize;
   density: AppearanceDensity;
   timeDisplay: AppearanceTimeDisplay;
+  wrapComments: boolean;
 }
 
 const STORAGE_KEY = 'fc.appearance';
@@ -24,6 +25,7 @@ const DEFAULT_APPEARANCE: AppearanceSnapshot = {
   fontSize: 'm',
   density: 'comfortable',
   timeDisplay: 'seconds',
+  wrapComments: false,
 };
 
 function canUseLocalStorage(): boolean {
@@ -61,12 +63,16 @@ function parseAppearanceSnapshot(value: unknown): AppearanceSnapshot | null {
   const timeDisplayValue = value.timeDisplay === undefined
     ? DEFAULT_APPEARANCE.timeDisplay
     : value.timeDisplay;
+  const wrapCommentsValue = value.wrapComments === undefined
+    ? DEFAULT_APPEARANCE.wrapComments
+    : value.wrapComments;
 
   if (
     !isTheme(themeValue) ||
     !isFontSize(fontSizeValue) ||
     !isDensity(densityValue) ||
-    !isTimeDisplay(timeDisplayValue)
+    !isTimeDisplay(timeDisplayValue) ||
+    typeof wrapCommentsValue !== 'boolean'
   ) {
     return null;
   }
@@ -76,6 +82,7 @@ function parseAppearanceSnapshot(value: unknown): AppearanceSnapshot | null {
     fontSize: fontSizeValue,
     density: densityValue,
     timeDisplay: timeDisplayValue,
+    wrapComments: wrapCommentsValue,
   };
 }
 
@@ -84,6 +91,7 @@ class ThemeStore {
   fontSize: AppearanceFontSize = $state(DEFAULT_APPEARANCE.fontSize);
   density: AppearanceDensity = $state(DEFAULT_APPEARANCE.density);
   timeDisplay: AppearanceTimeDisplay = $state(DEFAULT_APPEARANCE.timeDisplay);
+  wrapComments: boolean = $state(DEFAULT_APPEARANCE.wrapComments);
   systemTheme: ResolvedTheme = $state('dark');
 
   private mediaCleanup: (() => void) | null = null;
@@ -143,12 +151,18 @@ class ThemeStore {
     this.save();
   }
 
+  setWrapComments(value: boolean): void {
+    this.wrapComments = value;
+    this.save();
+  }
+
   getSnapshot(): AppearanceSnapshot {
     return {
       theme: this.theme,
       fontSize: this.fontSize,
       density: this.density,
       timeDisplay: this.timeDisplay,
+      wrapComments: this.wrapComments,
     };
   }
 
@@ -168,6 +182,7 @@ class ThemeStore {
     this.fontSize = next.fontSize;
     this.density = next.density;
     this.timeDisplay = next.timeDisplay;
+    this.wrapComments = next.wrapComments;
   }
 
   private save(): void {

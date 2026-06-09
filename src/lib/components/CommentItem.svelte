@@ -5,6 +5,8 @@
   import { theme, type AppearanceTimeDisplay } from '../theme.svelte';
   import type { ContextMenuItem } from './ContextMenu.svelte';
 
+  let wrap = $derived(theme.wrapComments);
+
   interface CommentContextMenuRequest {
     x: number;
     y: number;
@@ -258,6 +260,7 @@
 
 <div
   class="comment-item"
+  class:wrap={wrap}
   class:highlighted={isHighlighted}
   class:highlight-badge={hasHighlightBadge}
   style:background={kindBg}
@@ -358,6 +361,23 @@
     height: 28px;
     box-sizing: border-box;
     position: relative;
+  }
+
+  .comment-item.wrap {
+    height: auto;
+    min-height: 28px;
+    align-items: flex-start;
+    padding-top: 4px;
+    padding-bottom: 4px;
+  }
+
+  .comment-item.wrap .fragments {
+    white-space: normal;
+    overflow: visible;
+    text-overflow: clip;
+    flex-wrap: wrap;
+    overflow-wrap: anywhere;
+    word-break: break-word;
   }
 
   .comment-item:hover .hide-btn,
