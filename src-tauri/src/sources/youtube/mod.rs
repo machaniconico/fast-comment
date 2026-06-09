@@ -7,6 +7,7 @@
 //!   パス探索し、欠落しても None で安全に劣化。解析不能アクションはログへ追記。
 
 pub mod innertube;
+pub mod live_resolve;
 pub mod metadata;
 pub mod parser;
 
@@ -179,9 +180,52 @@ pub fn extract_video_id(input: &str) -> String {
     cut_id(s)
 }
 
+/// YouTube identifier がチャンネル指定かどうかを判定する。
+///
+/// 11桁 videoId / watch URL / youtu.be / /live/<videoId> は従来の配信単体扱いのまま。
+pub fn is_channel_identifier(input: &str) -> bool {
+    live_resolve::parse_channel_identifier(input).is_some()
+}
+
+pub(crate) fn is_video_id(value: &str) -> bool {
+    let s = value.trim();
+    s.len() == 11
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
 /// クエリ/フラグメント/スラッシュ手前までを videoId として切り出す。
 fn cut_id(s: &str) -> String {
     s.chars()
         .take_while(|&c| c != '&' && c != '?' && c != '/' && c != '#')
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classifies_direct_video_ids_as_video_mode() {
+        assert!(!is_channel_identifier("dQw4w9WgXcQ"));
+        assert!(!is_channel_identifier(
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+        ));
+        assert!(!is_channel_identifier("https://youtu.be/dQw4w9WgXcQ?t=1"));
+        assert!(!is_channel_identifier(
+            "https://www.youtube.com/live/dQw4w9WgXcQ"
+        ));
+    }
+
+    #[test]
+    fn classifies_handles_and_channel_urls_as_channel_mode() {
+        assert!(is_channel_identifier("@example_handle"));
+        assert!(is_channel_identifier("youtube.com/@example_handle/live"));
+        assert!(is_channel_identifier(
+            "https://www.youtube.com/channel/UC1234567890123456789012"
+        ));
+        assert!(is_channel_identifier(
+            "https://www.youtube.com/channel/UC1234567890123456789012/live"
+        ));
+    }
 }

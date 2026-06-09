@@ -1018,15 +1018,31 @@ fn spawn_one_channel(_app: &AppHandle, state: &AppState, ch: &ChannelConfig) {
     }
     let key = AppState::channel_key(ch);
     let overrides = state.config.lock().unwrap().youtube_overrides.clone();
-    let manager = SourceManager::new(state.source_tx.clone(), overrides.clone());
-    let token = manager.spawn_channel(ch);
+    let token = if ch.platform == ChannelPlatform::Youtube
+        && sources::youtube::is_channel_identifier(&ch.identifier)
+    {
+        let token = CancellationToken::new();
+        sources::youtube::live_resolve::spawn_live_resolve_poller(
+            ch.identifier.clone(),
+            overrides.clone(),
+            state.source_tx.clone(),
+            state.metadata_tx.clone(),
+            token.clone(),
+        );
+        token
+    } else {
+        let manager = SourceManager::new(state.source_tx.clone(), overrides.clone());
+        manager.spawn_channel(ch)
+    };
     let app_cancel = state.app_cancel.clone();
     let token_for_app_cancel = token.clone();
     tauri::async_runtime::spawn(async move {
         app_cancel.cancelled().await;
         token_for_app_cancel.cancel();
     });
-    if ch.platform == ChannelPlatform::Youtube {
+    if ch.platform == ChannelPlatform::Youtube
+        && !sources::youtube::is_channel_identifier(&ch.identifier)
+    {
         sources::youtube::metadata::spawn_metadata_poller(
             ch.identifier.clone(),
             overrides,
