@@ -76,7 +76,9 @@
   const YOUTUBE_PATH_ID_PREFIXES = new Set(['live', 'embed', 'shorts', 'v']);
   const YOUTUBE_VIDEO_ID_RE = /^[A-Za-z0-9_-]{11}$/;
   const YOUTUBE_CHANNEL_ID_RE = /^UC[A-Za-z0-9_-]{22}$/;
-  const YOUTUBE_HANDLE_RE = /^@[A-Za-z0-9._-]+$/;
+  // YouTube ハンドルは Unicode(日本語等)も許可される。ASCII 限定にすると @まちゃ05 を弾くため
+  // Unicode 文字クラスで判定する。
+  const YOUTUBE_HANDLE_RE = /^@[\p{L}\p{N}._-]+$/u;
   const TWITCH_LOGIN_RE = /^[a-z0-9_]{2,25}$/;
   const TWITCH_RESERVED_PATHS = new Set([
     'about', 'admin', 'bits', 'broadcast', 'clip', 'clips', 'creatorcamp',
@@ -136,6 +138,16 @@
     return YOUTUBE_HANDLE_RE.test(trimmed) ? trimmed : null;
   }
 
+  // URL の path セグメントは非ASCII(日本語ハンドル等)が percent-encoded のことがあるため
+  // ハンドル判定前にデコードする(@%E3%81%BE…→@まちゃ)。不正な encoding は素通し。
+  function decodeSegment(segment: string): string {
+    try {
+      return decodeURIComponent(segment);
+    } catch {
+      return segment;
+    }
+  }
+
   // YouTube URL から videoId を抽出する(watch?v= / youtu.be / live / embed / shorts)。
   function extractYoutubeId(url: URL): string | null {
     const host = normalizedHost(url);
@@ -163,7 +175,7 @@
     const coreSegments = trailingLive ? segments.slice(0, -1) : segments;
 
     if (coreSegments.length === 1) {
-      return validYoutubeHandle(coreSegments[0]);
+      return validYoutubeHandle(decodeSegment(coreSegments[0]));
     }
 
     if (coreSegments.length === 2 && coreSegments[0]?.toLowerCase() === 'channel') {
