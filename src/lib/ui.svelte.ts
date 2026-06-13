@@ -36,6 +36,8 @@ export const SETTINGS_ANCHOR_IDS: Record<SettingsAnchor, string> = {
 
 /** localStorage key for persisting recent command ids. */
 const RECENT_COMMANDS_KEY = 'fc.recentCommands';
+/** localStorage key for persisting the window always-on-top preference. */
+const ALWAYS_ON_TOP_KEY = 'fc.alwaysOnTop';
 /** Maximum number of recent command entries to retain. */
 const RECENT_COMMANDS_MAX = 5;
 
@@ -57,6 +59,22 @@ function loadRecentCommandIds(): string[] {
   }
 }
 
+/**
+ * Load the always-on-top preference from localStorage.
+ * Returns false on SSR, missing key, or any parse/validation error.
+ */
+function loadAlwaysOnTop(): boolean {
+  if (typeof window === 'undefined') return false;
+  try {
+    const raw = localStorage.getItem(ALWAYS_ON_TOP_KEY);
+    if (raw === null) return false;
+    const parsed: unknown = JSON.parse(raw);
+    return typeof parsed === 'boolean' ? parsed : false;
+  } catch {
+    return false;
+  }
+}
+
 class UiStore {
   activeTab: Tab = $state('comments');
   viewMode: ViewMode = $state('unified');
@@ -67,6 +85,7 @@ class UiStore {
   composerOpen: boolean = $state(false);
   paletteOpen: boolean = $state(false);
   showShortcuts: boolean = $state(false);
+  alwaysOnTop: boolean = $state(loadAlwaysOnTop());
   // One-shot scroll target. Set when navigating from the command palette;
   // Settings consumes it (scrolls, then clears) so reopening the tab later
   // does not re-scroll.
@@ -157,6 +176,16 @@ class UiStore {
     this.showShortcuts = !this.showShortcuts;
     if (this.showShortcuts) {
       this.paletteOpen = false;
+    }
+  }
+
+  setAlwaysOnTop(value: boolean): void {
+    this.alwaysOnTop = value;
+    if (typeof window === 'undefined') return;
+    try {
+      localStorage.setItem(ALWAYS_ON_TOP_KEY, JSON.stringify(value));
+    } catch {
+      // Storage quota or private-mode errors are non-fatal.
     }
   }
 

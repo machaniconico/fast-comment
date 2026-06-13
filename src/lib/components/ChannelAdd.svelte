@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
   import type { ChannelConfig, ChannelStatus } from '../ipc';
-  import { addChannel, removeChannel, getConfig, onStats } from '../ipc';
+  import { addChannel, removeChannel, getConfig, onStats, openUrl } from '../ipc';
 
   // 追加成功時に親へ通知(任意)。
   let { onAdded }: { onAdded?: (ch: ChannelConfig) => void } = $props();
@@ -13,7 +13,13 @@
   // チップ本文を識別子からタイトルへ差し替える。未取得のチャンネルは identifier 表示。
   let titles: Map<string, string> = $state(new Map());
   let channelStatus: Map<string, ChannelStatus> = $state(new Map());
+  let ctxMenu: { ch: ChannelConfig; x: number; y: number } | null = $state(null);
+  let ctxMenuEl: HTMLDivElement | null = $state(null);
   let unlistenStats: (() => void) | null = null;
+  let cleanupCtxMenuListeners: (() => void) | null = null;
+  const CTX_MENU_WIDTH = 180;
+  const CTX_MENU_HEIGHT = 44;
+  const CTX_MENU_MARGIN = 8;
 
   function chipKey(platform: string, identifier: string): string {
     return `${platform}:${identifier}`;
@@ -66,6 +72,84 @@
     return ch.identifier;
   }
 
+  function streamPageUrl(ch: ChannelConfig): string | null {
+    if (ch.platform === 'twitch') {
+      return `https://www.twitch.tv/${encodeURIComponent(ch.identifier)}`;
+    }
+    const id = ch.identifier;
+    if (id.startsWith('@')) {
+      return `https://www.youtube.com/@${encodeURIComponent(id.slice(1))}/live`;
+    }
+    if (/^UC[A-Za-z0-9_-]{22}$/.test(id)) {
+      return `https://www.youtube.com/channel/${id}/live`;
+    }
+    if (/^[A-Za-z0-9_-]{11}$/.test(id)) {
+      return `https://www.youtube.com/watch?v=${id}`;
+    }
+    return null;
+  }
+
+  const ctxMenuUrl = $derived.by((): string | null => {
+    const menu = ctxMenu;
+    return menu ? streamPageUrl(menu.ch) : null;
+  });
+
+  function clampCtxMenuPosition(x: number, y: number): { x: number; y: number } {
+    if (typeof window === 'undefined') return { x, y };
+    const maxX = Math.max(CTX_MENU_MARGIN, window.innerWidth - CTX_MENU_WIDTH - CTX_MENU_MARGIN);
+    const maxY = Math.max(CTX_MENU_MARGIN, window.innerHeight - CTX_MENU_HEIGHT - CTX_MENU_MARGIN);
+    return {
+      x: Math.min(Math.max(CTX_MENU_MARGIN, x), maxX),
+      y: Math.min(Math.max(CTX_MENU_MARGIN, y), maxY)
+    };
+  }
+
+  function onChipContextMenu(e: MouseEvent, ch: ChannelConfig) {
+    e.preventDefault();
+    const pos = clampCtxMenuPosition(e.clientX, e.clientY);
+    ctxMenu = { ch, x: pos.x, y: pos.y };
+  }
+
+  async function openStreamPage(ch: ChannelConfig) {
+    const url = streamPageUrl(ch);
+    try {
+      if (url) await openUrl(url);
+    } catch (e) {
+      console.warn('[ChannelAdd] open stream page failed', e);
+    } finally {
+      ctxMenu = null;
+    }
+  }
+
+  function clearCtxMenuListeners() {
+    cleanupCtxMenuListeners?.();
+    cleanupCtxMenuListeners = null;
+  }
+
+  $effect(() => {
+    clearCtxMenuListeners();
+    if (!ctxMenu || typeof window === 'undefined') return;
+
+    const onWindowClick = (e: MouseEvent) => {
+      if (e.button !== 0) return;
+      const target = e.target;
+      if (target instanceof Node && ctxMenuEl?.contains(target)) return;
+      ctxMenu = null;
+    };
+    const onWindowKeydown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') ctxMenu = null;
+    };
+
+    window.addEventListener('click', onWindowClick);
+    window.addEventListener('keydown', onWindowKeydown);
+    cleanupCtxMenuListeners = () => {
+      window.removeEventListener('click', onWindowClick);
+      window.removeEventListener('keydown', onWindowKeydown);
+    };
+
+    return clearCtxMenuListeners;
+  });
+
   onMount(async () => {
     const cfg = await getConfig();
     if (cfg) channels = cfg.channels;
@@ -89,6 +173,7 @@
 
   onDestroy(() => {
     unlistenStats?.();
+    clearCtxMenuListeners();
   });
 
   function sameChannel(a: ChannelConfig, b: ChannelConfig): boolean {
@@ -393,6 +478,7 @@
           class:idle={isIdle}
           role="listitem"
           title={chipTooltip(ch, status, bodyText)}
+          oncontextmenu={(e) => onChipContextMenu(e, ch)}
         >
           <span class="chip-dot" aria-hidden="true"></span>
           {#if isLive}<span class="live-badge">LIVE</span>{/if}
@@ -400,6 +486,29 @@
           <button class="chip-x" title="削除" aria-label="{bodyText} を削除" onclick={() => onRemove(ch)}>×</button>
         </span>
       {/each}
+    </div>
+  {/if}
+  {#if ctxMenu}
+    <div
+      bind:this={ctxMenuEl}
+      class="ctx-menu"
+      role="menu"
+      aria-label="チャンネルメニュー"
+      style={`left: ${ctxMenu.x}px; top: ${ctxMenu.y}px;`}
+    >
+      <button
+        type="button"
+        class="ctx-menu-item"
+        role="menuitem"
+        disabled={ctxMenuUrl === null}
+        onclick={(e) => {
+          e.stopPropagation();
+          const current = ctxMenu;
+          if (current) void openStreamPage(current.ch);
+        }}
+      >
+        配信ページを開く
+      </button>
     </div>
   {/if}
 </div>
@@ -541,4 +650,61 @@
     border-radius: 50%;
   }
   .chip-x:hover { color: #f44336; }
+
+  .ctx-menu {
+    position: fixed;
+    z-index: 100;
+    min-width: 180px;
+    padding: 4px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    background: #222;
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 4px;
+    box-shadow: 0 8px 20px rgba(0,0,0,0.35);
+  }
+
+  .ctx-menu-item {
+    width: 100%;
+    background: none;
+    border: none;
+    color: #bdbdbd;
+    padding: 6px 10px;
+    font-size: 12px;
+    text-align: left;
+    cursor: pointer;
+    border-radius: 3px;
+    transition: color 0.15s, background 0.15s;
+    white-space: nowrap;
+  }
+
+  .ctx-menu-item:hover:not(:disabled) {
+    color: #fff;
+    background: rgba(255,255,255,0.08);
+  }
+
+  .ctx-menu-item:disabled {
+    color: #777;
+    cursor: default;
+  }
+
+  :global(.app[data-theme='light']) .ctx-menu {
+    background: #fff;
+    border-color: rgba(15,23,42,0.14);
+    box-shadow: 0 8px 20px rgba(15,23,42,0.16);
+  }
+
+  :global(.app[data-theme='light']) .ctx-menu-item {
+    color: #52606d;
+  }
+
+  :global(.app[data-theme='light']) .ctx-menu-item:hover:not(:disabled) {
+    color: #111827;
+    background: rgba(15,23,42,0.06);
+  }
+
+  :global(.app[data-theme='light']) .ctx-menu-item:disabled {
+    color: #94a3b8;
+  }
 </style>

@@ -8,6 +8,7 @@
  */
 
 import type { ChatMessage } from './types';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 
 // ---- Tauri availability guard ----
 // @tauri-apps/api throws when window.__TAURI_INTERNALS__ is absent (browser dev).
@@ -153,6 +154,15 @@ export async function onStats(cb: (snapshot: StatsSnapshot) => void): Promise<()
     cb(event.payload);
   });
   return unlisten;
+}
+
+export async function setAlwaysOnTop(value: boolean): Promise<void> {
+  if (!isTauri()) return;
+  try {
+    await getCurrentWindow().setAlwaysOnTop(value);
+  } catch (e) {
+    console.warn('[ipc] setAlwaysOnTop failed', e);
+  }
 }
 
 interface TtsSpeakPayload {
@@ -466,6 +476,11 @@ export async function checkForUpdate(): Promise<UpdateStatus | null> {
 }
 
 export async function openReleaseUrl(url: string): Promise<void> {
+  if (!url) return;
+  await invoke<void>('open_url', { url });
+}
+
+export async function openUrl(url: string): Promise<void> {
   if (!url) return;
   await invoke<void>('open_url', { url });
 }
