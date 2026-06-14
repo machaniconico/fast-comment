@@ -55,6 +55,7 @@
   let obsTimerBaseUrl: string = $state('');
   let copiedObs: boolean = $state(false);
   let copiedGiftObs: boolean = $state(false);
+  let copiedDanmakuObs: boolean = $state(false);
   let copiedGoalsObs: boolean = $state(false);
   let copiedTimerObs: boolean = $state(false);
   let copiedCsvPath: boolean = $state(false);
@@ -113,6 +114,7 @@
   let saveMsgTimer: ReturnType<typeof setTimeout> | null = null;
   let copiedObsTimer: ReturnType<typeof setTimeout> | null = null;
   let copiedGiftObsTimer: ReturnType<typeof setTimeout> | null = null;
+  let copiedDanmakuObsTimer: ReturnType<typeof setTimeout> | null = null;
   let copiedGoalsObsTimer: ReturnType<typeof setTimeout> | null = null;
   let copiedTimerObsTimer: ReturnType<typeof setTimeout> | null = null;
   let copiedCsvPathTimer: ReturnType<typeof setTimeout> | null = null;
@@ -234,6 +236,7 @@
     if (saveMsgTimer !== null) clearTimeout(saveMsgTimer);
     if (copiedObsTimer !== null) clearTimeout(copiedObsTimer);
     if (copiedGiftObsTimer !== null) clearTimeout(copiedGiftObsTimer);
+    if (copiedDanmakuObsTimer !== null) clearTimeout(copiedDanmakuObsTimer);
     if (copiedGoalsObsTimer !== null) clearTimeout(copiedGoalsObsTimer);
     if (copiedTimerObsTimer !== null) clearTimeout(copiedTimerObsTimer);
     if (copiedCsvPathTimer !== null) clearTimeout(copiedCsvPathTimer);
@@ -252,6 +255,10 @@
 
   const giftObsUrl = $derived.by(() => {
     return withOnlyGift(obsUrl);
+  });
+
+  const danmakuObsUrl = $derived.by(() => {
+    return withDanmaku(obsUrl);
   });
 
   const goalsObsUrl = $derived.by(() => {
@@ -283,6 +290,31 @@
     try {
       const u = new URL(url);
       u.searchParams.set('only', 'gift');
+      return u.toString();
+    } catch {
+      return url;
+    }
+  }
+
+  function withDanmaku(url: string): string {
+    try {
+      const u = new URL(url);
+      // 弾幕 app.js が解釈するクエリのみ引き継ぐ。max は積み上げ式の maxRows(既定8)
+      // 由来で、弾幕の「同時に流れる最大本数」(app.js 既定240)とは別概念。引き継ぐと
+      // 弾幕が極端に少なくなる(=またスカスカ)ので除外し、app.js の既定240に任せる。
+      const keepParams = new Set(['channel', 'dur', 'size', 'opacity', 'name', 'outline', 'only', 'ws']);
+      const kept = new URLSearchParams();
+      for (const [key, value] of u.searchParams.entries()) {
+        if (keepParams.has(key)) kept.append(key, value);
+      }
+      if (!kept.has('ws')) {
+        kept.set('ws', `${u.protocol === 'https:' ? 'wss:' : 'ws:'}//${u.host}/ws`);
+      }
+      u.search = '';
+      u.searchParams.set('template', 'danmaku');
+      for (const [key, value] of kept.entries()) {
+        u.searchParams.append(key, value);
+      }
       return u.toString();
     } catch {
       return url;
@@ -349,7 +381,7 @@
     if (!config) return;
     config.obs.template = (config.obs.template || 'default').trim() || 'default';
     config.obs.fontScalePct = clampInt(config.obs.fontScalePct, 100, 50, 200);
-    config.obs.maxRows = clampInt(config.obs.maxRows, 8, 1, 20);
+    config.obs.maxRows = clampInt(config.obs.maxRows, 8, 1, 1000);
     config.obs.ttlMs = positiveInt(config.obs.ttlMs, 12000);
     config.obs.bgOpacityPct = clampInt(config.obs.bgOpacityPct, 0, 0, 100);
     config.obs.position = config.obs.position === 'top' ? 'top' : 'bottom';
@@ -763,6 +795,14 @@
       copiedGiftObs = true;
       if (copiedGiftObsTimer !== null) clearTimeout(copiedGiftObsTimer);
       copiedGiftObsTimer = setTimeout(() => { copiedGiftObs = false; copiedGiftObsTimer = null; }, 1500);
+    });
+  }
+
+  function onCopyDanmakuObs() {
+    copyText(danmakuObsUrl, () => {
+      copiedDanmakuObs = true;
+      if (copiedDanmakuObsTimer !== null) clearTimeout(copiedDanmakuObsTimer);
+      copiedDanmakuObsTimer = setTimeout(() => { copiedDanmakuObs = false; copiedDanmakuObsTimer = null; }, 1500);
     });
   }
 
@@ -1258,6 +1298,14 @@
       <input type="text" value={giftObsUrl} readonly class="obs-input" />
       <button class="copy-btn" class:copied={copiedGiftObs} onclick={onCopyGiftObs}>
         {copiedGiftObs ? 'コピー済' : 'コピー'}
+      </button>
+    </div>
+    <div class="obs-label">弾幕オーバーレイ用URL</div>
+    <p class="hint">弾幕オーバーレイ（画面を流れるニコ生風）。通常のコメント表示URLとは別に、OBSへ追加のブラウザソースとして貼ってください</p>
+    <div class="obs-row">
+      <input type="text" value={danmakuObsUrl} readonly class="obs-input" />
+      <button class="copy-btn" class:copied={copiedDanmakuObs} onclick={onCopyDanmakuObs}>
+        {copiedDanmakuObs ? 'コピー済' : 'コピー'}
       </button>
     </div>
     <p class="hint">OBSのブラウザソースにこのURLを貼り付けてください。</p>
