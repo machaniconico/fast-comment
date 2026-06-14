@@ -24,7 +24,14 @@
   import { store, initStore, clearMessages } from './lib/stores.svelte';
   import { ui } from './lib/ui.svelte';
   import { theme } from './lib/theme.svelte';
-  import { checkForUpdate, openReleaseUrl, getConfig, onTtsNotice } from './lib/ipc';
+  import {
+    checkForUpdate,
+    openReleaseUrl,
+    getConfig,
+    onTtsNotice,
+    toggleDanmakuOverlay,
+    isDanmakuOverlayOpen,
+  } from './lib/ipc';
   import type { AppConfig, TtsNotice, UpdateStatus } from './lib/ipc';
 
   let unlisten: (() => void) | null = null;
@@ -36,6 +43,7 @@
   let ttsNoticeTimer: ReturnType<typeof setTimeout> | null = null;
   let toolsOpen = $state(false);
   let toolsMenuEl: HTMLDivElement | null = null;
+  let danmakuOpen = $state(false);
 
   // ── Donation summary helpers ──────────────────────────────────────────────
 
@@ -94,6 +102,7 @@
     void loadConfig();
     unlisten = await initStore();
     unlistenTtsNotice = await onTtsNotice(showTtsNotice);
+    danmakuOpen = await isDanmakuOverlayOpen();
   });
 
   onDestroy(() => {
@@ -186,6 +195,15 @@
   function selectDashboard() {
     ui.toggleDashboard();
     closeToolsMenu();
+  }
+
+  async function selectDanmaku() {
+    closeToolsMenu();
+    try {
+      danmakuOpen = await toggleDanmakuOverlay();
+    } catch (e) {
+      console.warn('[danmaku] toggle failed', e);
+    }
   }
 
   async function loadUpdateStatus() {
@@ -375,6 +393,12 @@
               class:active={ui.showDashboard}
               onclick={selectDashboard}
             >振り返り</button>
+            <button
+              role="menuitem"
+              class="tools-menu-item"
+              class:active={danmakuOpen}
+              onclick={selectDanmaku}
+            >弾幕オーバーレイ{danmakuOpen ? '（表示中）' : ''}</button>
           </div>
         {/if}
       </div>

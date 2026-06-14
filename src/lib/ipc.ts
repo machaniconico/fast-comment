@@ -469,3 +469,82 @@ export async function openReleaseUrl(url: string): Promise<void> {
   if (!url) return;
   await invoke<void>('open_url', { url });
 }
+
+// ── Danmaku overlay window (透明・枠なし・クリック透過・最前面) ────────────────
+// ニコ生風にコメントを画面へ流す別ウィンドウ。?window=danmaku で開き、
+// main.ts が DanmakuOverlay だけを mount する。Rust の app.emit("chat") は
+// 全ウィンドウ配信なので、このウィンドウも追加配線なしでコメントを受信できる。
+const DANMAKU_LABEL = 'danmaku';
+
+export async function isDanmakuOverlayOpen(): Promise<boolean> {
+  if (!isTauri()) return false;
+  const { WebviewWindow } = await import('@tauri-apps/api/webviewWindow');
+  return (await WebviewWindow.getByLabel(DANMAKU_LABEL)) !== null;
+}
+
+export async function openDanmakuOverlay(): Promise<void> {
+  if (!isTauri()) return;
+  const { WebviewWindow } = await import('@tauri-apps/api/webviewWindow');
+  if (await WebviewWindow.getByLabel(DANMAKU_LABEL)) return; // 既に開いている
+
+  // プライマリモニタ全面を覆う(取得失敗時は 1920x1080 / 原点で代替)。
+  // WebviewWindow の width/height/x/y は論理ピクセルなので scaleFactor で割る。
+  let width = 1920;
+  let height = 1080;
+  let x = 0;
+  let y = 0;
+  try {
+    const { primaryMonitor } = await import('@tauri-apps/api/window');
+    const mon = await primaryMonitor();
+    if (mon) {
+      const sf = mon.scaleFactor || 1;
+      width = Math.round(mon.size.width / sf);
+      height = Math.round(mon.size.height / sf);
+      x = Math.round(mon.position.x / sf);
+      y = Math.round(mon.position.y / sf);
+    }
+  } catch (e) {
+    console.warn('[danmaku] primaryMonitor failed; using fallback size', e);
+  }
+
+  const overlay = new WebviewWindow(DANMAKU_LABEL, {
+    url: 'index.html?window=danmaku',
+    transparent: true,
+    decorations: false,
+    alwaysOnTop: true,
+    skipTaskbar: true,
+    resizable: false,
+    focus: false,
+    shadow: false,
+    width,
+    height,
+    x,
+    y,
+    title: 'fast-comment 弾幕',
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    overlay.once('tauri://created', () => resolve());
+    overlay.once('tauri://error', (e) =>
+      reject(new Error(`弾幕ウィンドウの生成に失敗: ${String((e as { payload?: unknown })?.payload ?? e)}`)),
+    );
+  });
+}
+
+export async function closeDanmakuOverlay(): Promise<void> {
+  if (!isTauri()) return;
+  const { WebviewWindow } = await import('@tauri-apps/api/webviewWindow');
+  const existing = await WebviewWindow.getByLabel(DANMAKU_LABEL);
+  if (existing) await existing.close();
+}
+
+/** トグル。新しい開閉状態(open=true)を返す。 */
+export async function toggleDanmakuOverlay(): Promise<boolean> {
+  if (!isTauri()) return false;
+  if (await isDanmakuOverlayOpen()) {
+    await closeDanmakuOverlay();
+    return false;
+  }
+  await openDanmakuOverlay();
+  return true;
+}

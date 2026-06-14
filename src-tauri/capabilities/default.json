@@ -3,5 +3,10 @@
   "identifier": "default",
   "description": "Default capability for the main window",
   "windows": ["main"],
-  "permissions": ["core:default", "shell:allow-open"]
+  "permissions": [
+    "core:default",
+    "shell:allow-open",
+    "core:webview:allow-create-webview-window",
+    "core:window:allow-close"
+  ]
 }
