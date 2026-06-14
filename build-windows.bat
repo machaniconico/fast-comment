@@ -218,6 +218,24 @@ if errorlevel 1 (
 )
 echo.
 
+REM --- Clean stale installers (prevents NSIS os error 5) -----------------
+REM This script auto-launches *-setup.exe after a successful build. If that
+REM installer is still open on a re-run, makensis cannot overwrite the
+REM running exe and fails with "access denied (os error 5)". Remove old
+REM bundle outputs first; if removal fails, the installer/app is still open.
+set "BUNDLE_DIR=src-tauri\target\release\bundle"
+if exist "%BUNDLE_DIR%\nsis\*-setup.exe" (
+  del /q "%BUNDLE_DIR%\nsis\*-setup.exe" >nul 2>nul
+  if exist "%BUNDLE_DIR%\nsis\*-setup.exe" (
+    echo [ERROR] Cannot delete the previous installer in bundle\nsis\.
+    echo         It is probably still running. Close the fast-comment
+    echo         installer window / quit the app, then run this script again.
+    goto :fail
+  )
+  echo [OK] Removed previous NSIS installer.
+)
+if exist "%BUNDLE_DIR%\msi\*.msi" del /q "%BUNDLE_DIR%\msi\*.msi" >nul 2>nul
+
 REM --- Step 2: Tauri build (also runs "pnpm build" via beforeBuildCommand)
 echo [2/2] pnpm tauri build  ^(first run compiles all Rust crates; takes several minutes^)
 call pnpm tauri build
