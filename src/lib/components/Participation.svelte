@@ -12,6 +12,7 @@
   let participants: Participant[] = $state([]);
   let actionError: string = $state('');
   let unlisten: (() => void) | null = null;
+  let destroyed = false;
 
   const waiting = $derived(participants.filter((p) => !p.picked));
   const picked = $derived(participants.filter((p) => p.picked));
@@ -22,15 +23,18 @@
       if (!current) return;
       participants = current;
       const { listen } = await import('@tauri-apps/api/event');
-      unlisten = await listen<Participant[]>('participants-updated', (event) => {
+      const fn = await listen<Participant[]>('participants-updated', (event) => {
         participants = event.payload;
       });
+      if (destroyed) fn();
+      else unlisten = fn;
     } catch (e) {
       actionError = `参加者一覧の取得に失敗しました: ${e instanceof Error ? e.message : String(e)}`;
     }
   });
 
   onDestroy(() => {
+    destroyed = true;
     unlisten?.();
   });
 

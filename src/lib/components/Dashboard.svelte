@@ -87,15 +87,19 @@
   let liveViewers = $state(0);
   let peakViewers = $state(0);
   let unlistenStats: (() => void) | null = null;
+  let destroyed = false;
 
   onMount(async () => {
-    unlistenStats = await onStats((s) => {
+    const fn = await onStats((s) => {
       liveViewers = s.viewers;
       peakViewers = s.viewersMax;
     });
+    if (destroyed) fn();
+    else unlistenStats = fn;
   });
 
   onDestroy(() => {
+    destroyed = true;
     unlistenStats?.();
   });
 

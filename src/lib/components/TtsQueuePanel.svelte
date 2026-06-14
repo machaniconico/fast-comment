@@ -11,6 +11,7 @@
 
   let queueState: TtsQueueState = $state({ depth: 0, paused: false, items: [] });
   let unlisten: (() => void) | null = null;
+  let destroyed = false;
   let busy: boolean = $state(false);
   let error: string = $state('');
 
@@ -21,15 +22,18 @@
     try {
       const current = await getTtsQueueState();
       if (current) queueState = normalizeQueueState(current);
-      unlisten = await onTtsQueueState((next) => {
+      const fn = await onTtsQueueState((next) => {
         queueState = normalizeQueueState(next);
       });
+      if (destroyed) fn();
+      else unlisten = fn;
     } catch (e) {
       error = `TTSキュー状態を取得できません: ${formatError(e)}`;
     }
   });
 
   onDestroy(() => {
+    destroyed = true;
     unlisten?.();
   });
 

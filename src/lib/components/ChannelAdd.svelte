@@ -17,6 +17,7 @@
   let ctxMenuEl: HTMLDivElement | null = $state(null);
   let unlistenStats: (() => void) | null = null;
   let cleanupCtxMenuListeners: (() => void) | null = null;
+  let destroyed = false;
   const CTX_MENU_WIDTH = 180;
   const CTX_MENU_HEIGHT = 44;
   const CTX_MENU_MARGIN = 8;
@@ -153,7 +154,7 @@
   onMount(async () => {
     const cfg = await getConfig();
     if (cfg) channels = cfg.channels;
-    unlistenStats = await onStats((s) => {
+    const fn = await onStats((s) => {
       if (s.channelTitles && s.channelTitles.length > 0) {
         const next = new Map(titles);
         let changed = false;
@@ -169,9 +170,12 @@
       }
       updateChannelStatus(s.channelStatus);
     });
+    if (destroyed) fn();
+    else unlistenStats = fn;
   });
 
   onDestroy(() => {
+    destroyed = true;
     unlistenStats?.();
     clearCtxMenuListeners();
   });

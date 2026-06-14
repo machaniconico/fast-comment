@@ -45,6 +45,9 @@
   let toolsOpen = $state(false);
   let toolsMenuEl: HTMLDivElement | null = null;
   let danmakuOpen = $state(false);
+  let unlistenDanmakuState: (() => void) | null = null;
+  let destroyed = false;
+  const DANMAKU_LABEL = 'danmaku';
 
   // ── Donation summary helpers ──────────────────────────────────────────────
 
@@ -102,17 +105,35 @@
     window.addEventListener('keydown', onWindowKey);
     void loadUpdateStatus();
     void loadConfig();
-    unlisten = await initStore();
-    unlistenTtsNotice = await onTtsNotice(showTtsNotice);
-    danmakuOpen = await isDanmakuOverlayOpen();
+    {
+      const fn = await initStore();
+      if (destroyed) fn();
+      else unlisten = fn;
+    }
+    {
+      const fn = await onTtsNotice(showTtsNotice);
+      if (destroyed) fn();
+      else unlistenTtsNotice = fn;
+    }
+    const initialDanmakuOpen = await isDanmakuOverlayOpen();
+    if (!destroyed) danmakuOpen = initialDanmakuOpen;
+    if (initialDanmakuOpen) {
+      const fn = await listenDanmakuDestroyed();
+      if (fn) {
+        if (destroyed) fn();
+        else unlistenDanmakuState = fn;
+      }
+    }
   });
 
   onDestroy(() => {
+    destroyed = true;
     theme.destroy();
     window.removeEventListener('click', onWindowClick);
     window.removeEventListener('keydown', onWindowKey);
     unlisten?.();
     unlistenTtsNotice?.();
+    unlistenDanmakuState?.();
     if (searchDebounce) clearTimeout(searchDebounce);
     if (ttsNoticeTimer) clearTimeout(ttsNoticeTimer);
   });
@@ -202,10 +223,39 @@
   async function selectDanmaku() {
     closeToolsMenu();
     try {
-      danmakuOpen = await toggleDanmakuOverlay();
+      const nextOpen = await toggleDanmakuOverlay();
+      danmakuOpen = nextOpen;
+      unlistenDanmakuState?.();
+      unlistenDanmakuState = null;
+      if (nextOpen) {
+        const fn = await listenDanmakuDestroyed();
+        if (destroyed) fn?.();
+        else unlistenDanmakuState = fn;
+      }
     } catch (e) {
       console.warn('[danmaku] toggle failed', e);
     }
+  }
+
+  function isTauri(): boolean {
+    return typeof window !== 'undefined'
+      && !!(window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
+  }
+
+  async function listenDanmakuDestroyed(): Promise<(() => void) | null> {
+    if (!isTauri()) return null;
+    const [{ WebviewWindow }, { TauriEvent }] = await Promise.all([
+      import('@tauri-apps/api/webviewWindow'),
+      import('@tauri-apps/api/event'),
+    ]);
+    const overlay = await WebviewWindow.getByLabel(DANMAKU_LABEL);
+    if (!overlay) return null;
+    return overlay.listen<null>(TauriEvent.WINDOW_DESTROYED, () => {
+      if (destroyed) return;
+      danmakuOpen = false;
+      unlistenDanmakuState?.();
+      unlistenDanmakuState = null;
+    });
   }
 
   function selectParticipation() {
@@ -258,13 +308,7 @@
   }
 
   function onSettingsSaved(nextConfig: AppConfig) {
-    config = {
-      ...nextConfig,
-      ui: { ...nextConfig.ui },
-      effects: { ...nextConfig.effects },
-      welcome: { ...nextConfig.welcome },
-      timer: { ...nextConfig.timer },
-    };
+    config = structuredClone(nextConfig);
   }
 
   async function onUpdateDownloadClick(e: MouseEvent) {

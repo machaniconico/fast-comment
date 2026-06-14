@@ -51,6 +51,12 @@ export function onChatBatch(handler: BatchHandler): void {
   _batchHandler = handler;
 }
 
+export function offChatBatch(): void {
+  _batchHandler = null;
+  _pending = [];
+  clearScheduled();
+}
+
 /**
  * Start listening to the 'chat' event from Tauri.
  * Returns an unlisten function; call it on component destroy.
@@ -120,7 +126,7 @@ export async function startTtsCancelListener(): Promise<() => void> {
 }
 
 export interface TtsNotice {
-  level: 'warn' | string;
+  level: 'info' | 'warn' | 'error';
   message: string;
 }
 

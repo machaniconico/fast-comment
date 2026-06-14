@@ -113,10 +113,8 @@ class CommentStore {
   // msg-only projection of _buf, rebuilt only on push/eviction/clear so the
   // no-filter fast path can return it without re-mapping all entries.
   private _msgs: UiChatMessage[] = $state([]);
-  // Viewer counts are internal mutable bookkeeping; _uniqueViewers is the
-  // reactive projection exposed to Svelte consumers.
+  // Viewer counts are internal mutable bookkeeping for viewerSeq.
   private _viewerCounts: Map<string, number> = new Map();
-  private _uniqueViewers: number = $state(0);
   private _maxBuffer: number = $state(DEFAULT_MAX_BUFFER);
   // Monotonically increasing counter — incremented by every pushBatch call,
   // never reset on clear. Used by CommentList to detect genuinely new messages
@@ -192,9 +190,6 @@ class CommentStore {
   // Derived: total buffered count
   readonly totalCount: number = $derived(this._buf.length);
 
-  // Derived: unique viewers seen since the last explicit clear.
-  readonly uniqueViewers: number = $derived(this._uniqueViewers);
-
   // Derived: monotonically increasing received count (never decreases on clear)
   readonly receivedCount: number = $derived(this._received);
 
@@ -230,7 +225,6 @@ class CommentStore {
     let memberships = don.memberships;
     let donChanged = false;
     let highlightDelta = 0;
-    let newViewerCount = 0;
     const incoming: BufEntry[] = [];
 
     for (const msg of messages) {
@@ -238,7 +232,6 @@ class CommentStore {
       let uiMsg: UiChatMessage = msg;
       if (key) {
         const seq = (this._viewerCounts.get(key) ?? 0) + 1;
-        if (seq === 1) newViewerCount += 1;
         this._viewerCounts.set(key, seq);
         uiMsg = { ...msg, viewerSeq: seq };
       }
@@ -265,7 +258,6 @@ class CommentStore {
       }
     }
     this._received += incoming.length;
-    if (newViewerCount) this._uniqueViewers += newViewerCount;
     if (donChanged) this._donations = { byCurrency, memberships };
     if (highlightDelta) this._highlightSeq += highlightDelta;
 
@@ -375,7 +367,6 @@ class CommentStore {
     this._buf = [];
     this._msgs = [];
     this._viewerCounts.clear();
-    this._uniqueViewers = 0;
     // Explicit clear is a session reset, so the donation summary resets too.
     this._donations = emptyDonationSummary();
     this._pinned = [];

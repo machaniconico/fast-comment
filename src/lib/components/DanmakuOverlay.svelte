@@ -11,7 +11,7 @@
    */
   import { onMount, onDestroy } from 'svelte';
   import type { ChatMessage } from '../types';
-  import { startChatListener, onChatBatch } from '../ipc';
+  import { startChatListener, onChatBatch, offChatBatch } from '../ipc';
   import {
     clampDanmakuSettings,
     DANMAKU_SETTINGS_EVENT,
@@ -44,17 +44,35 @@
   // 文字幅の実測(レーンが空く時刻の計算に使う)。canvas measureText で概算。
   let measureCtx: CanvasRenderingContext2D | null = null;
   function measureWidth(text: string, fontSize: number): number {
-    if (!measureCtx) return text.length * fontSize; // 全角主体を想定し安全側(広め)に推定
+    if (!measureCtx) {
+      let units = 0;
+      for (const ch of text) {
+        const code = ch.codePointAt(0) ?? 0;
+        units += code >= 0x3000 && code <= 0x9fff ? 1 : 0.5;
+      }
+      return units * fontSize;
+    }
     measureCtx.font = `bold ${fontSize}px sans-serif`;
     return measureCtx.measureText(text).width;
+  }
+
+  function resizeLaneFreeAt(nextLaneCount: number) {
+    const next = new Array(nextLaneCount).fill(0);
+    const preserveCount = Math.min(laneFreeAt.length, nextLaneCount);
+    for (let i = 0; i < preserveCount; i += 1) next[i] = laneFreeAt[i] ?? 0;
+    laneFreeAt = next;
   }
 
   function recomputeLanes() {
     viewportW = window.innerWidth || 1920;
     const viewportH = window.innerHeight || 1080;
-    laneHeight = Math.round(settings.fontSize * 1.45);
-    laneCount = Math.max(1, Math.floor(viewportH / laneHeight));
-    if (laneFreeAt.length !== laneCount) laneFreeAt = new Array(laneCount).fill(0);
+    const nextLaneHeight = Math.round(settings.fontSize * 1.45);
+    const nextLaneCount = Math.max(1, Math.floor(viewportH / nextLaneHeight));
+    if (laneFreeAt.length !== nextLaneCount || laneHeight !== nextLaneHeight) {
+      resizeLaneFreeAt(nextLaneCount);
+    }
+    laneHeight = nextLaneHeight;
+    laneCount = nextLaneCount;
   }
 
   // 最も長く空いている(= freeAt が最小の)レーンを選ぶ。
@@ -73,10 +91,17 @@
   }
 
   function spawn(msg: ChatMessage) {
-    const body = msg.fragments
+    if ((msg.kind ?? 'normal') === 'system') return;
+
+    let body = msg.fragments
       .map((f) => (f.type === 'text' ? f.text : f.type === 'emote' ? f.name : ''))
       .join('')
       .trim();
+    if (msg.kind === 'superChat' || msg.kind === 'bits') {
+      const amountText = msg.amount?.rawText?.trim();
+      if (amountText) body = body ? `${amountText} ${body}` : amountText;
+    }
+    if (msg.kind === 'membership') body = body || 'メンバー加入';
     if (!body) return;
     const text = settings.showName && msg.author?.name ? `${msg.author.name}: ${body}` : body;
 
@@ -169,6 +194,7 @@
     unlisten?.();
     unlistenSettings?.();
     removeResize?.();
+    offChatBatch();
   });
 </script>
 
