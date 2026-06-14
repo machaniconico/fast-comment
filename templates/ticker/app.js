@@ -16,6 +16,7 @@
   const params = new URLSearchParams(location.search);
   const CHANNEL_FILTER = params.get('channel') || null;
   const MAX_QUEUE = positiveIntParam('max', 20);
+  const ROTATE_MS = 4000;
   const WS_URL   = buildWsUrl(params.get('ws') || 'ws://127.0.0.1:11180/ws');
 
   const tickerText = document.getElementById('ticker-text');
@@ -23,6 +24,7 @@
   // ---- Queue tracking ----
   const queue = [];
   let queueIndex = 0;
+  let rotationTimer = null;
 
   // ---- WebSocket ----
   let ws = null;
@@ -69,20 +71,21 @@
 
   // ---- Message handler ----
   function handleMessage(msg) {
+    if ((msg.kind || 'normal') === 'system') return;
     // Channel filter
     if (CHANNEL_FILTER && msg.channel !== CHANNEL_FILTER) return;
 
     const text = commentText(msg);
     if (!text) return;
 
+    const wasEmpty = queue.length === 0;
     queue.push(text);
     while (queue.length > MAX_QUEUE) {
       queue.shift();
       queueIndex = Math.max(0, queueIndex - 1);
     }
 
-    queueIndex = queue.length - 1;
-    renderCurrent();
+    if (wasEmpty && rotationTimer === null) showNext();
   }
 
   function renderCurrent() {
@@ -96,9 +99,11 @@
   }
 
   function showNext() {
+    rotationTimer = null;
     if (queue.length === 0) return;
     queueIndex = (queueIndex + 1) % queue.length;
     renderCurrent();
+    rotationTimer = setTimeout(showNext, ROTATE_MS);
   }
 
   function positiveIntParam(name, fallback) {
@@ -138,6 +143,5 @@
   }
 
   // ---- Start ----
-  setInterval(showNext, 4000);
   connect();
 })();

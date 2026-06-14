@@ -19,6 +19,7 @@
   const params = new URLSearchParams(location.search);
   const CHANNEL_FILTER = params.get('channel') || null;
   const MAX_ROWS = Math.min(Math.max(positiveIntParam('max', 10), 1), 50);
+  const MAX_SPEAKERS = 5000;
   const FONT_SCALE = boundedNumberParam('font', 100, 50, 200) / 100;
   const BG_OPACITY = boundedNumberParam('bg', 0, 0, 100) / 100;
   const POSITION = params.get('pos') === 'top' ? 'top' : 'bottom';
@@ -35,9 +36,18 @@
 
   // ---- WebSocket ----
   let ws = null;
+  let reconnectDelay = 1000;
+  let stableTimer = null;
+  let reconnectTimer = null;
 
   function connect() {
     ws = new WebSocket(WS_URL);
+
+    ws.addEventListener('open', () => {
+      stableTimer = setTimeout(() => {
+        reconnectDelay = 1000;
+      }, 5000);
+    });
 
     ws.addEventListener('message', (ev) => {
       let batch;
@@ -52,17 +62,24 @@
     });
 
     ws.addEventListener('close', () => {
+      clearTimeout(stableTimer);
+      stableTimer = null;
       ws = null;
-      setTimeout(connect, 1500);
+      scheduleReconnect();
     });
 
     ws.addEventListener('error', () => {
-      ws && ws.close();
+      if (ws) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+        ws.close();
+      }
     });
   }
 
   // ---- Message handler ----
   function handleMessage(msg) {
+    if ((msg.kind || 'normal') === 'system') return;
     if (!msg || typeof msg !== 'object') return;
     if (CHANNEL_FILTER && msg.channel !== CHANNEL_FILTER) return;
 
@@ -80,6 +97,30 @@
     current.count += 1;
     if (name !== '') current.name = name;
     speakers.set(key, current);
+    if (speakers.size > MAX_SPEAKERS) pruneSmallestSpeaker();
+  }
+
+  function pruneSmallestSpeaker() {
+    let smallestKey = null;
+    let smallestCount = Infinity;
+
+    speakers.forEach((entry, key) => {
+      if (entry.count < smallestCount) {
+        smallestKey = key;
+        smallestCount = entry.count;
+      }
+    });
+
+    if (smallestKey !== null) speakers.delete(smallestKey);
+  }
+
+  function scheduleReconnect() {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      connect();
+    }, reconnectDelay);
+    reconnectDelay = Math.min(reconnectDelay * 2, 30000);
   }
 
   // ---- Render ----

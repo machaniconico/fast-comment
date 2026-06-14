@@ -20,6 +20,7 @@
   const params = new URLSearchParams(location.search);
   const CHANNEL_FILTER = params.get('channel') || null;
   const MAX_CARDS = Math.min(positiveIntParam('max', 4), 12);
+  const MAX_CURRENCIES = 200;
   const TTL_MS = positiveIntParam('ttl', 7000);
   const FONT_SCALE = boundedNumberParam('font', 100, 50, 200) / 100;
   const BG_OPACITY = boundedNumberParam('bg', 0, 0, 100) / 100;
@@ -40,9 +41,18 @@
 
   // ---- WebSocket ----
   let ws = null;
+  let reconnectDelay = 1000;
+  let stableTimer = null;
+  let reconnectTimer = null;
 
   function connect() {
     ws = new WebSocket(WS_URL);
+
+    ws.addEventListener('open', () => {
+      stableTimer = setTimeout(() => {
+        reconnectDelay = 1000;
+      }, 5000);
+    });
 
     ws.addEventListener('message', (ev) => {
       let batch;
@@ -56,13 +66,28 @@
     });
 
     ws.addEventListener('close', () => {
+      clearTimeout(stableTimer);
+      stableTimer = null;
       ws = null;
-      setTimeout(connect, 1500);
+      scheduleReconnect();
     });
 
     ws.addEventListener('error', () => {
-      ws && ws.close();
+      if (ws) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+        ws.close();
+      }
     });
+  }
+
+  function scheduleReconnect() {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      connect();
+    }, reconnectDelay);
+    reconnectDelay = Math.min(reconnectDelay * 2, 30000);
   }
 
   // ---- Message handler ----
@@ -153,7 +178,10 @@
   // ---- Totals ----
   function recordDonation(donation) {
     const key = donation.currency || donation.label;
-    const current = totals.get(key) || {
+    const existing = totals.get(key);
+    if (!existing && totals.size >= MAX_CURRENCIES) return;
+
+    const current = existing || {
       label: key,
       count: 0,
       amount: 0,

@@ -68,6 +68,7 @@
 
   // ---- Message handler ----
   function handleMessage(msg) {
+    if ((msg.kind || 'normal') === 'system') return;
     // Channel filter
     if (CHANNEL_FILTER && msg.channel !== CHANNEL_FILTER) return;
 
@@ -143,8 +144,8 @@
   }
 
   function isPaidMessage(msg) {
-    const kind = msg && msg.kind;
-    return kind === 'superchat' || kind === 'superChat' || kind === 'bits' || (msg && msg.amount != null);
+    const k = (msg.kind || '').toLowerCase();
+    return k === 'superchat' || k === 'bits' || k === 'membership' || k === 'supersticker';
   }
 
   // ---- Start ----
