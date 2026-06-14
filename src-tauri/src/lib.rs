@@ -458,9 +458,10 @@ async fn send_chat_message(
 async fn update_config(
     app: AppHandle,
     state: State<'_, AppState>,
-    new_config: AppConfig,
+    mut new_config: AppConfig,
 ) -> Result<(), String> {
     // 保存。
+    new_config.obs.normalize();
     new_config
         .save(&state.config_dir)
         .map_err(|e| e.to_string())?;

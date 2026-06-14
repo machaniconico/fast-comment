@@ -35,6 +35,8 @@ pub enum ChannelPlatform {
     Youtube,
 }
 
+const MAX_OBS_ROWS: u16 = 1000;
+
 /// OBS overlay サーバ設定。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -64,6 +66,18 @@ pub struct ObsConfig {
     /// プラットフォーム表示を出すか。既定 true。
     #[serde(default = "default_true")]
     pub show_platform: bool,
+}
+
+impl ObsConfig {
+    pub fn normalize(&mut self) {
+        self.max_rows = self.max_rows.clamp(1, MAX_OBS_ROWS);
+        self.font_scale_pct = self.font_scale_pct.clamp(50, 200);
+        self.bg_opacity_pct = self.bg_opacity_pct.clamp(0, 100);
+        self.ttl_ms = self.ttl_ms.clamp(500, 600_000);
+        if self.position != "top" && self.position != "bottom" {
+            self.position = "bottom".to_string();
+        }
+    }
 }
 
 impl Default for ObsConfig {
@@ -484,8 +498,9 @@ impl AppConfig {
         }
         let text = std::fs::read_to_string(&path)
             .map_err(|e| anyhow::anyhow!("設定ファイル読込失敗 {}: {e}", path.display()))?;
-        let cfg: AppConfig = serde_json::from_str(&text)
+        let mut cfg: AppConfig = serde_json::from_str(&text)
             .map_err(|e| anyhow::anyhow!("設定ファイル解析失敗 {}: {e}", path.display()))?;
+        cfg.obs.normalize();
         Ok(cfg)
     }
 
