@@ -26,6 +26,11 @@ const NICONICO_ORIGIN: &str = "https://live.nicovideo.jp";
 const USER_AGENT: &str = "fast-comment/0.1 niconico-source";
 const DEFAULT_KEEP_SEAT_INTERVAL_SECS: u64 = 30;
 const MAX_PROTOBUF_FRAME_LEN: usize = 8 * 1024 * 1024;
+/// View/Segment ストリームのチャンク間(無通信)タイムアウト。
+/// reqwest 0.12 は既定タイムアウト無し。half-open ストール(TCPは生きているが
+/// サーバが送信を止める)を検知して Err にし、run() の Backoff 再接続へ落とす。
+/// ストリームが健全に流れている間はチャンク毎に reset するので誤発火しない。
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// ニコ生番組1件を購読する Source。
 pub struct NiconicoSource {
@@ -95,8 +100,12 @@ impl NiconicoSource {
         tx: &broadcast::Sender<ChatMessage>,
         cancel: &CancellationToken,
     ) -> anyhow::Result<bool> {
+        // connect_timeout で TCP/TLS ハンドシェイクを縛る(全リクエスト共通)。
+        // blanket な .timeout() は付けない — NDGR の長期ストリーミング GET を
+        // 健全でも打ち切ってしまうため。ストリームの停滞は STREAM_IDLE_TIMEOUT で見る。
         let client = reqwest::Client::builder()
             .user_agent(USER_AGENT)
+            .connect_timeout(Duration::from_secs(15))
             .build()
             .context("reqwest client 初期化失敗")?;
 
@@ -270,7 +279,13 @@ async fn fetch_watch_websocket_url(
     live_id: &str,
 ) -> anyhow::Result<Option<String>> {
     let watch_url = format!("{WATCH_BASE_URL}{live_id}");
-    let response = client.get(&watch_url).send().await?;
+    // 視聴ページ取得は非ストリーミングなので全体タイムアウトで縛ってよい
+    // (本文 text() まで含めて 15s)。停滞したHTML取得で関数がハングしない。
+    let response = client
+        .get(&watch_url)
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await?;
     if !response.status().is_success() {
         tracing::warn!("niconico:{live_id} 視聴ページ取得失敗: {}", response.status());
         return Ok(None);
@@ -313,7 +328,14 @@ async fn stream_view_loop(
         let previous_at = at.clone();
         let url = view_url_with_at(&view_uri, &at)?;
         read_length_delimited_stream(&client, &url, &cancel, |frame| {
-            let entry = ChunkedEntry::decode(frame.as_slice())?;
+            // View フレームも1件 decode 失敗で View ストリーム全体を巻き込まず log-and-skip。
+            let entry = match ChunkedEntry::decode(frame.as_slice()) {
+                Ok(entry) => entry,
+                Err(e) => {
+                    tracing::warn!("niconico:{live_id} ChunkedEntry decode skip: {e}");
+                    return Ok(());
+                }
+            };
             match entry.entry {
                 Some(chunked_entry::Entry::Segment(segment)) => {
                     if segment.uri.is_empty() || active_segments.contains(&segment.uri) {
@@ -378,7 +400,16 @@ async fn stream_segment(
 ) -> anyhow::Result<bool> {
     let mut seen_message = false;
     read_length_delimited_stream(&client, &segment_uri, &cancel, |frame| {
-        let chunked = ChunkedMessage::decode(frame.as_slice())?;
+        // 1フレームが decode 不能でも、その1件だけ捨てて後続フレームを読み続ける。
+        // (寛容パース原則: 欠落/想定外は巻き込まず None 劣化。直下の to_chat_message
+        //  も同様に skip しており、ここで ? で巻き添えにするのは内部不整合だった。)
+        let chunked = match ChunkedMessage::decode(frame.as_slice()) {
+            Ok(chunked) => chunked,
+            Err(e) => {
+                tracing::warn!("niconico:{live_id} ChunkedMessage decode skip: {e}");
+                return Ok(());
+            }
+        };
         let Some(msg) = chunked.to_chat_message(&live_id) else {
             return Ok(());
         };
@@ -398,23 +429,33 @@ async fn read_length_delimited_stream<F>(
 where
     F: FnMut(Vec<u8>) -> anyhow::Result<()>,
 {
-    let response = client
-        .get(url)
-        .header("Origin", NICONICO_ORIGIN)
-        .header("Referer", format!("{NICONICO_ORIGIN}/"))
-        .send()
-        .await?
-        .error_for_status()?;
+    // send().await(接続+ヘッダ待ち)と error_for_status も cancel に乗せ、
+    // 停止要求(アプリ終了/チャンネル削除)へ pre-stream 段階でも即応する。
+    let response = tokio::select! {
+        _ = cancel.cancelled() => return Ok(()),
+        r = client
+            .get(url)
+            .header("Origin", NICONICO_ORIGIN)
+            .header("Referer", format!("{NICONICO_ORIGIN}/"))
+            .send() => r?.error_for_status()?,
+    };
     let mut stream = response.bytes_stream();
     let mut buffer = Vec::with_capacity(8192);
+    // チャンク間の無通信が STREAM_IDLE_TIMEOUT を超えたらストール扱いで Err。
+    // 健全に流れている間はチャンク受信毎に reset するので誤発火しない。
+    let mut idle = Box::pin(tokio::time::sleep(STREAM_IDLE_TIMEOUT));
 
     loop {
         tokio::select! {
             _ = cancel.cancelled() => return Ok(()),
+            _ = &mut idle => {
+                return Err(anyhow!("NDGR stream idle timeout ({STREAM_IDLE_TIMEOUT:?})"));
+            }
             chunk = stream.next() => {
                 let Some(chunk) = chunk else {
                     return Ok(());
                 };
+                idle.as_mut().reset(Instant::now() + STREAM_IDLE_TIMEOUT);
                 buffer.extend_from_slice(&chunk?);
                 while let Some(frame) = pop_length_delimited_frame(&mut buffer)? {
                     on_frame(frame)?;
