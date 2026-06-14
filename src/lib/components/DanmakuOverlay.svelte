@@ -12,34 +12,15 @@
   import { onMount, onDestroy } from 'svelte';
   import type { ChatMessage } from '../types';
   import { startChatListener, onChatBatch } from '../ipc';
+  import {
+    clampDanmakuSettings,
+    DANMAKU_SETTINGS_EVENT,
+    loadDanmakuSettings,
+    type DanmakuSettings,
+  } from '../danmaku';
 
   // ── 設定(localStorage 'fc.danmaku' から読む。未設定はデフォルト)──────────
-  type DanmakuSettings = {
-    fontSize: number; // px
-    durationSec: number; // 画面を横断する秒数(大きいほど遅い)
-    opacity: number; // 0..1
-    showName: boolean; // 名前を前置するか(既定: 本文のみ=ニコ生風)
-    outline: boolean; // 縁取り(背景が何でも読めるように)
-    maxActive: number; // 同時表示の上限(DOM 肥大防止)
-  };
-  const DEFAULTS: DanmakuSettings = {
-    fontSize: 30,
-    durationSec: 7,
-    opacity: 0.92,
-    showName: false,
-    outline: true,
-    maxActive: 240,
-  };
-  function loadSettings(): DanmakuSettings {
-    try {
-      const raw = localStorage.getItem('fc.danmaku');
-      if (!raw) return { ...DEFAULTS };
-      return { ...DEFAULTS, ...(JSON.parse(raw) as Partial<DanmakuSettings>) };
-    } catch {
-      return { ...DEFAULTS };
-    }
-  }
-  const settings: DanmakuSettings = loadSettings();
+  let settings: DanmakuSettings = $state(loadDanmakuSettings());
 
   // ── 流れる1件 ───────────────────────────────────────────────────────────
   type Item = {
@@ -134,6 +115,7 @@
   }
 
   let unlisten: (() => void) | null = null;
+  let unlistenSettings: (() => void) | null = null;
   let removeResize: (() => void) | null = null;
 
   onMount(async () => {
@@ -164,10 +146,28 @@
     // コメントストリーム購読(main と同じ 'chat' を rAF バッチで受ける)。
     onChatBatch(handleBatch);
     unlisten = await startChatListener();
+
+    // 設定画面での変更を、表示中の弾幕ウィンドウへ即時反映する。
+    try {
+      const isTauri =
+        typeof window !== 'undefined' &&
+        !!(window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
+      if (isTauri) {
+        const { listen } = await import('@tauri-apps/api/event');
+        unlistenSettings = await listen<Partial<DanmakuSettings>>(DANMAKU_SETTINGS_EVENT, (e) => {
+          settings = clampDanmakuSettings({ ...settings, ...(e.payload || {}) });
+          recomputeLanes();
+          if (items.length > settings.maxActive) items.splice(0, items.length - settings.maxActive);
+        });
+      }
+    } catch (e) {
+      console.warn('[danmaku] settings listener failed', e);
+    }
   });
 
   onDestroy(() => {
     unlisten?.();
+    unlistenSettings?.();
     removeResize?.();
   });
 </script>

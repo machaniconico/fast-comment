@@ -21,6 +21,7 @@ export type SettingsAnchor =
   | 'timer'
   | 'moderation'
   | 'notify'
+  | 'danmaku'
   | 'portability';
 
 /** Maps a SettingsAnchor to the DOM id rendered on the matching <section>. */
@@ -31,6 +32,7 @@ export const SETTINGS_ANCHOR_IDS: Record<SettingsAnchor, string> = {
   timer: 'settings-timer',
   moderation: 'settings-moderation',
   notify: 'settings-notify',
+  danmaku: 'settings-danmaku',
   portability: 'settings-portability',
 };
 

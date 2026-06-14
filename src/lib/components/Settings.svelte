@@ -18,6 +18,7 @@
   } from '../theme.svelte';
   import { buildCsv, setNotify, store } from '../stores.svelte';
   import ConfigPortability from './ConfigPortability.svelte';
+  import DanmakuSettings from './DanmakuSettings.svelte';
   import ModerationPortability from './ModerationPortability.svelte';
   import ModerationTester from './ModerationTester.svelte';
   import TemplateEditor from './TemplateEditor.svelte';
@@ -266,7 +267,7 @@
     try {
       const u = new URL(url);
       u.searchParams.set('template', name);
-      u.searchParams.set('max', String(clampInt(obs?.maxRows, 8, 1, 20)));
+      u.searchParams.set('max', String(clampInt(obs?.maxRows, 8, 1, 1000)));
       u.searchParams.set('ttl', String(obs ? ttlMsFromSeconds(obsTtlSeconds) : 12000));
       u.searchParams.set('font', String(clampInt(obs?.fontScalePct, 100, 50, 200)));
       u.searchParams.set('bg', String(clampInt(obs?.bgOpacityPct, 0, 0, 100)));
@@ -863,6 +864,11 @@
     <ConfigPortability onImported={onConfigImported} />
   </section>
 
+  <section id="settings-danmaku">
+    <h3>弾幕（画面を流れるコメント）</h3>
+    <DanmakuSettings />
+  </section>
+
   <!-- ── TTS ── -->
   {#if config}
   <section id="settings-test">
@@ -1198,7 +1204,7 @@
         id="obs-max-rows"
         type="number"
         min="1"
-        max="20"
+        max="1000"
         step="1"
         bind:value={config.obs.maxRows}
         class="num-input"
