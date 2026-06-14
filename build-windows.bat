@@ -219,10 +219,12 @@ if errorlevel 1 (
 echo.
 
 REM --- Clean stale installers (prevents NSIS os error 5) -----------------
-REM This script auto-launches *-setup.exe after a successful build. If that
-REM installer is still open on a re-run, makensis cannot overwrite the
-REM running exe and fails with "access denied (os error 5)". Remove old
-REM bundle outputs first; if removal fails, the installer/app is still open.
+REM If a previously built installer (or the installed app) is still open on a
+REM re-run, makensis / wix cannot overwrite the running exe and fails with
+REM "access denied (os error 5)". Remove old bundle outputs first; if removal
+REM fails, the installer/app is still open. (Auto-launching setup.exe after a
+REM build is now opt-in -- see FC_AUTORUN_SETUP near the end of this script --
+REM which is the main way to avoid leaving an installer holding the lock.)
 set "BUNDLE_DIR=src-tauri\target\release\bundle"
 if exist "%BUNDLE_DIR%\nsis\*-setup.exe" (
   del /q "%BUNDLE_DIR%\nsis\*-setup.exe" >nul 2>nul
@@ -234,7 +236,15 @@ if exist "%BUNDLE_DIR%\nsis\*-setup.exe" (
   )
   echo [OK] Removed previous NSIS installer.
 )
-if exist "%BUNDLE_DIR%\msi\*.msi" del /q "%BUNDLE_DIR%\msi\*.msi" >nul 2>nul
+if exist "%BUNDLE_DIR%\msi\*.msi" (
+  del /q "%BUNDLE_DIR%\msi\*.msi" >nul 2>nul
+  if exist "%BUNDLE_DIR%\msi\*.msi" (
+    echo [ERROR] Cannot delete the previous MSI in bundle\msi\.
+    echo         It is probably still open / mounted. Close it, then run again.
+    goto :fail
+  )
+  echo [OK] Removed previous MSI installer.
+)
 
 REM --- Step 2: Tauri build (also runs "pnpm build" via beforeBuildCommand)
 echo [2/2] pnpm tauri build  ^(first run compiles all Rust crates; takes several minutes^)
@@ -256,18 +266,25 @@ echo.
 echo  The NSIS installer creates a desktop shortcut on install.
 echo.
 
-REM --- Auto-launch the NSIS installer (newest *-setup.exe) -------------
+REM --- Auto-launch the NSIS installer (opt-in) -------------------------
+REM Auto-launching *-setup.exe leaves the installer holding a lock on the exe,
+REM which is the #1 cause of the NSIS "access denied (os error 5)" failure on
+REM the next rebuild. So it is OFF by default: we just open the output folder.
+REM Set FC_AUTORUN_SETUP=1 before running this script to auto-launch instead.
 set "NSIS_DIR=src-tauri\target\release\bundle\nsis"
-set "SETUP_EXE="
-for %%F in ("%NSIS_DIR%\*-setup.exe") do set "SETUP_EXE=%%F"
-if defined SETUP_EXE (
-  echo  Launching installer: %SETUP_EXE%
-  start "" "%SETUP_EXE%"
-  REM Installer runs in its own process; close this window automatically.
-  exit /b 0
+if "%FC_AUTORUN_SETUP%"=="1" (
+  set "SETUP_EXE="
+  for %%F in ("%NSIS_DIR%\*-setup.exe") do set "SETUP_EXE=%%F"
+  if defined SETUP_EXE (
+    echo  Launching installer: %SETUP_EXE%
+    echo  ^(close the installer before the next rebuild to avoid os error 5^)
+    start "" "%SETUP_EXE%"
+    exit /b 0
+  )
+  echo [WARN] NSIS setup exe not found under %NSIS_DIR%.
 )
-echo [WARN] NSIS setup exe not found under %NSIS_DIR%.
-echo        Opening the bundle output folder instead.
+echo  Opening the bundle output folder. Run the installer yourself when ready.
+echo  ^(tip: set FC_AUTORUN_SETUP=1 to auto-launch the installer after a build^)
 start "" "explorer.exe" "src-tauri\target\release\bundle"
 echo.
 pause
