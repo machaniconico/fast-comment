@@ -21,6 +21,24 @@ use crate::model::{Amount, Author, Badge, ChatMessage, Fragment, MessageKind, Pl
 const TWITCH_WS_URL: &str = "wss://irc-ws.chat.twitch.tv:443";
 static NICK_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
+#[derive(Debug)]
+struct TwitchSessionError {
+    error: anyhow::Error,
+    stable: bool,
+}
+
+impl TwitchSessionError {
+    fn new<E>(error: E, stable: bool) -> Self
+    where
+        E: Into<anyhow::Error>,
+    {
+        TwitchSessionError {
+            error: error.into(),
+            stable,
+        }
+    }
+}
+
 /// Twitch チャンネル1件を購読する Source。
 pub struct TwitchSource {
     /// `#` を含まないチャンネル名(小文字化して使う)。
@@ -65,7 +83,10 @@ impl Source for TwitchSource {
                         }
                     }
                     Err(e) => {
-                        tracing::warn!("twitch:{} 接続エラー: {e:#}", self.channel);
+                        if e.stable {
+                            backoff.reset();
+                        }
+                        tracing::warn!("twitch:{} 接続エラー: {:#}", self.channel, e.error);
                     }
                 }
 
@@ -89,25 +110,34 @@ impl TwitchSource {
         &self,
         tx: &broadcast::Sender<ChatMessage>,
         cancel: &CancellationToken,
-    ) -> anyhow::Result<bool> {
-        let (ws_stream, _resp) = tokio_tungstenite::connect_async(TWITCH_WS_URL).await?;
+    ) -> Result<bool, TwitchSessionError> {
+        let (ws_stream, _resp) = tokio_tungstenite::connect_async(TWITCH_WS_URL)
+            .await
+            .map_err(|e| TwitchSessionError::new(e, false))?;
         let (mut write, mut read) = ws_stream.split();
 
         // 匿名ログイン。justinfan + 数値サフィックスの NICK。
         let nick = format!("justinfan{}", fastrand_suffix());
         write
             .send(irc_text("CAP REQ :twitch.tv/tags twitch.tv/commands"))
-            .await?;
-        write.send(irc_text("PASS SCHMOOPIIE")).await?;
-        write.send(irc_text(&format!("NICK {nick}"))).await?;
+            .await
+            .map_err(|e| TwitchSessionError::new(e, false))?;
+        write
+            .send(irc_text("PASS SCHMOOPIIE"))
+            .await
+            .map_err(|e| TwitchSessionError::new(e, false))?;
+        write
+            .send(irc_text(&format!("NICK {nick}")))
+            .await
+            .map_err(|e| TwitchSessionError::new(e, false))?;
         write
             .send(irc_text(&format!("JOIN #{}", self.channel)))
-            .await?;
+            .await
+            .map_err(|e| TwitchSessionError::new(e, false))?;
 
         tracing::info!("twitch:{} 接続・JOIN 完了 (nick={nick})", self.channel);
 
-        // 安定セッション判定: 接続後 30 秒以上経過、または PRIVMSG を1件でも受信。
-        const STABLE_SECS: u64 = 30;
+        // 安定セッション判定: 接続後 30 秒以上経過、またはデータを1件でも受信。
         let connected_at = Instant::now();
         let mut received_data = false;
 
@@ -120,17 +150,21 @@ impl TwitchSource {
                 msg = read.next() => {
                     let msg = match msg {
                         Some(Ok(m)) => m,
-                        Some(Err(e)) => return Err(e.into()),
+                        Some(Err(e)) => {
+                            return Err(TwitchSessionError::new(
+                                e,
+                                session_is_stable(received_data, connected_at),
+                            ));
+                        }
                         None => {
                             // ストリーム終端=切断。安定判定を返す。
-                            let stable = received_data
-                                || connected_at.elapsed().as_secs() >= STABLE_SECS;
-                            return Ok(stable);
+                            return Ok(session_is_stable(received_data, connected_at));
                         }
                     };
 
                     match msg {
                         WsMessage::Text(text) => {
+                            received_data = true;
                             // 1フレームに複数IRC行が来ることがある(CRLF区切り)。
                             for line in text.split("\r\n").filter(|l| !l.is_empty()) {
                                 let handled = self.handle_line(line, tx);
@@ -139,18 +173,27 @@ impl TwitchSource {
                                 }
                                 if let Some(reply) = handled.reply {
                                     // PING への PONG など、即返信が必要なもの。
-                                    write.send(irc_text(&reply)).await?;
+                                    write.send(irc_text(&reply)).await.map_err(|e| {
+                                        TwitchSessionError::new(
+                                            e,
+                                            session_is_stable(received_data, connected_at),
+                                        )
+                                    })?;
                                 }
                             }
                         }
                         WsMessage::Ping(payload) => {
+                            received_data = true;
                             // WS レベルの ping にも応答。
-                            write.send(WsMessage::Pong(payload)).await?;
+                            write.send(WsMessage::Pong(payload)).await.map_err(|e| {
+                                TwitchSessionError::new(
+                                    e,
+                                    session_is_stable(received_data, connected_at),
+                                )
+                            })?;
                         }
                         WsMessage::Close(_) => {
-                            let stable = received_data
-                                || connected_at.elapsed().as_secs() >= STABLE_SECS;
-                            return Ok(stable);
+                            return Ok(session_is_stable(received_data, connected_at));
                         }
                         _ => {}
                     }
@@ -265,6 +308,11 @@ impl TwitchSource {
             skip_tts: false,
         })
     }
+}
+
+fn session_is_stable(received_data: bool, connected_at: Instant) -> bool {
+    const STABLE_SECS: u64 = 30;
+    received_data || connected_at.elapsed().as_secs() >= STABLE_SECS
 }
 
 /// パース済み IRC 行。

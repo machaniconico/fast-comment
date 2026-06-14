@@ -10,6 +10,7 @@
 //! 再ビルド無しに差し替えできる(SPEC §4.2)。
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use reqwest::Client;
 use serde_json::{json, Value};
@@ -84,6 +85,8 @@ impl InnerTubeClient {
         let http = Client::builder()
             .user_agent(USER_AGENT)
             .gzip(true)
+            .timeout(Duration::from_secs(15))
+            .connect_timeout(Duration::from_secs(10))
             .build()?;
         Ok(InnerTubeClient { http, overrides })
     }
@@ -230,15 +233,23 @@ fn extract_initial_continuation(html: &str, paths: &HashMap<String, String>) -> 
     None
 }
 
-/// `<marker>` 直後の JSON 文字列値を、終端 `"` まで(エスケープ考慮なしの単純抽出)で取り出す。
-///
-/// continuation/api_key にはエスケープが入りにくいため単純抽出で十分。
+/// `<marker>` 直後の JSON 文字列値を、終端 `"` まで取り出す。
 fn extract_json_string_field(html: &str, marker: &str) -> Option<String> {
     let start = html.find(marker)? + marker.len();
     let tail = &html[start..];
-    // 次の `"` までを値とする(値内に `\"` を含まない前提)。
-    let end = tail.find('"')?;
-    Some(tail[..end].to_string())
+    let mut escaped = false;
+    for (idx, ch) in tail.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            '"' => return Some(tail[..idx].to_string()),
+            _ => {}
+        }
+    }
+    None
 }
 
 #[cfg(test)]

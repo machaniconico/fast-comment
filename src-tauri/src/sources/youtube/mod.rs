@@ -14,6 +14,8 @@ pub mod parser;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
+use std::time::{Duration, Instant};
+
 use super::{Backoff, Source};
 use crate::config::YoutubeOverrides;
 use crate::model::ChatMessage;
@@ -60,20 +62,29 @@ impl Source for YoutubeSource {
                     return Ok(());
                 }
 
+                let mut no_progress = false;
                 match self.poll_session(&video_id, &tx, &cancel).await {
-                    Ok(()) => {
+                    Ok(made_progress) => {
                         if cancel.is_cancelled() {
                             return Ok(());
                         }
                         // 配信終了/continuation 枯渇など。少し待って再ブートストラップ。
-                        backoff.reset();
+                        if made_progress {
+                            backoff.reset();
+                        } else {
+                            no_progress = true;
+                        }
                     }
                     Err(e) => {
                         tracing::warn!("youtube:{video_id} ポーリングエラー: {e:#}");
                     }
                 }
 
-                let delay = backoff.next_delay();
+                let delay = if no_progress {
+                    backoff.next_delay().max(Duration::from_secs(3))
+                } else {
+                    backoff.next_delay()
+                };
                 tracing::info!("youtube:{video_id} {}ms 後に再接続", delay.as_millis());
                 tokio::select! {
                     _ = cancel.cancelled() => return Ok(()),
@@ -91,8 +102,10 @@ impl YoutubeSource {
         video_id: &str,
         tx: &broadcast::Sender<ChatMessage>,
         cancel: &CancellationToken,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         let client = InnerTubeClient::new(self.overrides.clone())?;
+        let session_started = Instant::now();
+        let mut received_message = false;
 
         // 初期HTMLから API_KEY / clientVersion / 初期 continuation を取得。
         let mut session = client.bootstrap(video_id).await?;
@@ -105,20 +118,26 @@ impl YoutubeSource {
         let mut first_poll = true;
         loop {
             if cancel.is_cancelled() {
-                return Ok(());
+                return Ok(session_made_progress(received_message, session_started));
             }
             if session.continuation.is_empty() {
                 // これ以上辿れない(配信終了 or 抽出失敗)。セッション終了。
-                return Ok(());
+                return Ok(session_made_progress(received_message, session_started));
             }
 
-            let resp = client.get_live_chat(&session).await?;
+            let resp = tokio::select! {
+                _ = cancel.cancelled() => {
+                    return Ok(session_made_progress(received_message, session_started));
+                }
+                resp = client.get_live_chat(&session) => resp?,
+            };
 
             // 寛容パース。actions を ChatMessage 群へ。
             // 抽出パスは overrides.paths で差し替え可能(欠落時は既定)。
             let actions = parser::extract_actions(&resp, &self.overrides.paths);
             for action in &actions {
                 if let Some(mut msg) = parser::parse_action(action, video_id) {
+                    received_message = true;
                     msg.skip_tts = first_poll;
                     // raw は通常 None。デバッグ目的で残したい場合のみ付与する。
                     msg.raw = None;
@@ -135,7 +154,7 @@ impl YoutubeSource {
                 Some(c) if !c.is_empty() => session.continuation = c,
                 _ => {
                     // 次が取れない=ライブ終了等。セッションを閉じる。
-                    return Ok(());
+                    return Ok(session_made_progress(received_message, session_started));
                 }
             }
             first_poll = false;
@@ -146,11 +165,18 @@ impl YoutubeSource {
             // 下限はレート制限/空ポール回避のため 700ms。欠落時の既定も 1000ms。
             let wait = timeout_ms.unwrap_or(1000).clamp(700, 1500);
             tokio::select! {
-                _ = cancel.cancelled() => return Ok(()),
+                _ = cancel.cancelled() => {
+                    return Ok(session_made_progress(received_message, session_started));
+                }
                 _ = tokio::time::sleep(std::time::Duration::from_millis(wait)) => {}
             }
         }
     }
+}
+
+fn session_made_progress(received_message: bool, started_at: Instant) -> bool {
+    const MEANINGFUL_SESSION_SECS: u64 = 30;
+    received_message || started_at.elapsed() >= Duration::from_secs(MEANINGFUL_SESSION_SECS)
 }
 
 /// 配信URL もしくは生の videoId から videoId を抽出する。
