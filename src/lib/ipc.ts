@@ -21,16 +21,26 @@ type BatchHandler = (messages: ChatMessage[]) => void;
 let _batchHandler: BatchHandler | null = null;
 let _pending: ChatMessage[] = [];
 let _rafId: number | null = null;
+let _timerId: ReturnType<typeof setTimeout> | null = null;
+
+function clearScheduled() {
+  if (_rafId !== null) { cancelAnimationFrame(_rafId); _rafId = null; }
+  if (_timerId !== null) { clearTimeout(_timerId); _timerId = null; }
+}
+
+function flush() {
+  clearScheduled();
+  if (_pending.length === 0 || !_batchHandler) return;
+  const batch = _pending;
+  _pending = [];
+  _batchHandler(batch);
+}
 
 function scheduleFlusher() {
-  if (_rafId !== null) return;
-  _rafId = requestAnimationFrame(() => {
-    _rafId = null;
-    if (_pending.length === 0 || !_batchHandler) return;
-    const batch = _pending;
-    _pending = [];
-    _batchHandler(batch);
-  });
+  if (_rafId !== null || _timerId !== null) return;
+  _rafId = requestAnimationFrame(flush);
+  // 保険: WebViewが最小化/オクルージョンされ rAF が止まっても、タイマーで確実に flush する
+  _timerId = setTimeout(flush, 250);
 }
 
 /**
