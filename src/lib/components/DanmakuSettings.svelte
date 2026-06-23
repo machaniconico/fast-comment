@@ -61,6 +61,12 @@
     void apply();
   }
 
+  function onAreaChange(event: Event) {
+    const value = (event.currentTarget as HTMLSelectElement).value;
+    s.area = value === 'top' || value === 'bottom' ? value : 'full';
+    void apply();
+  }
+
   function resetDefaults() {
     s = { ...DANMAKU_DEFAULTS };
     void apply();
@@ -136,6 +142,16 @@
   </div>
 
   <div class="field-row">
+    <label for="danmaku-area">表示領域</label>
+    <select id="danmaku-area" value={s.area} onchange={onAreaChange}>
+      <option value="full">全体</option>
+      <option value="top">上半分</option>
+      <option value="bottom">下半分</option>
+    </select>
+    <span class="hint-inline">中央のゲーム画面を空ける</span>
+  </div>
+
+  <div class="field-row">
     <button type="button" class="copy-btn" onclick={resetDefaults}>既定に戻す</button>
   </div>
 
@@ -167,6 +183,16 @@
   input[type='range'] {
     width: min(280px, 100%);
     flex: 1 1 180px;
+  }
+
+  select {
+    background: #263238;
+    color: #e0e0e0;
+    border: 1px solid #455a64;
+    border-radius: 4px;
+    font-size: 13px;
+    padding: 4px 8px;
+    cursor: pointer;
   }
 
   .value {

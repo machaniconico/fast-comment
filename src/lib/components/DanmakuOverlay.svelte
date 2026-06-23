@@ -36,10 +36,16 @@
   let seq = 0;
 
   // ── レーン(行)管理 ──────────────────────────────────────────────────────
+  type LanePrev = { t: number; w: number; s: number } | null;
   let viewportW = 0;
   let laneHeight = 0;
   let laneCount = 1;
-  let laneFreeAt: number[] = []; // 各レーンが次に空く時刻(performance.now ベース, ms)
+  // 表示縦帯(画面上半分/下半分/全体)。recomputeLanes で更新。
+  let y0 = 0;
+  // 各レーンの直近投入コメントの記録 {t,w,s} または null。
+  //   t=投入時刻(performance.now() ms), w=実幅 px, s=速度 px/秒。
+  // laneFreeAt(時刻配列)から置換: 相対速度を考慮した精密追突防止に用いる。
+  let lanePrev: LanePrev[] = [];
 
   // 文字幅の実測(レーンが空く時刻の計算に使う)。canvas measureText で概算。
   let measureCtx: CanvasRenderingContext2D | null = null;
@@ -56,35 +62,55 @@
     return measureCtx.measureText(text).width;
   }
 
-  function resizeLaneFreeAt(nextLaneCount: number) {
-    const next = new Array(nextLaneCount).fill(0);
-    const preserveCount = Math.min(laneFreeAt.length, nextLaneCount);
-    for (let i = 0; i < preserveCount; i += 1) next[i] = laneFreeAt[i] ?? 0;
-    laneFreeAt = next;
-  }
-
   function recomputeLanes() {
     viewportW = window.innerWidth || 1920;
     const viewportH = window.innerHeight || 1080;
     const nextLaneHeight = Math.round(settings.fontSize * 1.45);
-    const nextLaneCount = Math.max(1, Math.floor(viewportH / nextLaneHeight));
-    if (laneFreeAt.length !== nextLaneCount || laneHeight !== nextLaneHeight) {
-      resizeLaneFreeAt(nextLaneCount);
+    // E2: settings.area で表示縦帯 [y0,y1] を決める(中央のゲーム画面を空ける)。
+    let ya = 0;
+    let yb = viewportH;
+    if (settings.area === 'top') yb = Math.floor(viewportH / 2);
+    else if (settings.area === 'bottom') ya = Math.floor(viewportH / 2);
+    const bandH = yb - ya;
+    const nextLaneCount = Math.max(1, Math.floor(bandH / nextLaneHeight));
+    if (lanePrev.length !== nextLaneCount || laneHeight !== nextLaneHeight) {
+      // レーン数/高さが変わったら lanePrev を作り直す(既存値は捨てて fill(null))。
+      lanePrev = new Array(nextLaneCount).fill(null);
     }
+    y0 = ya;
     laneHeight = nextLaneHeight;
     laneCount = nextLaneCount;
   }
 
-  // 最も長く空いている(= freeAt が最小の)レーンを選ぶ。
-  // 全レーンが埋まっている高負荷時は「最も早く空く」レーンに相乗りする(劣化許容)。
-  function pickLane(): number {
+  // E1: 精密追突防止。先行コメント(prev)と新規コメント(sNew px/秒)の相対速度を考慮し、
+  // 追突しないのに十分な投入間隔(ms)を返す。prev==null なら 0(空きレーン)。
+  //   base = prev.w + gap(gap=fontSize, 1文字ぶんの間隔)
+  //   A = base / prev.s        ← 先行が画面端に消えるまでの時間(秒)
+  //   B = (sNew>prev.s) ? (base + (sNew-prev.s)*durationSec) / sNew : A
+  //                            ← 新規が速いとき、相対距離が base に開くまでの時間(秒)
+  //   return max(A,B) * 1000
+  function requiredGapMs(prev: LanePrev, sNew: number): number {
+    if (!prev) return 0;
+    const base = prev.w + settings.fontSize;
+    const a = base / prev.s;
+    const b = sNew > prev.s ? (base + (sNew - prev.s) * settings.durationSec) / sNew : a;
+    return Math.max(a, b) * 1000;
+  }
+
+  // 各レーンの slack(今投入可能か余裕 ms)を比較し、最も空いているレーンを選ぶ。
+  //   slack = (now - prev.t) - requiredGapMs(prev, sNew)
+  //   prev==null は slack=+Infinity(完全に空き)。
+  // 空き(slack>=0)があれば slack 最大のレーン、無ければ slack 最大に相乗り(劣化許容)。
+  function pickLane(sNew: number): number {
+    const now = performance.now();
     let best = 0;
-    let bestFree = laneFreeAt[0] ?? 0;
-    for (let i = 1; i < laneCount; i++) {
-      const f = laneFreeAt[i] ?? 0;
-      if (f < bestFree) {
+    let bestSlack = -Infinity;
+    for (let i = 0; i < laneCount; i += 1) {
+      const prev = lanePrev[i] ?? null;
+      const slack = prev ? now - prev.t - requiredGapMs(prev, sNew) : Infinity;
+      if (slack > bestSlack) {
         best = i;
-        bestFree = f;
+        bestSlack = slack;
       }
     }
     return best;
@@ -106,13 +132,12 @@
     const text = settings.showName && msg.author?.name ? `${msg.author.name}: ${body}` : body;
 
     const now = performance.now();
-    const lane = pickLane();
     const w = measureWidth(text, settings.fontSize);
     // 等速。画面幅+自分の幅を durationSec で割った速度(px/s)。
-    const speed = (viewportW + w) / settings.durationSec;
-    // 前のコメントが「自分の幅 + 1文字ぶんの間隔」流れ切るまで、このレーンは塞がっている扱い。
-    const clearMs = ((w + settings.fontSize) / speed) * 1000;
-    laneFreeAt[lane] = now + clearMs;
+    const s = (viewportW + w) / settings.durationSec;
+    const lane = pickLane(s);
+    // 選択レーンの直近投入を更新(次回の requiredGapMs 計算に使う)。
+    lanePrev[lane] = { t: now, w, s };
 
     const dc = msg.author?.displayColor;
     const color = dc && dc.trim() ? dc : '#ffffff';
@@ -121,7 +146,7 @@
       id: ++seq,
       text,
       color,
-      top: lane * laneHeight,
+      top: y0 + lane * laneHeight,
       durationSec: settings.durationSec,
       fontSize: settings.fontSize,
       kind: msg.kind,
@@ -206,7 +231,9 @@
       class:superchat={item.kind === 'superChat' || item.kind === 'bits'}
       class:member={item.kind === 'membership'}
       style="top:{item.top}px; --dur:{item.durationSec}s; font-size:{item.fontSize}px; color:{item.color};"
-      onanimationend={() => onEnd(item.id)}
+      onanimationend={(e) => {
+        if (e.animationName === 'danmaku-fly') onEnd(item.id);
+      }}
     >
       {item.text}
     </div>
@@ -244,10 +271,11 @@
       Meiryo, sans-serif;
     will-change: transform;
     transform: translateX(100vw);
-    animation-name: danmaku-fly;
-    animation-timing-function: linear;
-    animation-fill-mode: forwards;
-    animation-duration: var(--dur);
+    /* E3: 端フェード。fly(移動)と fade(不透明度)を2本同時再生。
+       右端の出現と左端の消失を opacity でなめらかに。 */
+    animation:
+      danmaku-fly var(--dur) linear forwards,
+      danmaku-fade var(--dur) linear forwards;
   }
 
   /* 背景が何でも読めるよう縁取り(text-shadow 4方向 + 軽いぼかし)。 */
@@ -273,6 +301,22 @@
     }
     to {
       transform: translateX(-100%);
+    }
+  }
+
+  /* E3: 端フェード。冒頭6%で浮かび上がり、末尾94%→100%で消える。 */
+  @keyframes danmaku-fade {
+    0% {
+      opacity: 0;
+    }
+    6% {
+      opacity: 1;
+    }
+    94% {
+      opacity: 1;
+    }
+    100% {
+      opacity: 0;
     }
   }
 </style>

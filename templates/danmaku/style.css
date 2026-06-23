@@ -37,12 +37,12 @@ body {
   line-height: 1.2;
   color: #ffffff;
   will-change: transform;
-  /* 右端の外(translateX(100vw))から左端の外(translateX(-100%))へ等速で。 */
+  /* 右端の外(translateX(100vw))から左端の外(translateX(-100%))へ等速で。
+     端フェード(opacity)は danmaku-fade で別アニメとして合成。全体の #danmaku opacity は
+     ?opacity= で制御され要素単位のフェードと乗算される。 */
   transform: translateX(100vw);
-  animation-name: danmaku-fly;
-  animation-timing-function: linear;
-  animation-fill-mode: forwards;
-  animation-duration: var(--dur, 7s);
+  animation: danmaku-fly var(--dur, 7s) linear forwards,
+    danmaku-fade var(--dur, 7s) linear forwards;
 }
 
 /* 背景が何でも読めるよう縁取り(text-shadow 4方向 + 軽いぼかし)。 */
@@ -69,5 +69,21 @@ body {
   }
   to {
     transform: translateX(-100%);
+  }
+}
+
+/* 端フェード: 右端出現(0→6%で 0→1)、左端消失(94→100%で 1→0)。 */
+@keyframes danmaku-fade {
+  0% {
+    opacity: 0;
+  }
+  6% {
+    opacity: 1;
+  }
+  94% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
   }
 }

@@ -1,3 +1,5 @@
+export type DanmakuArea = 'full' | 'top' | 'bottom';
+
 export type DanmakuSettings = {
   fontSize: number;
   durationSec: number;
@@ -5,6 +7,7 @@ export type DanmakuSettings = {
   showName: boolean;
   outline: boolean;
   maxActive: number;
+  area: DanmakuArea;
 };
 
 export const DANMAKU_STORAGE_KEY = 'fc.danmaku';
@@ -17,6 +20,7 @@ export const DANMAKU_DEFAULTS: DanmakuSettings = {
   showName: false,
   outline: true,
   maxActive: 240,
+  area: 'full',
 };
 
 function finiteNumber(value: unknown, fallback: number): number {
@@ -39,6 +43,7 @@ export function clampDanmakuSettings(s: Partial<DanmakuSettings>): DanmakuSettin
     maxActive: Math.trunc(
       clamp(finiteNumber(merged.maxActive, DANMAKU_DEFAULTS.maxActive), 20, 1000),
     ),
+    area: merged.area === 'top' || merged.area === 'bottom' ? merged.area : 'full',
   };
 }
 

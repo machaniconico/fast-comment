@@ -18,6 +18,7 @@
  *   ?max=240             同時表示の最大数(DOM 肥大防止)
  *   ?only=gift           SuperChat/Bits/メンバーのみ流す
  *   ?ws=ws://127.0.0.1:11180/ws   WS エンドポイント上書き
+ *   ?area=full|top|bottom 表示縦帯(既定 full、上半分/下半分に制限可能)
  */
 
 (function () {
@@ -34,6 +35,7 @@
   const MAX_ACTIVE = positiveIntParam('max', 240);
   const ONLY_GIFT = params.get('only') === 'gift';
   const WS_URL = buildWsUrl(params.get('ws') || 'ws://127.0.0.1:11180/ws');
+  const AREA = normalizeArea(params.get('area'));
 
   const root = document.getElementById('danmaku');
   if (!root) return;
@@ -43,8 +45,11 @@
   let viewportW = 0;
   let laneHeight = 0;
   let laneCount = 1;
-  // 各レーンが次に空く時刻(performance.now ベース, ms)。
-  let laneFreeAt = [];
+  // 表示縦帯(画面上半分/下半分/全体)。recomputeLanes で更新。
+  let y0 = 0;
+  // 各レーンの直近投入コメントの記録 {t,w,s} または null。
+  // t=投入時刻(performance.now() ms), w=実幅 px, s=速度 px/秒。
+  let lanePrev = [];
 
   // 文字幅の実測(レーンが空く時刻の計算に使う)。canvas measureText で概算。
   let measureCtx = null;
@@ -64,20 +69,55 @@
     viewportW = window.innerWidth || 1920;
     const viewportH = window.innerHeight || 1080;
     laneHeight = Math.round(FONT_SIZE * 1.45);
-    laneCount = Math.max(1, Math.floor(viewportH / laneHeight));
-    if (laneFreeAt.length !== laneCount) laneFreeAt = new Array(laneCount).fill(0);
+    let y1;
+    if (AREA === 'top') {
+      y0 = 0;
+      y1 = Math.floor(viewportH / 2);
+    } else if (AREA === 'bottom') {
+      y0 = Math.floor(viewportH / 2);
+      y1 = viewportH;
+    } else {
+      y0 = 0;
+      y1 = viewportH;
+    }
+    const bandH = y1 - y0;
+    laneCount = Math.max(1, Math.floor(bandH / laneHeight));
+    lanePrev = new Array(laneCount).fill(null);
   }
 
-  // 最も長く空いている(= freeAt が最小の)レーンを選ぶ。
-  // 全レーンが埋まっている高負荷時は「最も早く空く」レーンに相乗りする(劣化許容)。
-  function pickLane() {
+  // 相対速度を考慮した必要投入間隔(ms)。
+  // 前コメント prev と今回の速度 sNew(px/秒) を比較し、頭被り(すぐ後ろに被せる)と
+  // 追突(速い後続が遅い先行を追い越す)の両方を防ぐ最小間隔を返す。
+  function requiredGapMs(prev, sNew, durationSec, gapPx) {
+    if (!prev) return 0;
+    const base = prev.w + gapPx;
+    // A: 前コメントの末尾(右端)が画面右端から gapPx 入るまでの時間(頭被り防止)。
+    const A = base / prev.s;
+    // B: 追突防止。後続が前より速いとき、前を追い越さないために必要な間隔。
+    //    速さが同じか遅ければ追突しないので B=A。
+    const B = sNew > prev.s ? (base + (sNew - prev.s) * durationSec) / sNew : A;
+    return Math.max(A, B) * 1000;
+  }
+
+  // 各レーンの slack(= now - prev.t - requiredGapMs) を比較し、
+  // 空き(slack>=0)があれば slack 最大のレーンを選ぶ。
+  // 空きが無ければ高負荷劣化として slack 最大(最も早く空く)レーンに相乗りする。
+  function pickLane(sNew) {
+    const now = performance.now();
+    const gapPx = FONT_SIZE;
     let best = 0;
-    let bestFree = laneFreeAt[0] || 0;
-    for (let i = 1; i < laneCount; i++) {
-      const f = laneFreeAt[i] || 0;
-      if (f < bestFree) {
+    let bestSlack = -Infinity;
+    for (let i = 0; i < laneCount; i++) {
+      const prev = lanePrev[i];
+      let slack;
+      if (prev === null) {
+        slack = Infinity;
+      } else {
+        slack = now - prev.t - requiredGapMs(prev, sNew, DURATION_SEC, gapPx);
+      }
+      if (slack > bestSlack) {
         best = i;
-        bestFree = f;
+        bestSlack = slack;
       }
     }
     return best;
@@ -101,13 +141,11 @@
     const text = SHOW_NAME && author ? author + ': ' + core : core;
 
     const now = performance.now();
-    const lane = pickLane();
     const w = measureWidth(text, FONT_SIZE);
-    // 等速。画面幅 + 自分の幅を DURATION_SEC で割った速度(px/s)。
-    const speed = (viewportW + w) / DURATION_SEC;
-    // 前のコメントが「自分の幅 + 1文字ぶんの間隔」流れ切るまで、このレーンは塞がっている扱い。
-    const clearMs = ((w + FONT_SIZE) / speed) * 1000;
-    laneFreeAt[lane] = now + clearMs;
+    // 等速。画面幅 + 自分の幅を DURATION_SEC で割った速度(px/秒)。
+    const newSpeed = (viewportW + w) / DURATION_SEC;
+    const lane = pickLane(newSpeed);
+    lanePrev[lane] = { t: now, w: w, s: newSpeed };
 
     const el = document.createElement('div');
     el.className = 'danmaku-item';
@@ -123,14 +161,15 @@
       el.style.color = isSafeHexColor(color) ? color : '#ffffff';
     }
 
-    el.style.top = lane * laneHeight + 'px';
+    el.style.top = (y0 + lane * laneHeight) + 'px';
     el.style.fontSize = FONT_SIZE + 'px';
     el.style.setProperty('--dur', DURATION_SEC + 's');
     el.textContent = text;
 
-    // アニメ終了で自分を撤去。
-    el.addEventListener('animationend', function () {
-      el.remove();
+    // アニメ終了で自分を撤去。fly(座標) と fade(opacity) の2アニメで2回発火するので、
+    // 座標側(danmaku-fly)の時だけ撤去し二重/早期撤去を防ぐ。
+    el.addEventListener('animationend', function (e) {
+      if (e.animationName === 'danmaku-fly') el.remove();
     });
 
     root.appendChild(el);
@@ -234,6 +273,10 @@
   function isGiftMessage(msg) {
     const kind = msg && msg.kind;
     return kind === 'superChat' || kind === 'membership' || kind === 'bits';
+  }
+
+  function normalizeArea(value) {
+    return value === 'top' || value === 'bottom' ? value : 'full';
   }
 
   // ---- Start ----
