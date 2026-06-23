@@ -157,6 +157,8 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
   - **精密追突防止スケジューラ**: 各レーンは直近投入コメントの `{t, w, s}`(投入時刻/幅/速度 px秒)を保持し、新規コメントの速度と相対比較して「頭被り(`A=(prev.w+gap)/prev.s`)」と「追突=速い後続が遅い先行を追い越す(`B=(base+(sNew-prev.s)*dur)/sNew`)」の両方を防ぐ最小投入間隔 `max(A,B)` を満たすレーン(slack 最大)を選ぶ。高負荷で全レーンが埋まると最も早く空くレーンに相乗り(劣化許容)。デスクトップ窓と OBS テンプレで同一アルゴリズム(パリティ必須)。
   - **表示領域(area)**: コメントを流す縦帯を `full`(全体)/`top`(上半分)/`bottom`(下半分)に制限可能(中央のゲーム画面を空ける)。デスクトップは弾幕設定の「表示領域」セレクト、OBS は `?area=` で指定(不正/未指定は `full`)。
   - **端フェード**: 右端の出現(0→6%)と左端の消失(94→100%)を opacity アニメ(`danmaku-fade`)で柔らかく。移動アニメ(`danmaku-fly`)の linear タイミングは不変で、撤去は `animationName==='danmaku-fly'` 側のみ(2アニメでの二重/早期撤去を防ぐ)。全体不透明度(`?opacity=`/`--opacity`)と要素フェードは乗算合成。
+  - **連投まとめ(×N)**: 同一本文(名前前置前の素の本文 `core` をキー)の連投を `COALESCE_WINDOW_MS`(1500ms)内なら1つの弾幕に集約し `×N` カウント表示(『草』『w』『888』のスパム抑制)。流れるコメント(非gift/非system)のみ対象。集約は既存要素のテキスト書き換えのみで `lanePrev`(追突防止状態)は触らない。撤去/間引き時に集約マップから掃除(OBSは `size<32` ガード)。デスクトップは設定トグル、OBS は `?coalesce=0` で無効化(既定 ON)。
+  - **投げ銭固定強調弾幕**: SuperChat/Bits/メンバーは流さず画面上部に `PIN_SEC`(8秒)固定表示してフェード撤去(ニコ生 `ue` コマンド風・見逃し防止)。同時 `PIN_MAX`(6件)・最古から間引き・最新を上。半透明角丸ボックス+種別色。デスクトップは設定トグル(タイマは `onDestroy` で `clearTimeout` しリーク防止)、OBS は `?pin=0` で無効化(既定 ON、OFF時は従来通り流す)。
 - **コメント投稿** (`CommentComposer.svelte`, `sources/twitch_send.rs`): 自分でコメントを送信。Twitch は IRC で送信(実機ビルド検証済みは要確認)。**YouTube 投稿は未実装(スタブ)** — UI 上は選択不可/注意表示にする。
 - **参加型配信の管理** (`Participation.svelte`, `Raffle.svelte`): キーワード(既定「参加」)での参加登録、先着/ランダム抽選、専用タブ。既定 OFF。
 - **投げ銭パネル** (`DonationPanel.svelte`): SuperChat/Bits/メンバーを通常コメントと分けて表示(アプリ内タブ / OBS `?only=gift`)。既定 OFF。
@@ -184,7 +186,7 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
   | `timer` | カウントダウン/アップタイマー |
   | `danmaku` | ニコ生風に画面を横切る弾幕(後述 §8.1) |
 
-- 共通クエリパラメータ: `ws`(接続先), `channel`(フィルタ), `only=gift`(投げ銭のみ) 等。テンプレ間で `max` の意味が異なる点に注意 — 通常overlayでは「表示行数の上限」、`danmaku` では「同時アニメDOM数の上限(MAX_ACTIVE)」。`danmaku` 専用: `dur`(横断秒数)/`size`(文字px)/`opacity`/`name`(名前前置)/`outline`(縁取り)/`area`(`full`/`top`/`bottom` 表示縦帯)。弾幕URL生成(`Settings.svelte` の `withDanmaku()`)は弾幕に無関係なパラメータ(`max`/`ttl`/`font`/`bg`/`pos`/`icon`)を allowlist で除外する。
+- 共通クエリパラメータ: `ws`(接続先), `channel`(フィルタ), `only=gift`(投げ銭のみ) 等。テンプレ間で `max` の意味が異なる点に注意 — 通常overlayでは「表示行数の上限」、`danmaku` では「同時アニメDOM数の上限(MAX_ACTIVE)」。`danmaku` 専用: `dur`(横断秒数)/`size`(文字px)/`opacity`/`name`(名前前置)/`outline`(縁取り)/`area`(`full`/`top`/`bottom` 表示縦帯)/`coalesce`(連投まとめ ×N、`0`で無効)/`pin`(投げ銭を上部固定強調、`0`で無効)。弾幕URL生成(`Settings.svelte` の `withDanmaku()`)は弾幕に無関係なパラメータ(`max`/`ttl`/`font`/`bg`/`pos`/`icon`)を allowlist で除外する。
 - システム種別(`kind==='system'` 接続通知等)は配信画面に流さない(全テンプレで除外)。
 
 ## 10. 設定永続化 (`config.rs`)

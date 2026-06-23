@@ -8,6 +8,8 @@ export type DanmakuSettings = {
   outline: boolean;
   maxActive: number;
   area: DanmakuArea;
+  coalesce: boolean;
+  pinGifts: boolean;
 };
 
 export const DANMAKU_STORAGE_KEY = 'fc.danmaku';
@@ -21,6 +23,8 @@ export const DANMAKU_DEFAULTS: DanmakuSettings = {
   outline: true,
   maxActive: 240,
   area: 'full',
+  coalesce: true,
+  pinGifts: true,
 };
 
 function finiteNumber(value: unknown, fallback: number): number {
@@ -44,6 +48,8 @@ export function clampDanmakuSettings(s: Partial<DanmakuSettings>): DanmakuSettin
       clamp(finiteNumber(merged.maxActive, DANMAKU_DEFAULTS.maxActive), 20, 1000),
     ),
     area: merged.area === 'top' || merged.area === 'bottom' ? merged.area : 'full',
+    coalesce: merged.coalesce !== false,
+    pinGifts: merged.pinGifts !== false,
   };
 }
 

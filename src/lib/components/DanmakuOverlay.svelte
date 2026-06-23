@@ -35,6 +35,21 @@
   let items: Item[] = $state([]);
   let seq = 0;
 
+  // ── E4: 連投まとめ(同一本文の連投を ×N に集約)──────────────────────────
+  // 集約窓口(ms)。同じ本文の連投がこの時間内なら 1 つにまとめる。
+  const COALESCE_WINDOW_MS = 1500;
+  // key=本文 core(名前前置前の本文)。Svelte の items は id 管理なので el ではなく
+  // item.id を保持し、生存判定は items.some(it=>it.id===entry.id) で行う。
+  let recentByText = new Map<string, { id: number; base: string; count: number; at: number }>();
+
+  // ── E5: 投げ銭/メンバー固定強調弾幕(流さず上部に固定表示してフェード)──
+  const PIN_SEC = 8;
+  const PIN_MAX = 6;
+  type Pin = { id: number; text: string; kind: ChatMessage['kind']; leaving: boolean };
+  let pins = $state<Pin[]>([]);
+  // in-flight タイマ(onDestroy で clearTimeout し leak を防ぐ)。
+  let pinTimers: ReturnType<typeof setTimeout>[] = [];
+
   // ── レーン(行)管理 ──────────────────────────────────────────────────────
   type LanePrev = { t: number; w: number; s: number } | null;
   let viewportW = 0;
@@ -116,22 +131,80 @@
     return best;
   }
 
+  // E5: 投げ銭/メンバーを流さず画面上部に固定表示する。
+  // 既存の金額/ラベルfallbackで表示文字列を作り、pins 先頭に unshift。
+  // PIN_MAX 超過で末尾を pop。PIN_SEC 秒後に leaving:true → ~400ms 後に除去。
+  function pinGift(msg: ChatMessage) {
+    const kind = msg.kind;
+    let body = msg.fragments
+      .map((f) => (f.type === 'text' ? f.text : f.type === 'emote' ? f.name : ''))
+      .join('')
+      .trim();
+    if (kind === 'superChat' || kind === 'bits') {
+      const amountText = msg.amount?.rawText?.trim();
+      if (amountText) body = body ? `${amountText} ${body}` : amountText;
+    }
+    if (kind === 'membership') body = body || 'メンバー加入';
+    if (!body) return;
+
+    const id = ++seq;
+    pins.unshift({ id, text: body, kind, leaving: false });
+    if (pins.length > PIN_MAX) pins.pop();
+
+    const leaveTimer = setTimeout(() => {
+      const p = pins.find((it) => it.id === id);
+      if (p) p.leaving = true;
+      const removeTimer = setTimeout(() => {
+        const i = pins.findIndex((it) => it.id === id);
+        if (i >= 0) pins.splice(i, 1);
+      }, 400);
+      pinTimers.push(removeTimer);
+    }, PIN_SEC * 1000);
+    pinTimers.push(leaveTimer);
+  }
+
   function spawn(msg: ChatMessage) {
-    if ((msg.kind ?? 'normal') === 'system') return;
+    const kind = msg.kind ?? 'normal';
+    if (kind === 'system') return;
+
+    // E5: 投げ銭/メンバーは固定強調弾幕へ(OFF のときは従来通り流す)。
+    if (settings.pinGifts && (kind === 'superChat' || kind === 'bits' || kind === 'membership')) {
+      pinGift(msg);
+      return;
+    }
 
     let body = msg.fragments
       .map((f) => (f.type === 'text' ? f.text : f.type === 'emote' ? f.name : ''))
       .join('')
       .trim();
-    if (msg.kind === 'superChat' || msg.kind === 'bits') {
+    if (kind === 'superChat' || kind === 'bits') {
       const amountText = msg.amount?.rawText?.trim();
       if (amountText) body = body ? `${amountText} ${body}` : amountText;
     }
-    if (msg.kind === 'membership') body = body || 'メンバー加入';
+    if (kind === 'membership') body = body || 'メンバー加入';
     if (!body) return;
-    const text = settings.showName && msg.author?.name ? `${msg.author.name}: ${body}` : body;
 
     const now = performance.now();
+
+    // E4: 連投まとめ(非gift=通常コメントのみ)。key=core=名前前置前の本文。
+    // 既存 entry があり窓口内かつその id の item がまだ items に在るなら集約して spawn 中断。
+    if (settings.coalesce && kind === 'normal') {
+      const entry = recentByText.get(body);
+      if (
+        entry &&
+        now - entry.at <= COALESCE_WINDOW_MS &&
+        items.some((it) => it.id === entry.id)
+      ) {
+        entry.count += 1;
+        entry.at = now;
+        const target = items.find((it) => it.id === entry.id);
+        if (target) target.text = `${entry.base} ×${entry.count}`;
+        return;
+      }
+    }
+
+    const text = settings.showName && msg.author?.name ? `${msg.author.name}: ${body}` : body;
+
     const w = measureWidth(text, settings.fontSize);
     // 等速。画面幅+自分の幅を durationSec で割った速度(px/s)。
     const s = (viewportW + w) / settings.durationSec;
@@ -142,15 +215,20 @@
     const dc = msg.author?.displayColor;
     const color = dc && dc.trim() ? dc : '#ffffff';
 
+    const newId = ++seq;
     items.push({
-      id: ++seq,
+      id: newId,
       text,
       color,
       top: y0 + lane * laneHeight,
       durationSec: settings.durationSec,
       fontSize: settings.fontSize,
-      kind: msg.kind,
+      kind,
     });
+    // E4: 新規 spawn 後に Map 登録(次回の連投集約に使う)。
+    if (settings.coalesce && kind === 'normal') {
+      recentByText.set(body, { id: newId, base: text, count: 1, at: now });
+    }
     // 上限超過は古いものから捨てる(アニメ未終了でも DOM 肥大を防ぐ)。
     if (items.length > settings.maxActive) items.splice(0, items.length - settings.maxActive);
   }
@@ -158,6 +236,13 @@
   function onEnd(id: number) {
     const i = items.findIndex((it) => it.id === id);
     if (i >= 0) items.splice(i, 1);
+    // E4: recentByText から value.id===id のエントリを削除(肥大防止)。
+    for (const [key, value] of recentByText) {
+      if (value.id === id) {
+        recentByText.delete(key);
+        break;
+      }
+    }
   }
 
   function handleBatch(messages: ChatMessage[]) {
@@ -220,6 +305,9 @@
     unlistenSettings?.();
     removeResize?.();
     offChatBatch();
+    // E5: in-flight タイマを破棄(リーク防止)。
+    for (const t of pinTimers) clearTimeout(t);
+    pinTimers.length = 0;
   });
 </script>
 
@@ -237,6 +325,17 @@
     >
       {item.text}
     </div>
+  {/each}
+</div>
+
+<div class="danmaku-pins">
+  {#each pins as p (p.id)}
+    <div
+      class="danmaku-pin"
+      class:superchat={p.kind === 'superChat' || p.kind === 'bits'}
+      class:member={p.kind === 'membership'}
+      class:leaving={p.leaving}
+    >{p.text}</div>
   {/each}
 </div>
 
@@ -293,6 +392,54 @@
   }
   .danmaku-item.member {
     color: #66bb6a !important;
+  }
+
+  /* E5: 投げ銭/メンバー固定強調弾幕。.danmaku-root の opacity とは独立。 */
+  .danmaku-pins {
+    position: fixed;
+    top: 12px;
+    left: 0;
+    right: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+    pointer-events: none;
+    z-index: 10;
+  }
+
+  .danmaku-pin {
+    background: rgba(0, 0, 0, 0.55);
+    border: 1px solid rgba(255, 255, 255, 0.25);
+    border-radius: 8px;
+    padding: 6px 14px;
+    font-weight: 800;
+    font-size: 18px;
+    line-height: 1.2;
+    color: #ffffff;
+    white-space: nowrap;
+    text-shadow:
+      0 0 4px rgba(0, 0, 0, 0.8),
+      -1px -1px 0 rgba(0, 0, 0, 0.85),
+      1px -1px 0 rgba(0, 0, 0, 0.85),
+      -1px 1px 0 rgba(0, 0, 0, 0.85),
+      1px 1px 0 rgba(0, 0, 0, 0.85);
+    transition: opacity 0.4s ease;
+    opacity: 1;
+  }
+
+  .danmaku-pin.superchat {
+    color: #ffd54f;
+    border-color: rgba(255, 213, 79, 0.6);
+  }
+
+  .danmaku-pin.member {
+    color: #66bb6a;
+    border-color: rgba(102, 187, 106, 0.6);
+  }
+
+  .danmaku-pin.leaving {
+    opacity: 0;
   }
 
   @keyframes danmaku-fly {

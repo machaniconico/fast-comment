@@ -67,6 +67,16 @@
     void apply();
   }
 
+  function onCoalesceChange(event: Event) {
+    s.coalesce = (event.currentTarget as HTMLInputElement).checked;
+    void apply();
+  }
+
+  function onPinGiftsChange(event: Event) {
+    s.pinGifts = (event.currentTarget as HTMLInputElement).checked;
+    void apply();
+  }
+
   function resetDefaults() {
     s = { ...DANMAKU_DEFAULTS };
     void apply();
@@ -149,6 +159,16 @@
       <option value="bottom">下半分</option>
     </select>
     <span class="hint-inline">中央のゲーム画面を空ける</span>
+  </div>
+
+  <div class="field-row">
+    <label for="danmaku-coalesce">連投をまとめる（×N）</label>
+    <input id="danmaku-coalesce" type="checkbox" checked={s.coalesce} class="chk" onchange={onCoalesceChange} />
+  </div>
+
+  <div class="field-row">
+    <label for="danmaku-pin-gifts">投げ銭を上部に固定表示</label>
+    <input id="danmaku-pin-gifts" type="checkbox" checked={s.pinGifts} class="chk" onchange={onPinGiftsChange} />
   </div>
 
   <div class="field-row">

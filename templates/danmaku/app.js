@@ -36,10 +36,25 @@
   const ONLY_GIFT = params.get('only') === 'gift';
   const WS_URL = buildWsUrl(params.get('ws') || 'ws://127.0.0.1:11180/ws');
   const AREA = normalizeArea(params.get('area'));
+  // E4: 同一本文の連投を ×N に集約する(既定 ON。'0' で OFF)。
+  const COALESCE = params.get('coalesce') !== '0';
+  // E5: 投げ銭/メンバーを固定強調弾幕にする(既定 ON。'0' で OFF)。
+  const PIN_GIFTS = params.get('pin') !== '0';
+
+  // E4 の集約窓口(ms)。同じ本文の連投がこの時間内なら 1 つにまとめる。
+  const COALESCE_WINDOW_MS = 1500;
+  // E5 の固定表示秒数と同時固定数上限。
+  const PIN_SEC = 8;
+  const PIN_MAX = 6;
 
   const root = document.getElementById('danmaku');
+  const pinLayer = document.getElementById('danmaku-pins');
   if (!root) return;
   root.style.opacity = String(OPACITY);
+
+  // E4: recentByText は key=本文 core(名前前置/金額を含まない素の本文)
+  // value={el, base, count, at} の Map。element 撤去時に掃除して肥大を防ぐ。
+  const recentByText = new Map();
 
   // ---- Lane(行)management ----
   let viewportW = 0;
@@ -125,6 +140,14 @@
 
   function spawn(msg) {
     const kind = msg.kind || 'normal';
+    const isGift = kind === 'superChat' || kind === 'bits' || kind === 'membership';
+
+    // E5: 投げ銭/メンバーは固定強調弾幕へ。PIN_GIFTS OFF なら従来通り流す。
+    if (PIN_GIFTS && isGift) {
+      pinGift(msg);
+      return;
+    }
+
     const body = messageText(msg).trim();
     const amountText = (msg.amount && msg.amount.rawText) || '';
     const author = (msg.author && msg.author.name) || '';
@@ -139,6 +162,29 @@
     }
     if (!core) return;
     const text = SHOW_NAME && author ? author + ': ' + core : core;
+
+    // E4: 流れるコメント(非gift/非system)のみ集約対象。
+    //      既に同じ本文 core の弾幕が COALESCE_WINDOW_MS 内にあり DOM 接続中なら、
+    //      その弾幕の textContent を書き換えて count++ し、新規 spawn を中断する。
+    //      lanePrev は触らない(配置済み要素のテキスト書き換えのみ)。
+    if (COALESCE && !isGift) {
+      const existing = recentByText.get(core);
+      const now = performance.now();
+      if (
+        existing &&
+        now - existing.at <= COALESCE_WINDOW_MS &&
+        existing.el && existing.el.isConnected
+      ) {
+        existing.count += 1;
+        existing.at = now;
+        existing.el.textContent =
+          existing.base + (existing.count >= 2 ? ' ×' + existing.count : '');
+        // 古いエントリの間引き(Map 肥大防止の保険)。
+        pruneRecentByText(now);
+        return;
+      }
+      pruneRecentByText(now);
+    }
 
     const now = performance.now();
     const w = measureWidth(text, FONT_SIZE);
@@ -168,16 +214,93 @@
 
     // アニメ終了で自分を撤去。fly(座標) と fade(opacity) の2アニメで2回発火するので、
     // 座標側(danmaku-fly)の時だけ撤去し二重/早期撤去を防ぐ。
+    // E4: 撤去時に recentByText から該当エントリ(value.el===el)も削除して肥大を防ぐ。
     el.addEventListener('animationend', function (e) {
-      if (e.animationName === 'danmaku-fly') el.remove();
+      if (e.animationName === 'danmaku-fly') {
+        removeRecentByTextEl(el);
+        el.remove();
+      }
     });
 
     root.appendChild(el);
 
+    // E4: 新規生成後に recentByText へ登録。集約キーは本文 core。
+    //      base には実際に表示した文字列(SHOW_NAME 前置込みの text)を保存する。
+    if (COALESCE && !isGift) {
+      recentByText.set(core, { el: el, base: text, count: 1, at: now });
+    }
+
     // 上限超過は古いもの(先頭)から捨てる(アニメ未終了でも DOM 肥大を防ぐ)。
     while (root.childElementCount > MAX_ACTIVE && root.firstElementChild) {
-      root.firstElementChild.remove();
+      const oldest = root.firstElementChild;
+      // E4: 上限間引きで捨てられる要素も recentByText から外す。
+      removeRecentByTextEl(oldest);
+      oldest.remove();
     }
+  }
+
+  // E4: recentByText から value.el===el のエントリを削除。
+  function removeRecentByTextEl(el) {
+    for (const [key, value] of recentByText) {
+      if (value && value.el === el) {
+        recentByText.delete(key);
+      }
+    }
+  }
+
+  // E4: COALESCE_WINDOW_MS を過ぎた古いエントリを間引く(Map 肥大防止の保険)。
+  function pruneRecentByText(now) {
+    if (recentByText.size < 32) return;
+    for (const [key, value] of recentByText) {
+      if (value && now - value.at > COALESCE_WINDOW_MS) {
+        recentByText.delete(key);
+      }
+    }
+  }
+
+  // E5: 投げ銭/メンバーを画面上部に固定強調表示してフェードさせる。
+  function pinGift(msg) {
+    if (!pinLayer) return;
+    const kind = msg.kind || 'normal';
+    const body = messageText(msg).trim();
+    const amountText = (msg.amount && msg.amount.rawText) || '';
+    const author = (msg.author && msg.author.name) || '';
+
+    // spawn と同じ core 算出ロジックを再利用(投げ銭は金額、メンバーはラベル fallback)。
+    let core = body;
+    if (kind === 'superChat' || kind === 'bits') {
+      core = [amountText, body].filter(Boolean).join(' ');
+    } else if (kind === 'membership') {
+      core = body || 'メンバー加入';
+    }
+    if (!core) return;
+    const text = SHOW_NAME && author ? author + ': ' + core : core;
+
+    const el = document.createElement('div');
+    el.className = 'danmaku-pin';
+    if (kind === 'superChat' || kind === 'bits') {
+      el.classList.add('superchat');
+    } else if (kind === 'membership') {
+      el.classList.add('member');
+    }
+    el.textContent = text;
+
+    // 最新を上に。PIN_MAX 超過は末尾(最古)から間引く。
+    pinLayer.prepend(el);
+    while (pinLayer.childElementCount > PIN_MAX && pinLayer.lastElementChild) {
+      pinLayer.lastElementChild.remove();
+    }
+
+    // PIN_SEC 後の最後 ~0.5s でフェード→撤去。
+    const fadeAt = PIN_SEC * 1000 - 500;
+    if (fadeAt > 0) {
+      setTimeout(function () {
+        el.classList.add('leaving');
+      }, fadeAt);
+    }
+    setTimeout(function () {
+      el.remove();
+    }, PIN_SEC * 1000);
   }
 
   // ---- WebSocket(default テンプレと同じ再接続戦略)----
