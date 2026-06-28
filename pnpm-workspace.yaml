@@ -1,0 +1,5 @@
+# pnpm 10+ はビルドスクリプトを既定でブロックする。
+# esbuild(vite が使用)のネイティブバイナリ用 postinstall を明示的に承認し、
+# CI の `pnpm install` が ERR_PNPM_IGNORED_BUILDS で落ちないようにする。
+allowBuilds:
+  esbuild: true
