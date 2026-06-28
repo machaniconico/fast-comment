@@ -403,8 +403,19 @@ fn balanced_json_object(text: &str) -> Option<&str> {
 fn extract_json_string_field(html: &str, marker: &str) -> Option<String> {
     let start = html.find(marker)? + marker.len();
     let tail = &html[start..];
-    let end = tail.find('"')?;
-    Some(tail[..end].to_string())
+    let mut escaped = false;
+    for (idx, ch) in tail.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            '"' => return Some(tail[..idx].to_string()),
+            _ => {}
+        }
+    }
+    None
 }
 
 fn extract_og_title(html: &str) -> Option<String> {
@@ -433,8 +444,7 @@ fn extract_html_title(html: &str) -> Option<String> {
 }
 
 fn extract_attr_value(tag: &str, attr: &str) -> Option<String> {
-    let lower = tag.to_lowercase();
-    let attr_pos = lower.find(attr)?;
+    let attr_pos = find_ascii_case_insensitive(tag, attr)?;
     let after_attr = &tag[attr_pos + attr.len()..];
     let equals_pos = after_attr.find('=')?;
     let mut value = after_attr[equals_pos + 1..].trim_start();
@@ -472,6 +482,9 @@ fn decode_html_entities(text: &str) -> String {
 }
 
 fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
     haystack
         .as_bytes()
         .windows(needle.len())

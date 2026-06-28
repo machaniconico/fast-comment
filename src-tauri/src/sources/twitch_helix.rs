@@ -48,6 +48,8 @@ pub fn spawn_twitch_viewer_poller(
             }
         };
         let mut client_id: Option<String> = None;
+        let mut client_id_failures = 0usize;
+        let mut metadata_failures = 0usize;
 
         loop {
             if cancel.is_cancelled() {
@@ -56,9 +58,19 @@ pub fn spawn_twitch_viewer_poller(
 
             if client_id.is_none() {
                 match fetch_client_id(&http, &token).await {
-                    Ok(id) => client_id = Some(id),
+                    Ok(id) => {
+                        client_id = Some(id);
+                        client_id_failures = 0;
+                    }
                     Err(e) => {
-                        tracing::debug!("twitch:{login} client_id 取得失敗: {e:#}");
+                        client_id_failures += 1;
+                        if client_id_failures >= 3 {
+                            tracing::warn!(
+                                "twitch:{login} client_id 取得失敗が連続しています({client_id_failures}回): {e:#}"
+                            );
+                        } else {
+                            tracing::debug!("twitch:{login} client_id 取得失敗: {e:#}");
+                        }
                     }
                 }
             }
@@ -66,6 +78,7 @@ pub fn spawn_twitch_viewer_poller(
             if let Some(id) = client_id.as_deref() {
                 match fetch_stream_metadata(&http, &login, &token, id).await {
                     Ok(values) => {
+                        metadata_failures = 0;
                         let update = YoutubeMetadataUpdate {
                             platform: Platform::Twitch,
                             channel: login.clone(),
@@ -84,7 +97,14 @@ pub fn spawn_twitch_viewer_poller(
                         }
                     }
                     Err(e) => {
-                        tracing::debug!("twitch:{login} viewer_count 取得失敗: {e:#}");
+                        metadata_failures += 1;
+                        if metadata_failures >= 3 {
+                            tracing::warn!(
+                                "twitch:{login} viewer_count 取得失敗が連続しています({metadata_failures}回): {e:#}"
+                            );
+                        } else {
+                            tracing::debug!("twitch:{login} viewer_count 取得失敗: {e:#}");
+                        }
                     }
                 }
             }

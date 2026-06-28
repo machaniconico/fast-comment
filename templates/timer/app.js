@@ -14,6 +14,10 @@ let snapshot = {
   updatedAt: 0,
 };
 
+let reconnectDelay = 1000;
+let stableTimer = null;
+let reconnectTimer = null;
+
 applyParams();
 connect();
 window.setInterval(render, 200);
@@ -42,6 +46,12 @@ function connect() {
     return;
   }
 
+  socket.addEventListener('open', () => {
+    stableTimer = window.setTimeout(() => {
+      reconnectDelay = 1000;
+    }, 5000);
+  });
+
   socket.addEventListener('message', (event) => {
     try {
       const parsed = JSON.parse(event.data);
@@ -53,8 +63,14 @@ function connect() {
       // Ignore malformed frames and wait for the next snapshot.
     }
   });
-  socket.addEventListener('close', retry);
+  socket.addEventListener('close', () => {
+    window.clearTimeout(stableTimer);
+    stableTimer = null;
+    retry();
+  });
   socket.addEventListener('error', () => {
+    window.clearTimeout(reconnectTimer);
+    reconnectTimer = null;
     try {
       socket.close();
     } catch {
@@ -64,7 +80,12 @@ function connect() {
 }
 
 function retry() {
-  window.setTimeout(connect, 1500);
+  window.clearTimeout(reconnectTimer);
+  reconnectTimer = window.setTimeout(() => {
+    reconnectTimer = null;
+    connect();
+  }, reconnectDelay);
+  reconnectDelay = Math.min(reconnectDelay * 2, 30000);
 }
 
 function normalizeSnapshot(value) {

@@ -38,6 +38,7 @@ pub struct Backoff {
     current: Duration,
     min: Duration,
     max: Duration,
+    jitter: u64,
 }
 
 impl Backoff {
@@ -47,6 +48,7 @@ impl Backoff {
             current: Duration::from_secs(1),
             min: Duration::from_secs(1),
             max: Duration::from_secs(30),
+            jitter: jitter_seed(),
         }
     }
 
@@ -59,8 +61,21 @@ impl Backoff {
     pub fn next_delay(&mut self) -> Duration {
         let d = self.current;
         self.current = (self.current * 2).min(self.max);
-        d
+        self.jitter = self
+            .jitter
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1);
+        let percent = 80 + (self.jitter % 41);
+        Duration::from_millis(((d.as_millis() * percent as u128) / 100).max(1) as u64)
     }
+}
+
+fn jitter_seed() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
 }
 
 impl Default for Backoff {

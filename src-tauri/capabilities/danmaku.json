@@ -1,0 +1,11 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "danmaku-overlay",
+  "description": "Capability for the transparent click-through danmaku overlay window",
+  "windows": ["danmaku"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-set-ignore-cursor-events",
+    "core:window:allow-set-always-on-top"
+  ]
+}

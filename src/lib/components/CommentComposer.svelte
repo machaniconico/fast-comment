@@ -4,8 +4,7 @@
    * configured account. Toggled open from below the comment list (App.svelte).
    *
    * - Twitch: posts via an authenticated one-shot IRC connection (Rust side).
-   * - YouTube: not yet supported — the backend returns an explicit error which
-   *   is surfaced inline here.
+   * - YouTube: not yet supported.
    * Enter sends, Shift+Enter inserts a newline. IME composition is respected so
    * confirming a Japanese conversion with Enter never sends by accident.
    */
@@ -26,6 +25,8 @@
   let sending: boolean = $state(false);
   let errorMsg: string = $state('');
   let okMsg: string = $state('');
+  let channelDirty = false;
+  let previousPlatform: SendPlatform = 'twitch';
 
   // Enabled channels from config — the source of channel candidates.
   const enabledChannels = $derived(
@@ -40,8 +41,9 @@
   // Pick the initial platform from the first enabled channel (once).
   let initialized = false;
   $effect(() => {
-    if (!initialized && enabledChannels.length > 0) {
-      platform = enabledChannels[0].platform as SendPlatform;
+    const firstSupported = enabledChannels.find((c) => c.platform === 'twitch');
+    if (!initialized && firstSupported) {
+      platform = firstSupported.platform as SendPlatform;
       initialized = true;
     }
   });
@@ -49,9 +51,13 @@
   // Keep `channel` pointed at a valid candidate. When candidates exist and the
   // current value is not among them (platform switch, first load), snap to the
   // first candidate. When there are no candidates the field is a free text input
-  // and we leave whatever the user typed untouched.
+  // and we leave manually typed text untouched when candidates later arrive.
   $effect(() => {
-    if (channelCandidates.length > 0 && !channelCandidates.includes(channel)) {
+    if (platform !== previousPlatform) {
+      previousPlatform = platform;
+      channelDirty = false;
+    }
+    if (channelCandidates.length > 0 && !channelCandidates.includes(channel) && !channelDirty) {
       channel = channelCandidates[0];
     }
   });
@@ -61,6 +67,10 @@
     okMsg = '';
     const body = text.trim();
     if (body === '') return;
+    if (platform === 'youtube') {
+      errorMsg = 'YouTube投稿は未対応です';
+      return;
+    }
     const target = channel.trim();
     if (target === '') {
       errorMsg = '送信先チャンネルを指定してください';
@@ -87,6 +97,25 @@
   }
 
   function onInput() {
+    clearComposerMessages();
+  }
+
+  function onChannelInput() {
+    channelDirty = true;
+    clearComposerMessages();
+  }
+
+  function onChannelSelectChange() {
+    channelDirty = false;
+    clearComposerMessages();
+  }
+
+  function onPlatformChange() {
+    channelDirty = false;
+    clearComposerMessages();
+  }
+
+  function clearComposerMessages() {
     if (errorMsg) errorMsg = '';
     if (okMsg) okMsg = '';
   }
@@ -99,9 +128,10 @@
       bind:value={platform}
       aria-label="送信先プラットフォーム"
       disabled={sending}
+      onchange={onPlatformChange}
     >
       <option value="twitch">Twitch</option>
-      <option value="youtube">YouTube</option>
+      <option value="youtube" disabled>YouTube（未対応）</option>
     </select>
 
     {#if channelCandidates.length > 0}
@@ -110,6 +140,7 @@
         bind:value={channel}
         aria-label="送信先チャンネル"
         disabled={sending}
+        onchange={onChannelSelectChange}
       >
         {#each channelCandidates as cand}
           <option value={cand}>{cand}</option>
@@ -120,6 +151,7 @@
         class="composer-channel"
         type="text"
         bind:value={channel}
+        oninput={onChannelInput}
         placeholder="チャンネル名"
         aria-label="送信先チャンネル"
         disabled={sending}
@@ -136,12 +168,12 @@
       placeholder="コメントを入力（Enterで送信 / Shift+Enterで改行）"
       aria-label="投稿するコメント"
       rows="2"
-      disabled={sending}
+      disabled={sending || platform === 'youtube'}
     ></textarea>
     <button
       class="composer-send"
       onclick={send}
-      disabled={sending || text.trim() === ''}
+      disabled={sending || platform === 'youtube' || text.trim() === ''}
       title="チャットへ送信"
     >
       {sending ? '送信中…' : '送信'}

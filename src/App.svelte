@@ -24,7 +24,15 @@
   import { store, initStore, clearMessages } from './lib/stores.svelte';
   import { ui } from './lib/ui.svelte';
   import { theme } from './lib/theme.svelte';
-  import { checkForUpdate, openReleaseUrl, getConfig, onTtsNotice } from './lib/ipc';
+  import {
+    checkForUpdate,
+    openReleaseUrl,
+    getConfig,
+    onTtsNotice,
+    toggleDanmakuOverlay,
+    isDanmakuOverlayOpen,
+    setAlwaysOnTop,
+  } from './lib/ipc';
   import type { AppConfig, TtsNotice, UpdateStatus } from './lib/ipc';
 
   let unlisten: (() => void) | null = null;
@@ -36,6 +44,10 @@
   let ttsNoticeTimer: ReturnType<typeof setTimeout> | null = null;
   let toolsOpen = $state(false);
   let toolsMenuEl: HTMLDivElement | null = null;
+  let danmakuOpen = $state(false);
+  let unlistenDanmakuState: (() => void) | null = null;
+  let destroyed = false;
+  const DANMAKU_LABEL = 'danmaku';
 
   // ── Donation summary helpers ──────────────────────────────────────────────
 
@@ -88,20 +100,40 @@
 
   onMount(async () => {
     theme.load();
+    void setAlwaysOnTop(ui.alwaysOnTop);
     window.addEventListener('click', onWindowClick);
     window.addEventListener('keydown', onWindowKey);
     void loadUpdateStatus();
     void loadConfig();
-    unlisten = await initStore();
-    unlistenTtsNotice = await onTtsNotice(showTtsNotice);
+    {
+      const fn = await initStore();
+      if (destroyed) fn();
+      else unlisten = fn;
+    }
+    {
+      const fn = await onTtsNotice(showTtsNotice);
+      if (destroyed) fn();
+      else unlistenTtsNotice = fn;
+    }
+    const initialDanmakuOpen = await isDanmakuOverlayOpen();
+    if (!destroyed) danmakuOpen = initialDanmakuOpen;
+    if (initialDanmakuOpen) {
+      const fn = await listenDanmakuDestroyed();
+      if (fn) {
+        if (destroyed) fn();
+        else unlistenDanmakuState = fn;
+      }
+    }
   });
 
   onDestroy(() => {
+    destroyed = true;
     theme.destroy();
     window.removeEventListener('click', onWindowClick);
     window.removeEventListener('keydown', onWindowKey);
     unlisten?.();
     unlistenTtsNotice?.();
+    unlistenDanmakuState?.();
     if (searchDebounce) clearTimeout(searchDebounce);
     if (ttsNoticeTimer) clearTimeout(ttsNoticeTimer);
   });
@@ -188,6 +220,55 @@
     closeToolsMenu();
   }
 
+  async function selectDanmaku() {
+    closeToolsMenu();
+    try {
+      const nextOpen = await toggleDanmakuOverlay();
+      danmakuOpen = nextOpen;
+      unlistenDanmakuState?.();
+      unlistenDanmakuState = null;
+      if (nextOpen) {
+        const fn = await listenDanmakuDestroyed();
+        if (destroyed) fn?.();
+        else unlistenDanmakuState = fn;
+      }
+    } catch (e) {
+      console.warn('[danmaku] toggle failed', e);
+    }
+  }
+
+  function isTauri(): boolean {
+    return typeof window !== 'undefined'
+      && !!(window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
+  }
+
+  async function listenDanmakuDestroyed(): Promise<(() => void) | null> {
+    if (!isTauri()) return null;
+    const [{ WebviewWindow }, { TauriEvent }] = await Promise.all([
+      import('@tauri-apps/api/webviewWindow'),
+      import('@tauri-apps/api/event'),
+    ]);
+    const overlay = await WebviewWindow.getByLabel(DANMAKU_LABEL);
+    if (!overlay) return null;
+    return overlay.listen<null>(TauriEvent.WINDOW_DESTROYED, () => {
+      if (destroyed) return;
+      danmakuOpen = false;
+      unlistenDanmakuState?.();
+      unlistenDanmakuState = null;
+    });
+  }
+
+  function selectParticipation() {
+    ui.setTab('participation');
+    closeToolsMenu();
+  }
+
+  function toggleAlwaysOnTop() {
+    const next = !ui.alwaysOnTop;
+    ui.setAlwaysOnTop(next);
+    void setAlwaysOnTop(next);
+  }
+
   async function loadUpdateStatus() {
     try {
       const status = await checkForUpdate();
@@ -227,13 +308,7 @@
   }
 
   function onSettingsSaved(nextConfig: AppConfig) {
-    config = {
-      ...nextConfig,
-      ui: { ...nextConfig.ui },
-      effects: { ...nextConfig.effects },
-      welcome: { ...nextConfig.welcome },
-      timer: { ...nextConfig.timer },
-    };
+    config = structuredClone(nextConfig);
   }
 
   async function onUpdateDownloadClick(e: MouseEvent) {
@@ -321,6 +396,14 @@
     </div>
 
     <div class="header-actions">
+      <button
+        class="window-pin-btn"
+        class:active={ui.alwaysOnTop}
+        title={ui.alwaysOnTop ? '常に最前面を解除' : '常に最前面'}
+        aria-label={ui.alwaysOnTop ? '常に最前面を解除' : '常に最前面'}
+        aria-pressed={ui.alwaysOnTop}
+        onclick={toggleAlwaysOnTop}
+      >📌</button>
       <!-- Tab switcher -->
       <div class="tabs tabs-primary" role="tablist" aria-label="メイン表示">
         <button
@@ -339,24 +422,23 @@
             onclick={() => ui.setTab('donations')}
           >投げ銭</button>
         {/if}
-        <button
-          role="tab"
-          class="tab-btn"
-          class:active={ui.activeTab === 'participation' && !standaloneOpen}
-          aria-selected={ui.activeTab === 'participation' && !standaloneOpen}
-          onclick={() => ui.setTab('participation')}
-        >参加</button>
       </div>
       <div class="tools-menu" bind:this={toolsMenuEl}>
         <button
           class="tab-btn tools-trigger"
-          class:active={standaloneOpen}
+          class:active={standaloneOpen || ui.activeTab === 'participation'}
           aria-haspopup="menu"
           aria-expanded={toolsOpen}
           onclick={toggleToolsMenu}
         >ツール ▾</button>
         {#if toolsOpen}
           <div class="tools-dropdown" role="menu" aria-label="ツール">
+            <button
+              role="menuitem"
+              class="tools-menu-item"
+              class:active={ui.activeTab === 'participation' && !standaloneOpen}
+              onclick={selectParticipation}
+            >参加</button>
             <button
               role="menuitem"
               class="tools-menu-item"
@@ -375,6 +457,12 @@
               class:active={ui.showDashboard}
               onclick={selectDashboard}
             >振り返り</button>
+            <button
+              role="menuitem"
+              class="tools-menu-item"
+              class:active={danmakuOpen}
+              onclick={selectDanmaku}
+            >弾幕オーバーレイ{danmakuOpen ? '（表示中）' : ''}</button>
           </div>
         {/if}
       </div>
@@ -754,6 +842,37 @@
     order: 3;
   }
 
+  .window-pin-btn {
+    width: 26px;
+    height: 26px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(255,255,255,0.08);
+    color: #bdbdbd;
+    padding: 0;
+    font-size: 14px;
+    line-height: 1;
+    cursor: pointer;
+    border-radius: 4px;
+    filter: grayscale(1);
+    transition: color 0.15s, background 0.15s, border-color 0.15s, filter 0.15s;
+  }
+
+  .window-pin-btn.active {
+    color: #fff;
+    background: rgba(88,166,255,0.18);
+    border-color: rgba(88,166,255,0.5);
+    filter: grayscale(0);
+  }
+
+  .window-pin-btn:hover:not(.active) {
+    color: #ddd;
+    background: rgba(255,255,255,0.08);
+  }
+
   .tab-btn {
     background: none;
     border: none;
@@ -856,6 +975,23 @@
   .app[data-theme='light'] .tab-btn:hover:not(.active) {
     color: #1f2937;
     background: rgba(15,23,42,0.05);
+  }
+
+  .app[data-theme='light'] .window-pin-btn {
+    background: rgba(15,23,42,0.03);
+    border-color: rgba(15,23,42,0.12);
+    color: #52606d;
+  }
+
+  .app[data-theme='light'] .window-pin-btn.active {
+    color: #0f172a;
+    background: rgba(25,118,210,0.13);
+    border-color: rgba(25,118,210,0.38);
+  }
+
+  .app[data-theme='light'] .window-pin-btn:hover:not(.active) {
+    color: #1f2937;
+    background: rgba(15,23,42,0.06);
   }
 
   .app[data-theme='light'] .tools-dropdown {

@@ -377,8 +377,8 @@ fn object_says_live(map: &serde_json::Map<String, Value>) -> bool {
         // 「現在配信中」の確定シグナルのみを採用する。
         // `isLiveContent` は“ライブ配信タイプの動画”を表し配信終了後も true のため除外
         // (終了済み/アーカイブへの誤接続を防ぐ)。live-now を表す `isLive` / `isLiveNow` のみ。
-        let key_lower = key.to_lowercase();
-        matches!(key_lower.as_str(), "islive" | "islivenow") && value.as_bool().unwrap_or(false)
+        (key.eq_ignore_ascii_case("isLive") || key.eq_ignore_ascii_case("isLiveNow"))
+            && value.as_bool().unwrap_or(false)
     })
 }
 
@@ -413,16 +413,21 @@ fn nearby_live_hint(html: &str, center: usize) -> bool {
 }
 
 fn html_has_live_hint(html: &str) -> bool {
-    let lower = html
-        .to_lowercase()
-        .replace("\\\"", "\"")
-        .replace("&quot;", "\"");
-    let compact: String = lower.chars().filter(|c| !c.is_ascii_whitespace()).collect();
     // 「現在配信中」を表すフラグのみ。`isLiveContent`(配信タイプ=終了後も true) や
     // `liveBroadcastDetails`(終了配信にも存在) は live-now の証拠にならないので採用しない。
-    compact.contains("\"islive\":true")
-        || compact.contains("\"islivenow\":true")
-        || compact.contains("\"isnowlive\":true")
+    [
+        "\"isLive\":true",
+        "\"isLiveNow\":true",
+        "\"isNowLive\":true",
+        "\\\"isLive\\\":true",
+        "\\\"isLiveNow\\\":true",
+        "\\\"isNowLive\\\":true",
+        "&quot;isLive&quot;:true",
+        "&quot;isLiveNow&quot;:true",
+        "&quot;isNowLive&quot;:true",
+    ]
+    .iter()
+    .any(|needle| contains_ascii_case_insensitive_ignoring_ws(html, needle))
 }
 
 fn previous_char_boundary(text: &str, mut idx: usize) -> usize {
@@ -502,8 +507,7 @@ fn extract_meta_content(html: &str, needle: &str) -> Option<String> {
 }
 
 fn extract_attr_value(tag: &str, attr: &str) -> Option<String> {
-    let lower = tag.to_lowercase();
-    let attr_pos = lower.find(attr)?;
+    let attr_pos = find_ascii_case_insensitive(tag, attr)?;
     let after_attr = &tag[attr_pos + attr.len()..];
     let equals_pos = after_attr.find('=')?;
     let mut value = after_attr[equals_pos + 1..].trim_start();
@@ -522,6 +526,38 @@ fn decode_html_entities(text: &str) -> String {
         .replace("&#39;", "'")
         .replace("&lt;", "<")
         .replace("&gt;", ">")
+}
+
+fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .position(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
+fn contains_ascii_case_insensitive_ignoring_ws(haystack: &str, needle: &str) -> bool {
+    let needle = needle.as_bytes();
+    if needle.is_empty() {
+        return true;
+    }
+    let mut matched = 0usize;
+    for &byte in haystack.as_bytes() {
+        if byte.is_ascii_whitespace() {
+            continue;
+        }
+        if byte.eq_ignore_ascii_case(&needle[matched]) {
+            matched += 1;
+            if matched == needle.len() {
+                return true;
+            }
+        } else {
+            matched = usize::from(byte.eq_ignore_ascii_case(&needle[0]));
+        }
+    }
+    false
 }
 
 fn path_or<'a>(paths: &'a HashMap<String, String>, key: &str, default: &'a str) -> &'a str {
@@ -548,9 +584,8 @@ fn split_lines<'a>(
 }
 
 fn youtube_url_path(input: &str) -> Option<&str> {
-    let lower = input.to_lowercase();
     let marker = "youtube.com/";
-    let idx = lower.find(marker)?;
+    let idx = find_ascii_case_insensitive(input, marker)?;
     let tail = &input[idx + marker.len()..];
     let path = tail
         .split(['?', '#'])
