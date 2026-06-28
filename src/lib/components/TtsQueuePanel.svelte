@@ -3,6 +3,7 @@
   import {
     clearTtsQueue,
     getTtsQueueState,
+    onStats,
     onTtsQueueState,
     setTtsPaused,
     skipCurrentTts,
@@ -11,9 +12,13 @@
 
   let queueState: TtsQueueState = $state({ depth: 0, paused: false, items: [] });
   let unlisten: (() => void) | null = null;
+  let unlistenStats: (() => void) | null = null;
   let destroyed = false;
   let busy: boolean = $state(false);
   let error: string = $state('');
+  let viewers: number = $state(0);
+
+  const viewersLabel = $derived(new Intl.NumberFormat('ja-JP').format(Math.max(0, viewers)));
 
   const visibleItems = $derived(queueState.items.slice(0, 6));
   const hiddenCount = $derived(Math.max(0, queueState.depth - visibleItems.length));
@@ -30,11 +35,23 @@
     } catch (e) {
       error = `TTSキュー状態を取得できません: ${formatError(e)}`;
     }
+
+    try {
+      // 同接数は stats イベント(~1/s)で更新。初期値は0、最初のイベントで即埋まる。
+      const statsFn = await onStats((s) => {
+        viewers = s.viewers;
+      });
+      if (destroyed) statsFn();
+      else unlistenStats = statsFn;
+    } catch {
+      // 同接数は補助表示。取得失敗時は0のままにし、TTS操作は妨げない。
+    }
   });
 
   onDestroy(() => {
     destroyed = true;
     unlisten?.();
+    unlistenStats?.();
   });
 
   function normalizeQueueState(next: TtsQueueState): TtsQueueState {
@@ -84,6 +101,10 @@
     <span class:paused={queueState.paused} class="status">
       {queueState.paused ? '一時停止中' : '動作中'}
     </span>
+    <div class="metric viewers" title="同時接続数（視聴者数）">
+      <span class="metric-label">同接</span>
+      <strong aria-label={`同時接続数 ${viewersLabel}`}>{viewersLabel}</strong>
+    </div>
   </div>
 
   <div class="controls" role="group" aria-label="読み上げキュー操作">
@@ -139,6 +160,17 @@
     align-items: center;
     gap: 5px;
     min-width: 52px;
+  }
+
+  .metric.viewers {
+    padding-left: 6px;
+    border-left: 1px solid rgba(255,255,255,0.1);
+    min-width: auto;
+  }
+
+  .metric.viewers strong {
+    color: #7fc8ff;
+    min-width: 0;
   }
 
   .metric-label {
