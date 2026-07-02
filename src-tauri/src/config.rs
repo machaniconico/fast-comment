@@ -110,6 +110,9 @@ pub struct GoalsConfig {
     pub viewers: u32,
     /// 高評価数目標。0 は非表示。
     pub likes: u32,
+    /// YouTube 絵文字リアクション数目標。0 は非表示。
+    #[serde(default)]
+    pub reactions: u32,
 }
 
 /// OBS タイマー/カウントダウン overlay 設定。
@@ -649,6 +652,7 @@ mod tests {
                 comments: 100,
                 viewers: 50,
                 likes: 25,
+                reactions: 0,
             },
             timer: TimerConfig {
                 enabled: true,
@@ -745,6 +749,7 @@ mod tests {
         assert_eq!(json["goals"]["comments"].as_u64(), Some(100));
         assert_eq!(json["goals"]["viewers"].as_u64(), Some(50));
         assert_eq!(json["goals"]["likes"].as_u64(), Some(25));
+        assert_eq!(json["goals"]["reactions"].as_u64(), Some(0));
         assert_eq!(json["timer"]["enabled"].as_bool(), Some(true));
         assert_eq!(json["timer"]["defaultDurationSec"].as_u64(), Some(900));
         assert_eq!(json["timer"]["mode"].as_str(), Some("elapsed"));
@@ -892,6 +897,7 @@ mod tests {
         assert_eq!(cfg.goals.comments, 0);
         assert_eq!(cfg.goals.viewers, 0);
         assert_eq!(cfg.goals.likes, 0);
+        assert_eq!(cfg.goals.reactions, 0);
         assert_eq!(cfg.timer, TimerConfig::default());
         assert!(!cfg.timer.enabled);
         assert_eq!(cfg.timer.default_duration_sec, default_timer_duration_sec());
@@ -1080,6 +1086,7 @@ mod tests {
         assert_eq!(legacy_goals.comments, 10);
         assert_eq!(legacy_goals.viewers, 20);
         assert_eq!(legacy_goals.likes, 30);
+        assert_eq!(legacy_goals.reactions, 0);
 
         let cfg = GoalsConfig {
             enabled: true,
@@ -1087,10 +1094,12 @@ mod tests {
             comments: 100,
             viewers: 50,
             likes: 25,
+            reactions: 12,
         };
         let text = serde_json::to_string(&cfg).expect("serialize goals config");
         let json: serde_json::Value = serde_json::from_str(&text).expect("parse goals json");
         assert_eq!(json["showInApp"].as_bool(), Some(true));
+        assert_eq!(json["reactions"].as_u64(), Some(12));
 
         let decoded: GoalsConfig = serde_json::from_str(&text).expect("deserialize goals config");
         assert_eq!(decoded, cfg);

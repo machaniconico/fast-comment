@@ -266,6 +266,7 @@ export interface GoalsConfig {
   comments: number;
   viewers: number;
   likes: number;
+  reactions: number;
 }
 
 export interface TimerConfig {
@@ -297,6 +298,7 @@ export interface GoalsSnapshot {
   comments: number;
   viewers: number;
   likes: number;
+  reactions: number;
 }
 
 export interface ChannelTitle {
@@ -319,6 +321,8 @@ export interface StatsSnapshot {
   viewersMax: number;
   likes: number;
   likesAvailable: boolean;
+  reactions: number;
+  reactionsAvailable: boolean;
   goals: GoalsSnapshot;
   updatedAt: number;
   // Per-channel stream titles (currently YouTube only). Optional for backward

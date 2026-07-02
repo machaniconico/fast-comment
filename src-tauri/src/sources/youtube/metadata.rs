@@ -104,6 +104,7 @@ pub fn spawn_metadata_poller(
                         likes: last.likes,
                         title: last.title.clone(),
                         live: None,
+                        reactions_delta: None,
                     };
                     tokio::select! {
                         _ = cancel.cancelled() => break,

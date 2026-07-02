@@ -1032,7 +1032,11 @@ fn spawn_one_channel(_app: &AppHandle, state: &AppState, ch: &ChannelConfig) {
         );
         token
     } else {
-        let manager = SourceManager::new(state.source_tx.clone(), overrides.clone());
+        let manager = SourceManager::new(
+            state.source_tx.clone(),
+            overrides.clone(),
+            Some(state.metadata_tx.clone()),
+        );
         manager.spawn_channel(ch)
     };
     let app_cancel = state.app_cancel.clone();
