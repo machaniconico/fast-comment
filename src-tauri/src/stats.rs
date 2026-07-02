@@ -45,6 +45,8 @@ pub struct StatsSnapshot {
     pub viewers_max: u32,
     pub likes: u32,
     pub likes_available: bool,
+    pub reactions: u32,
+    pub reactions_available: bool,
     #[serde(default)]
     pub channel_titles: Vec<ChannelTitle>,
     #[serde(default)]
@@ -85,6 +87,7 @@ pub struct GoalsSnapshot {
     pub comments: u32,
     pub viewers: u32,
     pub likes: u32,
+    pub reactions: u32,
 }
 
 /// メタデータ poller から集約タスクへ渡す更新。
@@ -96,6 +99,7 @@ pub struct YoutubeMetadataUpdate {
     pub likes: Option<u32>,
     pub title: Option<String>,
     pub live: Option<bool>,
+    pub reactions_delta: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -117,7 +121,17 @@ impl Default for YoutubeMetadataUpdate {
             likes: None,
             title: None,
             live: None,
+            reactions_delta: None,
         }
+    }
+}
+
+impl YoutubeMetadataUpdate {
+    fn has_channel_metadata(&self) -> bool {
+        self.concurrent_viewers.is_some()
+            || self.likes.is_some()
+            || self.title.is_some()
+            || self.live.is_some()
     }
 }
 
@@ -135,6 +149,7 @@ pub fn spawn_stats_aggregator(
 ) -> tauri::async_runtime::JoinHandle<()> {
     tauri::async_runtime::spawn(async move {
         let mut comments = 0u32;
+        let mut reactions = 0u32;
         let mut viewers_max = 0u32;
         let mut viewer_scopes: HashMap<String, HashSet<String>> = HashMap::new();
         let mut metadata: HashMap<String, MetadataState> = HashMap::new();
@@ -146,6 +161,7 @@ pub fn spawn_stats_aggregator(
         let mut snapshot = build_snapshot(
             comments,
             viewers_max,
+            reactions,
             &viewer_scopes,
             &metadata,
             &config,
@@ -163,6 +179,7 @@ pub fn spawn_stats_aggregator(
                             snapshot = build_snapshot(
                                 comments,
                                 viewers_max,
+                                reactions,
                                 &viewer_scopes,
                                 &metadata,
                                 &config,
@@ -181,11 +198,11 @@ pub fn spawn_stats_aggregator(
                     let Some(update) = update else {
                         break;
                     };
-                    merge_metadata_update(&mut metadata, update);
-                    retain_enabled_metadata(&mut metadata, &config);
+                    apply_metadata_update(&mut metadata, &mut reactions, update, &config);
                     snapshot = build_snapshot(
                         comments,
                         viewers_max,
+                        reactions,
                         &viewer_scopes,
                         &metadata,
                         &config,
@@ -204,6 +221,7 @@ pub fn spawn_stats_aggregator(
                     snapshot = build_snapshot(
                         comments,
                         viewers_max,
+                        reactions,
                         &viewer_scopes,
                         &metadata,
                         &config,
@@ -216,6 +234,7 @@ pub fn spawn_stats_aggregator(
                     snapshot = build_snapshot(
                         comments,
                         viewers_max,
+                        reactions,
                         &viewer_scopes,
                         &metadata,
                         &config,
@@ -246,6 +265,7 @@ fn publish_snapshot(
 fn build_snapshot(
     comments: u32,
     viewers_max: u32,
+    reactions: u32,
     viewer_scopes: &HashMap<String, HashSet<String>>,
     metadata: &HashMap<String, MetadataState>,
     config: &AppConfig,
@@ -308,10 +328,28 @@ fn build_snapshot(
         viewers_max: viewers_max.max(viewers),
         likes,
         likes_available: has_enabled_youtube(config),
+        reactions,
+        reactions_available: has_enabled_youtube(config),
         channel_titles,
         channel_status,
         goals: goals_from_config(config),
         updated_at: 0,
+    }
+}
+
+fn apply_metadata_update(
+    metadata: &mut HashMap<String, MetadataState>,
+    reactions: &mut u32,
+    update: YoutubeMetadataUpdate,
+    config: &AppConfig,
+) {
+    let has_channel_metadata = update.has_channel_metadata();
+    if let Some(delta) = update.reactions_delta {
+        *reactions = (*reactions).saturating_add(delta);
+    }
+    if has_channel_metadata {
+        merge_metadata_update(metadata, update);
+        retain_enabled_metadata(metadata, config);
     }
 }
 
@@ -445,6 +483,7 @@ fn goals_from_config(config: &AppConfig) -> GoalsSnapshot {
         comments: config.goals.comments,
         viewers: config.goals.viewers,
         likes: config.goals.likes,
+        reactions: config.goals.reactions,
     }
 }
 
@@ -512,6 +551,23 @@ mod tests {
     }
 
     #[test]
+    fn goals_from_config_includes_reactions_when_enabled() {
+        let mut config = AppConfig::default();
+        config.goals.enabled = true;
+        config.goals.comments = 10;
+        config.goals.viewers = 20;
+        config.goals.likes = 30;
+        config.goals.reactions = 40;
+
+        let goals = goals_from_config(&config);
+
+        assert_eq!(goals.comments, 10);
+        assert_eq!(goals.viewers, 20);
+        assert_eq!(goals.likes, 30);
+        assert_eq!(goals.reactions, 40);
+    }
+
+    #[test]
     fn unique_viewers_are_scoped_by_platform_and_channel() {
         let mut scopes = HashMap::new();
         record_unique_viewer(&mut scopes, &msg(Platform::Youtube, "abc", "id1", "Alice"));
@@ -565,10 +621,11 @@ mod tests {
             },
         );
 
-        let snapshot = build_snapshot(0, 0, &HashMap::new(), &metadata, &config);
+        let snapshot = build_snapshot(0, 0, 0, &HashMap::new(), &metadata, &config);
 
         assert_eq!(snapshot.viewers, 17);
         assert_eq!(snapshot.likes, 3);
+        assert_eq!(snapshot.reactions, 0);
         assert_eq!(snapshot.channel_titles.len(), 1);
         assert_eq!(snapshot.channel_titles[0].platform, "youtube");
         assert_eq!(snapshot.channel_status.len(), 2);
@@ -588,7 +645,7 @@ mod tests {
             },
         );
 
-        let snapshot = build_snapshot(0, 0, &HashMap::new(), &metadata, &config);
+        let snapshot = build_snapshot(0, 0, 0, &HashMap::new(), &metadata, &config);
 
         assert_eq!(snapshot.channel_status.len(), 1);
         assert_eq!(snapshot.channel_status[0].identifier, "@example");
@@ -608,6 +665,7 @@ mod tests {
                 likes: Some(45),
                 title: Some("Live title".to_string()),
                 live: Some(true),
+                reactions_delta: None,
             },
         );
         merge_metadata_update(
@@ -620,7 +678,7 @@ mod tests {
             },
         );
 
-        let snapshot = build_snapshot(0, 0, &HashMap::new(), &metadata, &config);
+        let snapshot = build_snapshot(0, 0, 0, &HashMap::new(), &metadata, &config);
 
         assert_eq!(snapshot.viewers, 0);
         assert_eq!(snapshot.likes, 0);
@@ -656,12 +714,58 @@ mod tests {
             },
         );
 
-        let snapshot = build_snapshot(0, 0, &HashMap::new(), &metadata, &config);
+        let snapshot = build_snapshot(0, 0, 0, &HashMap::new(), &metadata, &config);
 
         assert_eq!(snapshot.channel_status.len(), 1);
         assert_eq!(snapshot.channel_status[0].title.as_deref(), Some("Updated title"));
         assert_eq!(snapshot.channel_status[0].viewers, Some(9));
         assert_eq!(snapshot.channel_status[0].live, Some(true));
+    }
+
+    #[test]
+    fn reaction_only_update_accumulates_without_touching_metadata() {
+        let config = config_with_youtube("@example");
+        let mut metadata = HashMap::new();
+        let mut reactions = 0u32;
+
+        apply_metadata_update(
+            &mut metadata,
+            &mut reactions,
+            YoutubeMetadataUpdate {
+                platform: Platform::Youtube,
+                channel: "@example".to_string(),
+                concurrent_viewers: Some(123),
+                likes: Some(45),
+                title: Some("Live title".to_string()),
+                live: Some(true),
+                reactions_delta: None,
+            },
+            &config,
+        );
+        apply_metadata_update(
+            &mut metadata,
+            &mut reactions,
+            YoutubeMetadataUpdate {
+                platform: Platform::Youtube,
+                channel: "video-id".to_string(),
+                reactions_delta: Some(7),
+                ..YoutubeMetadataUpdate::default()
+            },
+            &config,
+        );
+
+        let snapshot = build_snapshot(0, 0, reactions, &HashMap::new(), &metadata, &config);
+
+        assert_eq!(reactions, 7);
+        assert_eq!(metadata.len(), 1);
+        assert_eq!(snapshot.reactions, 7);
+        assert!(snapshot.reactions_available);
+        assert_eq!(snapshot.viewers, 123);
+        assert_eq!(snapshot.likes, 45);
+        assert_eq!(snapshot.channel_titles.len(), 1);
+        assert_eq!(snapshot.channel_titles[0].identifier, "@example");
+        assert_eq!(snapshot.channel_status.len(), 1);
+        assert_eq!(snapshot.channel_status[0].viewers, Some(123));
     }
 
     fn config_with_youtube(identifier: &str) -> AppConfig {

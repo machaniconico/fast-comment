@@ -395,7 +395,7 @@
   }
 
   function defaultGoals(): GoalsConfig {
-    return { enabled: false, showInApp: false, comments: 0, viewers: 0, likes: 0 };
+    return { enabled: false, showInApp: false, comments: 0, viewers: 0, likes: 0, reactions: 0 };
   }
 
   function normalizeGoalsConfig() {
@@ -407,6 +407,7 @@
     editable.goals.comments = clampInt(editable.goals.comments, 0, 0, 4294967295);
     editable.goals.viewers = clampInt(editable.goals.viewers, 0, 0, 4294967295);
     editable.goals.likes = clampInt(editable.goals.likes, 0, 0, 4294967295);
+    editable.goals.reactions = clampInt(editable.goals.reactions, 0, 0, 4294967295);
   }
 
   function defaultTimer(): TimerConfig {
@@ -1365,6 +1366,19 @@
       />
       <span class="hint-inline">（0で非表示）</span>
     </div>
+    <div class="field-row">
+      <label for="goals-reactions">リアクション</label>
+      <input
+        id="goals-reactions"
+        type="number"
+        min="0"
+        max="4294967295"
+        step="1"
+        bind:value={config.goals.reactions}
+        class="num-input"
+      />
+      <span class="hint-inline">（0で非表示）</span>
+    </div>
     <div class="obs-label">GoalsオーバーレイURL</div>
     <div class="obs-row">
       <input type="text" value={goalsObsUrl} readonly class="obs-input" />
@@ -1372,7 +1386,7 @@
         {copiedGoalsObs ? 'コピー済' : 'コピー'}
       </button>
     </div>
-    <p class="hint">コメント・視聴者・高評価の目標ゲージをOBSに表示します。</p>
+    <p class="hint">コメント・視聴者・高評価・リアクションの目標ゲージをOBSに表示します。高評価とリアクションはYouTubeのみです。</p>
   </section>
 
   <!-- ── Timer ── -->

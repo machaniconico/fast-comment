@@ -34,6 +34,12 @@ const KEY_CONTINUATIONS_PATH: &str = "continuationsPath";
 /// continuations[] の入れ子 continuationData キー群(改行区切りで複数指定可)。
 /// 既定は下記 `DEFAULT_CONTINUATION_DATA_KEYS`。
 const KEY_CONTINUATION_DATA_KEYS: &str = "continuationDataKeys";
+/// 絵文字リアクション mutation 配列までの探索パス(`>` 区切りのキー列)。
+/// 既定 `frameworkUpdates>entityBatchUpdate>mutations`。
+const KEY_REACTION_MUTATIONS_PATH: &str = "reactionMutationsPath";
+/// mutation 配下の reactionBuckets 配列までの探索パス(`>` 区切りのキー列)。
+/// 既定 `payload>emojiFountainDataEntity>reactionBuckets`。
+const KEY_REACTION_BUCKET_PATH: &str = "reactionBucketPath";
 
 const DEFAULT_ACTIONS_PATH: &[&str] =
     &["continuationContents", "liveChatContinuation", "actions"];
@@ -46,6 +52,10 @@ const DEFAULT_CONTINUATION_DATA_KEYS: &[&str] = &[
     "liveChatReplayContinuationData",
     "playerSeekContinuationData",
 ];
+const DEFAULT_REACTION_MUTATIONS_PATH: &[&str] =
+    &["frameworkUpdates", "entityBatchUpdate", "mutations"];
+const DEFAULT_REACTION_BUCKET_PATH: &[&str] =
+    &["payload", "emojiFountainDataEntity", "reactionBuckets"];
 
 /// `paths` のキー値(`>` 区切り)をキー列へ分割。欠落/空なら `default` を返す。
 fn split_path<'a>(
@@ -150,6 +160,75 @@ pub fn next_continuation(resp: &Value, paths: &HashMap<String, String>) -> (Opti
     }
 
     (None, None)
+}
+
+/// レスポンス1回分に含まれる YouTube 絵文字リアクション増分を合算する。
+///
+/// InnerTube の `frameworkUpdates.entityBatchUpdate.mutations[]` から
+/// `payload.emojiFountainDataEntity.reactionBuckets[]` を辿る。bucket 内は
+/// `reactions[].value` を優先し、`reactions` が無い/空のときだけ
+/// `reactionsData[].reactionCount` にフォールバックする。
+/// 探索パスは `paths` の `reactionMutationsPath` / `reactionBucketPath` で差し替え可能。
+pub fn extract_reactions_delta(resp: &Value, paths: &HashMap<String, String>) -> u32 {
+    let mutations_path = split_path(
+        paths,
+        KEY_REACTION_MUTATIONS_PATH,
+        DEFAULT_REACTION_MUTATIONS_PATH,
+    );
+    let bucket_path = split_path(paths, KEY_REACTION_BUCKET_PATH, DEFAULT_REACTION_BUCKET_PATH);
+    let Some(mutations) = dig_keys(resp, &mutations_path).and_then(|v| v.as_array()) else {
+        return 0;
+    };
+
+    let mut total = 0u32;
+    for mutation in mutations {
+        let Some(buckets) = dig_keys(mutation, &bucket_path).and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for bucket in buckets {
+            total = total.saturating_add(sum_reaction_bucket(bucket));
+        }
+    }
+
+    total
+}
+
+fn sum_reaction_bucket(bucket: &Value) -> u32 {
+    if let Some(reactions) = bucket
+        .get("reactions")
+        .and_then(|v| v.as_array())
+        .filter(|arr| !arr.is_empty())
+    {
+        return reactions.iter().fold(0u32, |acc, reaction| {
+            acc.saturating_add(
+                reaction
+                    .get("value")
+                    .and_then(|v| v.as_u64())
+                    .map(saturating_u32)
+                    .unwrap_or(0),
+            )
+        });
+    }
+
+    bucket
+        .get("reactionsData")
+        .and_then(|v| v.as_array())
+        .map(|reactions| {
+            reactions.iter().fold(0u32, |acc, reaction| {
+                acc.saturating_add(
+                    reaction
+                        .get("reactionCount")
+                        .and_then(|v| v.as_u64())
+                        .map(saturating_u32)
+                        .unwrap_or(0),
+                )
+            })
+        })
+        .unwrap_or(0)
+}
+
+fn saturating_u32(value: u64) -> u32 {
+    value.min(u64::from(u32::MAX)) as u32
 }
 
 /// このアクションが `addChatItemAction`(本来パースすべき種類)かどうか。
@@ -635,7 +714,10 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{dig, extract_actions, parse_action, parse_runs, split_currency_value, Seg};
+    use super::{
+        dig, extract_actions, extract_reactions_delta, parse_action, parse_runs,
+        split_currency_value, Seg,
+    };
     use crate::model::{Fragment, MessageKind};
 
     #[test]
@@ -802,6 +884,175 @@ mod tests {
         assert_eq!(membership.kind, MessageKind::Membership);
         assert_eq!(membership.plain_text(), "メンバーになりました");
         assert!(membership.amount.is_none());
+    }
+
+    #[test]
+    fn extract_reactions_delta_sums_reactions_values() {
+        let payload = json!({
+            "frameworkUpdates": {
+                "entityBatchUpdate": {
+                    "mutations": [
+                        {
+                            "payload": {
+                                "emojiFountainDataEntity": {
+                                    "reactionBuckets": [
+                                        {
+                                            "reactions": [
+                                                { "key": "😂", "value": 3 },
+                                                { "key": "❤", "value": 4 }
+                                            ]
+                                        },
+                                        {
+                                            "reactions": [
+                                                { "key": "👍", "value": 5 }
+                                            ]
+                                        }
+                                    ]
+                                }
+                            }
+                        }
+                    ]
+                }
+            }
+        });
+        let paths: HashMap<String, String> = HashMap::new();
+
+        assert_eq!(extract_reactions_delta(&payload, &paths), 12);
+    }
+
+    #[test]
+    fn extract_reactions_delta_uses_reactions_data_when_reactions_missing_or_empty() {
+        let payload = json!({
+            "frameworkUpdates": {
+                "entityBatchUpdate": {
+                    "mutations": [
+                        {
+                            "payload": {
+                                "emojiFountainDataEntity": {
+                                    "reactionBuckets": [
+                                        {
+                                            "reactionsData": [
+                                                { "unicodeEmojiId": "😂", "reactionCount": 6 }
+                                            ]
+                                        },
+                                        {
+                                            "reactions": [],
+                                            "reactionsData": [
+                                                { "unicodeEmojiId": "❤", "reactionCount": 7 },
+                                                { "unicodeEmojiId": "👍", "reactionCount": 8 }
+                                            ]
+                                        }
+                                    ]
+                                }
+                            }
+                        }
+                    ]
+                }
+            }
+        });
+        let paths: HashMap<String, String> = HashMap::new();
+
+        assert_eq!(extract_reactions_delta(&payload, &paths), 21);
+    }
+
+    #[test]
+    fn extract_reactions_delta_returns_zero_when_missing() {
+        let payload = json!({
+            "continuationContents": {
+                "liveChatContinuation": {
+                    "actions": []
+                }
+            }
+        });
+        let paths: HashMap<String, String> = HashMap::new();
+
+        assert_eq!(extract_reactions_delta(&payload, &paths), 0);
+    }
+
+    #[test]
+    fn extract_reactions_delta_handles_mixed_formats_and_overrides() {
+        let payload = json!({
+            "custom": {
+                "updates": [
+                    {
+                        "data": {
+                            "buckets": [
+                                {
+                                    "reactions": [
+                                        { "key": "😂", "value": 2 }
+                                    ],
+                                    "reactionsData": [
+                                        { "unicodeEmojiId": "😂", "reactionCount": 999 }
+                                    ]
+                                },
+                                {
+                                    "reactions": [],
+                                    "reactionsData": [
+                                        { "unicodeEmojiId": "❤", "reactionCount": 3 }
+                                    ]
+                                }
+                            ]
+                        }
+                    },
+                    {
+                        "data": {
+                            "buckets": [
+                                {
+                                    "reactions": [
+                                        { "key": "👍", "value": 4 }
+                                    ]
+                                },
+                                {
+                                    "reactionsData": [
+                                        { "unicodeEmojiId": "🎉", "reactionCount": 5 }
+                                    ]
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        });
+        let mut paths = HashMap::new();
+        paths.insert(
+            "reactionMutationsPath".to_string(),
+            "custom>updates".to_string(),
+        );
+        paths.insert("reactionBucketPath".to_string(), "data>buckets".to_string());
+
+        assert_eq!(extract_reactions_delta(&payload, &paths), 14);
+    }
+
+    #[test]
+    fn extract_reactions_delta_saturates_large_values() {
+        let payload = json!({
+            "frameworkUpdates": {
+                "entityBatchUpdate": {
+                    "mutations": [
+                        {
+                            "payload": {
+                                "emojiFountainDataEntity": {
+                                    "reactionBuckets": [
+                                        {
+                                            "reactions": [
+                                                {
+                                                    "key": "😂",
+                                                    "value": u64::from(u32::MAX) + 10
+                                                },
+                                                { "key": "❤", "value": 1 }
+                                            ]
+                                        }
+                                    ]
+                                }
+                            }
+                        }
+                    ]
+                }
+            }
+        });
+        let paths: HashMap<String, String> = HashMap::new();
+
+        assert_eq!(extract_reactions_delta(&payload, &paths), u32::MAX);
     }
 
     #[test]
