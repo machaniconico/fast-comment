@@ -4,6 +4,7 @@ const goalsRoot = document.getElementById('goals');
 
 const METRICS = [
   { key: 'likes', label: 'LIKES', className: 'likes' },
+  { key: 'reactions', label: 'REACTIONS', className: 'reactions' },
   { key: 'comments', label: 'COMMENTS', className: 'comments' },
   { key: 'viewers', label: 'VIEWERS', className: 'viewers' },
 ];
@@ -91,6 +92,7 @@ function render(snapshot) {
   for (const metric of METRICS) {
     if (only.size > 0 && !only.has(metric.key)) continue;
     if (metric.key === 'likes' && snapshot.likesAvailable === false) continue;
+    if (metric.key === 'reactions' && snapshot.reactionsAvailable === false) continue;
 
     const target = toCount(goals[metric.key]);
     if (target === 0) continue;

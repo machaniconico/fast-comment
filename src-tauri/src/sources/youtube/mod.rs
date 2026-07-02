@@ -11,14 +11,15 @@ pub mod live_resolve;
 pub mod metadata;
 pub mod parser;
 
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use std::time::{Duration, Instant};
 
 use super::{Backoff, Source};
 use crate::config::YoutubeOverrides;
-use crate::model::ChatMessage;
+use crate::model::{ChatMessage, Platform};
+use crate::stats::YoutubeMetadataUpdate;
 
 use innertube::InnerTubeClient;
 
@@ -27,13 +28,19 @@ pub struct YoutubeSource {
     /// videoId もしくは配信URL(URL からは videoId を抽出する)。
     video_input: String,
     overrides: YoutubeOverrides,
+    metadata_tx: Option<mpsc::Sender<YoutubeMetadataUpdate>>,
 }
 
 impl YoutubeSource {
-    pub fn new(video_input: String, overrides: YoutubeOverrides) -> Self {
+    pub fn new(
+        video_input: String,
+        overrides: YoutubeOverrides,
+        metadata_tx: Option<mpsc::Sender<YoutubeMetadataUpdate>>,
+    ) -> Self {
         YoutubeSource {
             video_input,
             overrides,
+            metadata_tx,
         }
     }
 
@@ -135,6 +142,17 @@ impl YoutubeSource {
             // 寛容パース。actions を ChatMessage 群へ。
             // 抽出パスは overrides.paths で差し替え可能(欠落時は既定)。
             let actions = parser::extract_actions(&resp, &self.overrides.paths);
+            let reactions_delta = parser::extract_reactions_delta(&resp, &self.overrides.paths);
+            if reactions_delta > 0 {
+                if let Some(metadata_tx) = &self.metadata_tx {
+                    let _ = metadata_tx.try_send(YoutubeMetadataUpdate {
+                        platform: Platform::Youtube,
+                        channel: video_id.to_string(),
+                        reactions_delta: Some(reactions_delta),
+                        ..YoutubeMetadataUpdate::default()
+                    });
+                }
+            }
             for action in &actions {
                 if let Some(mut msg) = parser::parse_action(action, video_id) {
                     received_message = true;

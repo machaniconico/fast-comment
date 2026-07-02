@@ -11,11 +11,12 @@ pub mod youtube;
 
 use std::time::Duration;
 
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{ChannelConfig, ChannelPlatform};
 use crate::model::ChatMessage;
+use crate::stats::YoutubeMetadataUpdate;
 
 /// 接続元の共通インタフェース。
 ///
@@ -90,6 +91,7 @@ impl Default for Backoff {
 /// `cancel` 一括で全 Source を停止できる。
 pub struct SourceManager {
     tx: broadcast::Sender<ChatMessage>,
+    metadata_tx: Option<mpsc::Sender<YoutubeMetadataUpdate>>,
     /// YouTube overrides 等を渡すための設定スナップショット。
     youtube_overrides: crate::config::YoutubeOverrides,
 }
@@ -98,9 +100,11 @@ impl SourceManager {
     pub fn new(
         tx: broadcast::Sender<ChatMessage>,
         youtube_overrides: crate::config::YoutubeOverrides,
+        metadata_tx: Option<mpsc::Sender<YoutubeMetadataUpdate>>,
     ) -> Self {
         SourceManager {
             tx,
+            metadata_tx,
             youtube_overrides,
         }
     }
@@ -118,6 +122,7 @@ impl SourceManager {
         let child = cancel.clone();
         let identifier = ch.identifier.clone();
         let overrides = self.youtube_overrides.clone();
+        let metadata_tx = self.metadata_tx.clone();
 
         match ch.platform {
             ChannelPlatform::Twitch => {
@@ -127,7 +132,7 @@ impl SourceManager {
                 });
             }
             ChannelPlatform::Youtube => {
-                let src = youtube::YoutubeSource::new(identifier, overrides);
+                let src = youtube::YoutubeSource::new(identifier, overrides, metadata_tx);
                 tauri::async_runtime::spawn(async move {
                     run_with_logging(&src, tx, child).await;
                 });

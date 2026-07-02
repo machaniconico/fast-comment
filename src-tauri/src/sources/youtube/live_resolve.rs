@@ -115,7 +115,7 @@ pub fn spawn_live_resolve_poller(
             }
         };
 
-        let manager = SourceManager::new(source_tx, overrides.clone());
+        let manager = SourceManager::new(source_tx, overrides.clone(), Some(metadata_tx.clone()));
         let mut active_video_id: Option<String> = None;
         let mut active_cancel: Option<CancellationToken> = None;
         let mut live_state: Option<bool> = None;
@@ -215,6 +215,7 @@ async fn send_live_status(
         likes: None,
         title: None,
         live: Some(live),
+        reactions_delta: None,
     };
     tokio::select! {
         _ = cancel.cancelled() => false,

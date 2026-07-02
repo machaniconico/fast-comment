@@ -24,6 +24,7 @@
 
   const METRICS: Metric[] = [
     { key: 'likes', label: 'LIKES', className: 'likes' },
+    { key: 'reactions', label: 'REACTIONS', className: 'reactions' },
     { key: 'comments', label: 'COMMENTS', className: 'comments' },
     { key: 'viewers', label: 'VIEWERS', className: 'viewers' },
   ];
@@ -40,11 +41,12 @@
   const cards = $derived.by((): GoalCard[] => {
     if (!snapshot) return [];
 
-    const goals = snapshot.goals ?? { comments: 0, viewers: 0, likes: 0 };
+    const goals = snapshot.goals ?? { comments: 0, viewers: 0, likes: 0, reactions: 0 };
     const nextCards: GoalCard[] = [];
 
     for (const metric of METRICS) {
       if (metric.key === 'likes' && snapshot.likesAvailable === false) continue;
+      if (metric.key === 'reactions' && snapshot.reactionsAvailable === false) continue;
 
       const target = toCount(goals[metric.key]);
       if (target === 0) continue;
@@ -242,6 +244,7 @@
   }
 
   .likes .goal-fill { background: #f6c453; }
+  .reactions .goal-fill { background: #ff8a8a; }
   .comments .goal-fill { background: #58a6ff; }
   .viewers .goal-fill { background: #56d364; }
 
