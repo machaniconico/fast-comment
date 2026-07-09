@@ -23,6 +23,12 @@ use crate::stats::YoutubeMetadataUpdate;
 
 use innertube::InnerTubeClient;
 
+const ACTIVE_POLL_MIN_MS: u64 = 700;
+const ACTIVE_POLL_MAX_MS: u64 = 1500;
+const QUIET_POLL_MIN_MS: u64 = 1000;
+const QUIET_POLL_MAX_MS: u64 = 10_000;
+const DEFAULT_POLL_MS: u64 = 1000;
+
 /// YouTube ライブ1配信を購読する Source。
 pub struct YoutubeSource {
     /// videoId もしくは配信URL(URL からは videoId を抽出する)。
@@ -143,6 +149,7 @@ impl YoutubeSource {
             // 抽出パスは overrides.paths で差し替え可能(欠落時は既定)。
             let actions = parser::extract_actions(&resp, &self.overrides.paths);
             let reactions_delta = parser::extract_reactions_delta(&resp, &self.overrides.paths);
+            let had_activity = !actions.is_empty() || reactions_delta > 0;
             if reactions_delta > 0 {
                 if let Some(metadata_tx) = &self.metadata_tx {
                     let _ = metadata_tx.try_send(YoutubeMetadataUpdate {
@@ -172,6 +179,10 @@ impl YoutubeSource {
                 Some(c) if !c.is_empty() => session.continuation = c,
                 _ => {
                     // 次が取れない=ライブ終了等。セッションを閉じる。
+                    tracing::debug!(
+                        "youtube:{video_id} continuation なし (actions={}, reactions_delta={reactions_delta})",
+                        actions.len()
+                    );
                     return Ok(session_made_progress(received_message, session_started));
                 }
             }
@@ -179,9 +190,10 @@ impl YoutubeSource {
 
             // YouTube の timeoutMs はライブチャットだと数秒〜10秒と長めで、その間に届いた
             // コメントが次ポールまでバッファされ「まとめてドサッと表示」=遅延に感じる。
-            // 低遅延重視(SPEC: わんコメより低遅延)のため上限を短く抑えてこまめに取得する。
-            // 下限はレート制限/空ポール回避のため 700ms。欠落時の既定も 1000ms。
-            let wait = timeout_ms.unwrap_or(1000).clamp(700, 1500);
+            // ただしコメントが無い静かな時間帯まで 1.5 秒で叩き続けると、長時間配信で
+            // continuation 枯れ/レート制限を踏みやすい。活動があった直後だけ短い上限にし、
+            // 空ポール時は YouTube の指示に寄せて接続を長持ちさせる。
+            let wait = poll_wait_ms(timeout_ms, had_activity);
             tokio::select! {
                 _ = cancel.cancelled() => {
                     return Ok(session_made_progress(received_message, session_started));
@@ -195,6 +207,15 @@ impl YoutubeSource {
 fn session_made_progress(received_message: bool, started_at: Instant) -> bool {
     const MEANINGFUL_SESSION_SECS: u64 = 30;
     received_message || started_at.elapsed() >= Duration::from_secs(MEANINGFUL_SESSION_SECS)
+}
+
+fn poll_wait_ms(timeout_ms: Option<u64>, had_activity: bool) -> u64 {
+    let timeout_ms = timeout_ms.unwrap_or(DEFAULT_POLL_MS);
+    if had_activity {
+        timeout_ms.clamp(ACTIVE_POLL_MIN_MS, ACTIVE_POLL_MAX_MS)
+    } else {
+        timeout_ms.clamp(QUIET_POLL_MIN_MS, QUIET_POLL_MAX_MS)
+    }
 }
 
 /// 配信URL もしくは生の videoId から videoId を抽出する。
@@ -271,5 +292,20 @@ mod tests {
         assert!(is_channel_identifier(
             "https://www.youtube.com/channel/UC1234567890123456789012/live"
         ));
+    }
+
+    #[test]
+    fn poll_wait_keeps_low_latency_after_activity() {
+        assert_eq!(poll_wait_ms(Some(500), true), 700);
+        assert_eq!(poll_wait_ms(Some(1200), true), 1200);
+        assert_eq!(poll_wait_ms(Some(10_000), true), 1500);
+    }
+
+    #[test]
+    fn poll_wait_respects_longer_timeout_when_quiet() {
+        assert_eq!(poll_wait_ms(None, false), 1000);
+        assert_eq!(poll_wait_ms(Some(500), false), 1000);
+        assert_eq!(poll_wait_ms(Some(5000), false), 5000);
+        assert_eq!(poll_wait_ms(Some(30_000), false), 10_000);
     }
 }

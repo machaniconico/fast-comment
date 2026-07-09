@@ -21,6 +21,7 @@ use super::{extract_video_id, is_video_id};
 const USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
 const POLL_INTERVAL: Duration = Duration::from_secs(20);
+const LIVE_RESOLVE_MISS_LIMIT: u8 = 3;
 
 const KEY_PLAYER_RESPONSE_MARKERS: &str = "liveResolvePlayerResponseMarkers";
 const KEY_INITIAL_DATA_MARKERS: &str = "liveResolveInitialDataMarkers";
@@ -119,6 +120,7 @@ pub fn spawn_live_resolve_poller(
         let mut active_video_id: Option<String> = None;
         let mut active_cancel: Option<CancellationToken> = None;
         let mut live_state: Option<bool> = None;
+        let mut consecutive_unresolved: u8 = 0;
 
         loop {
             if cancel.is_cancelled() {
@@ -133,6 +135,7 @@ pub fn spawn_live_resolve_poller(
             };
             match resolved {
                 Ok(Some(video_id)) if is_video_id(&video_id) => {
+                    consecutive_unresolved = 0;
                     if active_video_id.as_deref() != Some(video_id.as_str()) {
                         if let Some(child) = active_cancel.take() {
                             child.cancel();
@@ -151,9 +154,7 @@ pub fn spawn_live_resolve_poller(
                             metadata_tx.clone(),
                             child.clone(),
                         );
-                        tracing::info!(
-                            "youtube:{identifier} live videoId 解決: {video_id} を接続"
-                        );
+                        tracing::info!("youtube:{identifier} live videoId 解決: {video_id} を接続");
                         active_video_id = Some(video_id);
                         active_cancel = Some(child);
                     }
@@ -165,26 +166,38 @@ pub fn spawn_live_resolve_poller(
                     }
                 }
                 Ok(Some(video_id)) => {
+                    consecutive_unresolved = 0;
                     tracing::debug!(
                         "youtube:{identifier} live resolve が不正な videoId を返した: {video_id}"
                     );
                 }
                 Ok(None) => {
-                    if let Some(child) = active_cancel.take() {
-                        tracing::info!(
-                            "youtube:{identifier} live videoId 未解決につき子接続を停止"
-                        );
-                        child.cancel();
-                    }
-                    active_video_id = None;
-                    if live_state != Some(false) {
-                        if !send_live_status(&metadata_tx, &identifier, false, &cancel).await {
-                            break;
+                    consecutive_unresolved = consecutive_unresolved.saturating_add(1);
+                    let has_active_child = active_cancel.is_some();
+                    if live_resolve_none_confirms_offline(has_active_child, consecutive_unresolved)
+                    {
+                        if let Some(child) = active_cancel.take() {
+                            tracing::info!(
+                                "youtube:{identifier} live videoId 未解決が続いたため子接続を停止 ({consecutive_unresolved}回)"
+                            );
+                            child.cancel();
                         }
-                        live_state = Some(false);
+                        active_video_id = None;
+                        if live_state != Some(false) {
+                            if !send_live_status(&metadata_tx, &identifier, false, &cancel).await {
+                                break;
+                            }
+                            live_state = Some(false);
+                        }
+                    } else {
+                        tracing::debug!(
+                            "youtube:{identifier} live videoId 未解決 ({consecutive_unresolved}/{LIVE_RESOLVE_MISS_LIMIT})。active={:?} は継続",
+                            active_video_id
+                        );
                     }
                 }
                 Err(e) => {
+                    consecutive_unresolved = 0;
                     tracing::debug!("youtube:{identifier} live resolve 取得失敗: {e:#}");
                 }
             }
@@ -200,6 +213,10 @@ pub fn spawn_live_resolve_poller(
         }
         tracing::info!("youtube:{identifier} live resolve poller 終了");
     });
+}
+
+fn live_resolve_none_confirms_offline(has_active_child: bool, consecutive_misses: u8) -> bool {
+    !has_active_child || consecutive_misses >= LIVE_RESOLVE_MISS_LIMIT
 }
 
 async fn send_live_status(
@@ -276,7 +293,11 @@ fn extract_from_json_roots(html: &str, paths: &HashMap<String, String>) -> Optio
             roots.push(value);
         }
     }
-    for marker in split_lines(paths, KEY_INITIAL_DATA_MARKERS, DEFAULT_INITIAL_DATA_MARKERS) {
+    for marker in split_lines(
+        paths,
+        KEY_INITIAL_DATA_MARKERS,
+        DEFAULT_INITIAL_DATA_MARKERS,
+    ) {
         if let Some(value) = extract_json_value_after_marker(html, marker) {
             roots.push(value);
         }
@@ -743,5 +764,17 @@ mod tests {
 
         let html = r#"{"isLiveContent":false,"videoId":"dQw4w9WgXcQ"}"#;
         assert_eq!(extract_live_video_id_from_html(html, &empty_paths()), None);
+    }
+
+    #[test]
+    fn unresolved_live_resolve_is_offline_when_no_active_child() {
+        assert!(live_resolve_none_confirms_offline(false, 1));
+    }
+
+    #[test]
+    fn unresolved_live_resolve_needs_consecutive_misses_with_active_child() {
+        assert!(!live_resolve_none_confirms_offline(true, 1));
+        assert!(!live_resolve_none_confirms_offline(true, 2));
+        assert!(live_resolve_none_confirms_offline(true, 3));
     }
 }
