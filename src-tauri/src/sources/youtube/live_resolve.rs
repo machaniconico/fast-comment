@@ -233,6 +233,7 @@ async fn send_live_status(
         title: None,
         live: Some(live),
         reactions_delta: None,
+        full_snapshot: false,
     };
     tokio::select! {
         _ = cancel.cancelled() => false,

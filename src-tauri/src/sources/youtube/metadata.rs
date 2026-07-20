@@ -19,7 +19,7 @@ use super::extract_video_id;
 
 const USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
-const POLL_INTERVAL: Duration = Duration::from_secs(20);
+const POLL_INTERVAL: Duration = Duration::from_secs(10);
 
 const KEY_PLAYER_RESPONSE_MARKERS: &str = "metadataPlayerResponseMarkers";
 const KEY_INITIAL_DATA_MARKERS: &str = "metadataInitialDataMarkers";
@@ -70,6 +70,8 @@ pub fn spawn_metadata_poller(
         let http = match Client::builder()
             .user_agent(USER_AGENT)
             .gzip(true)
+            .timeout(Duration::from_secs(8))
+            .connect_timeout(Duration::from_secs(5))
             .build()
         {
             Ok(client) => client,
@@ -87,24 +89,17 @@ pub fn spawn_metadata_poller(
 
             match fetch_metadata(&http, &video_id, &overrides.paths).await {
                 Ok(values) => {
-                    if values.concurrent_viewers.is_some() {
-                        last.concurrent_viewers = values.concurrent_viewers;
-                    }
-                    if values.likes.is_some() {
-                        last.likes = values.likes;
-                    }
-                    if values.title.is_some() {
-                        last.title = values.title;
-                    }
+                    let values = metadata_values_for_update(&mut last, values);
 
                     let update = YoutubeMetadataUpdate {
                         platform: Platform::Youtube,
                         channel: status_channel.clone(),
-                        concurrent_viewers: last.concurrent_viewers,
-                        likes: last.likes,
-                        title: last.title.clone(),
+                        concurrent_viewers: values.concurrent_viewers,
+                        likes: values.likes,
+                        title: values.title,
                         live: None,
                         reactions_delta: None,
+                        full_snapshot: true,
                     };
                     tokio::select! {
                         _ = cancel.cancelled() => break,
@@ -127,6 +122,22 @@ pub fn spawn_metadata_poller(
         }
         tracing::info!("youtube:{video_id} metadata poller 終了");
     });
+}
+
+fn metadata_values_for_update(
+    last: &mut MetadataValues,
+    current: MetadataValues,
+) -> MetadataValues {
+    // 同時接続はリアルタイム値なので、現レスポンスで欠落した値を前回値で
+    // 埋めない。高評価とタイトルは変化が緩く、部分的な抽出失敗時も保持する。
+    last.concurrent_viewers = current.concurrent_viewers;
+    if current.likes.is_some() {
+        last.likes = current.likes;
+    }
+    if current.title.is_some() {
+        last.title = current.title;
+    }
+    last.clone()
 }
 
 async fn fetch_metadata(
@@ -529,6 +540,26 @@ mod tests {
         assert_eq!(parse_count_text("1,234"), Some(1234));
         assert_eq!(parse_count_text("1.2K likes"), Some(1200));
         assert_eq!(parse_count_text("2.5万"), Some(25_000));
+    }
+
+    #[test]
+    fn metadata_poll_interval_limits_viewer_count_staleness() {
+        assert!(POLL_INTERVAL <= Duration::from_secs(10));
+    }
+
+    #[test]
+    fn missing_current_viewer_count_does_not_reuse_stale_value() {
+        let mut last = MetadataValues {
+            concurrent_viewers: Some(123),
+            likes: Some(45),
+            title: Some("Live title".to_string()),
+        };
+
+        let update = metadata_values_for_update(&mut last, MetadataValues::default());
+
+        assert_eq!(update.concurrent_viewers, None);
+        assert_eq!(update.likes, Some(45));
+        assert_eq!(update.title.as_deref(), Some("Live title"));
     }
 
     #[test]

@@ -26,7 +26,7 @@ use innertube::InnerTubeClient;
 const ACTIVE_POLL_MIN_MS: u64 = 700;
 const ACTIVE_POLL_MAX_MS: u64 = 1500;
 const QUIET_POLL_MIN_MS: u64 = 1000;
-const QUIET_POLL_MAX_MS: u64 = 10_000;
+const QUIET_POLL_MAX_MS: u64 = 1500;
 const DEFAULT_POLL_MS: u64 = 1000;
 
 /// YouTube ライブ1配信を購読する Source。
@@ -190,9 +190,9 @@ impl YoutubeSource {
 
             // YouTube の timeoutMs はライブチャットだと数秒〜10秒と長めで、その間に届いた
             // コメントが次ポールまでバッファされ「まとめてドサッと表示」=遅延に感じる。
-            // ただしコメントが無い静かな時間帯まで 1.5 秒で叩き続けると、長時間配信で
-            // continuation 枯れ/レート制限を踏みやすい。活動があった直後だけ短い上限にし、
-            // 空ポール時は YouTube の指示に寄せて接続を長持ちさせる。
+            // 静かな時間帯も長い timeoutMs をそのまま使うと、待機中に投稿されたコメントが
+            // 次ポールまで最大10秒滞留する。低遅延を優先して上限1.5秒を維持しつつ、
+            // 空ポール時の下限だけ1秒にして過剰な連打を避ける。
             let wait = poll_wait_ms(timeout_ms, had_activity);
             tokio::select! {
                 _ = cancel.cancelled() => {
@@ -302,10 +302,10 @@ mod tests {
     }
 
     #[test]
-    fn poll_wait_respects_longer_timeout_when_quiet() {
+    fn poll_wait_caps_quiet_streams_for_low_latency() {
         assert_eq!(poll_wait_ms(None, false), 1000);
         assert_eq!(poll_wait_ms(Some(500), false), 1000);
-        assert_eq!(poll_wait_ms(Some(5000), false), 5000);
-        assert_eq!(poll_wait_ms(Some(30_000), false), 10_000);
+        assert_eq!(poll_wait_ms(Some(5000), false), 1500);
+        assert_eq!(poll_wait_ms(Some(30_000), false), 1500);
     }
 }

@@ -100,6 +100,8 @@ pub struct YoutubeMetadataUpdate {
     pub title: Option<String>,
     pub live: Option<bool>,
     pub reactions_delta: Option<u32>,
+    /// `None` を「取得値なし」として反映する完全なメタデータスナップショットか。
+    pub full_snapshot: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -122,6 +124,7 @@ impl Default for YoutubeMetadataUpdate {
             title: None,
             live: None,
             reactions_delta: None,
+            full_snapshot: false,
         }
     }
 }
@@ -132,6 +135,7 @@ impl YoutubeMetadataUpdate {
             || self.likes.is_some()
             || self.title.is_some()
             || self.live.is_some()
+            || self.full_snapshot
     }
 }
 
@@ -487,12 +491,10 @@ fn goals_from_config(config: &AppConfig) -> GoalsSnapshot {
     }
 }
 
-fn resolve_viewers(concurrent_total: u32, unique_count: u32) -> u32 {
-    if concurrent_total > 0 {
-        concurrent_total
-    } else {
-        unique_count
-    }
+fn resolve_viewers(concurrent_total: u32, _unique_count: u32) -> u32 {
+    // UI/OBS ではこの値を「同時接続」と表示するため、取得不能・0人時に
+    // セッション累積のユニークコメント投稿者数へ置き換えない。
+    concurrent_total
 }
 
 /// ゲージ進捗率。UI 側は 100% を超えた値を強調表示できる。
@@ -545,9 +547,42 @@ mod tests {
     }
 
     #[test]
-    fn viewers_prefer_concurrent_when_available() {
+    fn viewers_use_only_concurrent_count() {
         assert_eq!(resolve_viewers(42, 7), 42);
-        assert_eq!(resolve_viewers(0, 7), 7);
+        assert_eq!(resolve_viewers(0, 7), 0);
+    }
+
+    #[test]
+    fn full_metadata_snapshot_clears_missing_viewer_count() {
+        let config = config_with_youtube("@example");
+        let mut metadata = HashMap::new();
+        let mut reactions = 0;
+        apply_metadata_update(
+            &mut metadata,
+            &mut reactions,
+            YoutubeMetadataUpdate {
+                channel: "@example".to_string(),
+                concurrent_viewers: Some(123),
+                full_snapshot: true,
+                ..YoutubeMetadataUpdate::default()
+            },
+            &config,
+        );
+        apply_metadata_update(
+            &mut metadata,
+            &mut reactions,
+            YoutubeMetadataUpdate {
+                channel: "@example".to_string(),
+                full_snapshot: true,
+                ..YoutubeMetadataUpdate::default()
+            },
+            &config,
+        );
+
+        let snapshot = build_snapshot(0, 0, 0, &HashMap::new(), &metadata, &config);
+
+        assert_eq!(snapshot.viewers, 0);
+        assert_eq!(snapshot.channel_status[0].viewers, None);
     }
 
     #[test]
@@ -666,6 +701,7 @@ mod tests {
                 title: Some("Live title".to_string()),
                 live: Some(true),
                 reactions_delta: None,
+                full_snapshot: true,
             },
         );
         merge_metadata_update(
@@ -739,6 +775,7 @@ mod tests {
                 title: Some("Live title".to_string()),
                 live: Some(true),
                 reactions_delta: None,
+                full_snapshot: true,
             },
             &config,
         );
