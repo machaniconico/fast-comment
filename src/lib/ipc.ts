@@ -8,7 +8,9 @@
  */
 
 import type { ChatMessage } from './types';
-import { getCurrentWindow } from '@tauri-apps/api/window';
+import { invoke as tauriInvoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
+import { getCurrentWindow, primaryMonitor } from '@tauri-apps/api/window';
 
 // ---- Tauri availability guard ----
 // @tauri-apps/api throws when window.__TAURI_INTERNALS__ is absent (browser dev).
@@ -66,7 +68,6 @@ export async function startChatListener(): Promise<() => void> {
     console.info('[ipc] Tauri not detected — running in browser-only mode');
     return () => {};
   }
-  const { listen } = await import('@tauri-apps/api/event');
   const unlisten = await listen<ChatMessage[]>('chat', (event) => {
     _pending.push(...event.payload);
     scheduleFlusher();
@@ -83,7 +84,6 @@ export async function startChatListener(): Promise<() => void> {
 export async function startTtsSpeakListener(): Promise<() => void> {
   if (!isTauri()) return () => {};
   if (typeof window === 'undefined' || !('speechSynthesis' in window)) return () => {};
-  const { listen } = await import('@tauri-apps/api/event');
   const unlisten = await listen<TtsSpeakPayload | string>('tts-speak', (event) => {
     const payload = typeof event.payload === 'string'
       ? { text: event.payload, rate: 1, pitch: 1, volume: 1, voice: '' }
@@ -114,7 +114,6 @@ export async function startTtsSpeakListener(): Promise<() => void> {
 export async function startTtsCancelListener(): Promise<() => void> {
   if (!isTauri()) return () => {};
   if (typeof window === 'undefined' || !('speechSynthesis' in window)) return () => {};
-  const { listen } = await import('@tauri-apps/api/event');
   const unlisten = await listen('tts-cancel', () => {
     try {
       window.speechSynthesis.cancel();
@@ -143,7 +142,6 @@ export interface TtsQueueState {
 
 export async function onTtsNotice(cb: (notice: TtsNotice) => void): Promise<() => void> {
   if (!isTauri()) return () => {};
-  const { listen } = await import('@tauri-apps/api/event');
   const unlisten = await listen<TtsNotice>('tts-notice', (event) => {
     cb(event.payload);
   });
@@ -152,7 +150,6 @@ export async function onTtsNotice(cb: (notice: TtsNotice) => void): Promise<() =
 
 export async function onTtsQueueState(cb: (state: TtsQueueState) => void): Promise<() => void> {
   if (!isTauri()) return () => {};
-  const { listen } = await import('@tauri-apps/api/event');
   const unlisten = await listen<TtsQueueState>('tts-queue-state', (event) => {
     cb(event.payload);
   });
@@ -165,7 +162,6 @@ export async function onTtsQueueState(cb: (state: TtsQueueState) => void): Promi
  */
 export async function onStats(cb: (snapshot: StatsSnapshot) => void): Promise<() => void> {
   if (!isTauri()) return () => {};
-  const { listen } = await import('@tauri-apps/api/event');
   const unlisten = await listen<StatsSnapshot>('stats', (event) => {
     cb(event.payload);
   });
@@ -198,7 +194,6 @@ function boundedNumber(value: unknown, fallback: number, min: number, max: numbe
 
 async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T | null> {
   if (!isTauri()) return null;
-  const { invoke: tauriInvoke } = await import('@tauri-apps/api/core');
   return tauriInvoke<T>(cmd, args);
 }
 
@@ -524,7 +519,6 @@ export async function openDanmakuOverlay(): Promise<void> {
   let x = 0;
   let y = 0;
   try {
-    const { primaryMonitor } = await import('@tauri-apps/api/window');
     const mon = await primaryMonitor();
     if (mon) {
       const sf = mon.scaleFactor || 1;

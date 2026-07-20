@@ -10,6 +10,8 @@
    * - 各コメントを右→左へ等速で流す。レーン(行)単位で重なりを避ける。
    */
   import { onMount, onDestroy } from 'svelte';
+  import { listen } from '@tauri-apps/api/event';
+  import { getCurrentWindow } from '@tauri-apps/api/window';
   import type { ChatMessage } from '../types';
   import { startChatListener, onChatBatch, offChatBatch } from '../ipc';
   import {
@@ -271,7 +273,6 @@
         typeof window !== 'undefined' &&
         !!(window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
       if (isTauri) {
-        const { getCurrentWindow } = await import('@tauri-apps/api/window');
         await getCurrentWindow().setIgnoreCursorEvents(true);
       }
     } catch (e) {
@@ -288,7 +289,6 @@
         typeof window !== 'undefined' &&
         !!(window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
       if (isTauri) {
-        const { listen } = await import('@tauri-apps/api/event');
         unlistenSettings = await listen<Partial<DanmakuSettings>>(DANMAKU_SETTINGS_EVENT, (e) => {
           settings = clampDanmakuSettings({ ...settings, ...(e.payload || {}) });
           recomputeLanes();

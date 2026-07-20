@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
+  import { TauriEvent } from '@tauri-apps/api/event';
   import type { Platform } from './lib/types';
   import CommentList from './lib/components/CommentList.svelte';
   import Dashboard from './lib/components/Dashboard.svelte';
@@ -244,10 +245,7 @@
 
   async function listenDanmakuDestroyed(): Promise<(() => void) | null> {
     if (!isTauri()) return null;
-    const [{ WebviewWindow }, { TauriEvent }] = await Promise.all([
-      import('@tauri-apps/api/webviewWindow'),
-      import('@tauri-apps/api/event'),
-    ]);
+    const { WebviewWindow } = await import('@tauri-apps/api/webviewWindow');
     const overlay = await WebviewWindow.getByLabel(DANMAKU_LABEL);
     if (!overlay) return null;
     return overlay.listen<null>(TauriEvent.WINDOW_DESTROYED, () => {

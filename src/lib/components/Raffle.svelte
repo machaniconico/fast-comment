@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte';
+  import { listen } from '@tauri-apps/api/event';
   import {
     clearParticipants,
     getParticipants,
@@ -41,7 +42,6 @@
       if (!current) return;
       participants = current;
 
-      const { listen } = await import('@tauri-apps/api/event');
       unlisten = await listen<Participant[]>('participants-updated', (event) => {
         participants = event.payload;
       });

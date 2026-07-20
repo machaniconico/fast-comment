@@ -222,9 +222,8 @@ REM --- Clean stale installers (prevents NSIS os error 5) -----------------
 REM If a previously built installer (or the installed app) is still open on a
 REM re-run, makensis / wix cannot overwrite the running exe and fails with
 REM "access denied (os error 5)". Remove old bundle outputs first; if removal
-REM fails, the installer/app is still open. (Auto-launching setup.exe after a
-REM build is now opt-in -- see FC_AUTORUN_SETUP near the end of this script --
-REM which is the main way to avoid leaving an installer holding the lock.)
+REM fails, the installer/app is still open. The setup exe launches after a
+REM successful build by default, so close it before the next rebuild.
 set "BUNDLE_DIR=src-tauri\target\release\bundle"
 if exist "%BUNDLE_DIR%\nsis\*-setup.exe" (
   del /q "%BUNDLE_DIR%\nsis\*-setup.exe" >nul 2>nul
@@ -266,25 +265,25 @@ echo.
 echo  The NSIS installer creates a desktop shortcut on install.
 echo.
 
-REM --- Auto-launch the NSIS installer (opt-in) -------------------------
-REM Auto-launching *-setup.exe leaves the installer holding a lock on the exe,
-REM which is the #1 cause of the NSIS "access denied (os error 5)" failure on
-REM the next rebuild. So it is OFF by default: we just open the output folder.
-REM Set FC_AUTORUN_SETUP=1 before running this script to auto-launch instead.
+REM --- Auto-launch the NSIS installer (default ON) ---------------------
+REM Set FC_AUTORUN_SETUP=0 before running this script to open the output folder
+REM without launching setup. Close setup before rebuilding to avoid os error 5.
 set "NSIS_DIR=src-tauri\target\release\bundle\nsis"
-if "%FC_AUTORUN_SETUP%"=="1" (
-  set "SETUP_EXE="
-  for %%F in ("%NSIS_DIR%\*-setup.exe") do set "SETUP_EXE=%%F"
-  if defined SETUP_EXE (
-    echo  Launching installer: %SETUP_EXE%
-    echo  ^(close the installer before the next rebuild to avoid os error 5^)
-    start "" "%SETUP_EXE%"
-    exit /b 0
-  )
-  echo [WARN] NSIS setup exe not found under %NSIS_DIR%.
-)
+if "%FC_AUTORUN_SETUP%"=="0" goto :open_bundle
+set "SETUP_EXE="
+for %%F in ("%NSIS_DIR%\*-setup.exe") do if exist "%%~fF" set "SETUP_EXE=%%~fF"
+if not defined SETUP_EXE goto :setup_missing
+echo  Launching installer: %SETUP_EXE%
+echo  ^(close the installer before the next rebuild to avoid os error 5^)
+start "" "%SETUP_EXE%"
+exit /b 0
+
+:setup_missing
+echo [WARN] NSIS setup exe not found under %NSIS_DIR%.
+
+:open_bundle
 echo  Opening the bundle output folder. Run the installer yourself when ready.
-echo  ^(tip: set FC_AUTORUN_SETUP=1 to auto-launch the installer after a build^)
+echo  ^(tip: remove FC_AUTORUN_SETUP=0 to auto-launch after a build^)
 start "" "explorer.exe" "src-tauri\target\release\bundle"
 echo.
 pause

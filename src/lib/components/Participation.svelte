@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
+  import { listen } from '@tauri-apps/api/event';
   import type { Participant } from '../ipc';
   import {
     clearParticipants,
@@ -22,7 +23,6 @@
       const current = await getParticipants();
       if (!current) return;
       participants = current;
-      const { listen } = await import('@tauri-apps/api/event');
       const fn = await listen<Participant[]>('participants-updated', (event) => {
         participants = event.payload;
       });

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { emit } from '@tauri-apps/api/event';
   import {
     clampDanmakuSettings,
     DANMAKU_DEFAULTS,
@@ -23,7 +24,6 @@
       !!(window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
     if (isTauri) {
       try {
-        const { emit } = await import('@tauri-apps/api/event');
         await emit(DANMAKU_SETTINGS_EVENT, next);
       } catch (e) {
         console.warn('[danmaku] settings emit failed', e);
