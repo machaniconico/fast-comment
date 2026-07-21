@@ -222,6 +222,11 @@ fn to_chat_message(item: LiveChatMessage, video_id: &str) -> Option<ChatMessage>
             None,
             membership_text(&snippet, type_id),
         ),
+        TYPE_GIFT => (
+            MessageKind::Gift,
+            None,
+            Some(static_gift_text(snippet.display_message.as_deref())),
+        ),
         _ => (MessageKind::Normal, None, None),
     };
 
@@ -275,6 +280,15 @@ fn membership_text(snippet: &LiveChatMessageSnippet, type_id: i32) -> Option<Str
         TYPE_GIFT_MEMBERSHIP_RECEIVED => Some("メンバーシップギフトを受け取りました".to_string()),
         TYPE_NEW_SPONSOR => Some("メンバーになりました".to_string()),
         _ => None,
+    }
+}
+
+fn static_gift_text(display_message: Option<&str>) -> String {
+    let text = display_message.unwrap_or_default().trim();
+    if text.is_empty() {
+        "[ギフト]".to_string()
+    } else {
+        text.to_string()
     }
 }
 
@@ -519,6 +533,29 @@ mod tests {
         let amount = message.amount.expect("amount");
         assert_eq!(amount.value, 250.0);
         assert_eq!(amount.raw_text, "¥250");
+    }
+
+    #[test]
+    fn converts_jewels_gift_into_static_comment() {
+        let item = LiveChatMessage {
+            id: Some("gift-1".to_string()),
+            snippet: Some(LiveChatMessageSnippet {
+                r#type: Some(TYPE_GIFT),
+                display_message: Some("Aliceさんがバラのギフトを贈りました".to_string()),
+                ..Default::default()
+            }),
+            author_details: Some(LiveChatMessageAuthorDetails {
+                display_name: Some("Alice".to_string()),
+                ..Default::default()
+            }),
+        };
+
+        let message = to_chat_message(item, "video-1").expect("gift event");
+        assert_eq!(message.kind, MessageKind::Gift);
+        assert_eq!(
+            message.plain_text(),
+            "Aliceさんがバラのギフトを贈りました"
+        );
     }
 
     #[test]

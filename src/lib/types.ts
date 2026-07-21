@@ -7,7 +7,7 @@
 
 export type Platform = 'twitch' | 'youtube';
 
-export type MessageKind = 'normal' | 'superChat' | 'membership' | 'bits' | 'system';
+export type MessageKind = 'normal' | 'superChat' | 'membership' | 'bits' | 'gift' | 'system';
 
 export interface Roles {
   broadcaster: boolean;

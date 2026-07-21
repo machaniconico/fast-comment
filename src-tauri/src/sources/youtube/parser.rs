@@ -16,7 +16,7 @@ use serde_json::Value;
 use crate::model::{Amount, Author, Badge, ChatMessage, Fragment, MessageKind, Platform, Roles};
 
 /// パーサのバージョン。レスポンス構造の解釈が変わったら上げる。
-pub const PARSER_VERSION: &str = "yt-1";
+pub const PARSER_VERSION: &str = "yt-2";
 
 static UNPARSED_LOG_DIR: OnceLock<PathBuf> = OnceLock::new();
 
@@ -244,6 +244,7 @@ pub fn is_chat_item_action(action: &Value) -> bool {
 /// - liveChatPaidMessageRenderer  : SuperChat
 /// - liveChatMembershipItemRenderer: メンバーシップ
 /// - liveChatPaidStickerRenderer  : SuperSticker
+/// - liveChat*Gift*Renderer / gift情報付き通知: Jewelsギフト(静的通知)
 pub fn parse_action(action: &Value, channel: &str) -> Option<ChatMessage> {
     // addChatItemAction.item の中に各種 renderer がぶら下がる。
     let item = dig_keys(action, &["addChatItemAction", "item"])?;
@@ -260,8 +261,125 @@ pub fn parse_action(action: &Value, channel: &str) -> Option<ChatMessage> {
     if let Some(r) = item.get("liveChatPaidStickerRenderer") {
         return parse_paid_sticker(r, channel);
     }
+    if let Some(r) = find_virtual_gift_renderer(item) {
+        return parse_virtual_gift_notice(r, channel);
+    }
 
     None
+}
+
+/// Jewelsギフトは新機能のため、renderer名だけでなく公式フィールド
+/// (`giftDetails` / `jewelsAmount`)と通知本文からも寛容に判定する。
+/// メンバーシップギフトは既存のMembership扱いと混同しない。
+fn find_virtual_gift_renderer(item: &Value) -> Option<&Value> {
+    let renderers = item.as_object()?;
+    renderers.iter().find_map(|(name, renderer)| {
+        let lower_name = name.to_ascii_lowercase();
+        let is_membership_gift = lower_name.contains("membership")
+            || lower_name.contains("sponsorship");
+        let direct_gift_renderer = lower_name.contains("gift") && !is_membership_gift;
+        let structured_gift = !is_membership_gift && contains_virtual_gift_field(renderer);
+        let generic_gift_notice = lower_name.contains("viewerengagement")
+            && contains_virtual_gift_text(renderer);
+
+        (direct_gift_renderer || structured_gift || generic_gift_notice).then_some(renderer)
+    })
+}
+
+fn contains_virtual_gift_field(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => map.iter().any(|(key, child)| {
+            matches!(
+                key.to_ascii_lowercase().as_str(),
+                "giftdetails" | "giftmetadata" | "giftname" | "gifturl" | "jewelsamount"
+            ) || contains_virtual_gift_field(child)
+        }),
+        Value::Array(values) => values.iter().any(contains_virtual_gift_field),
+        _ => false,
+    }
+}
+
+fn contains_virtual_gift_text(value: &Value) -> bool {
+    let lower = value.to_string().to_lowercase();
+    let mentions_gift = lower.contains("gift")
+        || lower.contains("jewel")
+        || lower.contains("ギフト");
+    let mentions_membership = lower.contains("membership")
+        || lower.contains("sponsorship")
+        || lower.contains("メンバーシップ");
+    mentions_gift && !mentions_membership
+}
+
+fn parse_virtual_gift_notice(r: &Value, channel: &str) -> Option<ChatMessage> {
+    let author = parse_author(r);
+    let gift_name = find_value_by_key(r, &["giftName", "altText"])
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let jewels = find_value_by_key(r, &["jewelsAmount"]).and_then(parse_u64_value);
+    let combo = find_value_by_key(r, &["comboCount"]).and_then(parse_u64_value);
+
+    let text = if let Some(name) = gift_name {
+        let mut details = Vec::new();
+        if let Some(jewels) = jewels.filter(|value| *value > 0) {
+            details.push(format!("{jewels} Jewels"));
+        }
+        if let Some(combo) = combo.filter(|value| *value > 1) {
+            details.push(format!("×{combo}"));
+        }
+        if details.is_empty() {
+            name.to_string()
+        } else {
+            format!("{name}（{}）", details.join("・"))
+        }
+    } else {
+        let notice = ["message", "headerPrimaryText", "headerSubtext", "text"]
+            .iter()
+            .find_map(|key| r.get(*key).and_then(simple_text));
+        static_gift_notice(notice.as_deref())
+    };
+
+    Some(build_message(
+        r,
+        channel,
+        author,
+        vec![Fragment::text(text)],
+        MessageKind::Gift,
+        None,
+    ))
+}
+
+fn find_value_by_key<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a Value> {
+    match value {
+        Value::Object(map) => {
+            for key in keys {
+                if let Some(found) = map.get(*key) {
+                    return Some(found);
+                }
+            }
+            map.values()
+                .find_map(|child| find_value_by_key(child, keys))
+        }
+        Value::Array(values) => values
+            .iter()
+            .find_map(|child| find_value_by_key(child, keys)),
+        _ => None,
+    }
+}
+
+fn parse_u64_value(value: &Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+}
+
+fn static_gift_notice(display_message: Option<&str>) -> String {
+    let text = display_message.unwrap_or_default().trim();
+    if text.is_empty() {
+        "[ギフト]".to_string()
+    } else {
+        text.to_string()
+    }
 }
 
 /// 通常テキストコメント。
@@ -884,6 +1002,72 @@ mod tests {
         assert_eq!(membership.kind, MessageKind::Membership);
         assert_eq!(membership.plain_text(), "メンバーになりました");
         assert!(membership.amount.is_none());
+    }
+
+    #[test]
+    fn parse_action_keeps_jewels_gift_notice_as_static_comment() {
+        let action = json!({
+            "addChatItemAction": {
+                "item": {
+                    "liveChatGiftPurchaseAnnouncementRenderer": {
+                        "id": "gift-1",
+                        "timestampUsec": "2000000",
+                        "authorExternalChannelId": "gift-author-1",
+                        "authorName": { "simpleText": "Alice" },
+                        "giftDetails": {
+                            "giftName": "バラ",
+                            "jewelsAmount": 100,
+                            "comboCount": 3
+                        }
+                    }
+                }
+            }
+        });
+
+        let message = parse_action(&action, "video-1").expect("gift notice");
+        assert_eq!(message.kind, MessageKind::Gift);
+        assert_eq!(message.author.name, "Alice");
+        assert_eq!(message.plain_text(), "バラ（100 Jewels・×3）");
+    }
+
+    #[test]
+    fn parse_action_keeps_generic_jewels_gift_notice() {
+        let action = json!({
+            "addChatItemAction": {
+                "item": {
+                    "liveChatViewerEngagementMessageRenderer": {
+                        "id": "gift-generic-1",
+                        "timestampUsec": "3000000",
+                        "icon": { "iconType": "GIFT" },
+                        "message": {
+                            "runs": [{ "text": "Aliceさんがギフトを贈りました" }]
+                        }
+                    }
+                }
+            }
+        });
+
+        let message = parse_action(&action, "video-1").expect("generic gift notice");
+        assert_eq!(message.kind, MessageKind::Gift);
+        assert_eq!(message.plain_text(), "Aliceさんがギフトを贈りました");
+    }
+
+    #[test]
+    fn jewels_gift_fallback_does_not_capture_membership_gifts() {
+        let action = json!({
+            "addChatItemAction": {
+                "item": {
+                    "liveChatSponsorshipsGiftPurchaseAnnouncementRenderer": {
+                        "id": "membership-gift-1",
+                        "headerPrimaryText": {
+                            "runs": [{ "text": "メンバーシップギフトを贈りました" }]
+                        }
+                    }
+                }
+            }
+        });
+
+        assert!(parse_action(&action, "video-1").is_none());
     }
 
     #[test]

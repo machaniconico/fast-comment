@@ -23,6 +23,8 @@ pub enum MessageKind {
     Membership,
     /// Twitch Bits(cheer)
     Bits,
+    /// YouTube Jewelsギフト(メンバーシップギフトとは別)
+    Gift,
     /// システム/通知メッセージ
     System,
 }

@@ -50,6 +50,7 @@
   };
 
   let platformColor = $derived(PLATFORM_COLORS[message.platform] ?? '#888');
+  let isGift = $derived(message.kind === 'gift');
   let hasHighlightBadge = $derived(
     message.author.badges.some(b => b.kind === 'highlight')
   );
@@ -263,6 +264,7 @@
   class:wrap={wrap}
   class:highlighted={isHighlighted}
   class:highlight-badge={hasHighlightBadge}
+  class:gift={isGift}
   style:background={kindBg}
   style:color={kindFg}
   role="listitem"
@@ -308,6 +310,10 @@
   <!-- Amount badge for SuperChat/Bits -->
   {#if message.amount}
     <span class="amount-badge">{message.amount.rawText}</span>
+  {/if}
+
+  {#if isGift}
+    <span class="gift-label" title="YouTubeギフト" aria-label="YouTubeギフト">GIFT</span>
   {/if}
 
   <!-- Fragments -->
@@ -399,6 +405,30 @@
   .comment-item.highlight-badge {
     border-left-color: #ff9800;
     background: rgba(255, 152, 0, 0.08);
+  }
+
+  /* Jewelsギフト: 通常コメントと同じ密度を保ち、静かな紫アクセントだけで判別する。 */
+  .comment-item.gift {
+    border-left-color: #b66cff;
+    background: rgba(182, 108, 255, 0.1);
+  }
+
+  .comment-item.gift .author-name {
+    color: #e1c4ff;
+    font-weight: 700;
+  }
+
+  .gift-label {
+    flex-shrink: 0;
+    padding: 1px 5px;
+    border: 1px solid rgba(205, 158, 255, 0.75);
+    border-radius: 3px;
+    background: #6f2da8;
+    color: #fff;
+    font-size: 9px;
+    font-weight: 800;
+    line-height: 13px;
+    letter-spacing: 0.06em;
   }
 
   .platform-dot {

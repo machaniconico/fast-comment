@@ -358,7 +358,7 @@ export interface InjectTestCommentOptions {
   platform: 'twitch' | 'youtube';
   name: string;
   text: string;
-  kind?: 'normal' | 'superChat' | 'membership' | 'bits';
+  kind?: 'normal' | 'superChat' | 'membership' | 'bits' | 'gift';
   amount?: number;
   count?: number;
 }

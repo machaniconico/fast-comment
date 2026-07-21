@@ -82,6 +82,7 @@ trait Source {
 - **official_stream.rs**: `credentials.youtubeApiKey` が設定済みなら、YouTube Data API v3の
   `liveChatMessages.streamList` (gRPC server streaming) を最優先する。`videos.list` で
   `activeLiveChatId` を解決し、`nextPageToken` を引き継いで長時間接続する。
+  - Jewelsによる`giftEvent`はメンバーシップギフトと分け、静的なギフト通知としてコメント欄へ表示する（アニメーション再現は対象外）。
   - APIキー未設定、認証・quota・接続エラー、継続トークンなし終了時はInnerTubeへ自動フォールバック。
   - 公式→InnerTube切替時は直近8192件のYouTubeメッセージIDで重複表示を抑止する。
   - APIキー変更保存時は接続中のYouTube Sourceを再起動し、新しい受信方式を即時反映する。
@@ -106,6 +107,7 @@ trait Source {
   - `serde_json::Value` をパス探索で辿る。固い struct deserialize はしない。
   - ヘルパ `dig(value, &["a","b",0,"c"])` で Option を返す。途中欠落でも None で安全に劣化。
   - 対応アクション: `addChatItemAction` → `liveChatTextMessageRenderer`(通常), `liveChatPaidMessageRenderer`(SuperChat), `liveChatMembershipItemRenderer`(メンバー), `liveChatPaidStickerRenderer`(ステッカー)
+  - Jewelsギフトは専用renderer名・`giftDetails`/`jewelsAmount`・汎用通知本文を寛容に判定し、メンバーシップギフトを誤分類しない。
   - 著者バッジ(`authorBadges`)から member/moderator/owner を Roles へ。
   - `runs[]` を Fragment(text|emote) に変換(`emoji` は Emote)。
   - **解析できなかったアクションは `logs/yt-unparsed.jsonl` に1行追記**(原因究明用)。

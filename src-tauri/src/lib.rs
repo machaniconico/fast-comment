@@ -877,6 +877,7 @@ fn inject_test_comment(
         "superChat" => MessageKind::SuperChat,
         "membership" => MessageKind::Membership,
         "bits" => MessageKind::Bits,
+        "gift" => MessageKind::Gift,
         other => return Err(format!("不正な kind です: {other}")),
     };
     let count = count.unwrap_or(1).clamp(1, 20);

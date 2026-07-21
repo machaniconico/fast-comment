@@ -978,6 +978,7 @@
         <option value="superChat">Super Chat</option>
         <option value="membership">メンバーシップ</option>
         <option value="bits">Bits</option>
+        <option value="gift">YouTubeギフト</option>
       </select>
       <label for="test-amount" class="compact-label">金額</label>
       <input
