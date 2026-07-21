@@ -53,6 +53,10 @@
     theme.setShowViewerBadges((event.currentTarget as HTMLInputElement).checked);
   }
 
+  function onShowCommentMilestonesChange(event: Event) {
+    theme.setShowCommentMilestones((event.currentTarget as HTMLInputElement).checked);
+  }
+
   let config: AppConfig | null = $state(null);
   let obsBaseUrl: string = $state('');
   let obsGoalsBaseUrl: string = $state('');
@@ -909,6 +913,15 @@
         type="checkbox"
         checked={theme.showViewerBadges}
         onchange={onShowViewerBadgesChange}
+      />
+    </div>
+    <div class="field-row">
+      <label for="appearance-show-comment-milestones">コメント達成表示</label>
+      <input
+        id="appearance-show-comment-milestones"
+        type="checkbox"
+        checked={theme.showCommentMilestones}
+        onchange={onShowCommentMilestonesChange}
       />
     </div>
   </section>

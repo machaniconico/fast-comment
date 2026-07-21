@@ -18,6 +18,7 @@ export interface AppearanceSnapshot {
   timeDisplay: AppearanceTimeDisplay;
   wrapComments: boolean;
   showViewerBadges: boolean;
+  showCommentMilestones: boolean;
 }
 
 const STORAGE_KEY = 'fc.appearance';
@@ -28,6 +29,7 @@ const DEFAULT_APPEARANCE: AppearanceSnapshot = {
   timeDisplay: 'seconds',
   wrapComments: false,
   showViewerBadges: false,
+  showCommentMilestones: false,
 };
 
 function canUseLocalStorage(): boolean {
@@ -71,6 +73,9 @@ function parseAppearanceSnapshot(value: unknown): AppearanceSnapshot | null {
   const showViewerBadgesValue = value.showViewerBadges === undefined
     ? DEFAULT_APPEARANCE.showViewerBadges
     : value.showViewerBadges;
+  const showCommentMilestonesValue = value.showCommentMilestones === undefined
+    ? DEFAULT_APPEARANCE.showCommentMilestones
+    : value.showCommentMilestones;
 
   if (
     !isTheme(themeValue) ||
@@ -78,7 +83,8 @@ function parseAppearanceSnapshot(value: unknown): AppearanceSnapshot | null {
     !isDensity(densityValue) ||
     !isTimeDisplay(timeDisplayValue) ||
     typeof wrapCommentsValue !== 'boolean' ||
-    typeof showViewerBadgesValue !== 'boolean'
+    typeof showViewerBadgesValue !== 'boolean' ||
+    typeof showCommentMilestonesValue !== 'boolean'
   ) {
     return null;
   }
@@ -90,6 +96,7 @@ function parseAppearanceSnapshot(value: unknown): AppearanceSnapshot | null {
     timeDisplay: timeDisplayValue,
     wrapComments: wrapCommentsValue,
     showViewerBadges: showViewerBadgesValue,
+    showCommentMilestones: showCommentMilestonesValue,
   };
 }
 
@@ -100,6 +107,7 @@ class ThemeStore {
   timeDisplay: AppearanceTimeDisplay = $state(DEFAULT_APPEARANCE.timeDisplay);
   wrapComments: boolean = $state(DEFAULT_APPEARANCE.wrapComments);
   showViewerBadges: boolean = $state(DEFAULT_APPEARANCE.showViewerBadges);
+  showCommentMilestones: boolean = $state(DEFAULT_APPEARANCE.showCommentMilestones);
   systemTheme: ResolvedTheme = $state('dark');
 
   private mediaCleanup: (() => void) | null = null;
@@ -169,6 +177,11 @@ class ThemeStore {
     this.save();
   }
 
+  setShowCommentMilestones(value: boolean): void {
+    this.showCommentMilestones = value;
+    this.save();
+  }
+
   getSnapshot(): AppearanceSnapshot {
     return {
       theme: this.theme,
@@ -177,6 +190,7 @@ class ThemeStore {
       timeDisplay: this.timeDisplay,
       wrapComments: this.wrapComments,
       showViewerBadges: this.showViewerBadges,
+      showCommentMilestones: this.showCommentMilestones,
     };
   }
 
@@ -198,6 +212,7 @@ class ThemeStore {
     this.timeDisplay = next.timeDisplay;
     this.wrapComments = next.wrapComments;
     this.showViewerBadges = next.showViewerBadges;
+    this.showCommentMilestones = next.showCommentMilestones;
   }
 
   private save(): void {

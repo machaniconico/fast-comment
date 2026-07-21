@@ -329,7 +329,9 @@
   <Welcome config={config.welcome} />
 {/if}
 
-<Milestone />
+{#if theme.showCommentMilestones}
+  <Milestone />
+{/if}
 
 <div
   class="app"

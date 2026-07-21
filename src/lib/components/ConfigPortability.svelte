@@ -36,7 +36,8 @@
       (value.theme === 'dark' || value.theme === 'light' || value.theme === 'auto') &&
       (value.fontSize === 's' || value.fontSize === 'm' || value.fontSize === 'l') &&
       (value.density === 'comfortable' || value.density === 'compact') &&
-      (value.showViewerBadges === undefined || typeof value.showViewerBadges === 'boolean')
+      (value.showViewerBadges === undefined || typeof value.showViewerBadges === 'boolean') &&
+      (value.showCommentMilestones === undefined || typeof value.showCommentMilestones === 'boolean')
     );
   }
 
