@@ -281,7 +281,7 @@
   {/each}
 
   <!-- Viewer sequence badge: after platform/role badges so Host/Mod stay first. -->
-  {#if viewerSeq}
+  {#if theme.showViewerBadges && viewerSeq}
     <span
       class="viewer-badge"
       class:badge-first={viewerSeq === 1}

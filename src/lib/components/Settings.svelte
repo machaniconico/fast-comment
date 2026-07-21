@@ -49,6 +49,10 @@
     theme.setWrapComments((event.currentTarget as HTMLInputElement).checked);
   }
 
+  function onShowViewerBadgesChange(event: Event) {
+    theme.setShowViewerBadges((event.currentTarget as HTMLInputElement).checked);
+  }
+
   let config: AppConfig | null = $state(null);
   let obsBaseUrl: string = $state('');
   let obsGoalsBaseUrl: string = $state('');
@@ -897,6 +901,15 @@
     <div class="field-row">
       <label for="appearance-wrap-comments">コメントを折り返す</label>
       <input id="appearance-wrap-comments" type="checkbox" checked={theme.wrapComments} onchange={onWrapCommentsChange} />
+    </div>
+    <div class="field-row">
+      <label for="appearance-show-viewer-badges">初回・常連表示</label>
+      <input
+        id="appearance-show-viewer-badges"
+        type="checkbox"
+        checked={theme.showViewerBadges}
+        onchange={onShowViewerBadgesChange}
+      />
     </div>
   </section>
 
