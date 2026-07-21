@@ -2,11 +2,12 @@
   import { onMount, onDestroy } from 'svelte';
   import type {
     AppConfig, EffectRule, EffectsConfig, GoalsConfig, InjectTestCommentOptions, TtsDictEntry, TtsOptions,
-    TimerConfig, WelcomeConfig
+    TimerConfig, WelcomeConfig, YoutubeOauthStatus
   } from '../ipc';
   import {
     getConfig, setConfig, getObsUrl, getObsGoalsUrl, getObsTimerUrl, exportCommentsCsv, injectTestComment,
-    setTtsPaused, clearTtsQueue, skipCurrentTts, testTts
+    setTtsPaused, clearTtsQueue, skipCurrentTts, testTts, getYoutubeOauthStatus,
+    connectYoutubeOauth, disconnectYoutubeOauth
   } from '../ipc';
   import { ui, SETTINGS_ANCHOR_IDS } from '../ui.svelte';
   import {
@@ -101,6 +102,11 @@
   let credTwitchOauth: string = $state('');
   let credTwitchUsername: string = $state('');
   let credYoutubeApiKey: string = $state('');
+  let credYoutubeOauthClientId: string = $state('');
+  let youtubeOauthStatus: YoutubeOauthStatus | null = $state(null);
+  let youtubeOauthBusy: boolean = $state(false);
+  let youtubeOauthMsg: string = $state('');
+  let youtubeOauthOk: boolean | null = $state(null);
 
   // Scroll to settings section when the command palette sets a settingsAnchor.
   // Gate on `config`: the tts/obs/moderation sections live inside {#if config},
@@ -191,6 +197,7 @@
       credTwitchOauth = config.credentials?.twitchOauth ?? '';
       credTwitchUsername = config.credentials?.twitchUsername ?? '';
       credYoutubeApiKey = config.credentials?.youtubeApiKey ?? '';
+      credYoutubeOauthClientId = config.credentials?.youtubeOauthClientId ?? '';
       voicevoxSpeaker = ttsNum('voicevoxSpeaker', 1);
       maxLength = ttsNum('maxLength', MAX_LENGTH_DEFAULT);
       stripEmoji = ttsBool('stripEmoji', true);
@@ -229,6 +236,12 @@
 
   onMount(async () => {
     hydrateConfig(await getConfig());
+    try {
+      youtubeOauthStatus = await getYoutubeOauthStatus();
+    } catch (e) {
+      youtubeOauthMsg = e instanceof Error ? e.message : String(e);
+      youtubeOauthOk = false;
+    }
 
     const url = await getObsUrl();
     obsBaseUrl = url ?? 'http://127.0.0.1:11180/?template=default';
@@ -771,9 +784,15 @@
       twitchOauth: credTwitchOauth.trim(),
       twitchUsername: credTwitchUsername.trim(),
       youtubeApiKey: credYoutubeApiKey.trim(),
+      youtubeOauthClientId: credYoutubeOauthClientId.trim(),
     };
     try {
       await setConfig(config);
+      try {
+        youtubeOauthStatus = await getYoutubeOauthStatus();
+      } catch {
+        // Saving succeeded; a credential-store status failure should not report save failure.
+      }
       setNotify(config.ui.notifySound, config.ui.notifyVolume);
       onConfigSaved?.(config);
       saveMsg = '保存しました';
@@ -784,6 +803,57 @@
     }
     if (saveMsgTimer !== null) clearTimeout(saveMsgTimer);
     saveMsgTimer = setTimeout(() => { saveMsg = ''; saveMsgTimer = null; }, 3000);
+  }
+
+  async function onConnectYoutubeOauth() {
+    if (youtubeOauthBusy) return;
+    const clientId = credYoutubeOauthClientId.trim();
+    if (!clientId) {
+      youtubeOauthMsg = 'OAuthクライアントIDを入力してください';
+      youtubeOauthOk = false;
+      return;
+    }
+    youtubeOauthBusy = true;
+    youtubeOauthMsg = 'ブラウザでGoogleアカウントを選び、許可してください…';
+    youtubeOauthOk = null;
+    try {
+      youtubeOauthStatus = await connectYoutubeOauth(clientId);
+      if (config) {
+        config.credentials = {
+          ...(config.credentials ?? {}),
+          youtubeOauthClientId: clientId,
+        };
+      }
+      youtubeOauthMsg = 'Googleアカウントに接続しました';
+      youtubeOauthOk = true;
+    } catch (e) {
+      youtubeOauthMsg = e instanceof Error ? e.message : String(e);
+      youtubeOauthOk = false;
+      try {
+        youtubeOauthStatus = await getYoutubeOauthStatus();
+      } catch {
+        // The original OAuth error is more useful than a follow-up status error.
+      }
+    } finally {
+      youtubeOauthBusy = false;
+    }
+  }
+
+  async function onDisconnectYoutubeOauth() {
+    if (youtubeOauthBusy) return;
+    youtubeOauthBusy = true;
+    youtubeOauthMsg = '';
+    youtubeOauthOk = null;
+    try {
+      youtubeOauthStatus = await disconnectYoutubeOauth();
+      youtubeOauthMsg = 'このPCのGoogle接続情報を削除しました';
+      youtubeOauthOk = true;
+    } catch (e) {
+      youtubeOauthMsg = e instanceof Error ? e.message : String(e);
+      youtubeOauthOk = false;
+    } finally {
+      youtubeOauthBusy = false;
+    }
   }
 
   function copyText(text: string, markCopied: () => void) {
@@ -1036,9 +1106,83 @@
     <h3>コメント投稿（送信）</h3>
     <p class="hint">
       コメント一覧の下にある「✍ 自分でコメントを投稿」から、配信チャットへ自分でコメントを送れます。
-      Twitch へ送るには chat:edit 権限付きの OAuth トークンと送信に使うユーザー名が必要です。
-      トークンは https://twitchtokengenerator.com などで取得できます。
-      （YouTube への投稿は未対応です。）
+      YouTubeは接続した配信者アカウント、Twitchは設定したアカウントとして投稿されます。
+    </p>
+
+    <div class="youtube-oauth-card">
+      <div class="oauth-card-head">
+        <span class="credential-subhead">YouTube</span>
+        <span
+          class="oauth-status"
+          class:oauth-status--connected={youtubeOauthStatus?.connected === true}
+          class:oauth-status--unknown={youtubeOauthStatus === null}
+        >
+          <span class="oauth-status-dot" aria-hidden="true"></span>
+          {youtubeOauthStatus?.connected
+            ? `${youtubeOauthStatus.channelTitle ?? 'Google接続済み'} で投稿`
+            : youtubeOauthStatus === null ? '確認中' : '未接続'}
+        </span>
+      </div>
+      <div class="field-row oauth-client-row">
+        <label for="cred-youtube-oauth-client-id">OAuthクライアントID</label>
+        <input
+          id="cred-youtube-oauth-client-id"
+          type="text"
+          bind:value={credYoutubeOauthClientId}
+          class="id-input"
+          placeholder="xxxxx.apps.googleusercontent.com"
+          autocomplete="off"
+          autocapitalize="off"
+          spellcheck="false"
+        />
+      </div>
+      <div class="field-row oauth-actions">
+        {#if youtubeOauthStatus?.connected}
+          <button
+            type="button"
+            class="copy-btn oauth-disconnect-btn"
+            onclick={onDisconnectYoutubeOauth}
+            disabled={youtubeOauthBusy}
+          >
+            接続解除
+          </button>
+        {:else}
+          <button
+            type="button"
+            class="export-btn youtube-connect-btn"
+            onclick={onConnectYoutubeOauth}
+            disabled={youtubeOauthBusy || credYoutubeOauthClientId.trim() === ''}
+          >
+            {youtubeOauthBusy ? '接続待ち…' : 'Googleに接続'}
+          </button>
+        {/if}
+        {#if youtubeOauthMsg}
+          <span
+            class="oauth-result"
+            class:oauth-result--ok={youtubeOauthOk === true}
+            class:oauth-result--error={youtubeOauthOk === false}
+            role="status"
+            aria-live="polite"
+          >{youtubeOauthMsg}</span>
+        {/if}
+      </div>
+      <p class="hint">
+        Google Cloudで「デスクトップアプリ」のOAuthクライアントを作成してIDを貼り付けます。
+        投稿権限はブラウザで許可し、更新トークンはconfig.jsonではなくOSの資格情報ストアへ保存します。
+      </p>
+      <details class="oauth-setup">
+        <summary>初回設定の手順</summary>
+        <ol>
+          <li>Google CloudでYouTube Data API v3を有効化</li>
+          <li>OAuth同意画面を設定し、種類「デスクトップアプリ」のクライアントを作成</li>
+          <li>クライアントIDを貼り付けて「Googleに接続」</li>
+        </ol>
+      </details>
+    </div>
+
+    <div class="credential-subhead twitch-credential-head">Twitch</div>
+    <p class="hint">
+      chat:edit 権限付きOAuthトークンと送信に使うユーザー名を設定します。
     </p>
     <div class="field-row">
       <label for="cred-twitch-username">Twitch ユーザー名</label>
@@ -1888,6 +2032,102 @@
   .export-btn { background: #1976d2; color: #fff; padding: 7px 14px; }
   .save-btn:disabled, .export-btn:disabled, .copy-btn:disabled { opacity: 0.5; cursor: not-allowed; }
   .tts-paused { background: #2e7d32; }
+
+  .youtube-oauth-card {
+    position: relative;
+    margin-top: 10px;
+    padding: 10px 12px 11px;
+    overflow: hidden;
+    border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 5px;
+    background: rgba(255,255,255,0.025);
+  }
+
+  .youtube-oauth-card::before {
+    content: '';
+    position: absolute;
+    inset: 0 auto 0 0;
+    width: 3px;
+    background: #ff3d3d;
+  }
+
+  .oauth-card-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+  }
+
+  .credential-subhead {
+    color: #e6e6e6;
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+  }
+
+  .twitch-credential-head {
+    margin-top: 13px;
+  }
+
+  .oauth-status {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    color: #9e9e9e;
+    font-size: 11px;
+    font-weight: 600;
+    min-width: 0;
+    max-width: 62%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .oauth-status-dot {
+    flex-shrink: 0;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: #757575;
+    box-shadow: 0 0 0 2px rgba(117,117,117,0.16);
+  }
+
+  .oauth-status--connected { color: #81c784; }
+  .oauth-status--connected .oauth-status-dot {
+    background: #66bb6a;
+    box-shadow: 0 0 0 2px rgba(102,187,106,0.18);
+  }
+  .oauth-status--unknown { color: #757575; }
+
+  .oauth-client-row label { min-width: 126px; }
+  .oauth-actions { min-height: 30px; }
+  .youtube-connect-btn { background: #c62828; }
+  .oauth-disconnect-btn { background: #4b3434; }
+
+  .oauth-result {
+    color: #bdbdbd;
+    font-size: 11px;
+  }
+  .oauth-result--ok { color: #81c784; }
+  .oauth-result--error { color: #ef9a9a; }
+
+  .oauth-setup {
+    margin-top: 7px;
+    color: #8d8d8d;
+    font-size: 11px;
+  }
+
+  .oauth-setup summary {
+    width: fit-content;
+    cursor: pointer;
+    color: #a8a8a8;
+  }
+
+  .oauth-setup ol {
+    margin: 6px 0 0;
+    padding-left: 20px;
+    line-height: 1.7;
+  }
 
   .tts-control-panel {
     margin-top: 8px;

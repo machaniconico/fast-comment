@@ -438,6 +438,10 @@ pub struct CredentialsConfig {
     /// 空なら従来の無認証 InnerTube ポーリングへフォールバックする。
     #[serde(default)]
     pub youtube_api_key: String,
+    /// YouTube投稿用の「デスクトップアプリ」OAuthクライアントID。
+    /// refresh token自体はOSの資格情報ストアへ保存し、config.jsonには入れない。
+    #[serde(default)]
+    pub youtube_oauth_client_id: String,
 }
 
 /// アプリ全体設定のルート。
@@ -731,6 +735,7 @@ mod tests {
                 twitch_oauth: "oauth:test-token".to_string(),
                 twitch_username: "FastCommentBot".to_string(),
                 youtube_api_key: "youtube-data-api-key".to_string(),
+                youtube_oauth_client_id: "desktop-client.apps.googleusercontent.com".to_string(),
             },
             youtube_overrides: YoutubeOverrides {
                 api_key: Some("test-api-key".to_string()),
@@ -789,6 +794,10 @@ mod tests {
         assert_eq!(
             json["credentials"]["youtubeApiKey"].as_str(),
             Some("youtube-data-api-key")
+        );
+        assert_eq!(
+            json["credentials"]["youtubeOauthClientId"].as_str(),
+            Some("desktop-client.apps.googleusercontent.com")
         );
         assert_eq!(
             json["tts"]["options"]["bouyomiHost"].as_str(),
@@ -970,6 +979,7 @@ mod tests {
         assert_eq!(cfg.credentials.twitch_oauth, "");
         assert_eq!(cfg.credentials.twitch_username, "");
         assert_eq!(cfg.credentials.youtube_api_key, "");
+        assert_eq!(cfg.credentials.youtube_oauth_client_id, "");
         assert_eq!(cfg.youtube_overrides, YoutubeOverrides::default());
     }
 

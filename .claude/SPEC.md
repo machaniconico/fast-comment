@@ -167,7 +167,7 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
   - **端フェード**: 右端の出現(0→6%)と左端の消失(94→100%)を opacity アニメ(`danmaku-fade`)で柔らかく。移動アニメ(`danmaku-fly`)の linear タイミングは不変で、撤去は `animationName==='danmaku-fly'` 側のみ(2アニメでの二重/早期撤去を防ぐ)。全体不透明度(`?opacity=`/`--opacity`)と要素フェードは乗算合成。
   - **連投まとめ(×N)**: 同一本文(名前前置前の素の本文 `core` をキー)の連投を `COALESCE_WINDOW_MS`(1500ms)内なら1つの弾幕に集約し `×N` カウント表示(『草』『w』『888』のスパム抑制)。流れるコメント(非gift/非system)のみ対象。集約は既存要素のテキスト書き換えのみで `lanePrev`(追突防止状態)は触らない。撤去/間引き時に集約マップから掃除(OBSは `size<32` ガード)。デスクトップは設定トグル、OBS は `?coalesce=0` で無効化(既定 ON)。
   - **投げ銭固定強調弾幕**: SuperChat/Bits/メンバーは流さず画面上部に `PIN_SEC`(8秒)固定表示してフェード撤去(ニコ生 `ue` コマンド風・見逃し防止)。同時 `PIN_MAX`(6件)・最古から間引き・最新を上。半透明角丸ボックス+種別色。デスクトップは設定トグル(タイマは `onDestroy` で `clearTimeout` しリーク防止)、OBS は `?pin=0` で無効化(既定 ON、OFF時は従来通り流す)。
-- **コメント投稿** (`CommentComposer.svelte`, `sources/twitch_send.rs`): 自分でコメントを送信。Twitch は IRC で送信(実機ビルド検証済みは要確認)。**YouTube 投稿は未実装(スタブ)** — UI 上は選択不可/注意表示にする。
+- **コメント投稿** (`CommentComposer.svelte`, `sources/twitch_send.rs`, `sources/youtube_send.rs`): 自分でコメントを送信。Twitch は IRC、YouTube は公式Data API `liveChatMessages.insert` で送信する。YouTube認証はシステムブラウザ + loopback redirect + Authorization Code/PKCE、scopeは`youtube.force-ssl`。refresh tokenはOS資格情報ストア、access tokenは期限付きメモリキャッシュに保持し、受信ホットパスへ処理を追加しない。配信中の`liveChatId`は`liveBroadcasts.list`で解決して60秒キャッシュする。
 - **参加型配信の管理** (`Participation.svelte`, `Raffle.svelte`): キーワード(既定「参加」)での参加登録、先着/ランダム抽選、専用タブ。既定 OFF。
 - **投げ銭パネル** (`DonationPanel.svelte`): SuperChat/Bits/メンバーを通常コメントと分けて表示(アプリ内タブ / OBS `?only=gift`)。既定 OFF。
 - **配信振り返りダッシュボード** (`Dashboard.svelte`, `Sparkline.svelte`): コメント数・視聴者推移などの集計表示。
@@ -216,8 +216,8 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
 - **P3 OBS**: axum WS + default テンプレ
 - **P4 TTS**: 3バックエンド + ルーティング
 - **P5 モデレーション + 設定UI仕上げ**
-- **P5+ 拡張UI(実装済み, §8.1)**: 弾幕オーバーレイ(デスクトップ窓 + danmaku テンプレ)、コメント投稿(Twitch)、参加型/抽選、投げ銭パネル、ダッシュボード、タイマー/ゴール/エフェクト、マルチカラム、設定ポータビリティ、テンプレ編集UI、最前面ピン、追加OBSテンプレ8種
-- **P6(後)**: OAuth実モデレーション(実BAN/削除)、YouTubeコメント投稿、niconico等の追加Source、テンプレ編集のライブプレビュー強化
+- **P5+ 拡張UI(実装済み, §8.1)**: 弾幕オーバーレイ(デスクトップ窓 + danmaku テンプレ)、コメント投稿(Twitch/YouTube)、参加型/抽選、投げ銭パネル、ダッシュボード、タイマー/ゴール/エフェクト、マルチカラム、設定ポータビリティ、テンプレ編集UI、最前面ピン、追加OBSテンプレ8種
+- **P6(後)**: OAuth実モデレーション(実BAN/削除)、niconico等の追加Source、テンプレ編集のライブプレビュー強化
 
 ## 12. 既知の制約・注意
 

@@ -28,6 +28,7 @@ tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 
 # YouTube InnerTube HTTP
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
+oauth2 = { version = "5", default-features = false, features = ["reqwest"] }
 
 # YouTube Data API liveChatMessages.streamList (official low-latency gRPC)
 tonic = { version = "0.12", features = ["tls", "tls-roots"] }
@@ -44,6 +45,18 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 regex = "1"
+
+# Google OAuth refresh tokens are kept out of config.json and stored in the
+# native OS credential store. Platform-specific features avoid shipping an
+# unused cross-platform keyring backend.
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3.6", default-features = false, features = ["windows-native"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3.6", default-features = false, features = ["apple-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3.6", default-features = false, features = ["linux-native-sync-persistent", "crypto-rust"] }
 
 [profile.release]
 opt-level = "s"

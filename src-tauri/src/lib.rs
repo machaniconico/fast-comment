@@ -38,6 +38,7 @@ use crate::model::{
     Amount, Author, Badge, ChatMessage, Fragment, MessageKind, Participant, Platform, Roles,
 };
 use crate::moderation::{Moderator, Verdict};
+use crate::sources::youtube_send::{YoutubeAuth, YoutubeOauthStatus};
 use crate::sources::SourceManager;
 use crate::stats::{spawn_stats_aggregator, StatsSnapshot, TimerSnapshot, YoutubeMetadataUpdate};
 use crate::tts::{
@@ -87,6 +88,8 @@ pub struct AppState {
     metadata_tx: mpsc::Sender<YoutubeMetadataUpdate>,
     /// 参加型配信の参加者一覧。
     participants: Mutex<Vec<Participant>>,
+    /// YouTube投稿用OAuth状態。バックグラウンド処理は持たず、操作時だけ通信する。
+    youtube_auth: YoutubeAuth,
 }
 
 /// OBS サーバの再起動に必要な実行時ハンドル。
@@ -400,8 +403,6 @@ fn export_comments_csv(app: AppHandle, csv: String) -> Result<String, String> {
 }
 
 /// チャットへコメントを投稿する。
-// TODO(YouTube投稿): liveChatId 解決 → liveChatMessages.insert → quota 管理と
-// Google OAuth 設定を次フェーズで実装する。
 #[tauri::command]
 async fn send_chat_message(
     state: State<'_, AppState>,
@@ -443,12 +444,90 @@ async fn send_chat_message(
             .await
             .map_err(|e| e.to_string())
         }
-        "youtube" => Err(
-            "YouTube投稿は未対応です(YouTube Data API v3 + Google OAuth の設定が必要・次フェーズ)"
-                .into(),
-        ),
+        "youtube" => {
+            let (client_id, target_channel) = {
+                let cfg = state.config.lock().unwrap();
+                let target_channel = if channel.trim().is_empty() {
+                    cfg.channels
+                        .iter()
+                        .find(|ch| ch.platform == ChannelPlatform::Youtube && ch.enabled)
+                        .or_else(|| {
+                            cfg.channels
+                                .iter()
+                                .find(|ch| ch.platform == ChannelPlatform::Youtube)
+                        })
+                        .map(|ch| ch.identifier.clone())
+                        .unwrap_or_default()
+                } else {
+                    channel.trim().to_string()
+                };
+                (
+                    cfg.credentials.youtube_oauth_client_id.clone(),
+                    target_channel,
+                )
+            };
+            state
+                .youtube_auth
+                .send_message(&client_id, &target_channel, &text)
+                .await
+        }
         other => Err(format!("不明なplatformです: {other}")),
     }
+}
+
+/// YouTube投稿用Google OAuthの接続状態を取得する。
+#[tauri::command]
+async fn get_youtube_oauth_status(
+    state: State<'_, AppState>,
+) -> Result<YoutubeOauthStatus, String> {
+    let client_id = state
+        .config
+        .lock()
+        .unwrap()
+        .credentials
+        .youtube_oauth_client_id
+        .clone();
+    state.youtube_auth.status(&client_id).await
+}
+
+/// システムブラウザを開き、YouTube投稿権限をGoogleアカウントから取得する。
+#[tauri::command]
+async fn connect_youtube_oauth(
+    state: State<'_, AppState>,
+    client_id: String,
+) -> Result<YoutubeOauthStatus, String> {
+    let client_id = client_id.trim().to_string();
+    if client_id.is_empty() {
+        return Err("YouTube OAuth クライアントIDを設定してください".to_string());
+    }
+    // OAuthボタンはこの項目だけを保存する。他の未保存設定を巻き込まない。
+    let (next_config, changed) = {
+        let mut cfg = state.config.lock().unwrap();
+        let changed = cfg.credentials.youtube_oauth_client_id.trim() != client_id;
+        cfg.credentials.youtube_oauth_client_id = client_id.clone();
+        cfg.save(&state.config_dir).map_err(|e| e.to_string())?;
+        (cfg.clone(), changed)
+    };
+    let _ = state.config_tx.send(next_config);
+    if changed {
+        state.youtube_auth.clear_caches().await;
+    }
+    state.youtube_auth.connect(&client_id).await
+}
+
+/// このPCに保存したYouTube投稿用認証を削除する。
+#[tauri::command]
+async fn disconnect_youtube_oauth(
+    state: State<'_, AppState>,
+) -> Result<YoutubeOauthStatus, String> {
+    let client_id = state
+        .config
+        .lock()
+        .unwrap()
+        .credentials
+        .youtube_oauth_client_id
+        .clone();
+    state.youtube_auth.disconnect(&client_id).await
 }
 
 /// 設定全体を更新して保存する。moderation/tts/obs などの実行時状態も反映する。
@@ -460,11 +539,15 @@ async fn update_config(
     state: State<'_, AppState>,
     mut new_config: AppConfig,
 ) -> Result<(), String> {
-    let youtube_source_config_changed = {
+    let (youtube_source_config_changed, youtube_oauth_client_changed) = {
         let current = state.config.lock().unwrap();
-        current.youtube_overrides != new_config.youtube_overrides
-            || current.credentials.youtube_api_key.trim()
-                != new_config.credentials.youtube_api_key.trim()
+        (
+            current.youtube_overrides != new_config.youtube_overrides
+                || current.credentials.youtube_api_key.trim()
+                    != new_config.credentials.youtube_api_key.trim(),
+            current.credentials.youtube_oauth_client_id.trim()
+                != new_config.credentials.youtube_oauth_client_id.trim(),
+        )
     };
 
     // 保存。
@@ -494,6 +577,9 @@ async fn update_config(
 
     if youtube_source_config_changed {
         stop_active_youtube_channels(&state);
+    }
+    if youtube_oauth_client_changed {
+        state.youtube_auth.clear_caches().await;
     }
 
     // チャンネル差分適用(コミット済み設定を参照する)。
@@ -1340,6 +1426,8 @@ pub fn run() {
                 tts_clear_notify: Arc::new(Notify::new()),
                 metadata_tx,
                 participants: Mutex::new(Vec::new()),
+                youtube_auth: YoutubeAuth::new()
+                    .expect("YouTube投稿用HTTPクライアントの作成に失敗しました"),
             };
             app.manage(state);
 
@@ -1399,6 +1487,9 @@ pub fn run() {
             test_tts,
             export_comments_csv,
             send_chat_message,
+            get_youtube_oauth_status,
+            connect_youtube_oauth,
+            disconnect_youtube_oauth,
             update_config,
             add_channel,
             remove_channel,

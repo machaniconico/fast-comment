@@ -252,7 +252,18 @@ export interface AppConfig {
   youtubeOverrides?: { apiKey?: string; clientVersion?: string; paths?: Record<string, string> };
   // External API/chat credentials (Rust `CredentialsConfig`, serde camelCase).
   // Optional so older config.json without the field still deserializes cleanly.
-  credentials?: { twitchOauth?: string; twitchUsername?: string; youtubeApiKey?: string };
+  credentials?: {
+    twitchOauth?: string;
+    twitchUsername?: string;
+    youtubeApiKey?: string;
+    youtubeOauthClientId?: string;
+  };
+}
+
+export interface YoutubeOauthStatus {
+  configured: boolean;
+  connected: boolean;
+  channelTitle?: string | null;
 }
 
 export interface GoalsConfig {
@@ -475,7 +486,7 @@ export async function injectTestComment(opts: InjectTestCommentOptions): Promise
 /**
  * Post a message to the live chat as the configured account.
  * Twitch sends via an authenticated one-shot IRC connection (Rust side).
- * YouTube is not yet supported (returns an error from the backend).
+ * YouTube sends through the official Data API using the connected Google account.
  * No-op in browser-only mode (Tauri absent).
  */
 export async function sendChatMessage(
@@ -484,6 +495,26 @@ export async function sendChatMessage(
   text: string,
 ): Promise<void> {
   await invoke<void>('send_chat_message', { platform, channel, text });
+}
+
+export async function getYoutubeOauthStatus(): Promise<YoutubeOauthStatus | null> {
+  return invoke<YoutubeOauthStatus>('get_youtube_oauth_status');
+}
+
+export async function connectYoutubeOauth(clientId: string): Promise<YoutubeOauthStatus> {
+  return (await invoke<YoutubeOauthStatus>('connect_youtube_oauth', { clientId })) ?? {
+    configured: false,
+    connected: false,
+    channelTitle: null,
+  };
+}
+
+export async function disconnectYoutubeOauth(): Promise<YoutubeOauthStatus> {
+  return (await invoke<YoutubeOauthStatus>('disconnect_youtube_oauth')) ?? {
+    configured: false,
+    connected: false,
+    channelTitle: null,
+  };
 }
 
 export async function checkForUpdate(): Promise<UpdateStatus | null> {

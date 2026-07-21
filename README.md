@@ -16,6 +16,7 @@ Twitch / YouTube のライブコメントを1つの画面に集約し、OBS オ�
 - **読み上げ(TTS) 3バックエンド** — 棒読みちゃん / VOICEVOX / ブラウザ Web Speech をアダプタ化。速度・音程・音量・声質、名前読み上げ/URL省略/絵文字除去/最大文字数などを細かく調整可能。棒読みちゃんは自動起動にも対応
 - **投げ銭の別表示** — SuperChat / Bits / メンバーシップを通常コメントと分けて表示（アプリ内タブ / OBS `?only=gift`）。既定OFF
 - **参加型配信の管理** — キーワード(既定「参加」)での参加登録、先着/ランダム抽選、専用タブ。既定OFF
+- **運営コメント投稿** — Twitch / YouTube Liveへ配信者・運営アカウントとして投稿。YouTubeは公式Data API + PKCE認証を使い、更新トークンをOS資格情報ストアへ保管
 - **モデレーション(ローカル)** — NGワード/NGユーザー(正規表現)・ハイライトルール。MVPはローカル非表示/グレー化のみ（実BAN/削除はOAuth必須でP6予定）
 - **コマンドパレット** — `Ctrl+K` でアクション実行・設定ジャンプ・コメント検索
 - **コメントピン留め / キーワード通知音** — 重要コメントの固定表示、一致コメント到着時の効果音通知
@@ -28,7 +29,7 @@ Twitch / YouTube のライブコメントを1つの画面に集約し、OBS オ�
 | シェル | Tauri 2.x (Rust) |
 | UI | Svelte 5 + Vite + TypeScript |
 | 非同期 | tokio |
-| 接続 | tokio-tungstenite (Twitch IRC-WS) / reqwest (YouTube InnerTube) |
+| 接続 | tokio-tungstenite (Twitch IRC-WS) / reqwest (YouTube InnerTube・Data API) |
 | OBS配信サーバ | axum (HTTP + WebSocket) + tower-http |
 
 ## アーキテクチャ
@@ -76,6 +77,8 @@ npm run build   # vite build
 ## 設定
 
 設定はアプリ内の設定画面から行えます。永続化先はユーザーデータディレクトリ配下の `config.json` です。YouTube の仕様変更には `youtubeOverrides`（API キー / clientVersion / 抽出パス上書き）で再ビルド無しに対応できます。
+
+YouTubeへ運営コメントを投稿する場合は、Google CloudでYouTube Data API v3を有効にし、OAuthクライアントを種類「デスクトップアプリ」で作成します。設定画面にクライアントIDを貼り付けて「Googleに接続」を実行してください。クライアントシークレットは不要で、Googleの更新トークンは`config.json`ではなくOSの資格情報ストアへ保存されます。認証・配信探索・投稿はユーザー操作時だけ動作し、コメント受信ループへの常駐処理追加はありません。
 
 ## ロードマップ
 

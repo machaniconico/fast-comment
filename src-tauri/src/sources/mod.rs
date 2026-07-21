@@ -8,6 +8,7 @@ pub mod twitch;
 pub mod twitch_helix;
 pub mod twitch_send;
 pub mod youtube;
+pub mod youtube_send;
 
 use std::time::Duration;
 

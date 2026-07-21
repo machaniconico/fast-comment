@@ -4,7 +4,7 @@
    * configured account. Toggled open from below the comment list (App.svelte).
    *
    * - Twitch: posts via an authenticated one-shot IRC connection (Rust side).
-   * - YouTube: not yet supported.
+   * - YouTube: posts via the official Data API and the connected Google account.
    * Enter sends, Shift+Enter inserts a newline. IME composition is respected so
    * confirming a Japanese conversion with Enter never sends by accident.
    */
@@ -38,10 +38,12 @@
     enabledChannels.filter((c) => c.platform === platform).map((c) => c.identifier),
   );
 
-  // Pick the initial platform from the first enabled channel (once).
+  // Pick the initial platform from the first enabled supported channel (once).
   let initialized = false;
   $effect(() => {
-    const firstSupported = enabledChannels.find((c) => c.platform === 'twitch');
+    const firstSupported = enabledChannels.find(
+      (c) => c.platform === 'twitch' || c.platform === 'youtube',
+    );
     if (!initialized && firstSupported) {
       platform = firstSupported.platform as SendPlatform;
       initialized = true;
@@ -67,10 +69,6 @@
     okMsg = '';
     const body = text.trim();
     if (body === '') return;
-    if (platform === 'youtube') {
-      errorMsg = 'YouTube投稿は未対応です';
-      return;
-    }
     const target = channel.trim();
     if (target === '') {
       errorMsg = '送信先チャンネルを指定してください';
@@ -131,7 +129,7 @@
       onchange={onPlatformChange}
     >
       <option value="twitch">Twitch</option>
-      <option value="youtube" disabled>YouTube（未対応）</option>
+      <option value="youtube">YouTube</option>
     </select>
 
     {#if channelCandidates.length > 0}
@@ -168,12 +166,12 @@
       placeholder="コメントを入力（Enterで送信 / Shift+Enterで改行）"
       aria-label="投稿するコメント"
       rows="2"
-      disabled={sending || platform === 'youtube'}
+      disabled={sending}
     ></textarea>
     <button
       class="composer-send"
       onclick={send}
-      disabled={sending || platform === 'youtube' || text.trim() === ''}
+      disabled={sending || text.trim() === ''}
       title="チャットへ送信"
     >
       {sending ? '送信中…' : '送信'}
