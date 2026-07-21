@@ -40,6 +40,8 @@ const DEFAULT_INITIAL_DATA_MARKERS: &[&str] = &[
     "\"ytInitialData\":",
 ];
 const DEFAULT_CONCURRENT_PATHS: &[&str] = &[
+    "contents>twoColumnWatchNextResults>results>results>contents>0>videoPrimaryInfoRenderer>viewCount>videoViewCountRenderer>viewCount",
+    "contents>twoColumnWatchNextResults>results>results>contents>0>videoPrimaryInfoRenderer>viewCount>videoViewCountRenderer>originalViewCount",
     "microformat>playerMicroformatRenderer>liveBroadcastDetails>concurrentViewers",
     "videoDetails>isLiveContent>concurrentViewers",
 ];
@@ -571,6 +573,28 @@ mod tests {
         "#;
         let values = extract_metadata_from_html(html, &empty_paths());
         assert_eq!(values.concurrent_viewers, Some(321));
+    }
+
+    #[test]
+    fn extracts_current_live_viewer_count_from_primary_info() {
+        let html = r#"
+            <script>
+            var ytInitialPlayerResponse = {"videoDetails":{"viewCount":"443406","isLive":true}};
+            var ytInitialData = {
+                "contents":{"twoColumnWatchNextResults":{"results":{"results":{"contents":[
+                    {"videoPrimaryInfoRenderer":{"viewCount":{"videoViewCountRenderer":{
+                        "viewCount":{"runs":[{"text":"1,145"},{"text":" 人が視聴中"}]},
+                        "isLive":true,
+                        "originalViewCount":"1145"
+                    }}}}
+                ]}}}}
+            };
+            </script>
+        "#;
+
+        let values = extract_metadata_from_html(html, &empty_paths());
+
+        assert_eq!(values.concurrent_viewers, Some(1_145));
     }
 
     #[test]
