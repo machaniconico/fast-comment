@@ -225,7 +225,10 @@ fn to_chat_message(item: LiveChatMessage, video_id: &str) -> Option<ChatMessage>
         TYPE_GIFT => (
             MessageKind::Gift,
             None,
-            Some(static_gift_text(snippet.display_message.as_deref())),
+            Some(static_gift_text(
+                snippet.gift_details.as_ref(),
+                snippet.display_message.as_deref(),
+            )),
         ),
         _ => (MessageKind::Normal, None, None),
     };
@@ -283,7 +286,33 @@ fn membership_text(snippet: &LiveChatMessageSnippet, type_id: i32) -> Option<Str
     }
 }
 
-fn static_gift_text(display_message: Option<&str>) -> String {
+fn static_gift_text(
+    details: Option<&LiveChatGiftDetails>,
+    display_message: Option<&str>,
+) -> String {
+    if let Some(details) = details {
+        let gift_name = details
+            .gift_name
+            .as_deref()
+            .or(details.alt_text.as_deref())
+            .unwrap_or_default()
+            .trim();
+        if !gift_name.is_empty() {
+            let mut metadata = Vec::new();
+            if let Some(jewels) = details.jewels_amount.filter(|value| *value > 0) {
+                metadata.push(format!("{jewels} Jewels"));
+            }
+            if let Some(combo) = details.combo_count.filter(|value| *value > 1) {
+                metadata.push(format!("×{combo}"));
+            }
+            return if metadata.is_empty() {
+                gift_name.to_string()
+            } else {
+                format!("{gift_name}（{}）", metadata.join("・"))
+            };
+        }
+    }
+
     let text = display_message.unwrap_or_default().trim();
     if text.is_empty() {
         "[ギフト]".to_string()
@@ -413,6 +442,8 @@ struct LiveChatMessageSnippet {
     member_milestone_chat_details: Option<LiveChatMemberMilestoneChatDetails>,
     #[prost(message, optional, tag = "31")]
     membership_gifting_details: Option<LiveChatMembershipGiftingDetails>,
+    #[prost(message, optional, tag = "34")]
+    gift_details: Option<LiveChatGiftDetails>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
@@ -477,9 +508,51 @@ struct LiveChatMembershipGiftingDetails {
     gift_memberships_count: Option<i32>,
 }
 
+#[derive(Clone, PartialEq, Message)]
+struct LiveChatGiftDetails {
+    #[prost(string, optional, tag = "1")]
+    gift_name: Option<String>,
+    #[prost(int32, optional, tag = "3")]
+    jewels_amount: Option<i32>,
+    #[prost(string, optional, tag = "5")]
+    alt_text: Option<String>,
+    #[prost(int32, optional, tag = "8")]
+    combo_count: Option<i32>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone, PartialEq, Message)]
+    struct GiftMessageFixture {
+        #[prost(string, optional, tag = "101")]
+        id: Option<String>,
+        #[prost(message, optional, tag = "2")]
+        snippet: Option<GiftSnippetFixture>,
+        #[prost(message, optional, tag = "3")]
+        author_details: Option<LiveChatMessageAuthorDetails>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    struct GiftSnippetFixture {
+        #[prost(int32, optional, tag = "1")]
+        r#type: Option<i32>,
+        #[prost(string, optional, tag = "16")]
+        display_message: Option<String>,
+        #[prost(message, optional, tag = "34")]
+        gift_details: Option<GiftDetailsFixture>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    struct GiftDetailsFixture {
+        #[prost(string, optional, tag = "1")]
+        gift_name: Option<String>,
+        #[prost(int32, optional, tag = "3")]
+        jewels_amount: Option<i32>,
+        #[prost(int32, optional, tag = "8")]
+        combo_count: Option<i32>,
+    }
 
     #[test]
     fn converts_text_message_with_roles_and_timestamp() {
@@ -537,25 +610,28 @@ mod tests {
 
     #[test]
     fn converts_jewels_gift_into_static_comment() {
-        let item = LiveChatMessage {
+        let wire_item = GiftMessageFixture {
             id: Some("gift-1".to_string()),
-            snippet: Some(LiveChatMessageSnippet {
+            snippet: Some(GiftSnippetFixture {
                 r#type: Some(TYPE_GIFT),
                 display_message: Some("Aliceさんがバラのギフトを贈りました".to_string()),
-                ..Default::default()
+                gift_details: Some(GiftDetailsFixture {
+                    gift_name: Some("バラ".to_string()),
+                    jewels_amount: Some(100),
+                    combo_count: Some(3),
+                }),
             }),
             author_details: Some(LiveChatMessageAuthorDetails {
                 display_name: Some("Alice".to_string()),
                 ..Default::default()
             }),
         };
+        let item = LiveChatMessage::decode(wire_item.encode_to_vec().as_slice())
+            .expect("decode gift fixture with the official stream field numbers");
 
         let message = to_chat_message(item, "video-1").expect("gift event");
         assert_eq!(message.kind, MessageKind::Gift);
-        assert_eq!(
-            message.plain_text(),
-            "Aliceさんがバラのギフトを贈りました"
-        );
+        assert_eq!(message.plain_text(), "バラ（100 Jewels・×3）");
     }
 
     #[test]

@@ -82,7 +82,7 @@ trait Source {
 - **official_stream.rs**: `credentials.youtubeApiKey` が設定済みなら、YouTube Data API v3の
   `liveChatMessages.streamList` (gRPC server streaming) を最優先する。`videos.list` で
   `activeLiveChatId` を解決し、`nextPageToken` を引き継いで長時間接続する。
-  - Jewelsによる`giftEvent`はメンバーシップギフトと分け、静的なギフト通知としてコメント欄へ表示する（アニメーション再現は対象外）。
+  - Jewelsによる`giftEvent`はメンバーシップギフトと分け、`gift_name`を種類名として静的にコメント欄へ表示する（アニメーション再現は対象外）。種類名が欠落した場合は代替説明文、通知本文の順で劣化する。
   - APIキー未設定、認証・quota・接続エラー、継続トークンなし終了時はInnerTubeへ自動フォールバック。
   - 公式→InnerTube切替時は直近8192件のYouTubeメッセージIDで重複表示を抑止する。
   - APIキー変更保存時は接続中のYouTube Sourceを再起動し、新しい受信方式を即時反映する。
