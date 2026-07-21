@@ -14,7 +14,7 @@
 - **シェル**: Tauri 2.x (Rust)
 - **UI**: Svelte 5 + Vite + TypeScript
 - **Rust 非同期**: tokio
-- **接続**: tokio-tungstenite (Twitch IRC-WS), reqwest (YouTube InnerTube HTTP)
+- **接続**: tokio-tungstenite (Twitch IRC-WS), tonic (YouTube公式streamList gRPC), reqwest (YouTube InnerTube HTTPフォールバック)
 - **OBS配信サーバ**: axum (HTTP + WebSocket) + tower-http (静的テンプレ配信)
 - **ビルド/実行ターゲット**: **Windows**（WSLでは編集のみ、ビルドはWindows側）
 
@@ -23,7 +23,7 @@
 ```
 [Twitch IRC-WS] ┐
                 ├─> Source trait ──> 正規化(ChatMessage) ──> Bus(tokio broadcast)
-[YouTube InnerTube] ┘                                          │
+[YouTube streamList / InnerTube] ┘                             │
                                                   ┌────────────┼─────────────┐
                                                   ▼            ▼             ▼
                                           Tauri IPC(UI)   axum WS(OBS)    TTS dispatch
@@ -79,6 +79,12 @@ trait Source {
 - emotes タグ(`id:start-end,...`)から本文を Fragment 分割。
 
 ### 4.2 YouTube (`youtube/`) — 仕様変更耐性が最重要
+- **official_stream.rs**: `credentials.youtubeApiKey` が設定済みなら、YouTube Data API v3の
+  `liveChatMessages.streamList` (gRPC server streaming) を最優先する。`videos.list` で
+  `activeLiveChatId` を解決し、`nextPageToken` を引き継いで長時間接続する。
+  - APIキー未設定、認証・quota・接続エラー、継続トークンなし終了時はInnerTubeへ自動フォールバック。
+  - 公式→InnerTube切替時は直近8192件のYouTubeメッセージIDで重複表示を抑止する。
+  - APIキー変更保存時は接続中のYouTube Sourceを再起動し、新しい受信方式を即時反映する。
 - **innertube.rs**: リクエスト組み立て
   - 手順: ①live配信URL/videoIdから初期HTMLを取得 → `ytInitialData` と INNERTUBE_API_KEY, client version, 初期 continuation を抽出
   - ②`POST https://www.youtube.com/youtubei/v1/live_chat/get_live_chat?key=<API_KEY>` に context+continuation で繰り返しポーリング
@@ -193,7 +199,8 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
 ## 10. 設定永続化 (`config.rs`)
 
 - 保存先: Tauri の app config dir に `config.json`。
-- 内容: channels[], obs{port}, tts{backend, options}, moderation{ngWords[], ngUsers[], highlights[]}, ui{maxBuffer, notifySound, notifyVolume}, youtubeOverrides{apiKey?, clientVersion?, paths?}。
+- 内容: channels[], obs{port}, tts{backend, options}, moderation{ngWords[], ngUsers[], highlights[]}, ui{maxBuffer, notifySound, notifyVolume}, youtubeOverrides{apiKey?, clientVersion?, paths?}, credentials{youtubeApiKey?, ...}。
+  - `credentials.youtubeApiKey`(空文字既定): 公式YouTube streamList用。空ならInnerTubeのみ。
   - `ui.notifySound`(bool 既定false) / `ui.notifyVolume`(f32 0.0〜1.0 既定0.5): キーワード通知の効果音設定。serde default でキー欠落の旧 config も後方互換。
   - `obs`: ポートに加え `maxRows` / `fontScalePct` / `ttlMs` / `bgOpacityPct` / `position` 等の見た目設定。範囲外値が入らないよう **Rust 側でも `normalize()` で clamp**(`maxRows` 1..=1000, `fontScalePct` 50..=200, `bgOpacityPct` 0..=100, `ttlMs` 500..=600000, `position`∈{top,bottom})。`normalize()` は config ロード時と `update_config` 適用時の両方で呼ぶ。上限定数は Rust 側に1箇所(`MAX_OBS_ROWS`)を置き UI/テンプレと値を揃える。
 - 起動時ロード、変更時保存。`config.json` をアプリ設定の正本とする。

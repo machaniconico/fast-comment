@@ -98,6 +98,7 @@ pub fn parse_channel_identifier(input: &str) -> Option<ChannelIdentifier> {
 pub fn spawn_live_resolve_poller(
     identifier: String,
     overrides: YoutubeOverrides,
+    official_api_key: String,
     source_tx: broadcast::Sender<ChatMessage>,
     metadata_tx: mpsc::Sender<YoutubeMetadataUpdate>,
     cancel: CancellationToken,
@@ -116,7 +117,12 @@ pub fn spawn_live_resolve_poller(
             }
         };
 
-        let manager = SourceManager::new(source_tx, overrides.clone(), Some(metadata_tx.clone()));
+        let manager = SourceManager::new(
+            source_tx,
+            overrides.clone(),
+            official_api_key,
+            Some(metadata_tx.clone()),
+        );
         let mut active_video_id: Option<String> = None;
         let mut active_cancel: Option<CancellationToken> = None;
         let mut live_state: Option<bool> = None;

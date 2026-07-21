@@ -29,6 +29,11 @@ tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 # YouTube InnerTube HTTP
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
 
+# YouTube Data API liveChatMessages.streamList (official low-latency gRPC)
+tonic = { version = "0.12", features = ["tls", "tls-roots"] }
+prost = "0.13"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+
 # OBS overlay server
 axum = { version = "0.7", features = ["ws"] }
 tower-http = { version = "0.6", features = ["fs", "cors"] }

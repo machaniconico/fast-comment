@@ -460,6 +460,13 @@ async fn update_config(
     state: State<'_, AppState>,
     mut new_config: AppConfig,
 ) -> Result<(), String> {
+    let youtube_source_config_changed = {
+        let current = state.config.lock().unwrap();
+        current.youtube_overrides != new_config.youtube_overrides
+            || current.credentials.youtube_api_key.trim()
+                != new_config.credentials.youtube_api_key.trim()
+    };
+
     // 保存。
     new_config.obs.normalize();
     new_config
@@ -485,6 +492,10 @@ async fn update_config(
     *state.config.lock().unwrap() = new_config;
     let _ = state.config_tx.send(committed_config.clone());
 
+    if youtube_source_config_changed {
+        stop_active_youtube_channels(&state);
+    }
+
     // チャンネル差分適用(コミット済み設定を参照する)。
     apply_channel_diff(&app, &state, &desired_channels);
 
@@ -500,6 +511,21 @@ async fn update_config(
     }
 
     Ok(())
+}
+
+/// YouTubeの受信方式に関わる設定変更時だけ既存タスクを止め、差分適用で再起動させる。
+fn stop_active_youtube_channels(state: &AppState) {
+    let mut channels = state.channels.lock().unwrap();
+    let keys: Vec<String> = channels
+        .keys()
+        .filter(|key| key.starts_with("youtube:"))
+        .cloned()
+        .collect();
+    for key in keys {
+        if let Some(token) = channels.remove(&key) {
+            token.cancel();
+        }
+    }
 }
 
 /// チャンネルを1件追加して起動する。
@@ -1018,7 +1044,13 @@ fn spawn_one_channel(_app: &AppHandle, state: &AppState, ch: &ChannelConfig) {
         return;
     }
     let key = AppState::channel_key(ch);
-    let overrides = state.config.lock().unwrap().youtube_overrides.clone();
+    let (overrides, youtube_api_key) = {
+        let config = state.config.lock().unwrap();
+        (
+            config.youtube_overrides.clone(),
+            config.credentials.youtube_api_key.clone(),
+        )
+    };
     let token = if ch.platform == ChannelPlatform::Youtube
         && sources::youtube::is_channel_identifier(&ch.identifier)
     {
@@ -1026,6 +1058,7 @@ fn spawn_one_channel(_app: &AppHandle, state: &AppState, ch: &ChannelConfig) {
         sources::youtube::live_resolve::spawn_live_resolve_poller(
             ch.identifier.clone(),
             overrides.clone(),
+            youtube_api_key.clone(),
             state.source_tx.clone(),
             state.metadata_tx.clone(),
             token.clone(),
@@ -1035,6 +1068,7 @@ fn spawn_one_channel(_app: &AppHandle, state: &AppState, ch: &ChannelConfig) {
         let manager = SourceManager::new(
             state.source_tx.clone(),
             overrides.clone(),
+            youtube_api_key,
             Some(state.metadata_tx.clone()),
         );
         manager.spawn_channel(ch)

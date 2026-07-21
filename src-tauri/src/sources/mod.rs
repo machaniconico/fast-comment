@@ -94,18 +94,22 @@ pub struct SourceManager {
     metadata_tx: Option<mpsc::Sender<YoutubeMetadataUpdate>>,
     /// YouTube overrides 等を渡すための設定スナップショット。
     youtube_overrides: crate::config::YoutubeOverrides,
+    /// 公式YouTube Data API streamList用。空ならInnerTubeのみ。
+    youtube_api_key: String,
 }
 
 impl SourceManager {
     pub fn new(
         tx: broadcast::Sender<ChatMessage>,
         youtube_overrides: crate::config::YoutubeOverrides,
+        youtube_api_key: String,
         metadata_tx: Option<mpsc::Sender<YoutubeMetadataUpdate>>,
     ) -> Self {
         SourceManager {
             tx,
             metadata_tx,
             youtube_overrides,
+            youtube_api_key,
         }
     }
 
@@ -122,6 +126,7 @@ impl SourceManager {
         let child = cancel.clone();
         let identifier = ch.identifier.clone();
         let overrides = self.youtube_overrides.clone();
+        let youtube_api_key = self.youtube_api_key.clone();
         let metadata_tx = self.metadata_tx.clone();
 
         match ch.platform {
@@ -132,7 +137,12 @@ impl SourceManager {
                 });
             }
             ChannelPlatform::Youtube => {
-                let src = youtube::YoutubeSource::new(identifier, overrides, metadata_tx);
+                let src = youtube::YoutubeSource::new(
+                    identifier,
+                    overrides,
+                    youtube_api_key,
+                    metadata_tx,
+                );
                 tauri::async_runtime::spawn(async move {
                     run_with_logging(&src, tx, child).await;
                 });

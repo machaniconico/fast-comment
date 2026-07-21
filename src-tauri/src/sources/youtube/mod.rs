@@ -9,8 +9,10 @@
 pub mod innertube;
 pub mod live_resolve;
 pub mod metadata;
+mod official_stream;
 pub mod parser;
 
+use std::collections::{HashSet, VecDeque};
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
@@ -28,12 +30,45 @@ const ACTIVE_POLL_MAX_MS: u64 = 1500;
 const QUIET_POLL_MIN_MS: u64 = 1000;
 const QUIET_POLL_MAX_MS: u64 = 1500;
 const DEFAULT_POLL_MS: u64 = 1000;
+const RECENT_MESSAGE_IDS: usize = 8192;
+
+/// 公式streamListからInnerTubeへ切り替わった際の履歴重複を抑止する。
+/// 長時間配信で無制限に増えないよう直近IDだけを保持する。
+pub(super) struct RecentMessageIds {
+    ids: HashSet<String>,
+    order: VecDeque<String>,
+}
+
+impl RecentMessageIds {
+    fn new() -> Self {
+        Self {
+            ids: HashSet::with_capacity(RECENT_MESSAGE_IDS),
+            order: VecDeque::with_capacity(RECENT_MESSAGE_IDS),
+        }
+    }
+
+    pub(super) fn insert(&mut self, id: &str) -> bool {
+        if self.ids.contains(id) {
+            return false;
+        }
+        let owned = id.to_string();
+        self.ids.insert(owned.clone());
+        self.order.push_back(owned);
+        if self.order.len() > RECENT_MESSAGE_IDS {
+            if let Some(oldest) = self.order.pop_front() {
+                self.ids.remove(&oldest);
+            }
+        }
+        true
+    }
+}
 
 /// YouTube ライブ1配信を購読する Source。
 pub struct YoutubeSource {
     /// videoId もしくは配信URL(URL からは videoId を抽出する)。
     video_input: String,
     overrides: YoutubeOverrides,
+    official_api_key: String,
     metadata_tx: Option<mpsc::Sender<YoutubeMetadataUpdate>>,
 }
 
@@ -41,11 +76,13 @@ impl YoutubeSource {
     pub fn new(
         video_input: String,
         overrides: YoutubeOverrides,
+        official_api_key: String,
         metadata_tx: Option<mpsc::Sender<YoutubeMetadataUpdate>>,
     ) -> Self {
         YoutubeSource {
             video_input,
             overrides,
+            official_api_key,
             metadata_tx,
         }
     }
@@ -68,6 +105,31 @@ impl Source for YoutubeSource {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + '_>> {
         Box::pin(async move {
             let video_id = self.video_id();
+            let mut seen = RecentMessageIds::new();
+
+            if !self.official_api_key.trim().is_empty() {
+                tracing::info!("youtube:{video_id} 公式streamListで低遅延接続を開始");
+                match official_stream::stream_live_chat(
+                    &video_id,
+                    self.official_api_key.trim(),
+                    &tx,
+                    &cancel,
+                    &mut seen,
+                )
+                .await
+                {
+                    Ok(()) if cancel.is_cancelled() => return Ok(()),
+                    Ok(()) => tracing::warn!(
+                        "youtube:{video_id} 公式streamListが終了したためInnerTubeへ切替"
+                    ),
+                    Err(e) => tracing::warn!(
+                        "youtube:{video_id} 公式streamList接続失敗: {e:#}; InnerTubeへ自動切替"
+                    ),
+                }
+            } else {
+                tracing::info!("youtube:{video_id} APIキー未設定のためInnerTubeで接続");
+            }
+
             let mut backoff = Backoff::new();
 
             loop {
@@ -76,7 +138,7 @@ impl Source for YoutubeSource {
                 }
 
                 let mut no_progress = false;
-                match self.poll_session(&video_id, &tx, &cancel).await {
+                match self.poll_session(&video_id, &tx, &cancel, &mut seen).await {
                     Ok(made_progress) => {
                         if cancel.is_cancelled() {
                             return Ok(());
@@ -115,6 +177,7 @@ impl YoutubeSource {
         video_id: &str,
         tx: &broadcast::Sender<ChatMessage>,
         cancel: &CancellationToken,
+        seen: &mut RecentMessageIds,
     ) -> anyhow::Result<bool> {
         let client = InnerTubeClient::new(self.overrides.clone())?;
         let session_started = Instant::now();
@@ -166,7 +229,9 @@ impl YoutubeSource {
                     msg.skip_tts = first_poll;
                     // raw は通常 None。デバッグ目的で残したい場合のみ付与する。
                     msg.raw = None;
-                    let _ = tx.send(msg);
+                    if seen.insert(&msg.id) {
+                        let _ = tx.send(msg);
+                    }
                 } else if parser::is_chat_item_action(action) {
                     // 解析できなかった addChatItemAction はログへ1行追記。
                     parser::log_unparsed(action);

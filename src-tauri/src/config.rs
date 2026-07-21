@@ -434,6 +434,10 @@ pub struct CredentialsConfig {
     /// Twitch 投稿用ユーザー名。
     #[serde(default)]
     pub twitch_username: String,
+    /// YouTube Data API v3 の公式 streamList で使う API キー。
+    /// 空なら従来の無認証 InnerTube ポーリングへフォールバックする。
+    #[serde(default)]
+    pub youtube_api_key: String,
 }
 
 /// アプリ全体設定のルート。
@@ -726,6 +730,7 @@ mod tests {
             credentials: CredentialsConfig {
                 twitch_oauth: "oauth:test-token".to_string(),
                 twitch_username: "FastCommentBot".to_string(),
+                youtube_api_key: "youtube-data-api-key".to_string(),
             },
             youtube_overrides: YoutubeOverrides {
                 api_key: Some("test-api-key".to_string()),
@@ -780,6 +785,10 @@ mod tests {
         assert_eq!(
             json["credentials"]["twitchUsername"].as_str(),
             Some("FastCommentBot")
+        );
+        assert_eq!(
+            json["credentials"]["youtubeApiKey"].as_str(),
+            Some("youtube-data-api-key")
         );
         assert_eq!(
             json["tts"]["options"]["bouyomiHost"].as_str(),
@@ -960,6 +969,7 @@ mod tests {
         assert_eq!(cfg.credentials, CredentialsConfig::default());
         assert_eq!(cfg.credentials.twitch_oauth, "");
         assert_eq!(cfg.credentials.twitch_username, "");
+        assert_eq!(cfg.credentials.youtube_api_key, "");
         assert_eq!(cfg.youtube_overrides, YoutubeOverrides::default());
     }
 

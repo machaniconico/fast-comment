@@ -97,9 +97,10 @@
   let testAmount: string = $state('500');
   let testCount: number = $state(1);
 
-  // Self-post (chat send) credentials.
+  // External API/chat credentials.
   let credTwitchOauth: string = $state('');
   let credTwitchUsername: string = $state('');
+  let credYoutubeApiKey: string = $state('');
 
   // Scroll to settings section when the command palette sets a settingsAnchor.
   // Gate on `config`: the tts/obs/moderation sections live inside {#if config},
@@ -189,6 +190,7 @@
       highlights = normalizeModerationEntries(config.moderation.highlights);
       credTwitchOauth = config.credentials?.twitchOauth ?? '';
       credTwitchUsername = config.credentials?.twitchUsername ?? '';
+      credYoutubeApiKey = config.credentials?.youtubeApiKey ?? '';
       voicevoxSpeaker = ttsNum('voicevoxSpeaker', 1);
       maxLength = ttsNum('maxLength', MAX_LENGTH_DEFAULT);
       stripEmoji = ttsBool('stripEmoji', true);
@@ -768,6 +770,7 @@
     config.credentials = {
       twitchOauth: credTwitchOauth.trim(),
       twitchUsername: credTwitchUsername.trim(),
+      youtubeApiKey: credYoutubeApiKey.trim(),
     };
     try {
       await setConfig(config);
@@ -1003,6 +1006,29 @@
       </button>
       {#if testCommentMsg}<span class="hint-inline">{testCommentMsg}</span>{/if}
     </div>
+  </section>
+
+  <section id="settings-youtube-low-latency">
+    <h3>YouTube低遅延受信</h3>
+    <p class="hint">
+      Google CloudでYouTube Data API v3を有効にしたAPIキーを設定すると、公式streamListでコメントを低遅延受信します。
+      未設定または公式接続に失敗した場合は、従来のInnerTube方式へ自動で切り替わります。
+    </p>
+    <div class="field-row">
+      <label for="cred-youtube-api-key">YouTube Data APIキー</label>
+      <input
+        id="cred-youtube-api-key"
+        type="password"
+        bind:value={credYoutubeApiKey}
+        class="id-input"
+        placeholder="AIza...（任意）"
+        autocomplete="off"
+        spellcheck="false"
+      />
+    </div>
+    <p class="hint">
+      APIキーはこのPCのconfig.jsonに平文で保存されます。空欄のままでも従来方式で利用できます。
+    </p>
   </section>
 
   <section id="settings-posting">

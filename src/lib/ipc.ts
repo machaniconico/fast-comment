@@ -250,9 +250,9 @@ export interface AppConfig {
   ui: { maxBuffer: number; showDonationPanel: boolean; notifySound: boolean; notifyVolume: number };
   participation: ParticipationConfig;
   youtubeOverrides?: { apiKey?: string; clientVersion?: string; paths?: Record<string, string> };
-  // Credentials for self-posting to chat (Rust `CredentialsConfig`, serde camelCase).
+  // External API/chat credentials (Rust `CredentialsConfig`, serde camelCase).
   // Optional so older config.json without the field still deserializes cleanly.
-  credentials?: { twitchOauth?: string; twitchUsername?: string };
+  credentials?: { twitchOauth?: string; twitchUsername?: string; youtubeApiKey?: string };
 }
 
 export interface GoalsConfig {
