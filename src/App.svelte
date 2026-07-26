@@ -523,7 +523,7 @@
     </div>
   </header>
 
-  {#if config?.goals?.enabled}
+  {#if config?.goals?.enabled && ui.activeTab !== 'settings'}
     <section class="goals-panel" aria-label="アプリ内の目標表示">
       <div class="goals-panel-controls">
         <span class="goals-panel-label">目標</span>
