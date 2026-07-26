@@ -7,7 +7,8 @@
    * - 透明・枠なし・クリック透過・最前面の別ウィンドウとして開かれる(ipc.openDanmakuOverlay)。
    * - Rust 側は app.emit("chat", batch)(全ウィンドウ配信)なので、このウィンドウでも
    *   同じ listen('chat') でコメントを受信できる(startChatListener / onChatBatch を再利用)。
-   * - 各コメントを右→左へ等速で流す。レーン(行)単位で重なりを避ける。
+   * - 各コメントを右→左へ等速で流す。
+   * - 配置は他コメントとの重複を判定せず、表示帯の行を単純に順送りする。
    */
   import { onMount, onDestroy } from 'svelte';
   import { listen } from '@tauri-apps/api/event';
@@ -52,35 +53,14 @@
   // in-flight タイマ(onDestroy で clearTimeout し leak を防ぐ)。
   let pinTimers: ReturnType<typeof setTimeout>[] = [];
 
-  // ── レーン(行)管理 ──────────────────────────────────────────────────────
-  type LanePrev = { t: number; w: number; s: number } | null;
-  let viewportW = 0;
+  // ── 表示行管理 ──────────────────────────────────────────────────────────
   let laneHeight = 0;
   let laneCount = 1;
+  let nextLane = 0;
   // 表示縦帯(画面上半分/下半分/全体)。recomputeLanes で更新。
   let y0 = 0;
-  // 各レーンの直近投入コメントの記録 {t,w,s} または null。
-  //   t=投入時刻(performance.now() ms), w=実幅 px, s=速度 px/秒。
-  // laneFreeAt(時刻配列)から置換: 相対速度を考慮した精密追突防止に用いる。
-  let lanePrev: LanePrev[] = [];
-
-  // 文字幅の実測(レーンが空く時刻の計算に使う)。canvas measureText で概算。
-  let measureCtx: CanvasRenderingContext2D | null = null;
-  function measureWidth(text: string, fontSize: number): number {
-    if (!measureCtx) {
-      let units = 0;
-      for (const ch of text) {
-        const code = ch.codePointAt(0) ?? 0;
-        units += code >= 0x3000 && code <= 0x9fff ? 1 : 0.5;
-      }
-      return units * fontSize;
-    }
-    measureCtx.font = `bold ${fontSize}px sans-serif`;
-    return measureCtx.measureText(text).width;
-  }
 
   function recomputeLanes() {
-    viewportW = window.innerWidth || 1920;
     const viewportH = window.innerHeight || 1080;
     const nextLaneHeight = Math.round(settings.fontSize * 1.45);
     // E2: settings.area で表示縦帯 [y0,y1] を決める(中央のゲーム画面を空ける)。
@@ -90,47 +70,10 @@
     else if (settings.area === 'bottom') ya = Math.floor(viewportH / 2);
     const bandH = yb - ya;
     const nextLaneCount = Math.max(1, Math.floor(bandH / nextLaneHeight));
-    if (lanePrev.length !== nextLaneCount || laneHeight !== nextLaneHeight) {
-      // レーン数/高さが変わったら lanePrev を作り直す(既存値は捨てて fill(null))。
-      lanePrev = new Array(nextLaneCount).fill(null);
-    }
     y0 = ya;
     laneHeight = nextLaneHeight;
     laneCount = nextLaneCount;
-  }
-
-  // E1: 精密追突防止。先行コメント(prev)と新規コメント(sNew px/秒)の相対速度を考慮し、
-  // 追突しないのに十分な投入間隔(ms)を返す。prev==null なら 0(空きレーン)。
-  //   base = prev.w + gap(gap=fontSize, 1文字ぶんの間隔)
-  //   A = base / prev.s        ← 先行が画面端に消えるまでの時間(秒)
-  //   B = (sNew>prev.s) ? (base + (sNew-prev.s)*durationSec) / sNew : A
-  //                            ← 新規が速いとき、相対距離が base に開くまでの時間(秒)
-  //   return max(A,B) * 1000
-  function requiredGapMs(prev: LanePrev, sNew: number): number {
-    if (!prev) return 0;
-    const base = prev.w + settings.fontSize;
-    const a = base / prev.s;
-    const b = sNew > prev.s ? (base + (sNew - prev.s) * settings.durationSec) / sNew : a;
-    return Math.max(a, b) * 1000;
-  }
-
-  // 各レーンの slack(今投入可能か余裕 ms)を比較し、最も空いているレーンを選ぶ。
-  //   slack = (now - prev.t) - requiredGapMs(prev, sNew)
-  //   prev==null は slack=+Infinity(完全に空き)。
-  // 空き(slack>=0)があれば slack 最大のレーン、無ければ slack 最大に相乗り(劣化許容)。
-  function pickLane(sNew: number): number {
-    const now = performance.now();
-    let best = 0;
-    let bestSlack = -Infinity;
-    for (let i = 0; i < laneCount; i += 1) {
-      const prev = lanePrev[i] ?? null;
-      const slack = prev ? now - prev.t - requiredGapMs(prev, sNew) : Infinity;
-      if (slack > bestSlack) {
-        best = i;
-        bestSlack = slack;
-      }
-    }
-    return best;
+    nextLane %= laneCount;
   }
 
   // E5: 投げ銭/メンバーを流さず画面上部に固定表示する。
@@ -207,12 +150,10 @@
 
     const text = settings.showName && msg.author?.name ? `${msg.author.name}: ${body}` : body;
 
-    const w = measureWidth(text, settings.fontSize);
-    // 等速。画面幅+自分の幅を durationSec で割った速度(px/s)。
-    const s = (viewportW + w) / settings.durationSec;
-    const lane = pickLane(s);
-    // 選択レーンの直近投入を更新(次回の requiredGapMs 計算に使う)。
-    lanePrev[lane] = { t: now, w, s };
+    // 他コメントの位置・文字幅・文字サイズは参照しない単純な行順送り。
+    // 混雑時の重なりは許容し、重複判定や回避配置は行わない。
+    const lane = nextLane;
+    nextLane = (nextLane + 1) % laneCount;
 
     const dc = msg.author?.displayColor;
     const color = dc && dc.trim() ? dc : '#ffffff';
@@ -261,7 +202,6 @@
     document.documentElement.style.background = 'transparent';
     document.body.style.background = 'transparent';
 
-    measureCtx = document.createElement('canvas').getContext('2d');
     recomputeLanes();
     const onResize = () => recomputeLanes();
     window.addEventListener('resize', onResize);
