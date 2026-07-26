@@ -405,6 +405,9 @@ pub struct UiConfig {
     /// YouTubeメンバーの通常コメントで投稿者名を緑色にするか。既定 true。
     #[serde(default = "default_true")]
     pub youtube_member_name_green: bool,
+    /// Twitchの通常コメントを本家チャット風に表示するか。既定 true。
+    #[serde(default = "default_true")]
+    pub twitch_native_style: bool,
     /// 投げ銭を別タブで表示するか。既定 false。
     #[serde(default)]
     pub show_donation_panel: bool,
@@ -421,6 +424,7 @@ impl Default for UiConfig {
         UiConfig {
             max_buffer: default_max_buffer(),
             youtube_member_name_green: true,
+            twitch_native_style: true,
             show_donation_panel: false,
             notify_sound: false,
             notify_volume: default_notify_volume(),
@@ -782,6 +786,7 @@ mod tests {
             ui: UiConfig {
                 max_buffer: 1234,
                 youtube_member_name_green: false,
+                twitch_native_style: false,
                 show_donation_panel: true,
                 notify_sound: true,
                 notify_volume: 0.8,
@@ -837,6 +842,7 @@ mod tests {
             json["ui"]["youtubeMemberNameGreen"].as_bool(),
             Some(false)
         );
+        assert_eq!(json["ui"]["twitchNativeStyle"].as_bool(), Some(false));
         assert_eq!(
             json["welcome"]["greeting"].as_str(),
             Some("{name} さん、ようこそ！")
@@ -1042,6 +1048,7 @@ mod tests {
         assert_eq!(cfg.ui.max_buffer, default_max_buffer());
         assert_eq!(cfg.ui.max_buffer, 2000);
         assert!(cfg.ui.youtube_member_name_green);
+        assert!(cfg.ui.twitch_native_style);
         assert!(!cfg.ui.show_donation_panel);
         // 通知設定は旧 config(キー欠落)でも default に劣化する(後方互換)。
         assert!(!cfg.ui.notify_sound);
@@ -1122,6 +1129,7 @@ mod tests {
         assert!(cfg.tts.options.dictionary.is_empty());
         assert_eq!(cfg.ui.max_buffer, 321);
         assert!(cfg.ui.youtube_member_name_green);
+        assert!(cfg.ui.twitch_native_style);
         assert!(!cfg.ui.show_donation_panel);
         assert_eq!(cfg.participation, ParticipationConfig::default());
         assert_eq!(cfg.credentials, CredentialsConfig::default());

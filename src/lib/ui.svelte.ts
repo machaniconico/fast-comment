@@ -18,6 +18,7 @@ export type SettingsAnchor =
   | 'appearance'
   | 'tts'
   | 'obs'
+  | 'goals'
   | 'timer'
   | 'moderation'
   | 'notify'
@@ -29,6 +30,7 @@ export const SETTINGS_ANCHOR_IDS: Record<SettingsAnchor, string> = {
   appearance: 'settings-appearance',
   tts: 'settings-tts',
   obs: 'settings-obs',
+  goals: 'settings-goals',
   timer: 'settings-timer',
   moderation: 'settings-moderation',
   notify: 'settings-notify',

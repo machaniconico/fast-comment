@@ -63,6 +63,11 @@
     config.ui.youtubeMemberNameGreen = (event.currentTarget as HTMLInputElement).checked;
   }
 
+  function onTwitchNativeStyleChange(event: Event) {
+    if (!config) return;
+    config.ui.twitchNativeStyle = (event.currentTarget as HTMLInputElement).checked;
+  }
+
   let config: AppConfig | null = $state(null);
   let obsBaseUrl: string = $state('');
   let obsGoalsBaseUrl: string = $state('');
@@ -1107,6 +1112,16 @@
         class="chk"
       />
     </div>
+    <div class="field-row">
+      <label for="appearance-twitch-native-style">Twitch本家風表示</label>
+      <input
+        id="appearance-twitch-native-style"
+        type="checkbox"
+        checked={config?.ui.twitchNativeStyle !== false}
+        onchange={onTwitchNativeStyleChange}
+        class="chk"
+      />
+    </div>
   </section>
 
   <section id="settings-portability">
@@ -1117,6 +1132,29 @@
   <section id="settings-danmaku">
     <h3>弾幕（画面を流れるコメント）</h3>
     <DanmakuSettings />
+    {#if config}
+      <div class="obs-label">OBS弾幕オーバーレイ用URL</div>
+      <p class="hint">通常のコメント表示URLとは別に、OBSへブラウザソースとして追加してください。</p>
+      <div class="field-row">
+        <label for="obs-danmaku-font-size">OBS弾幕文字サイズ</label>
+        <input
+          id="obs-danmaku-font-size"
+          type="number"
+          min="12"
+          max="96"
+          step="1"
+          bind:value={config.obs.danmakuFontSize}
+          class="num-input"
+        />
+        <span class="hint-inline">px（12〜96）</span>
+      </div>
+      <div class="obs-row">
+        <input type="text" value={danmakuObsUrl} readonly class="obs-input" />
+        <button class="copy-btn" class:copied={copiedDanmakuObs} onclick={onCopyDanmakuObs}>
+          {copiedDanmakuObs ? 'コピー済' : 'コピー'}
+        </button>
+      </div>
+    {/if}
   </section>
 
   <!-- ── TTS ── -->
@@ -1608,28 +1646,6 @@
         {copiedGiftObs ? 'コピー済' : 'コピー'}
       </button>
     </div>
-    <div class="obs-label">弾幕オーバーレイ用URL</div>
-    <p class="hint">弾幕オーバーレイ（画面を流れるニコ生風）。通常のコメント表示URLとは別に、OBSへ追加のブラウザソースとして貼ってください</p>
-    <div class="field-row">
-      <label for="obs-danmaku-font-size">弾幕文字サイズ</label>
-      <input
-        id="obs-danmaku-font-size"
-        type="number"
-        min="12"
-        max="96"
-        step="1"
-        bind:value={config.obs.danmakuFontSize}
-        class="num-input"
-      />
-      <span class="hint-inline">px（12〜96）</span>
-    </div>
-    <div class="obs-row">
-      <input type="text" value={danmakuObsUrl} readonly class="obs-input" />
-      <button class="copy-btn" class:copied={copiedDanmakuObs} onclick={onCopyDanmakuObs}>
-        {copiedDanmakuObs ? 'コピー済' : 'コピー'}
-      </button>
-    </div>
-    <p class="hint">OBSのブラウザソースにこのURLを貼り付けてください。</p>
     <div id="settings-obs-template-editor" class="template-editor-wrap">
       <h3>OBSテンプレート編集</h3>
       <TemplateEditor obsPort={config.obs.port} currentTemplate={config.obs.template} />

@@ -265,6 +265,7 @@
   class:highlighted={isHighlighted}
   class:highlight-badge={hasHighlightBadge}
   class:gift={isGift}
+  class:twitch-native={message.platform === 'twitch'}
   style:background={kindBg}
   style:color={kindFg}
   role="listitem"
@@ -278,7 +279,7 @@
     {#if badge.imageUrl}
       <img class="badge-img" src={badge.imageUrl} alt={badge.label} title={badge.label} />
     {:else}
-      <span class="badge-text" title={badge.label}>{badge.kind[0]?.toUpperCase()}</span>
+      <span class="badge-text" data-kind={badge.kind} title={badge.label}>{badge.kind[0]?.toUpperCase()}</span>
     {/if}
   {/each}
 
@@ -390,6 +391,88 @@
   .comment-item:hover .hide-btn,
   .comment-item:hover .menu-btn {
     opacity: 1;
+  }
+
+  :global(.app[data-twitch-native-style='true']) .comment-item.twitch-native {
+    gap: 3px;
+    border-bottom-color: transparent;
+    background: #18181b;
+    font-family: Inter, Roobert, "Segoe UI", sans-serif;
+  }
+
+  :global(.app[data-twitch-native-style='true']) .comment-item.twitch-native:hover {
+    background: #26262c;
+  }
+
+  :global(.app[data-theme='light'][data-twitch-native-style='true']) .comment-item.twitch-native {
+    background: #fff;
+    color: #0e0e10;
+  }
+
+  :global(.app[data-theme='light'][data-twitch-native-style='true']) .comment-item.twitch-native:hover {
+    background: #efeff1;
+  }
+
+  :global(.app[data-twitch-native-style='true']) .comment-item.twitch-native .platform-dot {
+    width: 4px;
+    height: 12px;
+    border-radius: 1px;
+  }
+
+  :global(.app[data-twitch-native-style='true']) .comment-item.twitch-native .author-name {
+    color: #adadb8;
+    font-weight: 700;
+  }
+
+  :global(.app[data-theme='light'][data-twitch-native-style='true'])
+    .comment-item.twitch-native
+    .author-name {
+    color: #53535f;
+  }
+
+  :global(.app[data-twitch-native-style='true']) .comment-item.twitch-native .sep {
+    margin-right: 1px;
+    opacity: 1;
+  }
+
+  :global(.app[data-twitch-native-style='true']) .comment-item.twitch-native .emote {
+    height: 22px;
+  }
+
+  :global(.app[data-twitch-native-style='true'])
+    .comment-item.twitch-native
+    .badge-text[data-kind='broadcaster'] {
+    background: #e91916;
+  }
+
+  :global(.app[data-twitch-native-style='true'])
+    .comment-item.twitch-native
+    .badge-text[data-kind='moderator'] {
+    background: #00ad03;
+  }
+
+  :global(.app[data-twitch-native-style='true'])
+    .comment-item.twitch-native
+    .badge-text[data-kind='vip'] {
+    background: #e005b9;
+  }
+
+  :global(.app[data-twitch-native-style='true'])
+    .comment-item.twitch-native
+    .badge-text[data-kind='subscriber'] {
+    background: #6441a5;
+  }
+
+  :global(.app[data-twitch-native-style='true'])
+    .comment-item.twitch-native
+    .badge-text[data-kind='founder'] {
+    background: #c89b3c;
+    color: #18181b;
+  }
+
+  :global(.app[data-twitch-native-style='true']) .comment-item.twitch-native .badge-text {
+    color: #fff;
+    font-weight: 800;
   }
 
   /* Highlight stays within the 28px row: only color/border, no size change. */

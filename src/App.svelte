@@ -241,6 +241,11 @@
     }
   }
 
+  function selectDanmakuSettings() {
+    ui.gotoSetting('danmaku');
+    closeToolsMenu();
+  }
+
   function isTauri(): boolean {
     return typeof window !== 'undefined'
       && !!(window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
@@ -261,6 +266,11 @@
 
   function selectParticipation() {
     ui.setTab('participation');
+    closeToolsMenu();
+  }
+
+  function selectGoalsSettings() {
+    ui.gotoSetting('goals');
     closeToolsMenu();
   }
 
@@ -328,7 +338,7 @@
   }
 
   function onSettingsSaved(nextConfig: AppConfig) {
-    config = structuredClone(nextConfig);
+    config = structuredClone($state.snapshot(nextConfig));
   }
 
   async function toggleGoalsInApp(event: Event) {
@@ -379,6 +389,7 @@
   data-font-size={theme.fontSize}
   data-density={theme.density}
   data-youtube-member-name-green={config?.ui.youtubeMemberNameGreen !== false}
+  data-twitch-native-style={config?.ui.twitchNativeStyle !== false}
 >
   {#if updateStatus?.updateAvailable && !updateDismissed}
     <div class="update-banner" role="status" aria-live="polite">
@@ -509,6 +520,16 @@
               class:active={danmakuOpen}
               onclick={selectDanmaku}
             >弾幕オーバーレイ{danmakuOpen ? '（表示中）' : ''}</button>
+            <button
+              role="menuitem"
+              class="tools-menu-item"
+              onclick={selectDanmakuSettings}
+            >弾幕・OBS設定</button>
+            <button
+              role="menuitem"
+              class="tools-menu-item"
+              onclick={selectGoalsSettings}
+            >目標設定</button>
           </div>
         {/if}
       </div>
@@ -650,7 +671,7 @@
   {/if}
 
   <!-- ── In-app goals (kept at the bottom; hidden by default via showInApp=false) ── -->
-  {#if config?.goals?.enabled && ui.activeTab !== 'settings'}
+  {#if showGoalsBar && ui.activeTab !== 'settings'}
     <section class="goals-panel" aria-label="アプリ内の目標表示">
       <div class="goals-panel-controls">
         <span class="goals-panel-label">目標</span>
@@ -667,9 +688,7 @@
           <span class="goals-toggle-error" title={goalsToggleError}>保存失敗</span>
         {/if}
       </div>
-      {#if showGoalsBar}
-        <GoalsBar />
-      {/if}
+      <GoalsBar />
     </section>
   {/if}
 

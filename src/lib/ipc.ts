@@ -251,6 +251,7 @@ export interface AppConfig {
   ui: {
     maxBuffer: number;
     youtubeMemberNameGreen: boolean;
+    twitchNativeStyle: boolean;
     showDonationPanel: boolean;
     notifySound: boolean;
     notifyVolume: number;
