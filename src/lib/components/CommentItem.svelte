@@ -299,6 +299,7 @@
   <!-- Author name -->
   <span
     class="author-name"
+    class:youtube-member-name={message.platform === 'youtube' && message.author.roles.member && !hasKindStyle}
     style:color={!hasKindStyle && message.author.displayColor ? message.author.displayColor : undefined}
   >
     {message.author.name}

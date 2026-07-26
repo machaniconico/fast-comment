@@ -58,6 +58,11 @@
     theme.setShowCommentMilestones((event.currentTarget as HTMLInputElement).checked);
   }
 
+  function onYoutubeMemberNameGreenChange(event: Event) {
+    if (!config) return;
+    config.ui.youtubeMemberNameGreen = (event.currentTarget as HTMLInputElement).checked;
+  }
+
   let config: AppConfig | null = $state(null);
   let obsBaseUrl: string = $state('');
   let obsGoalsBaseUrl: string = $state('');
@@ -1090,6 +1095,16 @@
         type="checkbox"
         checked={theme.showCommentMilestones}
         onchange={onShowCommentMilestonesChange}
+      />
+    </div>
+    <div class="field-row">
+      <label for="appearance-youtube-member-name-green">YouTubeメンバー名を緑色にする</label>
+      <input
+        id="appearance-youtube-member-name-green"
+        type="checkbox"
+        checked={config?.ui.youtubeMemberNameGreen !== false}
+        onchange={onYoutubeMemberNameGreenChange}
+        class="chk"
       />
     </div>
   </section>

@@ -402,6 +402,9 @@ pub struct UiConfig {
     /// リングバッファの保持上限件数。既定 2000。
     #[serde(default = "default_max_buffer")]
     pub max_buffer: usize,
+    /// YouTubeメンバーの通常コメントで投稿者名を緑色にするか。既定 true。
+    #[serde(default = "default_true")]
+    pub youtube_member_name_green: bool,
     /// 投げ銭を別タブで表示するか。既定 false。
     #[serde(default)]
     pub show_donation_panel: bool,
@@ -417,6 +420,7 @@ impl Default for UiConfig {
     fn default() -> Self {
         UiConfig {
             max_buffer: default_max_buffer(),
+            youtube_member_name_green: true,
             show_donation_panel: false,
             notify_sound: false,
             notify_volume: default_notify_volume(),
@@ -777,6 +781,7 @@ mod tests {
             },
             ui: UiConfig {
                 max_buffer: 1234,
+                youtube_member_name_green: false,
                 show_donation_panel: true,
                 notify_sound: true,
                 notify_volume: 0.8,
@@ -828,6 +833,10 @@ mod tests {
         assert_eq!(json["effects"]["rules"][0]["emoji"].as_str(), Some("🎉"));
         assert_eq!(json["effects"]["rules"][0]["count"].as_u64(), Some(24));
         assert_eq!(json["welcome"]["enabled"].as_bool(), Some(true));
+        assert_eq!(
+            json["ui"]["youtubeMemberNameGreen"].as_bool(),
+            Some(false)
+        );
         assert_eq!(
             json["welcome"]["greeting"].as_str(),
             Some("{name} さん、ようこそ！")
@@ -1032,6 +1041,7 @@ mod tests {
         assert!(cfg.moderation.highlights.is_empty());
         assert_eq!(cfg.ui.max_buffer, default_max_buffer());
         assert_eq!(cfg.ui.max_buffer, 2000);
+        assert!(cfg.ui.youtube_member_name_green);
         assert!(!cfg.ui.show_donation_panel);
         // 通知設定は旧 config(キー欠落)でも default に劣化する(後方互換)。
         assert!(!cfg.ui.notify_sound);
@@ -1111,6 +1121,7 @@ mod tests {
         assert_eq!(cfg.tts.options.max_length, default_max_read_len());
         assert!(cfg.tts.options.dictionary.is_empty());
         assert_eq!(cfg.ui.max_buffer, 321);
+        assert!(cfg.ui.youtube_member_name_green);
         assert!(!cfg.ui.show_donation_panel);
         assert_eq!(cfg.participation, ParticipationConfig::default());
         assert_eq!(cfg.credentials, CredentialsConfig::default());

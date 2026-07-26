@@ -378,6 +378,7 @@
   data-theme={theme.resolved}
   data-font-size={theme.fontSize}
   data-density={theme.density}
+  data-youtube-member-name-green={config?.ui.youtubeMemberNameGreen !== false}
 >
   {#if updateStatus?.updateAvailable && !updateDismissed}
     <div class="update-banner" role="status" aria-live="polite">
@@ -523,29 +524,6 @@
     </div>
   </header>
 
-  {#if config?.goals?.enabled && ui.activeTab !== 'settings'}
-    <section class="goals-panel" aria-label="アプリ内の目標表示">
-      <div class="goals-panel-controls">
-        <span class="goals-panel-label">目標</span>
-        <label class="goals-panel-toggle">
-          <input
-            type="checkbox"
-            checked={showGoalsBar}
-            disabled={goalsToggleSaving}
-            onchange={toggleGoalsInApp}
-          />
-          <span>{goalsToggleSaving ? '保存中' : 'コメビュに表示'}</span>
-        </label>
-        {#if goalsToggleError}
-          <span class="goals-toggle-error" title={goalsToggleError}>保存失敗</span>
-        {/if}
-      </div>
-      {#if showGoalsBar}
-        <GoalsBar />
-      {/if}
-    </section>
-  {/if}
-
   <!-- ── Channel add bar (URL paste → auto-detect) ── -->
   {#if ui.activeTab === 'comments' && !standaloneOpen}
     <div class="channel-bar">
@@ -669,6 +647,30 @@
     {#if ui.composerOpen}
       <CommentComposer {config} />
     {/if}
+  {/if}
+
+  <!-- ── In-app goals (kept at the bottom; hidden by default via showInApp=false) ── -->
+  {#if config?.goals?.enabled && ui.activeTab !== 'settings'}
+    <section class="goals-panel" aria-label="アプリ内の目標表示">
+      <div class="goals-panel-controls">
+        <span class="goals-panel-label">目標</span>
+        <label class="goals-panel-toggle">
+          <input
+            type="checkbox"
+            checked={showGoalsBar}
+            disabled={goalsToggleSaving}
+            onchange={toggleGoalsInApp}
+          />
+          <span>{goalsToggleSaving ? '保存中' : 'コメビュに表示'}</span>
+        </label>
+        {#if goalsToggleError}
+          <span class="goals-toggle-error" title={goalsToggleError}>保存失敗</span>
+        {/if}
+      </div>
+      {#if showGoalsBar}
+        <GoalsBar />
+      {/if}
+    </section>
   {/if}
 
   <CommandPalette />
@@ -1457,6 +1459,15 @@
   .app[data-density='compact'] :global(.badge-img),
   .app[data-density='compact'] :global(.emote) {
     height: 18px;
+  }
+
+  .app[data-youtube-member-name-green='true'] :global(.author-name.youtube-member-name) {
+    color: #2ba640 !important;
+  }
+
+  .app[data-theme='light'][data-youtube-member-name-green='true']
+    :global(.author-name.youtube-member-name) {
+    color: #137333 !important;
   }
 
   .app[data-theme='light'] :global(.comment-item) {

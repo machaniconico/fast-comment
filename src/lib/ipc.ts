@@ -248,7 +248,13 @@ export interface AppConfig {
   welcome: WelcomeConfig;
   tts: { backend: 'bouyomi' | 'voicevox' | 'webSpeech' | 'none'; options: TtsOptions };
   moderation: { ngWords: string[]; ngUsers: string[]; highlights: string[] };
-  ui: { maxBuffer: number; showDonationPanel: boolean; notifySound: boolean; notifyVolume: number };
+  ui: {
+    maxBuffer: number;
+    youtubeMemberNameGreen: boolean;
+    showDonationPanel: boolean;
+    notifySound: boolean;
+    notifyVolume: number;
+  };
   participation: ParticipationConfig;
   youtubeOverrides?: { apiKey?: string; clientVersion?: string; paths?: Record<string, string> };
   // External API/chat credentials (Rust `CredentialsConfig`, serde camelCase).
