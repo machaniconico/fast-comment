@@ -210,6 +210,11 @@ class UiStore {
 
   /** Switch to the settings tab and request a scroll to the given section. */
   gotoSetting(anchor: SettingsAnchor): void {
+    if (anchor === 'goals' || anchor === 'danmaku') {
+      this.openToolSettings(anchor);
+      this.settingsAnchor = null;
+      return;
+    }
     this.activeTab = 'settings';
     this.showDashboard = false;
     this.showRaffle = false;

@@ -39,7 +39,7 @@
   let snapshot: StatsSnapshot | null = $state(null);
 
   const cards = $derived.by((): GoalCard[] => {
-    if (!snapshot || snapshot.goalsEnabled === false) return [];
+    if (!snapshot) return [];
 
     const goals = snapshot.goals ?? { comments: 0, viewers: 0, likes: 0, reactions: 0 };
     const visible = snapshot.goalsVisible ?? {

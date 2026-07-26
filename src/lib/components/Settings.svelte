@@ -2186,6 +2186,11 @@
     display: none;
   }
 
+  .settings:not(.focus-goals):not(.focus-danmaku) > #settings-goals,
+  .settings:not(.focus-goals):not(.focus-danmaku) > #settings-danmaku {
+    display: none;
+  }
+
   h2 {
     font-size: 15px;
     font-weight: 700;

@@ -63,8 +63,8 @@
     return cfg?.ui.showDonationPanel === true;
   }
 
-  function isGoalsBarEnabled(cfg: AppConfig | null): boolean {
-    return cfg?.goals?.enabled === true && cfg?.goals?.showInApp === true;
+  function isGoalsBarVisible(cfg: AppConfig | null): boolean {
+    return cfg?.goals?.showInApp === true;
   }
 
   function isEffectsEnabled(cfg: AppConfig | null): boolean {
@@ -80,7 +80,7 @@
   }
 
   const showDonationPanel = $derived(isDonationPanelEnabled(config));
-  const showGoalsBar = $derived(isGoalsBarEnabled(config));
+  const showGoalsBar = $derived(isGoalsBarVisible(config));
   const showEffects = $derived(isEffectsEnabled(config));
   const showWelcome = $derived(isWelcomeEnabled(config));
   const ttsConfigured = $derived(isTtsConfigured(config));
