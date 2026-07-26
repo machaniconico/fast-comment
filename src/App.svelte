@@ -84,7 +84,9 @@
   const showEffects = $derived(isEffectsEnabled(config));
   const showWelcome = $derived(isWelcomeEnabled(config));
   const ttsConfigured = $derived(isTtsConfigured(config));
-  const standaloneOpen = $derived(ui.showDashboard || ui.showRaffle || ui.showTimer);
+  const standaloneOpen = $derived(
+    ui.showDashboard || ui.showRaffle || ui.showTimer || ui.toolSettingsView !== null
+  );
 
   $effect(() => {
     if (!showDonationPanel && ui.activeTab === 'donations') ui.setTab('comments');
@@ -242,7 +244,7 @@
   }
 
   function selectDanmakuSettings() {
-    ui.gotoSetting('danmaku');
+    ui.openToolSettings('danmaku');
     closeToolsMenu();
   }
 
@@ -270,7 +272,7 @@
   }
 
   function selectGoalsSettings() {
-    ui.gotoSetting('goals');
+    ui.openToolSettings('goals');
     closeToolsMenu();
   }
 
@@ -523,11 +525,13 @@
             <button
               role="menuitem"
               class="tools-menu-item"
+              class:active={ui.toolSettingsView === 'danmaku'}
               onclick={selectDanmakuSettings}
             >弾幕・OBS設定</button>
             <button
               role="menuitem"
               class="tools-menu-item"
+              class:active={ui.toolSettingsView === 'goals'}
               onclick={selectGoalsSettings}
             >目標設定</button>
           </div>
@@ -633,7 +637,11 @@
 
   <!-- ── Main content ── -->
   <div class="main-content" role="tabpanel">
-    {#if ui.showTimer}
+    {#if ui.toolSettingsView === 'goals'}
+      <Settings focus="goals" onConfigSaved={onSettingsSaved} />
+    {:else if ui.toolSettingsView === 'danmaku'}
+      <Settings focus="danmaku" onConfigSaved={onSettingsSaved} />
+    {:else if ui.showTimer}
       <Timer />
     {:else if ui.showDashboard}
       <Dashboard />

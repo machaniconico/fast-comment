@@ -26,9 +26,10 @@
 
   interface Props {
     onConfigSaved?: (config: AppConfig) => void;
+    focus?: 'all' | 'goals' | 'danmaku';
   }
 
-  let { onConfigSaved }: Props = $props();
+  let { onConfigSaved, focus = 'all' }: Props = $props();
 
   function onThemeChange(event: Event) {
     theme.setTheme((event.currentTarget as HTMLSelectElement).value as AppearanceTheme);
@@ -134,7 +135,21 @@
     if (!config) return;
     const id = SETTINGS_ANCHOR_IDS[a];
     requestAnimationFrame(() => {
-      document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      const target = document.getElementById(id);
+      const container = target?.closest<HTMLElement>('.settings');
+      if (!target || !container) return;
+
+      // scrollIntoView also scrolls the document, which moves the fixed-height
+      // app header outside the WebView with no visible way to scroll it back.
+      // Move only the Settings pane and recover any document scroll left by an
+      // older build.
+      window.scrollTo(0, 0);
+      const top =
+        container.scrollTop
+        + target.getBoundingClientRect().top
+        - container.getBoundingClientRect().top
+        - 12;
+      container.scrollTo({ top: Math.max(0, top), behavior: 'smooth' });
     });
     ui.clearSettingsAnchor();
   });
@@ -1039,8 +1054,12 @@
   }
 </script>
 
-<div class="settings">
-  <h2>設定</h2>
+<div
+  class="settings"
+  class:focus-goals={focus === 'goals'}
+  class:focus-danmaku={focus === 'danmaku'}
+>
+  <h2>{focus === 'goals' ? '目標設定' : focus === 'danmaku' ? '弾幕・OBS設定' : '設定'}</h2>
 
   <section id="settings-appearance">
     <h3>外観</h3>
@@ -2160,6 +2179,11 @@
     overflow-y: auto;
     height: 100%;
     box-sizing: border-box;
+  }
+
+  .settings.focus-goals > section:not(#settings-goals),
+  .settings.focus-danmaku > section:not(#settings-danmaku) {
+    display: none;
   }
 
   h2 {

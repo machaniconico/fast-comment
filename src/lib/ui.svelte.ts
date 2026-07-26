@@ -12,6 +12,7 @@
 
 export type Tab = 'comments' | 'donations' | 'participation' | 'settings';
 export type ViewMode = 'unified' | 'columns';
+export type ToolSettingsView = 'goals' | 'danmaku';
 
 /** Settings sections that the command palette can jump to. */
 export type SettingsAnchor =
@@ -85,6 +86,7 @@ class UiStore {
   showDashboard: boolean = $state(false);
   showRaffle: boolean = $state(false);
   showTimer: boolean = $state(false);
+  toolSettingsView: ToolSettingsView | null = $state(null);
   // Comment composer (self-post to chat) open flag — toggled below the comment list.
   composerOpen: boolean = $state(false);
   paletteOpen: boolean = $state(false);
@@ -102,6 +104,7 @@ class UiStore {
     this.showDashboard = false;
     this.showRaffle = false;
     this.showTimer = false;
+    this.toolSettingsView = null;
   }
 
   setViewMode(mode: ViewMode): void {
@@ -117,6 +120,7 @@ class UiStore {
     if (this.showDashboard) {
       this.showRaffle = false;
       this.showTimer = false;
+      this.toolSettingsView = null;
     }
   }
 
@@ -125,6 +129,7 @@ class UiStore {
     if (this.showDashboard) {
       this.showRaffle = false;
       this.showTimer = false;
+      this.toolSettingsView = null;
     }
   }
 
@@ -133,6 +138,7 @@ class UiStore {
     if (this.showRaffle) {
       this.showDashboard = false;
       this.showTimer = false;
+      this.toolSettingsView = null;
     }
   }
 
@@ -141,6 +147,7 @@ class UiStore {
     if (this.showTimer) {
       this.showDashboard = false;
       this.showRaffle = false;
+      this.toolSettingsView = null;
     }
   }
 
@@ -149,11 +156,19 @@ class UiStore {
     if (this.showTimer) {
       this.showDashboard = false;
       this.showRaffle = false;
+      this.toolSettingsView = null;
     }
   }
 
   toggleComposer(): void {
     this.composerOpen = !this.composerOpen;
+  }
+
+  openToolSettings(view: ToolSettingsView): void {
+    this.toolSettingsView = view;
+    this.showDashboard = false;
+    this.showRaffle = false;
+    this.showTimer = false;
   }
 
   openPalette(): void {
@@ -199,6 +214,7 @@ class UiStore {
     this.showDashboard = false;
     this.showRaffle = false;
     this.showTimer = false;
+    this.toolSettingsView = null;
     this.settingsAnchor = anchor;
   }
 
