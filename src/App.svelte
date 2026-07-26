@@ -30,7 +30,10 @@
     openReleaseUrl,
     getConfig,
     setConfig,
+    getTtsQueueState,
     onTtsNotice,
+    onTtsQueueState,
+    setTtsPaused,
     toggleDanmakuOverlay,
     isDanmakuOverlayOpen,
     setAlwaysOnTop,
@@ -39,6 +42,7 @@
 
   let unlisten: (() => void) | null = null;
   let unlistenTtsNotice: (() => void) | null = null;
+  let unlistenTtsQueueState: (() => void) | null = null;
   let config: AppConfig | null = $state(null);
   let updateStatus = $state<UpdateStatus | null>(null);
   let updateDismissed = $state(false);
@@ -49,6 +53,8 @@
   let danmakuOpen = $state(false);
   let goalsToggleSaving = $state(false);
   let goalsToggleError = $state('');
+  let ttsPaused = $state(false);
+  let ttsToggleBusy = $state(false);
   let unlistenDanmakuState: (() => void) | null = null;
   let destroyed = false;
   const DANMAKU_LABEL = 'danmaku';
@@ -92,10 +98,15 @@
     return cfg?.welcome?.enabled === true;
   }
 
+  function isTtsConfigured(cfg: AppConfig | null): boolean {
+    return cfg?.tts?.backend !== undefined && cfg.tts.backend !== 'none';
+  }
+
   const showDonationPanel = $derived(isDonationPanelEnabled(config));
   const showGoalsBar = $derived(isGoalsBarEnabled(config));
   const showEffects = $derived(isEffectsEnabled(config));
   const showWelcome = $derived(isWelcomeEnabled(config));
+  const ttsConfigured = $derived(isTtsConfigured(config));
   const standaloneOpen = $derived(ui.showDashboard || ui.showRaffle || ui.showTimer);
 
   $effect(() => {
@@ -119,6 +130,17 @@
       if (destroyed) fn();
       else unlistenTtsNotice = fn;
     }
+    try {
+      const current = await getTtsQueueState();
+      if (!destroyed && current) ttsPaused = current.paused === true;
+      const fn = await onTtsQueueState((next) => {
+        if (!destroyed) ttsPaused = next.paused === true;
+      });
+      if (destroyed) fn();
+      else unlistenTtsQueueState = fn;
+    } catch (e) {
+      console.warn('[tts] queue state load failed', e);
+    }
     const initialDanmakuOpen = await isDanmakuOverlayOpen();
     if (!destroyed) danmakuOpen = initialDanmakuOpen;
     if (initialDanmakuOpen) {
@@ -137,6 +159,7 @@
     window.removeEventListener('keydown', onWindowKey);
     unlisten?.();
     unlistenTtsNotice?.();
+    unlistenTtsQueueState?.();
     unlistenDanmakuState?.();
     if (searchDebounce) clearTimeout(searchDebounce);
     if (ttsNoticeTimer) clearTimeout(ttsNoticeTimer);
@@ -268,6 +291,25 @@
     const next = !ui.alwaysOnTop;
     ui.setAlwaysOnTop(next);
     void setAlwaysOnTop(next);
+  }
+
+  async function toggleTtsReading() {
+    if (!ttsConfigured || ttsToggleBusy) return;
+    const previous = ttsPaused;
+    const next = !previous;
+    ttsPaused = next;
+    ttsToggleBusy = true;
+    try {
+      await setTtsPaused(next);
+    } catch (e) {
+      ttsPaused = previous;
+      showTtsNotice({
+        level: 'error',
+        message: `読み上げの切り替えに失敗しました: ${e instanceof Error ? e.message : String(e)}`,
+      });
+    } finally {
+      ttsToggleBusy = false;
+    }
   }
 
   async function loadUpdateStatus() {
@@ -417,6 +459,25 @@
     </div>
 
     <div class="header-actions">
+      <button
+        class="tts-toggle-btn"
+        class:enabled={ttsConfigured && !ttsPaused}
+        class:muted={ttsPaused}
+        disabled={!ttsConfigured || ttsToggleBusy}
+        title={!ttsConfigured ? '読み上げ方式が設定されていません' : ttsPaused ? '音声読み上げをON' : '音声読み上げをOFF'}
+        aria-label={!ttsConfigured ? '音声読み上げは設定で無効です' : ttsPaused ? '音声読み上げをON' : '音声読み上げをOFF'}
+        aria-pressed={ttsConfigured && !ttsPaused}
+        onclick={toggleTtsReading}
+      >
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M4 9v6h4l5 4V5L8 9H4Z" />
+          {#if ttsPaused || !ttsConfigured}
+            <path class="speaker-slash" d="m17 9 5 5m0-5-5 5" />
+          {:else}
+            <path class="speaker-waves" d="M16 9.5a4 4 0 0 1 0 5M18.5 7a7.5 7.5 0 0 1 0 10" />
+          {/if}
+        </svg>
+      </button>
       <button
         class="window-pin-btn"
         class:active={ui.alwaysOnTop}
@@ -901,6 +962,62 @@
     transition: color 0.15s, background 0.15s, border-color 0.15s, filter 0.15s;
   }
 
+  .tts-toggle-btn {
+    width: 26px;
+    height: 26px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    padding: 0;
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 4px;
+    color: #8b949e;
+    background: rgba(255,255,255,0.04);
+    cursor: pointer;
+    transition: color 0.15s, background 0.15s, border-color 0.15s;
+  }
+
+  .tts-toggle-btn svg {
+    width: 16px;
+    height: 16px;
+    fill: currentColor;
+  }
+
+  .tts-toggle-btn .speaker-waves,
+  .tts-toggle-btn .speaker-slash {
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.8;
+    stroke-linecap: round;
+  }
+
+  .tts-toggle-btn.enabled {
+    color: #ffffff;
+    background: rgba(88,166,255,0.18);
+    border-color: rgba(88,166,255,0.5);
+  }
+
+  .tts-toggle-btn.muted {
+    color: #fca5a5;
+  }
+
+  .tts-toggle-btn:hover:not(:disabled) {
+    color: #ffffff;
+    background: rgba(255,255,255,0.1);
+  }
+
+  .tts-toggle-btn:focus-visible {
+    outline: 2px solid #58a6ff;
+    outline-offset: 2px;
+  }
+
+  .tts-toggle-btn:disabled {
+    color: #555;
+    cursor: not-allowed;
+    opacity: 0.55;
+  }
+
   .window-pin-btn.active {
     color: #fff;
     background: rgba(88,166,255,0.18);
@@ -1021,6 +1138,22 @@
     background: rgba(15,23,42,0.03);
     border-color: rgba(15,23,42,0.12);
     color: #52606d;
+  }
+
+  .app[data-theme='light'] .tts-toggle-btn {
+    color: #52606d;
+    background: rgba(15,23,42,0.03);
+    border-color: rgba(15,23,42,0.12);
+  }
+
+  .app[data-theme='light'] .tts-toggle-btn.enabled {
+    color: #0f172a;
+    background: rgba(25,118,210,0.13);
+    border-color: rgba(25,118,210,0.38);
+  }
+
+  .app[data-theme='light'] .tts-toggle-btn.muted {
+    color: #b91c1c;
   }
 
   .app[data-theme='light'] .window-pin-btn.active {
