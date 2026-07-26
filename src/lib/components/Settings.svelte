@@ -281,11 +281,11 @@
   });
 
   const danmakuObsUrl = $derived.by(() => {
-    return withDanmaku(obsUrl);
+    return withDanmaku(obsUrl, config?.obs ?? null);
   });
 
   const goalsObsUrl = $derived.by(() => {
-    return withGoalsParams(obsGoalsBaseUrl, config?.obs ?? null);
+    return withGoalsParams(obsGoalsBaseUrl, config?.obs ?? null, config?.goals ?? null);
   });
 
   const timerObsUrl = $derived.by(() => {
@@ -319,13 +319,13 @@
     }
   }
 
-  function withDanmaku(url: string): string {
+  function withDanmaku(url: string, obs: AppConfig['obs'] | null): string {
     try {
       const u = new URL(url);
       // 弾幕 app.js が解釈するクエリのみ引き継ぐ。max は積み上げ式の maxRows(既定8)
       // 由来で、弾幕の「同時に流れる最大本数」(app.js 既定240)とは別概念。引き継ぐと
       // 弾幕が極端に少なくなる(=またスカスカ)ので除外し、app.js の既定240に任せる。
-      const keepParams = new Set(['channel', 'dur', 'size', 'opacity', 'name', 'outline', 'only', 'ws']);
+      const keepParams = new Set(['channel', 'dur', 'opacity', 'name', 'outline', 'only', 'ws']);
       const kept = new URLSearchParams();
       for (const [key, value] of u.searchParams.entries()) {
         if (keepParams.has(key)) kept.append(key, value);
@@ -335,6 +335,7 @@
       }
       u.search = '';
       u.searchParams.set('template', 'danmaku');
+      u.searchParams.set('size', String(clampInt(obs?.danmakuFontSize, 30, 12, 96)));
       for (const [key, value] of kept.entries()) {
         u.searchParams.append(key, value);
       }
@@ -344,13 +345,25 @@
     }
   }
 
-  function withGoalsParams(url: string, obs: AppConfig['obs'] | null): string {
+  function withGoalsParams(
+    url: string,
+    obs: AppConfig['obs'] | null,
+    goals: GoalsConfig | null,
+  ): string {
     try {
       const u = new URL(url);
       u.searchParams.set('template', 'goals');
       u.searchParams.set('font', String(clampInt(obs?.fontScalePct, 100, 50, 200)));
       u.searchParams.set('bg', String(clampInt(obs?.bgOpacityPct, 0, 0, 100)));
       u.searchParams.set('pos', obs?.position === 'top' ? 'top' : 'bottom');
+      u.searchParams.set(
+        'layout',
+        goals?.layout === 'vertical' || goals?.layout === 'grid' ? goals.layout : 'horizontal',
+      );
+      u.searchParams.set(
+        'skin',
+        goals?.skin === 'solid' || goals?.skin === 'minimal' ? goals.skin : 'glass',
+      );
       return u.toString();
     } catch {
       return url;
@@ -404,6 +417,7 @@
     if (!config) return;
     config.obs.template = (config.obs.template || 'default').trim() || 'default';
     config.obs.fontScalePct = clampInt(config.obs.fontScalePct, 100, 50, 200);
+    config.obs.danmakuFontSize = clampInt(config.obs.danmakuFontSize, 30, 12, 96);
     config.obs.maxRows = clampInt(config.obs.maxRows, 8, 1, 1000);
     config.obs.ttlMs = positiveInt(config.obs.ttlMs, 12000);
     config.obs.bgOpacityPct = clampInt(config.obs.bgOpacityPct, 0, 0, 100);
@@ -418,7 +432,20 @@
   }
 
   function defaultGoals(): GoalsConfig {
-    return { enabled: false, showInApp: false, comments: 0, viewers: 0, likes: 0, reactions: 0 };
+    return {
+      enabled: false,
+      showInApp: false,
+      layout: 'horizontal',
+      skin: 'glass',
+      showComments: true,
+      showViewers: true,
+      showLikes: true,
+      showReactions: true,
+      comments: 0,
+      viewers: 0,
+      likes: 0,
+      reactions: 0,
+    };
   }
 
   function normalizeGoalsConfig() {
@@ -427,6 +454,30 @@
     if (!editable.goals) editable.goals = defaultGoals();
     editable.goals.enabled = editable.goals.enabled === true;
     editable.goals.showInApp = editable.goals.showInApp === true;
+    editable.goals.layout =
+      editable.goals.layout === 'vertical' || editable.goals.layout === 'grid'
+        ? editable.goals.layout
+        : 'horizontal';
+    editable.goals.skin =
+      editable.goals.skin === 'solid' || editable.goals.skin === 'minimal'
+        ? editable.goals.skin
+        : 'glass';
+    editable.goals.showComments =
+      typeof editable.goals.showComments === 'boolean'
+        ? editable.goals.showComments
+        : Number(editable.goals.comments) > 0;
+    editable.goals.showViewers =
+      typeof editable.goals.showViewers === 'boolean'
+        ? editable.goals.showViewers
+        : Number(editable.goals.viewers) > 0;
+    editable.goals.showLikes =
+      typeof editable.goals.showLikes === 'boolean'
+        ? editable.goals.showLikes
+        : Number(editable.goals.likes) > 0;
+    editable.goals.showReactions =
+      typeof editable.goals.showReactions === 'boolean'
+        ? editable.goals.showReactions
+        : Number(editable.goals.reactions) > 0;
     editable.goals.comments = clampInt(editable.goals.comments, 0, 0, 4294967295);
     editable.goals.viewers = clampInt(editable.goals.viewers, 0, 0, 4294967295);
     editable.goals.likes = clampInt(editable.goals.likes, 0, 0, 4294967295);
@@ -1500,6 +1551,19 @@
     </div>
     <div class="obs-label">弾幕オーバーレイ用URL</div>
     <p class="hint">弾幕オーバーレイ（画面を流れるニコ生風）。通常のコメント表示URLとは別に、OBSへ追加のブラウザソースとして貼ってください</p>
+    <div class="field-row">
+      <label for="obs-danmaku-font-size">弾幕文字サイズ</label>
+      <input
+        id="obs-danmaku-font-size"
+        type="number"
+        min="12"
+        max="96"
+        step="1"
+        bind:value={config.obs.danmakuFontSize}
+        class="num-input"
+      />
+      <span class="hint-inline">px（12〜96）</span>
+    </div>
     <div class="obs-row">
       <input type="text" value={danmakuObsUrl} readonly class="obs-input" />
       <button class="copy-btn" class:copied={copiedDanmakuObs} onclick={onCopyDanmakuObs}>
@@ -1525,6 +1589,22 @@
       <input id="goals-show-in-app" type="checkbox" bind:checked={config.goals.showInApp} class="chk" />
     </div>
     <div class="field-row">
+      <label for="goals-layout">OBSでの並び方</label>
+      <select id="goals-layout" bind:value={config.goals.layout} class="platform-select">
+        <option value="horizontal">横1列</option>
+        <option value="vertical">縦1列</option>
+        <option value="grid">2×2</option>
+      </select>
+    </div>
+    <div class="field-row">
+      <label for="goals-skin">OBSスキン</label>
+      <select id="goals-skin" bind:value={config.goals.skin} class="platform-select">
+        <option value="glass">グラス</option>
+        <option value="solid">ソリッド</option>
+        <option value="minimal">ミニマル</option>
+      </select>
+    </div>
+    <div class="field-row">
       <label for="goals-comments">コメント</label>
       <input
         id="goals-comments"
@@ -1535,7 +1615,10 @@
         bind:value={config.goals.comments}
         class="num-input"
       />
-      <span class="hint-inline">（0で非表示）</span>
+      <label class="goal-visibility">
+        <input type="checkbox" bind:checked={config.goals.showComments} class="chk" />
+        表示
+      </label>
     </div>
     <div class="field-row">
       <label for="goals-viewers">視聴者</label>
@@ -1548,7 +1631,10 @@
         bind:value={config.goals.viewers}
         class="num-input"
       />
-      <span class="hint-inline">（0で非表示）</span>
+      <label class="goal-visibility">
+        <input type="checkbox" bind:checked={config.goals.showViewers} class="chk" />
+        表示
+      </label>
     </div>
     <div class="field-row">
       <label for="goals-likes">高評価</label>
@@ -1561,7 +1647,10 @@
         bind:value={config.goals.likes}
         class="num-input"
       />
-      <span class="hint-inline">（0で非表示）</span>
+      <label class="goal-visibility">
+        <input type="checkbox" bind:checked={config.goals.showLikes} class="chk" />
+        表示
+      </label>
     </div>
     <div class="field-row">
       <label for="goals-reactions">リアクション</label>
@@ -1574,7 +1663,10 @@
         bind:value={config.goals.reactions}
         class="num-input"
       />
-      <span class="hint-inline">（0で非表示）</span>
+      <label class="goal-visibility">
+        <input type="checkbox" bind:checked={config.goals.showReactions} class="chk" />
+        表示
+      </label>
     </div>
     <div class="obs-label">GoalsオーバーレイURL</div>
     <div class="obs-row">
@@ -2317,6 +2409,20 @@
 
   .hint { font-size: 11px; color: #757575; margin: 4px 0 0; }
   .hint-inline { font-size: 11px; color: #757575; font-weight: 400; text-transform: none; letter-spacing: 0; }
+  .goal-visibility {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 72px;
+    color: #bdbdbd;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    user-select: none;
+  }
+  .goal-visibility:focus-within {
+    color: #ffffff;
+  }
   .tts-test-result { font-size: 12px; margin: 4px 0 0; }
   .tts-test-result--ok { color: #81c784; }
   .tts-test-result--error { color: #ef9a9a; }

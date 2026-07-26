@@ -47,6 +47,8 @@ pub struct StatsSnapshot {
     pub likes_available: bool,
     pub reactions: u32,
     pub reactions_available: bool,
+    pub goals_enabled: bool,
+    pub goals_visible: GoalsVisibilitySnapshot,
     #[serde(default)]
     pub channel_titles: Vec<ChannelTitle>,
     #[serde(default)]
@@ -80,7 +82,7 @@ impl Default for TimerSnapshot {
     }
 }
 
-/// 設定由来の目標値。0 は該当ゲージ非表示。
+/// 設定由来の目標値。0 は目標未設定として 0% のゲージを表示する。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct GoalsSnapshot {
@@ -88,6 +90,15 @@ pub struct GoalsSnapshot {
     pub viewers: u32,
     pub likes: u32,
     pub reactions: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct GoalsVisibilitySnapshot {
+    pub comments: bool,
+    pub viewers: bool,
+    pub likes: bool,
+    pub reactions: bool,
 }
 
 /// メタデータ poller から集約タスクへ渡す更新。
@@ -334,6 +345,8 @@ fn build_snapshot(
         likes_available: has_enabled_youtube(config),
         reactions,
         reactions_available: has_enabled_youtube(config),
+        goals_enabled: config.goals.enabled,
+        goals_visible: goals_visibility_from_config(config),
         channel_titles,
         channel_status,
         goals: goals_from_config(config),
@@ -491,6 +504,24 @@ fn goals_from_config(config: &AppConfig) -> GoalsSnapshot {
     }
 }
 
+fn goals_visibility_from_config(config: &AppConfig) -> GoalsVisibilitySnapshot {
+    GoalsVisibilitySnapshot {
+        comments: config
+            .goals
+            .show_comments
+            .unwrap_or(config.goals.comments > 0),
+        viewers: config
+            .goals
+            .show_viewers
+            .unwrap_or(config.goals.viewers > 0),
+        likes: config.goals.show_likes.unwrap_or(config.goals.likes > 0),
+        reactions: config
+            .goals
+            .show_reactions
+            .unwrap_or(config.goals.reactions > 0),
+    }
+}
+
 fn resolve_viewers(concurrent_total: u32, _unique_count: u32) -> u32 {
     // UI/OBS ではこの値を「同時接続」と表示するため、取得不能・0人時に
     // セッション累積のユニークコメント投稿者数へ置き換えない。
@@ -600,6 +631,41 @@ mod tests {
         assert_eq!(goals.viewers, 20);
         assert_eq!(goals.likes, 30);
         assert_eq!(goals.reactions, 40);
+    }
+
+    #[test]
+    fn snapshot_exposes_goals_enabled_separately_from_zero_targets() {
+        let mut config = AppConfig::default();
+        config.goals.enabled = true;
+
+        let snapshot = build_snapshot(0, 0, 0, &HashMap::new(), &HashMap::new(), &config);
+
+        assert!(snapshot.goals_enabled);
+        assert_eq!(snapshot.goals.comments, 0);
+        assert_eq!(snapshot.goals.viewers, 0);
+        assert_eq!(snapshot.goals.likes, 0);
+        assert_eq!(snapshot.goals.reactions, 0);
+        assert!(snapshot.goals_visible.comments);
+        assert!(snapshot.goals_visible.viewers);
+        assert!(snapshot.goals_visible.likes);
+        assert!(snapshot.goals_visible.reactions);
+    }
+
+    #[test]
+    fn legacy_goal_visibility_follows_nonzero_targets() {
+        let mut config = AppConfig::default();
+        config.goals.show_comments = None;
+        config.goals.show_viewers = None;
+        config.goals.show_likes = None;
+        config.goals.show_reactions = None;
+        config.goals.comments = 10;
+
+        let visible = goals_visibility_from_config(&config);
+
+        assert!(visible.comments);
+        assert!(!visible.viewers);
+        assert!(!visible.likes);
+        assert!(!visible.reactions);
     }
 
     #[test]

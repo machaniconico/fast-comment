@@ -51,6 +51,9 @@ pub struct ObsConfig {
     /// OBS オーバーレイのフォント倍率(%)。既定 100。
     #[serde(default = "default_obs_font_scale_pct")]
     pub font_scale_pct: u16,
+    /// OBS弾幕オーバーレイの文字サイズ(px)。既定 30。
+    #[serde(default = "default_obs_danmaku_font_size")]
+    pub danmaku_font_size: u16,
     /// OBS オーバーレイの最大表示行数。既定 8。
     #[serde(default = "default_obs_max_rows")]
     pub max_rows: u16,
@@ -72,6 +75,7 @@ impl ObsConfig {
     pub fn normalize(&mut self) {
         self.max_rows = self.max_rows.clamp(1, MAX_OBS_ROWS);
         self.font_scale_pct = self.font_scale_pct.clamp(50, 200);
+        self.danmaku_font_size = self.danmaku_font_size.clamp(12, 96);
         self.bg_opacity_pct = self.bg_opacity_pct.clamp(0, 100);
         self.ttl_ms = self.ttl_ms.clamp(500, 600_000);
         if self.position != "top" && self.position != "bottom" {
@@ -86,6 +90,7 @@ impl Default for ObsConfig {
             port: default_obs_port(),
             template: default_obs_template(),
             font_scale_pct: default_obs_font_scale_pct(),
+            danmaku_font_size: default_obs_danmaku_font_size(),
             max_rows: default_obs_max_rows(),
             ttl_ms: default_obs_ttl_ms(),
             bg_opacity_pct: default_obs_bg_opacity_pct(),
@@ -96,7 +101,7 @@ impl Default for ObsConfig {
 }
 
 /// OBS 配信目標ゲージ(Goals overlay)設定。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GoalsConfig {
     /// Goals overlay を有効にするか。false のときは全ゲージを非表示扱いにする。
@@ -104,15 +109,49 @@ pub struct GoalsConfig {
     /// アプリ本体内にも GoalsBar を常設表示するか。既定 false。
     #[serde(default)]
     pub show_in_app: bool,
-    /// コメント数目標。0 は非表示。
+    /// OBS上の配置("horizontal" / "vertical" / "grid")。
+    #[serde(default = "default_goals_layout")]
+    pub layout: String,
+    /// OBS上の外観("glass" / "solid" / "minimal")。
+    #[serde(default = "default_goals_skin")]
+    pub skin: String,
+    /// 各ゲージの表示可否。None は旧設定との互換用で、目標値が1以上なら表示。
+    #[serde(default)]
+    pub show_comments: Option<bool>,
+    #[serde(default)]
+    pub show_viewers: Option<bool>,
+    #[serde(default)]
+    pub show_likes: Option<bool>,
+    #[serde(default)]
+    pub show_reactions: Option<bool>,
+    /// コメント数目標。0 は 0% として表示。
     pub comments: u32,
-    /// 視聴者数目標。0 は非表示。
+    /// 視聴者数目標。0 は 0% として表示。
     pub viewers: u32,
-    /// 高評価数目標。0 は非表示。
+    /// 高評価数目標。0 は 0% として表示。
     pub likes: u32,
-    /// YouTube 絵文字リアクション数目標。0 は非表示。
+    /// YouTube 絵文字リアクション数目標。0 は 0% として表示。
     #[serde(default)]
     pub reactions: u32,
+}
+
+impl Default for GoalsConfig {
+    fn default() -> Self {
+        GoalsConfig {
+            enabled: false,
+            show_in_app: false,
+            layout: default_goals_layout(),
+            skin: default_goals_skin(),
+            show_comments: Some(true),
+            show_viewers: Some(true),
+            show_likes: Some(true),
+            show_reactions: Some(true),
+            comments: 0,
+            viewers: 0,
+            likes: 0,
+            reactions: 0,
+        }
+    }
 }
 
 /// OBS タイマー/カウントダウン overlay 設定。
@@ -556,6 +595,9 @@ fn default_obs_template() -> String {
 fn default_obs_font_scale_pct() -> u16 {
     100
 }
+fn default_obs_danmaku_font_size() -> u16 {
+    30
+}
 fn default_obs_max_rows() -> u16 {
     8
 }
@@ -567,6 +609,12 @@ fn default_obs_bg_opacity_pct() -> u16 {
 }
 fn default_obs_position() -> String {
     "bottom".to_string()
+}
+fn default_goals_layout() -> String {
+    "horizontal".to_string()
+}
+fn default_goals_skin() -> String {
+    "glass".to_string()
 }
 fn default_timer_duration_sec() -> u32 {
     300
@@ -648,6 +696,7 @@ mod tests {
                 port: 12000,
                 template: "compact".to_string(),
                 font_scale_pct: 125,
+                danmaku_font_size: 42,
                 max_rows: 12,
                 ttl_ms: 9000,
                 bg_opacity_pct: 35,
@@ -657,6 +706,12 @@ mod tests {
             goals: GoalsConfig {
                 enabled: true,
                 show_in_app: true,
+                layout: "grid".to_string(),
+                skin: "solid".to_string(),
+                show_comments: Some(true),
+                show_viewers: Some(false),
+                show_likes: Some(true),
+                show_reactions: Some(false),
                 comments: 100,
                 viewers: 50,
                 likes: 25,
@@ -749,6 +804,7 @@ mod tests {
 
         assert_eq!(json["obs"]["template"].as_str(), Some("compact"));
         assert_eq!(json["obs"]["fontScalePct"].as_u64(), Some(125));
+        assert_eq!(json["obs"]["danmakuFontSize"].as_u64(), Some(42));
         assert_eq!(json["obs"]["maxRows"].as_u64(), Some(12));
         assert_eq!(json["obs"]["ttlMs"].as_u64(), Some(9000));
         assert_eq!(json["obs"]["bgOpacityPct"].as_u64(), Some(35));
@@ -756,6 +812,10 @@ mod tests {
         assert_eq!(json["obs"]["showPlatform"].as_bool(), Some(false));
         assert_eq!(json["goals"]["enabled"].as_bool(), Some(true));
         assert_eq!(json["goals"]["showInApp"].as_bool(), Some(true));
+        assert_eq!(json["goals"]["layout"].as_str(), Some("grid"));
+        assert_eq!(json["goals"]["skin"].as_str(), Some("solid"));
+        assert_eq!(json["goals"]["showComments"].as_bool(), Some(true));
+        assert_eq!(json["goals"]["showViewers"].as_bool(), Some(false));
         assert_eq!(json["goals"]["comments"].as_u64(), Some(100));
         assert_eq!(json["goals"]["viewers"].as_u64(), Some(50));
         assert_eq!(json["goals"]["likes"].as_u64(), Some(25));
@@ -900,6 +960,11 @@ mod tests {
         assert_eq!(cfg.obs.template, "default");
         assert_eq!(cfg.obs.font_scale_pct, default_obs_font_scale_pct());
         assert_eq!(cfg.obs.font_scale_pct, 100);
+        assert_eq!(
+            cfg.obs.danmaku_font_size,
+            default_obs_danmaku_font_size()
+        );
+        assert_eq!(cfg.obs.danmaku_font_size, 30);
         assert_eq!(cfg.obs.max_rows, default_obs_max_rows());
         assert_eq!(cfg.obs.max_rows, 8);
         assert_eq!(cfg.obs.ttl_ms, default_obs_ttl_ms());
@@ -1103,6 +1168,12 @@ mod tests {
         .expect("deserialize legacy goals config");
         assert!(legacy_goals.enabled);
         assert!(!legacy_goals.show_in_app);
+        assert_eq!(legacy_goals.layout, "horizontal");
+        assert_eq!(legacy_goals.skin, "glass");
+        assert_eq!(legacy_goals.show_comments, None);
+        assert_eq!(legacy_goals.show_viewers, None);
+        assert_eq!(legacy_goals.show_likes, None);
+        assert_eq!(legacy_goals.show_reactions, None);
         assert_eq!(legacy_goals.comments, 10);
         assert_eq!(legacy_goals.viewers, 20);
         assert_eq!(legacy_goals.likes, 30);
@@ -1111,6 +1182,12 @@ mod tests {
         let cfg = GoalsConfig {
             enabled: true,
             show_in_app: true,
+            layout: "vertical".to_string(),
+            skin: "minimal".to_string(),
+            show_comments: Some(false),
+            show_viewers: Some(true),
+            show_likes: Some(false),
+            show_reactions: Some(true),
             comments: 100,
             viewers: 50,
             likes: 25,
@@ -1119,6 +1196,9 @@ mod tests {
         let text = serde_json::to_string(&cfg).expect("serialize goals config");
         let json: serde_json::Value = serde_json::from_str(&text).expect("parse goals json");
         assert_eq!(json["showInApp"].as_bool(), Some(true));
+        assert_eq!(json["layout"].as_str(), Some("vertical"));
+        assert_eq!(json["skin"].as_str(), Some("minimal"));
+        assert_eq!(json["showComments"].as_bool(), Some(false));
         assert_eq!(json["reactions"].as_u64(), Some(12));
 
         let decoded: GoalsConfig = serde_json::from_str(&text).expect("deserialize goals config");

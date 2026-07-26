@@ -48,12 +48,24 @@ body {
 
 .goals {
   display: flex;
-  flex-wrap: wrap;
   justify-content: center;
   gap: 12px;
   max-width: min(96vw, 1120px);
   transform: scale(var(--font-scale));
   transform-origin: bottom center;
+}
+
+.goals.layout-horizontal {
+  flex-flow: row nowrap;
+}
+
+.goals.layout-vertical {
+  flex-flow: column nowrap;
+}
+
+.goals.layout-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(220px, 330px));
 }
 
 .overlay.top .goals {
@@ -79,6 +91,41 @@ body {
   border: 1px solid rgba(255,255,255,0.24);
   box-shadow: 0 14px 34px rgba(0,0,0,0.34);
   backdrop-filter: blur(8px);
+}
+
+.skin-solid .goal-card {
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  background: rgba(18, 20, 28, 0.96);
+  box-shadow: 0 8px 20px rgba(0,0,0,0.32);
+  backdrop-filter: none;
+}
+
+.skin-solid .goal-percent {
+  border-radius: 4px;
+}
+
+.skin-minimal .goal-card {
+  padding: 8px 4px 10px;
+  border-color: transparent;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  backdrop-filter: none;
+}
+
+.skin-minimal .goal-head {
+  margin-bottom: 6px;
+}
+
+.skin-minimal .goal-percent {
+  color: #fff;
+  background: transparent;
+}
+
+.skin-minimal .goal-bar {
+  height: 6px;
+  margin-top: 9px;
+  background: rgba(255,255,255,0.24);
 }
 
 .goal-card.reached {

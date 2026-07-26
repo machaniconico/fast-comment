@@ -235,6 +235,7 @@ export interface AppConfig {
     port: number;
     template: string;
     fontScalePct: number;
+    danmakuFontSize: number;
     maxRows: number;
     ttlMs: number;
     bgOpacityPct: number;
@@ -269,6 +270,12 @@ export interface YoutubeOauthStatus {
 export interface GoalsConfig {
   enabled: boolean;
   showInApp: boolean;
+  layout: 'horizontal' | 'vertical' | 'grid';
+  skin: 'glass' | 'solid' | 'minimal';
+  showComments: boolean;
+  showViewers: boolean;
+  showLikes: boolean;
+  showReactions: boolean;
   comments: number;
   viewers: number;
   likes: number;
@@ -307,6 +314,13 @@ export interface GoalsSnapshot {
   reactions: number;
 }
 
+export interface GoalsVisibilitySnapshot {
+  comments: boolean;
+  viewers: boolean;
+  likes: boolean;
+  reactions: boolean;
+}
+
 export interface ChannelTitle {
   platform: string;
   identifier: string;
@@ -329,6 +343,8 @@ export interface StatsSnapshot {
   likesAvailable: boolean;
   reactions: number;
   reactionsAvailable: boolean;
+  goalsEnabled: boolean;
+  goalsVisible: GoalsVisibilitySnapshot;
   goals: GoalsSnapshot;
   updatedAt: number;
   // Per-channel stream titles (currently YouTube only). Optional for backward

@@ -9,7 +9,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "check": "svelte-check --tsconfig ./tsconfig.json",
-    "test": "svelte-check --tsconfig ./tsconfig.json && vite build",
+    "test": "svelte-check --tsconfig ./tsconfig.json && vite build && node --test templates/goals/app.test.mjs",
     "tauri": "tauri"
   },
   "devDependencies": {
