@@ -29,6 +29,7 @@
     checkForUpdate,
     openReleaseUrl,
     getConfig,
+    setConfig,
     onTtsNotice,
     toggleDanmakuOverlay,
     isDanmakuOverlayOpen,
@@ -46,6 +47,8 @@
   let toolsOpen = $state(false);
   let toolsMenuEl: HTMLDivElement | null = null;
   let danmakuOpen = $state(false);
+  let goalsToggleSaving = $state(false);
+  let goalsToggleError = $state('');
   let unlistenDanmakuState: (() => void) | null = null;
   let destroyed = false;
   const DANMAKU_LABEL = 'danmaku';
@@ -309,6 +312,24 @@
     config = structuredClone(nextConfig);
   }
 
+  async function toggleGoalsInApp(event: Event) {
+    if (!config || goalsToggleSaving) return;
+    const previous = structuredClone(config);
+    const next = structuredClone(config);
+    next.goals.showInApp = (event.currentTarget as HTMLInputElement).checked;
+    config = next;
+    goalsToggleSaving = true;
+    goalsToggleError = '';
+    try {
+      await setConfig(next);
+    } catch (e) {
+      config = previous;
+      goalsToggleError = e instanceof Error ? e.message : String(e);
+    } finally {
+      goalsToggleSaving = false;
+    }
+  }
+
   async function onUpdateDownloadClick(e: MouseEvent) {
     e.preventDefault();
     const url = updateStatus?.releaseUrl;
@@ -478,8 +499,27 @@
     </div>
   </header>
 
-  {#if showGoalsBar}
-    <GoalsBar />
+  {#if config?.goals?.enabled}
+    <section class="goals-panel" aria-label="アプリ内の目標表示">
+      <div class="goals-panel-controls">
+        <span class="goals-panel-label">目標</span>
+        <label class="goals-panel-toggle">
+          <input
+            type="checkbox"
+            checked={showGoalsBar}
+            disabled={goalsToggleSaving}
+            onchange={toggleGoalsInApp}
+          />
+          <span>{goalsToggleSaving ? '保存中' : 'コメビュに表示'}</span>
+        </label>
+        {#if goalsToggleError}
+          <span class="goals-toggle-error" title={goalsToggleError}>保存失敗</span>
+        {/if}
+      </div>
+      {#if showGoalsBar}
+        <GoalsBar />
+      {/if}
+    </section>
   {/if}
 
   <!-- ── Channel add bar (URL paste → auto-detect) ── -->
@@ -1182,6 +1222,81 @@
   .clear-btn:hover { color: #f44336; }
 
   /* Main content */
+  .goals-panel {
+    flex-shrink: 0;
+    background: #171a1f;
+    border-bottom: 1px solid rgba(255,255,255,0.08);
+  }
+
+  .goals-panel :global(.goals-bar) {
+    border-bottom: 0;
+  }
+
+  .goals-panel-controls {
+    min-height: 27px;
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 8px;
+    padding: 3px 10px;
+    color: #8b949e;
+    font-size: 11px;
+  }
+
+  .goals-panel-label {
+    margin-right: auto;
+    color: #aeb6c2;
+    font-weight: 800;
+  }
+
+  .goals-panel-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    min-height: 20px;
+    color: #c7cdd6;
+    font-weight: 600;
+    cursor: pointer;
+    user-select: none;
+  }
+
+  .goals-panel-toggle input {
+    width: 15px;
+    height: 15px;
+    margin: 0;
+    accent-color: #1976d2;
+    cursor: pointer;
+  }
+
+  .goals-panel-toggle input:disabled,
+  .goals-panel-toggle input:disabled + span {
+    cursor: wait;
+    opacity: 0.6;
+  }
+
+  .goals-panel-toggle:focus-within {
+    color: #ffffff;
+  }
+
+  .goals-toggle-error {
+    color: #fca5a5;
+    font-weight: 700;
+  }
+
+  .app[data-theme='light'] .goals-panel {
+    background: #eef2f6;
+    border-bottom-color: rgba(15,23,42,0.1);
+  }
+
+  .app[data-theme='light'] .goals-panel-label,
+  .app[data-theme='light'] .goals-panel-toggle {
+    color: #334155;
+  }
+
+  .app[data-theme='light'] .goals-toggle-error {
+    color: #b91c1c;
+  }
+
   .main-content {
     flex: 1;
     overflow: hidden;
