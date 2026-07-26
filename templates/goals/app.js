@@ -32,9 +32,14 @@ function applyParams() {
     ? requestedLayout
     : 'horizontal';
   const requestedSkin = (params.get('skin') || 'glass').toLowerCase();
-  const skin = ['glass', 'solid', 'minimal'].includes(requestedSkin)
-    ? requestedSkin
-    : 'glass';
+  const customImage = params.get('image') || '';
+  const hasCustomSkin = requestedSkin === 'custom'
+    && /^\/skin\/[^/]+\.png$/i.test(customImage);
+  const skin = hasCustomSkin
+    ? 'custom'
+    : ['glass', 'solid', 'minimal'].includes(requestedSkin)
+      ? requestedSkin
+      : 'glass';
 
   document.documentElement.style.setProperty('--font-scale', String(font));
   document.documentElement.style.setProperty('--bg-alpha', bg.toFixed(2));
@@ -43,8 +48,12 @@ function applyParams() {
   overlay.classList.add(['top', 'bottom', 'left', 'right'].includes(pos) ? pos : 'bottom');
   goalsRoot.classList.remove('layout-horizontal', 'layout-vertical', 'layout-grid');
   goalsRoot.classList.add(`layout-${layout}`);
-  goalsRoot.classList.remove('skin-glass', 'skin-solid', 'skin-minimal');
+  goalsRoot.classList.remove('skin-glass', 'skin-solid', 'skin-minimal', 'skin-custom');
   goalsRoot.classList.add(`skin-${skin}`);
+  goalsRoot.style.setProperty(
+    '--custom-skin-image',
+    hasCustomSkin ? `url(${JSON.stringify(customImage)})` : 'none'
+  );
 }
 
 function connect() {

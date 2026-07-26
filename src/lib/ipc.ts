@@ -271,7 +271,7 @@ export interface GoalsConfig {
   enabled: boolean;
   showInApp: boolean;
   layout: 'horizontal' | 'vertical' | 'grid';
-  skin: 'glass' | 'solid' | 'minimal';
+  skin: 'glass' | 'solid' | 'minimal' | `png:${string}`;
   showComments: boolean;
   showViewers: boolean;
   showLikes: boolean;
@@ -473,6 +473,15 @@ export async function readTemplateFile(name: string, file: string): Promise<stri
 
 export async function writeTemplateFile(name: string, file: string, contents: string): Promise<void> {
   await invoke<void>('write_template_file', { name, file, contents });
+}
+
+export interface GoalSkinInfo {
+  directory: string;
+  files: string[];
+}
+
+export async function getGoalSkinInfo(): Promise<GoalSkinInfo> {
+  return (await invoke<GoalSkinInfo>('get_goal_skin_info')) ?? { directory: '', files: [] };
 }
 
 export async function getParticipants(): Promise<Participant[] | null> {

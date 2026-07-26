@@ -121,14 +121,16 @@ impl Bus {
     /// - `GET /?template=<name>`: `templates_dir/<name>/index.html` を返す。
     ///   `template` 未指定時は `default`。`../` 等のトラバーサルは拒否する。
     /// - `GET /<name>/...`: テンプレの静的アセットを配信(ServeDir)。
+    /// - `GET /skin/<file>.png`: ユーザー作成のGoals背景スキンを配信。
     ///
     /// `cancel` 発火でサーバを graceful shutdown する。
     pub fn spawn_obs_server(
         &self,
         templates_dir: PathBuf,
+        goals_skin_dir: PathBuf,
         cancel: CancellationToken,
     ) -> Result<tauri::async_runtime::JoinHandle<()>, String> {
-        self.spawn_obs_server_on_port(templates_dir, self.obs_port, cancel)
+        self.spawn_obs_server_on_port(templates_dir, goals_skin_dir, self.obs_port, cancel)
     }
 
     /// 指定ポートで OBS overlay サーバ(axum)を起動する。
@@ -137,6 +139,7 @@ impl Bus {
     pub fn spawn_obs_server_on_port(
         &self,
         templates_dir: PathBuf,
+        goals_skin_dir: PathBuf,
         port: u16,
         cancel: CancellationToken,
     ) -> Result<tauri::async_runtime::JoinHandle<()>, String> {
@@ -172,19 +175,22 @@ impl Bus {
             // テンプレ静的配信。ディレクトリ直アクセス時は index.html を返す。
             let serve_dir =
                 ServeDir::new(&templates_dir).append_index_html_on_directories(true);
+            let skin_dir = ServeDir::new(&goals_skin_dir);
 
             let app = Router::new()
                 .route("/ws", get(ws_handler))
                 .route("/stats", get(stats_ws_handler))
                 .route("/timer", get(timer_ws_handler))
                 .route("/", get(template_index_handler))
+                .nest_service("/skin", skin_dir)
                 .fallback_service(serve_dir)
                 .layer(CorsLayer::permissive())
                 .with_state(state);
 
             tracing::info!(
-                "OBS overlay サーバ起動: http://{addr}/  (templates: {})",
-                templates_dir.display()
+                "OBS overlay サーバ起動: http://{addr}/  (templates: {}, skins: {})",
+                templates_dir.display(),
+                goals_skin_dir.display()
             );
 
             let shutdown = async move {

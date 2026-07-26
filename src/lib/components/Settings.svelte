@@ -7,7 +7,7 @@
   import {
     getConfig, setConfig, getObsUrl, getObsGoalsUrl, getObsTimerUrl, exportCommentsCsv, injectTestComment,
     setTtsPaused, clearTtsQueue, skipCurrentTts, testTts, getYoutubeOauthStatus,
-    connectYoutubeOauth, disconnectYoutubeOauth
+    connectYoutubeOauth, disconnectYoutubeOauth, getGoalSkinInfo
   } from '../ipc';
   import { ui, SETTINGS_ANCHOR_IDS } from '../ui.svelte';
   import {
@@ -68,6 +68,10 @@
   let copiedGoalsObs: boolean = $state(false);
   let copiedTimerObs: boolean = $state(false);
   let copiedCsvPath: boolean = $state(false);
+  let goalSkinDirectory: string = $state('');
+  let goalSkinFiles: string[] = $state([]);
+  let goalSkinLoading: boolean = $state(false);
+  let goalSkinError: string = $state('');
 
   // NG / highlight lists
   let ngWords: string[] = $state([]);
@@ -247,6 +251,7 @@
     obsBaseUrl = url ?? 'http://127.0.0.1:11180/?template=default';
     obsGoalsBaseUrl = await getObsGoalsUrl();
     obsTimerBaseUrl = await getObsTimerUrl();
+    await refreshGoalSkins();
 
     refreshSpeechVoices();
     if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
@@ -286,6 +291,16 @@
 
   const goalsObsUrl = $derived.by(() => {
     return withGoalsParams(obsGoalsBaseUrl, config?.obs ?? null, config?.goals ?? null);
+  });
+
+  const goalSkinOptions = $derived.by(() => {
+    const current = config?.goals.skin;
+    const files = [...goalSkinFiles];
+    if (typeof current === 'string' && current.startsWith('png:')) {
+      const currentFile = current.slice(4);
+      if (currentFile && !files.includes(currentFile)) files.unshift(currentFile);
+    }
+    return files;
   });
 
   const timerObsUrl = $derived.by(() => {
@@ -360,10 +375,17 @@
         'layout',
         goals?.layout === 'vertical' || goals?.layout === 'grid' ? goals.layout : 'horizontal',
       );
-      u.searchParams.set(
-        'skin',
-        goals?.skin === 'solid' || goals?.skin === 'minimal' ? goals.skin : 'glass',
-      );
+      const customSkin = customGoalSkinFile(goals?.skin);
+      if (customSkin) {
+        u.searchParams.set('skin', 'custom');
+        u.searchParams.set('image', `/skin/${customSkin}`);
+      } else {
+        u.searchParams.set(
+          'skin',
+          goals?.skin === 'solid' || goals?.skin === 'minimal' ? goals.skin : 'glass',
+        );
+        u.searchParams.delete('image');
+      }
       return u.toString();
     } catch {
       return url;
@@ -448,6 +470,26 @@
     };
   }
 
+  function customGoalSkinFile(value: unknown): string | null {
+    if (typeof value !== 'string') return null;
+    const match = /^png:([^/\\]+\.png)$/i.exec(value);
+    return match?.[1] ?? null;
+  }
+
+  async function refreshGoalSkins() {
+    goalSkinLoading = true;
+    goalSkinError = '';
+    try {
+      const info = await getGoalSkinInfo();
+      goalSkinDirectory = info.directory;
+      goalSkinFiles = info.files;
+    } catch (e) {
+      goalSkinError = e instanceof Error ? e.message : String(e);
+    } finally {
+      goalSkinLoading = false;
+    }
+  }
+
   function normalizeGoalsConfig() {
     if (!config) return;
     const editable = config as AppConfig & { goals?: Partial<GoalsConfig> };
@@ -459,7 +501,9 @@
         ? editable.goals.layout
         : 'horizontal';
     editable.goals.skin =
-      editable.goals.skin === 'solid' || editable.goals.skin === 'minimal'
+      editable.goals.skin === 'solid'
+      || editable.goals.skin === 'minimal'
+      || customGoalSkinFile(editable.goals.skin)
         ? editable.goals.skin
         : 'glass';
     editable.goals.showComments =
@@ -1602,8 +1646,28 @@
         <option value="glass">グラス</option>
         <option value="solid">ソリッド</option>
         <option value="minimal">ミニマル</option>
+        {#if goalSkinOptions.length > 0}
+          <optgroup label="自作PNG">
+            {#each goalSkinOptions as file (file)}
+              <option value={`png:${file}`}>{file}</option>
+            {/each}
+          </optgroup>
+        {/if}
       </select>
+      <button type="button" class="copy-btn" onclick={refreshGoalSkins} disabled={goalSkinLoading}>
+        {goalSkinLoading ? '読込中' : '再読込'}
+      </button>
     </div>
+    <p class="hint">
+      自作スキンはPNGをskinフォルダへ入れて「再読込」してください。各ゲージの背景として使用します。
+      推奨解像度は660×260px（透過PNG対応）です。
+    </p>
+    {#if goalSkinDirectory}
+      <code class="skin-directory">{goalSkinDirectory}</code>
+    {/if}
+    {#if goalSkinError}
+      <p class="inline-error">{goalSkinError}</p>
+    {/if}
     <div class="field-row">
       <label for="goals-comments">コメント</label>
       <input
@@ -2422,6 +2486,19 @@
   }
   .goal-visibility:focus-within {
     color: #ffffff;
+  }
+  .skin-directory {
+    display: block;
+    max-width: 100%;
+    margin: 6px 0 10px;
+    padding: 6px 8px;
+    overflow-wrap: anywhere;
+    border: 1px solid #383838;
+    border-radius: 4px;
+    color: #bdbdbd;
+    background: #191919;
+    font-size: 11px;
+    user-select: text;
   }
   .tts-test-result { font-size: 12px; margin: 4px 0 0; }
   .tts-test-result--ok { color: #81c784; }

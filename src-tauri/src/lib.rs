@@ -28,6 +28,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::{broadcast, mpsc, watch, Notify};
 use tokio_util::sync::CancellationToken;
@@ -66,6 +67,8 @@ pub struct AppState {
     bus: Bus,
     /// OBS テンプレートの配信元ディレクトリ。
     templates_dir: PathBuf,
+    /// ユーザー作成のGoals PNG背景を置く書き込み可能なディレクトリ。
+    goals_skin_dir: PathBuf,
     /// アプリ全体の停止トークン。
     app_cancel: CancellationToken,
     /// OBS サーバの現在の待受状態。
@@ -847,6 +850,80 @@ fn write_template_file(
         .map_err(|e| format!("テンプレートファイル書き込み失敗 {}: {e}", path.display()))
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GoalSkinInfo {
+    directory: String,
+    files: Vec<String>,
+}
+
+/// ユーザー作成Goals PNGスキンの配置先とファイル一覧を返す。
+#[tauri::command]
+fn get_goal_skin_info(state: State<'_, AppState>) -> Result<GoalSkinInfo, String> {
+    fs::create_dir_all(&state.goals_skin_dir).map_err(|e| {
+        format!(
+            "skinフォルダの作成に失敗 {}: {e}",
+            state.goals_skin_dir.display()
+        )
+    })?;
+
+    let mut files = Vec::new();
+    let entries = fs::read_dir(&state.goals_skin_dir).map_err(|e| {
+        format!(
+            "skinフォルダの読み込みに失敗 {}: {e}",
+            state.goals_skin_dir.display()
+        )
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("skinファイル一覧の取得に失敗: {e}"))?;
+        if !entry
+            .file_type()
+            .map_err(|e| format!("skinファイル種別の取得に失敗: {e}"))?
+            .is_file()
+        {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if is_png_skin_file_name(&name) {
+            files.push(name);
+        }
+    }
+    files.sort_by_key(|name| name.to_lowercase());
+    Ok(GoalSkinInfo {
+        directory: state.goals_skin_dir.to_string_lossy().into_owned(),
+        files,
+    })
+}
+
+fn is_png_skin_file_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > 255 {
+        return false;
+    }
+    let path = std::path::Path::new(name);
+    path.parent().is_none_or(|parent| parent.as_os_str().is_empty())
+        && path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("png"))
+}
+
+#[cfg(test)]
+mod goal_skin_tests {
+    use super::is_png_skin_file_name;
+
+    #[test]
+    fn accepts_png_files_and_rejects_paths_or_other_extensions() {
+        assert!(is_png_skin_file_name("my-goals.png"));
+        assert!(is_png_skin_file_name("配信用スキン.PNG"));
+        assert!(!is_png_skin_file_name("../skin.png"));
+        assert!(!is_png_skin_file_name("nested/skin.png"));
+        assert!(!is_png_skin_file_name("skin.jpg"));
+        assert!(!is_png_skin_file_name(""));
+    }
+}
+
 fn validate_template_file_name(file: &str) -> Result<&str, String> {
     EDITABLE_TEMPLATE_FILES
         .iter()
@@ -1080,6 +1157,7 @@ fn restart_obs_server_if_needed(state: &AppState, new_port: u16) -> Result<(), S
     let cancel = state.app_cancel.child_token();
     let _obs_task = state.bus.spawn_obs_server_on_port(
         state.templates_dir.clone(),
+        state.goals_skin_dir.clone(),
         new_port,
         cancel.clone(),
     )?;
@@ -1403,6 +1481,13 @@ pub fn run() {
             let app_cancel = CancellationToken::new();
             let obs_cancel = app_cancel.child_token();
             let templates_dir = resolve_templates_dir(&handle);
+            let goals_skin_dir = config_dir.join("skin");
+            if let Err(e) = fs::create_dir_all(&goals_skin_dir) {
+                tracing::warn!(
+                    "Goals skinフォルダの作成に失敗 {}: {e}",
+                    goals_skin_dir.display()
+                );
+            }
 
             let state = AppState {
                 config: Mutex::new(config.clone()),
@@ -1412,6 +1497,7 @@ pub fn run() {
                 source_tx: source_tx.clone(),
                 bus: bus.clone(),
                 templates_dir: templates_dir.clone(),
+                goals_skin_dir: goals_skin_dir.clone(),
                 app_cancel: app_cancel.clone(),
                 obs_server: Mutex::new(ObsServerControl {
                     port: obs_port,
@@ -1447,7 +1533,7 @@ pub fn run() {
 
             // Bus の UI forwarder と OBS サーバを起動。
             bus.spawn_ui_forwarder(handle.clone(), app_cancel.clone());
-            if let Err(e) = bus.spawn_obs_server(templates_dir, obs_cancel) {
+            if let Err(e) = bus.spawn_obs_server(templates_dir, goals_skin_dir, obs_cancel) {
                 tracing::error!("{e}");
             }
 
@@ -1502,6 +1588,7 @@ pub fn run() {
             list_templates,
             read_template_file,
             write_template_file,
+            get_goal_skin_info,
             get_participants,
             pick_next_participant,
             pick_random_participant,
