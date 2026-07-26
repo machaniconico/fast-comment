@@ -67,6 +67,10 @@
     return cfg?.goals?.showInApp === true;
   }
 
+  function isGoalsFeatureEnabled(cfg: AppConfig | null): boolean {
+    return cfg?.goals?.enabled === true;
+  }
+
   function isEffectsEnabled(cfg: AppConfig | null): boolean {
     return cfg?.effects?.enabled === true;
   }
@@ -81,11 +85,17 @@
 
   const showDonationPanel = $derived(isDonationPanelEnabled(config));
   const showGoalsBar = $derived(isGoalsBarVisible(config));
+  const goalsFeatureEnabled = $derived(isGoalsFeatureEnabled(config));
   const showEffects = $derived(isEffectsEnabled(config));
   const showWelcome = $derived(isWelcomeEnabled(config));
   const ttsConfigured = $derived(isTtsConfigured(config));
   const standaloneOpen = $derived(
     ui.showDashboard || ui.showRaffle || ui.showTimer || ui.toolSettingsView !== null
+  );
+  const showGoalsControls = $derived(
+    ui.activeTab === 'comments'
+      && !standaloneOpen
+      && (goalsFeatureEnabled || showGoalsBar)
   );
 
   $effect(() => {
@@ -679,7 +689,7 @@
   {/if}
 
   <!-- ── In-app goals (kept at the bottom; hidden by default via showInApp=false) ── -->
-  {#if showGoalsBar && ui.activeTab !== 'settings'}
+  {#if showGoalsControls}
     <section class="goals-panel" aria-label="アプリ内の目標表示">
       <div class="goals-panel-controls">
         <span class="goals-panel-label">目標</span>
@@ -696,7 +706,9 @@
           <span class="goals-toggle-error" title={goalsToggleError}>保存失敗</span>
         {/if}
       </div>
-      <GoalsBar />
+      {#if showGoalsBar}
+        <GoalsBar />
+      {/if}
     </section>
   {/if}
 
