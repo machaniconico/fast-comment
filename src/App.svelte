@@ -356,8 +356,8 @@
 
   async function toggleGoalsInApp(event: Event) {
     if (!config || goalsToggleSaving) return;
-    const previous = structuredClone(config);
-    const next = structuredClone(config);
+    const previous = $state.snapshot(config);
+    const next = structuredClone(previous);
     next.goals.showInApp = (event.currentTarget as HTMLInputElement).checked;
     config = next;
     goalsToggleSaving = true;

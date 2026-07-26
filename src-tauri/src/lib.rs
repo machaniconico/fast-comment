@@ -230,7 +230,46 @@ fn get_config(state: State<'_, AppState>) -> Result<AppConfig, String> {
 #[tauri::command]
 fn set_tts_paused(app: AppHandle, state: State<'_, AppState>, paused: bool) {
     state.tts_paused.store(paused, Ordering::Relaxed);
+    if paused {
+        state.tts_clear.store(true, Ordering::Relaxed);
+        state.tts_clear_notify.notify_one();
+        clear_tts_queue_snapshot(&app, &state);
+        if let Err(e) = app.emit("tts-cancel", ()) {
+            tracing::warn!("TTSキャンセルイベント送信失敗: {e}");
+        }
+    }
     emit_current_tts_queue_state(&app, &state);
+
+    let tts_config = state.config.lock().unwrap().tts.clone();
+    if tts_config.backend == TtsBackendKind::Bouyomi {
+        let options = tts_config.options;
+        let backend = bouyomi::BouyomiBackend::new(
+            options.bouyomi_host,
+            options.bouyomi_port,
+            options.bouyomi_speed,
+            options.bouyomi_tone,
+            options.bouyomi_volume,
+            options.bouyomi_voice,
+        );
+        let app_for_notice = app.clone();
+        tauri::async_runtime::spawn(async move {
+            let result = if paused {
+                backend.pause_and_clear().await
+            } else {
+                backend.resume().await
+            };
+            if let Err(e) = result {
+                emit_tts_notice(
+                    &app_for_notice,
+                    "warn",
+                    format!(
+                        "棒読みちゃんの{}命令に失敗しました: {e}",
+                        if paused { "停止" } else { "再開" }
+                    ),
+                );
+            }
+        });
+    }
 }
 
 /// 現在の TTS 待ちキュー状態を取得する。
@@ -1318,7 +1357,7 @@ fn spawn_pipeline(app: AppHandle, cancel: CancellationToken) {
                     // 読み上げは単一の長命ワーカーへ bounded channel で渡す。
                     // バースト時は try_send が Full を返すので drop し、UI/OBS 配信は止めない
                     // (背圧/有界・SPEC 設計原則2)。
-                    if !msg.skip_tts {
+                    if !msg.skip_tts && !state.tts_paused.load(Ordering::Relaxed) {
                         if let Err(mpsc::error::TrySendError::Full(_)) =
                             try_enqueue_tts_message(&app, &state, msg.clone())
                         {
