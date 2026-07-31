@@ -85,6 +85,7 @@ trait Source {
   - Jewelsによる`giftEvent`はメンバーシップギフトと分け、`gift_name`を種類名として静的にコメント欄へ表示する（アニメーション再現は対象外）。種類名が欠落した場合は代替説明文、通知本文の順で劣化する。
   - APIキー未設定、認証・quota・接続エラー、継続トークンなし終了時はInnerTubeへ自動フォールバック。
   - 公式→InnerTube切替時は直近8192件のYouTubeメッセージIDで重複表示を抑止する。
+  - 公開 `streamList` には匿名リアクションが無いため、公式コメント受信中も reaction-only InnerTube sidecar を並行し、公式終了時は停止して通常フォールバックとの二重pollを防ぐ。
   - APIキー変更保存時は接続中のYouTube Sourceを再起動し、新しい受信方式を即時反映する。
 - **innertube.rs**: リクエスト組み立て
   - 手順: ①live配信URL/videoIdから初期HTMLを取得 → `ytInitialData` と INNERTUBE_API_KEY, client version, 初期 continuation を抽出
@@ -103,6 +104,8 @@ trait Source {
     | `actionsPath` | アクション配列パス(`>`区切り) | `continuationContents>liveChatContinuation>actions` |
     | `continuationsPath` | continuation 配列パス(`>`区切り) | `continuationContents>liveChatContinuation>continuations` |
     | `continuationDataKeys` | continuation データキー候補(改行区切り) | `invalidationContinuationData` 他5種 |
+    | `reactionMutationsPath` | リアクション mutation 配列パス(`>`区切り) | `frameworkUpdates>entityBatchUpdate>mutations` |
+    | `reactionBucketPath` | mutation 内の bucket 配列パス(`>`区切り) | `payload>emojiFountainDataEntity>reactionBuckets` |
 - **parser.rs**: 寛容パース(アダプタの核)
   - `serde_json::Value` をパス探索で辿る。固い struct deserialize はしない。
   - ヘルパ `dig(value, &["a","b",0,"c"])` で Option を返す。途中欠落でも None で安全に劣化。
@@ -173,6 +176,7 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
 - **配信振り返りダッシュボード** (`Dashboard.svelte`, `Sparkline.svelte`): コメント数・視聴者推移などの集計表示。
 - **タイマー/ゴール/エフェクト/マイルストーン** (`Timer.svelte`, `GoalsBar.svelte`, `Effects.svelte`, `Milestone.svelte`): 配信演出系。OBS テンプレ `timer`/`goals` と連動。
   - Goals はコメント、視聴者、高評価、リアクションを表示できる。リアクションは YouTube 絵文字リアクション累計で、YouTube のみ有効(`reactionsAvailable=false` で自動非表示)。
+  - アプリ内エフェクト有効時は、YouTube匿名リアクションの絵文字別増分を専用16msバッチIPCで受け、右端寄りに浮上・フェード表示する。初回pollはrolling windowの再送分なので、再接続時の重複を避けるため統計・演出とも更新しない。描画数は画面幅別の上限を設け、`prefers-reduced-motion` では演出を省略する。コメント/TTS/OBSには混ぜない。
 - **マルチカラム表示** (`MultiColumnView.svelte`): チャンネル/種別ごとの複数列ビュー。
 - **設定/モデレーションのポータビリティ** (`ConfigPortability.svelte`, `ModerationPortability.svelte`): 設定・NG/ハイライトのエクスポート/インポート。
 - **ウィンドウ最前面ピン**: メインウィンドウを最前面固定するトグル(`core:window:allow-set-always-on-top`)。

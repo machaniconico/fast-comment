@@ -13,10 +13,12 @@ use std::sync::OnceLock;
 
 use serde_json::Value;
 
-use crate::model::{Amount, Author, Badge, ChatMessage, Fragment, MessageKind, Platform, Roles};
+use crate::model::{
+    Amount, Author, Badge, ChatMessage, Fragment, MessageKind, Platform, Roles, YoutubeReaction,
+};
 
 /// パーサのバージョン。レスポンス構造の解釈が変わったら上げる。
-pub const PARSER_VERSION: &str = "yt-2";
+pub const PARSER_VERSION: &str = "yt-3";
 
 static UNPARSED_LOG_DIR: OnceLock<PathBuf> = OnceLock::new();
 
@@ -56,6 +58,8 @@ const DEFAULT_REACTION_MUTATIONS_PATH: &[&str] =
     &["frameworkUpdates", "entityBatchUpdate", "mutations"];
 const DEFAULT_REACTION_BUCKET_PATH: &[&str] =
     &["payload", "emojiFountainDataEntity", "reactionBuckets"];
+const MAX_REACTION_EMOJI_UTF16_UNITS: usize = 32;
+const MAX_REACTION_TYPES_PER_POLL: usize = 64;
 
 /// `paths` のキー値(`>` 区切り)をキー列へ分割。欠落/空なら `default` を返す。
 fn split_path<'a>(
@@ -162,69 +166,144 @@ pub fn next_continuation(resp: &Value, paths: &HashMap<String, String>) -> (Opti
     (None, None)
 }
 
-/// レスポンス1回分に含まれる YouTube 絵文字リアクション増分を合算する。
+/// レスポンス1回分に含まれる YouTube 絵文字リアクション増分を種類別に返す。
 ///
 /// InnerTube の `frameworkUpdates.entityBatchUpdate.mutations[]` から
 /// `payload.emojiFountainDataEntity.reactionBuckets[]` を辿る。bucket 内は
 /// `reactions[].value` を優先し、`reactions` が無い/空のときだけ
 /// `reactionsData[].reactionCount` にフォールバックする。
 /// 探索パスは `paths` の `reactionMutationsPath` / `reactionBucketPath` で差し替え可能。
-pub fn extract_reactions_delta(resp: &Value, paths: &HashMap<String, String>) -> u32 {
+pub fn extract_reactions(
+    resp: &Value,
+    paths: &HashMap<String, String>,
+    channel: &str,
+) -> Vec<YoutubeReaction> {
+    extract_reaction_counts(resp, paths, channel).by_emoji
+}
+
+/// 統計用の総数と演出用の種類別リアクションを1回の走査で抽出する。
+///
+/// 絵文字IDが欠落・型不正でも、有効なcountは統計へ加算する。演出用データだけを
+/// 安全に捨てることで、InnerTubeの部分的な仕様変更時もGoals集計を維持する。
+#[derive(Debug, PartialEq, Eq)]
+pub struct ExtractedReactionCounts {
+    pub total_delta: u32,
+    pub by_emoji: Vec<YoutubeReaction>,
+}
+
+pub fn extract_reaction_counts(
+    resp: &Value,
+    paths: &HashMap<String, String>,
+    channel: &str,
+) -> ExtractedReactionCounts {
     let mutations_path = split_path(
         paths,
         KEY_REACTION_MUTATIONS_PATH,
         DEFAULT_REACTION_MUTATIONS_PATH,
     );
-    let bucket_path = split_path(paths, KEY_REACTION_BUCKET_PATH, DEFAULT_REACTION_BUCKET_PATH);
+    let bucket_path = split_path(
+        paths,
+        KEY_REACTION_BUCKET_PATH,
+        DEFAULT_REACTION_BUCKET_PATH,
+    );
     let Some(mutations) = dig_keys(resp, &mutations_path).and_then(|v| v.as_array()) else {
-        return 0;
+        return ExtractedReactionCounts {
+            total_delta: 0,
+            by_emoji: Vec::new(),
+        };
     };
 
-    let mut total = 0u32;
+    let mut reactions = Vec::<YoutubeReaction>::new();
+    let mut indexes = HashMap::<String, usize>::new();
+    let mut total_delta = 0u32;
     for mutation in mutations {
         let Some(buckets) = dig_keys(mutation, &bucket_path).and_then(|v| v.as_array()) else {
             continue;
         };
         for bucket in buckets {
-            total = total.saturating_add(sum_reaction_bucket(bucket));
+            append_reaction_bucket(
+                bucket,
+                channel,
+                &mut total_delta,
+                &mut reactions,
+                &mut indexes,
+            );
         }
     }
 
-    total
+    ExtractedReactionCounts {
+        total_delta,
+        by_emoji: reactions,
+    }
 }
 
-fn sum_reaction_bucket(bucket: &Value) -> u32 {
-    if let Some(reactions) = bucket
+/// 既存の Goals 累計向け合計値。
+pub fn extract_reactions_delta(resp: &Value, paths: &HashMap<String, String>) -> u32 {
+    extract_reaction_counts(resp, paths, "").total_delta
+}
+
+fn append_reaction_bucket(
+    bucket: &Value,
+    channel: &str,
+    total_delta: &mut u32,
+    output: &mut Vec<YoutubeReaction>,
+    indexes: &mut HashMap<String, usize>,
+) {
+    let (items, emoji_key, count_key) = if let Some(reactions) = bucket
         .get("reactions")
         .and_then(|v| v.as_array())
         .filter(|arr| !arr.is_empty())
     {
-        return reactions.iter().fold(0u32, |acc, reaction| {
-            acc.saturating_add(
-                reaction
-                    .get("value")
-                    .and_then(|v| v.as_u64())
-                    .map(saturating_u32)
-                    .unwrap_or(0),
-            )
-        });
-    }
+        (reactions.as_slice(), "key", "value")
+    } else if let Some(reactions) = bucket.get("reactionsData").and_then(|v| v.as_array()) {
+        (reactions.as_slice(), "unicodeEmojiId", "reactionCount")
+    } else {
+        return;
+    };
 
-    bucket
-        .get("reactionsData")
-        .and_then(|v| v.as_array())
-        .map(|reactions| {
-            reactions.iter().fold(0u32, |acc, reaction| {
-                acc.saturating_add(
-                    reaction
-                        .get("reactionCount")
-                        .and_then(|v| v.as_u64())
-                        .map(saturating_u32)
-                        .unwrap_or(0),
-                )
-            })
-        })
-        .unwrap_or(0)
+    for item in items {
+        let Some(count) = item.get(count_key).and_then(parse_reaction_count) else {
+            continue;
+        };
+        *total_delta = total_delta.saturating_add(count);
+
+        let Some(emoji) = item
+            .get(emoji_key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|emoji| is_bounded_reaction_emoji(emoji))
+        else {
+            continue;
+        };
+
+        if let Some(index) = indexes.get(emoji).copied() {
+            output[index].count = output[index].count.saturating_add(count);
+        } else if output.len() < MAX_REACTION_TYPES_PER_POLL {
+            indexes.insert(emoji.to_string(), output.len());
+            output.push(YoutubeReaction {
+                channel: channel.to_string(),
+                emoji: emoji.to_string(),
+                count,
+            });
+        }
+    }
+}
+
+fn is_bounded_reaction_emoji(emoji: &str) -> bool {
+    !emoji.is_empty()
+        && emoji
+            .encode_utf16()
+            .take(MAX_REACTION_EMOJI_UTF16_UNITS + 1)
+            .count()
+            <= MAX_REACTION_EMOJI_UTF16_UNITS
+}
+
+fn parse_reaction_count(value: &Value) -> Option<u32> {
+    value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|text| text.parse::<u64>().ok()))
+        .map(saturating_u32)
+        .filter(|count| *count > 0)
 }
 
 fn saturating_u32(value: u64) -> u32 {
@@ -833,10 +912,10 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        dig, extract_actions, extract_reactions_delta, parse_action, parse_runs,
-        split_currency_value, Seg,
+        dig, extract_actions, extract_reaction_counts, extract_reactions_delta, parse_action,
+        parse_runs, split_currency_value, Seg,
     };
-    use crate::model::{Fragment, MessageKind};
+    use crate::model::{Fragment, MessageKind, YoutubeReaction};
 
     #[test]
     fn dig_returns_value_or_none_for_missing_path() {
@@ -1102,6 +1181,59 @@ mod tests {
         let paths: HashMap<String, String> = HashMap::new();
 
         assert_eq!(extract_reactions_delta(&payload, &paths), 12);
+    }
+
+    #[test]
+    fn extract_reactions_preserves_emoji_counts_and_merges_duplicates() {
+        let payload = json!({
+            "frameworkUpdates": {
+                "entityBatchUpdate": {
+                    "mutations": [
+                        {
+                            "payload": {
+                                "emojiFountainDataEntity": {
+                                    "reactionBuckets": [
+                                        {
+                                            "reactions": [
+                                                { "key": "😂", "value": 2 },
+                                                { "key": "", "value": 9 },
+                                                { "key": "❤", "value": 0 }
+                                            ]
+                                        },
+                                        {
+                                            "reactionsData": [
+                                                { "unicodeEmojiId": "😂", "reactionCount": 3 },
+                                                { "unicodeEmojiId": "🎉", "reactionCount": "4" },
+                                                { "unicodeEmojiId": 123, "reactionCount": 5 }
+                                            ]
+                                        }
+                                    ]
+                                }
+                            }
+                        }
+                    ]
+                }
+            }
+        });
+        let paths = HashMap::new();
+
+        let parsed = extract_reaction_counts(&payload, &paths, "video-1");
+        assert_eq!(parsed.total_delta, 23);
+        assert_eq!(
+            parsed.by_emoji,
+            vec![
+                YoutubeReaction {
+                    channel: "video-1".to_string(),
+                    emoji: "😂".to_string(),
+                    count: 5,
+                },
+                YoutubeReaction {
+                    channel: "video-1".to_string(),
+                    emoji: "🎉".to_string(),
+                    count: 4,
+                },
+            ]
+        );
     }
 
     #[test]

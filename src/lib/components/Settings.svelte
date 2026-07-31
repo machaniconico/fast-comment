@@ -1842,11 +1842,12 @@
 
   <!-- ── Effects ── -->
   <section id="settings-effects">
-    <h3>コメントエフェクト</h3>
+    <h3>アプリ内エフェクト</h3>
     <div class="field-row">
-      <label for="effects-enabled">有効化</label>
+      <label for="effects-enabled">エフェクトを有効化</label>
       <input id="effects-enabled" type="checkbox" bind:checked={config.effects.enabled} class="chk" />
     </div>
+    <p class="hint">キーワード一致とYouTubeの匿名リアクションを、アプリ上の短いアニメーションで表示します。</p>
 
     <div class="dict-editor">
       <div class="dict-header">

@@ -7,7 +7,7 @@
  * - Safe to import in a plain browser (Tauri absent): all calls are no-ops.
  */
 
-import type { ChatMessage } from './types';
+import type { ChatMessage, YoutubeReaction } from './types';
 import { invoke as tauriInvoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { getCurrentWindow, primaryMonitor } from '@tauri-apps/api/window';
@@ -163,6 +163,20 @@ export async function onTtsQueueState(cb: (state: TtsQueueState) => void): Promi
 export async function onStats(cb: (snapshot: StatsSnapshot) => void): Promise<() => void> {
   if (!isTauri()) return () => {};
   const unlisten = await listen<StatsSnapshot>('stats', (event) => {
+    cb(event.payload);
+  });
+  return unlisten;
+}
+
+/**
+ * Listen to frame-batched anonymous YouTube reaction increments.
+ * The backend already merges all source updates that arrive within 16ms.
+ */
+export async function onYoutubeReactions(
+  cb: (reactions: YoutubeReaction[]) => void
+): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  const unlisten = await listen<YoutubeReaction[]>('youtube-reactions', (event) => {
     cb(event.payload);
   });
   return unlisten;

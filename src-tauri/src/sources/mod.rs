@@ -16,7 +16,7 @@ use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{ChannelConfig, ChannelPlatform};
-use crate::model::ChatMessage;
+use crate::model::{ChatMessage, YoutubeReaction};
 use crate::stats::YoutubeMetadataUpdate;
 
 /// 接続元の共通インタフェース。
@@ -93,6 +93,7 @@ impl Default for Backoff {
 pub struct SourceManager {
     tx: broadcast::Sender<ChatMessage>,
     metadata_tx: Option<mpsc::Sender<YoutubeMetadataUpdate>>,
+    reaction_tx: Option<mpsc::Sender<Vec<YoutubeReaction>>>,
     /// YouTube overrides 等を渡すための設定スナップショット。
     youtube_overrides: crate::config::YoutubeOverrides,
     /// 公式YouTube Data API streamList用。空ならInnerTubeのみ。
@@ -105,10 +106,12 @@ impl SourceManager {
         youtube_overrides: crate::config::YoutubeOverrides,
         youtube_api_key: String,
         metadata_tx: Option<mpsc::Sender<YoutubeMetadataUpdate>>,
+        reaction_tx: Option<mpsc::Sender<Vec<YoutubeReaction>>>,
     ) -> Self {
         SourceManager {
             tx,
             metadata_tx,
+            reaction_tx,
             youtube_overrides,
             youtube_api_key,
         }
@@ -129,6 +132,7 @@ impl SourceManager {
         let overrides = self.youtube_overrides.clone();
         let youtube_api_key = self.youtube_api_key.clone();
         let metadata_tx = self.metadata_tx.clone();
+        let reaction_tx = self.reaction_tx.clone();
 
         match ch.platform {
             ChannelPlatform::Twitch => {
@@ -143,6 +147,7 @@ impl SourceManager {
                     overrides,
                     youtube_api_key,
                     metadata_tx,
+                    reaction_tx,
                 );
                 tauri::async_runtime::spawn(async move {
                     run_with_logging(&src, tx, child).await;

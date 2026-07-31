@@ -19,7 +19,7 @@ use crate::config::YoutubeOverrides;
 
 /// HTML 取得時に名乗る UA(通常ブラウザ相当)。
 const USER_AGENT: &str =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36";
 
 /// clientVersion が抽出できなかった場合の保険値(古くなる可能性あり=overrides 推奨)。
 const FALLBACK_CLIENT_VERSION: &str = "2.20240101.00.00";

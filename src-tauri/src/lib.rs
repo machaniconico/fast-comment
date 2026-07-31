@@ -33,10 +33,11 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::{broadcast, mpsc, watch, Notify};
 use tokio_util::sync::CancellationToken;
 
-use crate::bus::{is_valid_template_name, Bus};
+use crate::bus::{is_valid_template_name, spawn_reaction_ui_forwarder, Bus};
 use crate::config::{AppConfig, ChannelConfig, ChannelPlatform, TtsBackendKind};
 use crate::model::{
     Amount, Author, Badge, ChatMessage, Fragment, MessageKind, Participant, Platform, Roles,
+    YoutubeReaction,
 };
 use crate::moderation::{Moderator, Verdict};
 use crate::sources::youtube_send::{YoutubeAuth, YoutubeOauthStatus};
@@ -89,6 +90,8 @@ pub struct AppState {
     tts_clear_notify: Arc<tokio::sync::Notify>,
     /// YouTube メタデータ poller → stats 集約への bounded 送信端。
     metadata_tx: mpsc::Sender<YoutubeMetadataUpdate>,
+    /// YouTubeリアクション Source → 1フレームIPC forwarder の bounded 送信端。
+    reaction_tx: mpsc::Sender<Vec<YoutubeReaction>>,
     /// 参加型配信の参加者一覧。
     participants: Mutex<Vec<Participant>>,
     /// YouTube投稿用OAuth状態。バックグラウンド処理は持たず、操作時だけ通信する。
@@ -1265,6 +1268,7 @@ fn spawn_one_channel(_app: &AppHandle, state: &AppState, ch: &ChannelConfig) {
             youtube_api_key.clone(),
             state.source_tx.clone(),
             state.metadata_tx.clone(),
+            state.reaction_tx.clone(),
             token.clone(),
         );
         token
@@ -1274,6 +1278,7 @@ fn spawn_one_channel(_app: &AppHandle, state: &AppState, ch: &ChannelConfig) {
             overrides.clone(),
             youtube_api_key,
             Some(state.metadata_tx.clone()),
+            Some(state.reaction_tx.clone()),
         );
         manager.spawn_channel(ch)
     };
@@ -1509,6 +1514,7 @@ pub fn run() {
             let (timer_tx, _timer_rx) = watch::channel::<TimerSnapshot>(TimerSnapshot::default());
             let (config_tx, config_rx) = watch::channel::<AppConfig>(config.clone());
             let (metadata_tx, metadata_rx) = mpsc::channel::<YoutubeMetadataUpdate>(64);
+            let (reaction_tx, reaction_rx) = mpsc::channel::<Vec<YoutubeReaction>>(64);
 
             // 下流 Bus(パイプライン → UI/OBS)。
             let bus = Bus::new(obs_port, stats_tx.clone(), timer_tx.clone());
@@ -1550,6 +1556,7 @@ pub fn run() {
                 tts_clear: Arc::new(AtomicBool::new(false)),
                 tts_clear_notify: Arc::new(Notify::new()),
                 metadata_tx,
+                reaction_tx,
                 participants: Mutex::new(Vec::new()),
                 youtube_auth: YoutubeAuth::new()
                     .expect("YouTube投稿用HTTPクライアントの作成に失敗しました"),
@@ -1572,6 +1579,7 @@ pub fn run() {
 
             // Bus の UI forwarder と OBS サーバを起動。
             bus.spawn_ui_forwarder(handle.clone(), app_cancel.clone());
+            spawn_reaction_ui_forwarder(reaction_rx, handle.clone(), app_cancel.clone());
             if let Err(e) = bus.spawn_obs_server(templates_dir, goals_skin_dir, obs_cancel) {
                 tracing::error!("{e}");
             }

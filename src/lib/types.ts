@@ -53,6 +53,13 @@ export interface ChatMessage {
   raw?: unknown;
 }
 
+/** Anonymous YouTube reaction counts received in one backend polling update. */
+export interface YoutubeReaction {
+  channel: string;
+  emoji: string;
+  count: number;
+}
+
 /**
  * Frontend-only projection of ChatMessage.
  * Keep ChatMessage itself a strict mirror of the Rust model.
