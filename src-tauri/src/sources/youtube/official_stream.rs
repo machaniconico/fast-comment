@@ -16,7 +16,7 @@ use tonic::transport::Endpoint;
 
 use crate::model::{Amount, Author, Badge, ChatMessage, Fragment, MessageKind, Platform, Roles};
 
-use super::RecentMessageIds;
+use super::{MessageDisposition, RecentMessageIds};
 
 const STREAM_ENDPOINT: &str = "https://youtube.googleapis.com";
 const STREAM_PATH: &str = "/youtube.api.v3.V3DataLiveChatMessageService/StreamList";
@@ -96,8 +96,16 @@ pub(super) async fn stream_live_chat(
             for item in response.items {
                 if let Some(mut message) = to_chat_message(item, video_id) {
                     message.skip_tts = first_response;
-                    if seen.insert(&message.id) {
-                        let _ = tx.send(message);
+                    match seen.accept(&message) {
+                        MessageDisposition::New => {
+                            let _ = tx.send(message);
+                        }
+                        MessageDisposition::GiftUpdate => {
+                            // giftEvent は同じIDでcomboCountだけ更新されることがある。
+                            message.skip_tts = true;
+                            let _ = tx.send(message);
+                        }
+                        MessageDisposition::Duplicate => {}
                     }
                 }
             }
@@ -177,7 +185,7 @@ fn to_chat_message(item: LiveChatMessage, video_id: &str) -> Option<ChatMessage>
     if member {
         badges.push(text_badge("member", "メンバー"));
     }
-    let author = Author {
+    let mut author = Author {
         id: author_details
             .channel_id
             .or_else(|| snippet.author_channel_id.clone())
@@ -193,6 +201,9 @@ fn to_chat_message(item: LiveChatMessage, video_id: &str) -> Option<ChatMessage>
             vip: false,
         },
     };
+    if type_id == TYPE_GIFT && author.name.trim().is_empty() {
+        author.name = "ギフト送信者".to_string();
+    }
 
     let (kind, amount, fallback_text) = match type_id {
         TYPE_SUPER_CHAT => {
@@ -228,19 +239,27 @@ fn to_chat_message(item: LiveChatMessage, video_id: &str) -> Option<ChatMessage>
             Some(static_gift_text(
                 snippet.gift_details.as_ref(),
                 snippet.display_message.as_deref(),
-            )),
+            )?),
         ),
         _ => (MessageKind::Normal, None, None),
     };
 
     let text = fallback_text
         .filter(|text| !text.is_empty())
-        .or_else(|| snippet.display_message.filter(|text| !text.is_empty()))
+        .or_else(|| {
+            snippet
+                .display_message
+                .as_deref()
+                .filter(|text| !text.is_empty())
+                .map(str::to_owned)
+        })
         .or_else(|| {
             snippet
                 .text_message_details
-                .and_then(|details| details.message_text)
+                .as_ref()
+                .and_then(|details| details.message_text.as_deref())
                 .filter(|text| !text.is_empty())
+                .map(str::to_owned)
         })
         .unwrap_or_else(|| match kind {
             MessageKind::Membership => "[Membership]".to_string(),
@@ -248,11 +267,20 @@ fn to_chat_message(item: LiveChatMessage, video_id: &str) -> Option<ChatMessage>
             _ => "[YouTube event]".to_string(),
         });
 
+    let id = item
+        .id
+        .filter(|id| !id.trim().is_empty())
+        .or_else(|| {
+            if kind == MessageKind::Gift {
+                gift_fallback_id(video_id, &author, &snippet)
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(ChatMessage::new_id);
+
     Some(ChatMessage {
-        id: item
-            .id
-            .filter(|id| !id.is_empty())
-            .unwrap_or_else(ChatMessage::new_id),
+        id,
         platform: Platform::Youtube,
         channel: video_id.to_string(),
         author,
@@ -289,7 +317,7 @@ fn membership_text(snippet: &LiveChatMessageSnippet, type_id: i32) -> Option<Str
 fn static_gift_text(
     details: Option<&LiveChatGiftDetails>,
     display_message: Option<&str>,
-) -> String {
+) -> Option<String> {
     if let Some(details) = details {
         let gift_name = details
             .gift_name
@@ -297,7 +325,7 @@ fn static_gift_text(
             .or(details.alt_text.as_deref())
             .unwrap_or_default()
             .trim();
-        if !gift_name.is_empty() {
+        if !gift_name.is_empty() && !is_placeholder_gift_text(gift_name) {
             let mut metadata = Vec::new();
             if let Some(jewels) = details.jewels_amount.filter(|value| *value > 0) {
                 metadata.push(format!("{jewels} Jewels"));
@@ -305,20 +333,82 @@ fn static_gift_text(
             if let Some(combo) = details.combo_count.filter(|value| *value > 1) {
                 metadata.push(format!("×{combo}"));
             }
-            return if metadata.is_empty() {
+            return Some(if metadata.is_empty() {
                 gift_name.to_string()
             } else {
                 format!("{gift_name}（{}）", metadata.join("・"))
-            };
+            });
+        }
+
+        if let Some(jewels) = details.jewels_amount.filter(|value| *value > 0) {
+            let combo = details
+                .combo_count
+                .filter(|value| *value > 1)
+                .map(|value| format!("・×{value}"))
+                .unwrap_or_default();
+            return Some(format!("{jewels} Jewels{combo}"));
         }
     }
 
     let text = display_message.unwrap_or_default().trim();
-    if text.is_empty() {
-        "[ギフト]".to_string()
+    if text.is_empty() || is_placeholder_gift_text(text) {
+        None
     } else {
-        text.to_string()
+        Some(text.to_string())
     }
+}
+
+fn is_placeholder_gift_text(text: &str) -> bool {
+    matches!(
+        text.trim().to_ascii_lowercase().as_str(),
+        "gift" | "[gift]" | "ギフト" | "[ギフト]"
+    )
+}
+
+/// streamListの一部レスポンスではidが欠けることがあるため、ギフト更新用に
+/// コンボ数を含めない安定キーを作る。同じギフトのcomboCount更新は同じ行へ届く。
+fn gift_fallback_id(
+    video_id: &str,
+    author: &Author,
+    snippet: &LiveChatMessageSnippet,
+) -> Option<String> {
+    let details = snippet.gift_details.as_ref();
+    let gift_name = details
+        .and_then(|details| details.gift_name.as_deref().or(details.alt_text.as_deref()))
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && !is_placeholder_gift_text(value))
+        .unwrap_or_default();
+    let jewels = details
+        .and_then(|details| details.jewels_amount)
+        .filter(|value| *value > 0)
+        .map(|value| value.to_string())
+        .unwrap_or_default();
+    let published_at = snippet
+        .published_at
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default();
+    let author_id = author.id.trim();
+    let author_name = author.name.trim();
+
+    if gift_name.is_empty()
+        && jewels.is_empty()
+        && snippet
+            .display_message
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default()
+            .is_empty()
+    {
+        return None;
+    }
+    if author_id.is_empty() && author_name.is_empty() && published_at.is_empty() {
+        return None;
+    }
+
+    Some(format!(
+        "youtube-gift:{video_id}:{author_id}:{author_name}:{published_at}:{gift_name}:{jewels}"
+    ))
 }
 
 fn amount_from_super_chat(details: &LiveChatSuperChatDetails) -> Amount {
@@ -635,13 +725,115 @@ mod tests {
     }
 
     #[test]
+    fn drops_gift_without_renderable_details() {
+        let item = LiveChatMessage {
+            id: None,
+            snippet: Some(LiveChatMessageSnippet {
+                r#type: Some(TYPE_GIFT),
+                ..Default::default()
+            }),
+            author_details: None,
+        };
+
+        assert!(to_chat_message(item, "video-1").is_none());
+    }
+
+    #[test]
+    fn drops_placeholder_gift_text() {
+        let item = LiveChatMessage {
+            id: Some("gift-placeholder".to_string()),
+            snippet: Some(LiveChatMessageSnippet {
+                r#type: Some(TYPE_GIFT),
+                display_message: Some("[ギフト]".to_string()),
+                ..Default::default()
+            }),
+            author_details: None,
+        };
+
+        assert!(to_chat_message(item, "video-1").is_none());
+    }
+
+    #[test]
+    fn missing_gift_id_reuses_stable_key_for_combo_updates() {
+        let make_item = |combo_count| LiveChatMessage {
+            id: None,
+            snippet: Some(LiveChatMessageSnippet {
+                r#type: Some(TYPE_GIFT),
+                published_at: Some("2026-07-21T01:02:03.456Z".to_string()),
+                gift_details: Some(LiveChatGiftDetails {
+                    gift_name: Some("バラ".to_string()),
+                    jewels_amount: Some(100),
+                    combo_count: Some(combo_count),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            author_details: Some(LiveChatMessageAuthorDetails {
+                channel_id: Some("author-1".to_string()),
+                display_name: Some("Alice".to_string()),
+                ..Default::default()
+            }),
+        };
+
+        let first = to_chat_message(make_item(1), "video-1").expect("first gift");
+        let update = to_chat_message(make_item(2), "video-1").expect("combo update");
+        assert_eq!(first.id, update.id);
+        assert_ne!(first.plain_text(), update.plain_text());
+    }
+
+    #[test]
     fn recent_ids_reject_duplicates_and_remain_bounded() {
         let mut recent = RecentMessageIds::new();
-        assert!(recent.insert("same"));
-        assert!(!recent.insert("same"));
+        let message = text_message("same", "本文");
+        assert_eq!(recent.accept(&message), MessageDisposition::New);
+        assert_eq!(recent.accept(&message), MessageDisposition::Duplicate);
         for index in 0..=super::super::RECENT_MESSAGE_IDS {
-            assert!(recent.insert(&format!("id-{index}")));
+            assert_eq!(
+                recent.accept(&text_message(&format!("id-{index}"), "本文")),
+                MessageDisposition::New
+            );
         }
         assert!(recent.ids.len() <= super::super::RECENT_MESSAGE_IDS);
+    }
+
+    #[test]
+    fn recent_ids_accept_changed_gift_as_update() {
+        let mut recent = RecentMessageIds::new();
+        let first = gift_message("gift-1", "バラ（100 Jewels）");
+        let update = gift_message("gift-1", "バラ（100 Jewels・×2）");
+
+        assert_eq!(recent.accept(&first), MessageDisposition::New);
+        assert_eq!(recent.accept(&first), MessageDisposition::Duplicate);
+        assert_eq!(recent.accept(&update), MessageDisposition::GiftUpdate);
+        assert_eq!(recent.accept(&update), MessageDisposition::Duplicate);
+    }
+
+    fn text_message(id: &str, text: &str) -> ChatMessage {
+        fixture_message(id, text, MessageKind::Normal)
+    }
+
+    fn gift_message(id: &str, text: &str) -> ChatMessage {
+        fixture_message(id, text, MessageKind::Gift)
+    }
+
+    fn fixture_message(id: &str, text: &str, kind: MessageKind) -> ChatMessage {
+        ChatMessage {
+            id: id.to_string(),
+            platform: Platform::Youtube,
+            channel: "video-1".to_string(),
+            author: Author {
+                id: "author-1".to_string(),
+                name: "Alice".to_string(),
+                display_color: None,
+                badges: Vec::new(),
+                roles: Roles::default(),
+            },
+            fragments: vec![Fragment::text(text)],
+            kind,
+            amount: None,
+            timestamp_ms: 0,
+            raw: None,
+            skip_tts: false,
+        }
     }
 }

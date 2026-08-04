@@ -37,6 +37,14 @@ const RECENT_MESSAGE_IDS: usize = 8192;
 pub(super) struct RecentMessageIds {
     ids: HashSet<String>,
     order: VecDeque<String>,
+    gift_fingerprints: HashMap<String, String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum MessageDisposition {
+    New,
+    GiftUpdate,
+    Duplicate,
 }
 
 impl RecentMessageIds {
@@ -44,23 +52,49 @@ impl RecentMessageIds {
         Self {
             ids: HashSet::with_capacity(RECENT_MESSAGE_IDS),
             order: VecDeque::with_capacity(RECENT_MESSAGE_IDS),
+            gift_fingerprints: HashMap::new(),
         }
     }
 
-    pub(super) fn insert(&mut self, id: &str) -> bool {
-        if self.ids.contains(id) {
-            return false;
+    pub(super) fn accept(&mut self, message: &ChatMessage) -> MessageDisposition {
+        if self.ids.contains(&message.id) {
+            if message.kind != crate::model::MessageKind::Gift {
+                return MessageDisposition::Duplicate;
+            }
+
+            let fingerprint = gift_fingerprint(message);
+            if self.gift_fingerprints.get(&message.id) == Some(&fingerprint) {
+                return MessageDisposition::Duplicate;
+            }
+            self.gift_fingerprints
+                .insert(message.id.clone(), fingerprint);
+            return MessageDisposition::GiftUpdate;
         }
-        let owned = id.to_string();
+
+        let owned = message.id.clone();
         self.ids.insert(owned.clone());
         self.order.push_back(owned);
+        if message.kind == crate::model::MessageKind::Gift {
+            self.gift_fingerprints
+                .insert(message.id.clone(), gift_fingerprint(message));
+        }
         if self.order.len() > RECENT_MESSAGE_IDS {
             if let Some(oldest) = self.order.pop_front() {
                 self.ids.remove(&oldest);
+                self.gift_fingerprints.remove(&oldest);
             }
         }
-        true
+        MessageDisposition::New
     }
+}
+
+fn gift_fingerprint(message: &ChatMessage) -> String {
+    format!(
+        "{}\0{}\0{}",
+        message.author.id,
+        message.author.name,
+        message.plain_text()
+    )
 }
 
 /// YouTube ライブ1配信を購読する Source。
@@ -250,8 +284,16 @@ impl YoutubeSource {
                     msg.skip_tts = first_poll;
                     // raw は通常 None。デバッグ目的で残したい場合のみ付与する。
                     msg.raw = None;
-                    if seen.insert(&msg.id) {
-                        let _ = tx.send(msg);
+                    match seen.accept(&msg) {
+                        MessageDisposition::New => {
+                            let _ = tx.send(msg);
+                        }
+                        MessageDisposition::GiftUpdate => {
+                            // コンボ更新は同じ行へ上書きする。更新のたびに読み上げない。
+                            msg.skip_tts = true;
+                            let _ = tx.send(msg);
+                        }
+                        MessageDisposition::Duplicate => {}
                     }
                 } else if parser::is_chat_item_action(action) {
                     // 解析できなかった addChatItemAction はログへ1行追記。
