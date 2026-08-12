@@ -413,12 +413,20 @@
 
   let newPlatform: ChannelPlatform = $state('twitch');
   let newIdentifier: string = $state('');
+  let idInputEl: HTMLInputElement | undefined = $state(undefined);
   let addError: string = $state('');
 
   // URL を貼ったときの自動判別結果(プレビュー表示と追加処理に使う)。
   const detection = $derived(detectChannel(newIdentifier));
   const detected = $derived(detection.kind === 'detected' ? detection : null);
   const effectivePlatform = $derived(detected?.platform ?? newPlatform);
+  // X は配信ごとに URL を貼る運用のため、未登録でも常設の「未接続」チップを見せる。
+  const hasXChannel = $derived(channels.some((c) => c.platform === 'x'));
+
+  function focusXAdd() {
+    newPlatform = 'x';
+    idInputEl?.focus();
+  }
   const detectHint = $derived.by((): DetectHint | null => {
     if (detection.kind === 'detected') {
       const label = detection.platform === 'twitch'
@@ -482,6 +490,7 @@
     </select>
     <input
       type="text"
+      bind:this={idInputEl}
       bind:value={newIdentifier}
       placeholder="配信URLを貼り付け（または Twitchチャンネル名 / YouTube動画ID / @handle / チャンネルURL / X broadcast ID）"
       class="id-input"
@@ -497,7 +506,7 @@
     </p>
   {/if}
   {#if addError}<p class="error">{addError}</p>{/if}
-  {#if channels.length > 0}
+  {#if channels.length > 0 || !hasXChannel}
     <div class="channel-chips" role="list" aria-label="接続中チャンネル">
       {#each channels as ch (ch.platform + ':' + ch.identifier)}
         {@const key = chipKey(ch.platform, ch.identifier)}
@@ -523,6 +532,16 @@
           <button class="chip-x" title="削除" aria-label="{bodyText} を削除" onclick={() => onRemove(ch)}>×</button>
         </span>
       {/each}
+      {#if !hasXChannel}
+        <span
+          class="chip x placeholder"
+          role="listitem"
+          title="X (Twitter) は配信ごとに URL を追加します。クリックで入力欄へ。"
+        >
+          <span class="chip-dot" aria-hidden="true"></span>
+          <button type="button" class="chip-add" onclick={focusXAdd}>X 未接続</button>
+        </span>
+      {/if}
     </div>
   {/if}
   {#if ctxMenu}
@@ -646,6 +665,24 @@
     background: rgba(231,233,234,0.12);
   }
   .chip.x .chip-dot { background: #e7e9ea; }
+
+  /* X 未登録時の常設プレースホルダー。破線+減光で「未接続の枠」を示す。 */
+  .chip.placeholder {
+    border-style: dashed;
+    opacity: 0.55;
+    padding: 1px 8px;
+  }
+  .chip.placeholder:hover { opacity: 0.9; }
+  .chip.placeholder .chip-dot { background: #6b6f73; }
+  .chip.placeholder .chip-add {
+    background: none;
+    border: none;
+    padding: 0;
+    font: inherit;
+    font-size: 11px;
+    color: #ccc;
+    cursor: pointer;
+  }
 
   .chip.live .chip-dot {
     animation: live-pulse 1.3s ease-in-out infinite;
