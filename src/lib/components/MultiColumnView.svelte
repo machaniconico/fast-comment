@@ -74,7 +74,7 @@
   }
 
   .platform-mark.x {
-    background: #e7e9ea;
+    background: #1da1f2;
   }
 
   .column-title {

@@ -38,7 +38,7 @@
       id: 'filter-x',
       title: 'フィルタ: X',
       keywords: ['x', 'twitter', 'filter', 'フィルタ', 'エックス'],
-      icon: '⚫',
+      icon: '🔵',
       run: () => { store.setFilterPlatform('x'); ui.setTab('comments'); },
     },
     {

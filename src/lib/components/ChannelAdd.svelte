@@ -661,10 +661,10 @@
   .chip.youtube .chip-dot { background: #ff0000; }
 
   .chip.x {
-    border-color: rgba(231,233,234,0.55);
-    background: rgba(231,233,234,0.12);
+    border-color: rgba(29,161,242,0.55);
+    background: rgba(29,161,242,0.12);
   }
-  .chip.x .chip-dot { background: #e7e9ea; }
+  .chip.x .chip-dot { background: #1da1f2; }
 
   /* X 未登録時の常設プレースホルダー。破線+減光で「未接続の枠」を示す。 */
   .chip.placeholder {

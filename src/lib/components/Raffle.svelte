@@ -717,7 +717,7 @@
   }
 
   .platform.x {
-    color: #e7e9ea;
+    color: #1da1f2;
   }
 
   .name,

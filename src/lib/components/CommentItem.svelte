@@ -33,7 +33,7 @@
   const PLATFORM_COLORS: Record<string, string> = {
     twitch: '#9146ff',
     youtube: '#ff0000',
-    x: '#e7e9ea',
+    x: '#1da1f2',
   };
 
   const KIND_BG: Record<string, string> = {

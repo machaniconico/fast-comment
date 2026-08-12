@@ -1305,7 +1305,7 @@
 
   .platform-fill.youtube { background: #ff5555; }
   .platform-fill.twitch { background: #9146ff; }
-  .platform-fill.x { background: #e7e9ea; }
+  .platform-fill.x { background: #1da1f2; }
   .platform-fill.other { background: #8b949e; }
 
   .emote-ranking-section {

@@ -220,7 +220,7 @@
 
   .platform.twitch { color: #d4aaff; }
   .platform.youtube { color: #ff9999; }
-  .platform.x { color: #e7e9ea; }
+  .platform.x { color: #1da1f2; }
 
   .name {
     min-width: 0;
