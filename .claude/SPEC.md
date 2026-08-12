@@ -116,6 +116,16 @@ trait Source {
   - **解析できなかったアクションは `logs/yt-unparsed.jsonl` に1行追記**(原因究明用)。
   - パーサにバージョンタグを持たせ、将来の差し替えを容易に。
 
+### 4.3 X (Twitter) ライブ配信 (`x.rs`)
+- ログイン不要のゲストトークンフロー(Periscope 由来 chatapi)で公開ブロードキャストのチャットを受信する。読み取り専用で、コメント投稿は非対応。
+- 手順: ①`POST https://api.x.com/1.1/guest/activate.json`(X Web の公開 Bearer) → guest_token ②`GET https://x.com/i/api/1.1/broadcasts/show.json?ids={broadcastId}` → media_key ③`GET https://x.com/i/api/1.1/live_video_stream/status/{media_key}?client=web&...` → chatToken ④`POST https://proxsee-cf.pscp.tv/api/v2/accessChatPublic` に chat_token → endpoint + access_token ⑤`{endpoint}/chatapi/v1/chatnow`(wss) へ接続し kind:3(認証) → kind:2(ルーム参加) を送信して受信開始
+- 受信フレームは `kind==1` のみがチャット。payload は二重 JSON ネスト(payload 文字列 → その中の body 文字列を再パース)。`body.type==1` が本文で、ハート/参加通知等は無視。
+- YouTube と同じく固い struct deserialize はせず `serde_json::Value` のパス探索で寛容にパースし、欠落は None/既定値へ劣化。
+- `identifier` は broadcast URL(`https://x.com/i/broadcasts/{id}` / twitter.com 同形)または生の broadcast ID。`extract_broadcast_id()` で正規化し、`ChatMessage.channel` には正規化済み ID を入れる。
+- **Bearer とエンドポイント URL は `config.rs` の `xOverrides` から上書き可能**(再ビルド不要)。`xOverrides.bearerToken` と `xOverrides.endpoints`(キー: `guestActivateUrl` / `broadcastShowUrl` / `liveStatusUrl` / `accessChatUrl`)。未指定/空は既定値。
+- 金額系イベント(投げ銭等)の概念が無いため `MessageKind::Normal` のみ。Roles は broadcaster(配信者の user_id 一致)だけ判定。
+- 再接続は他 Source と同じ指数バックオフ。HTTP フロー失敗(配信未開始/終了)も不安定扱いでバックオフを伸ばし続け、配信開始待ちポーリングを兼ねる。
+
 ## 5. Bus 層 (`bus.rs`)
 
 - 内部: `tokio::sync::broadcast`（容量上限あり、lag は drop 容認=最新優先）。
@@ -221,11 +231,13 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
 - **P4 TTS**: 3バックエンド + ルーティング
 - **P5 モデレーション + 設定UI仕上げ**
 - **P5+ 拡張UI(実装済み, §8.1)**: 弾幕オーバーレイ(デスクトップ窓 + danmaku テンプレ)、コメント投稿(Twitch/YouTube)、参加型/抽選、投げ銭パネル、ダッシュボード、タイマー/ゴール/エフェクト、マルチカラム、設定ポータビリティ、テンプレ編集UI、最前面ピン、追加OBSテンプレ8種
+- **P5++ X対応(実装済み, §4.3)**: X (Twitter) ライブ配信のチャット受信(ゲストトークン + chatnow WebSocket、読み取り専用・投稿非対応)
 - **P6(後)**: OAuth実モデレーション(実BAN/削除)、niconico等の追加Source、テンプレ編集のライブプレビュー強化
 
 ## 12. 既知の制約・注意
 
 - WSLでは Tauri ビルド不可(Linuxバイナリになる)。ビルドはWindows側。
 - YouTube InnerTube は非公式 → 仕様変更リスク。寛容パース+overrides+ログで吸収。
+- X chatapi も非公式(Periscope 由来) → 同リスク。寛容パース+`xOverrides` で吸収。
 - 実モデレーションはOAuth必須(P6)。
 - Tauri build にはアイコン(`src-tauri/icons/`)が必要。

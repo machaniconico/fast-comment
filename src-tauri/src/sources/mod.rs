@@ -7,6 +7,7 @@
 pub mod twitch;
 pub mod twitch_helix;
 pub mod twitch_send;
+pub mod x;
 pub mod youtube;
 pub mod youtube_send;
 
@@ -98,6 +99,8 @@ pub struct SourceManager {
     youtube_overrides: crate::config::YoutubeOverrides,
     /// 公式YouTube Data API streamList用。空ならInnerTubeのみ。
     youtube_api_key: String,
+    /// X (Twitter) ライブ配信の overrides スナップショット。
+    x_overrides: crate::config::XOverrides,
 }
 
 impl SourceManager {
@@ -105,6 +108,7 @@ impl SourceManager {
         tx: broadcast::Sender<ChatMessage>,
         youtube_overrides: crate::config::YoutubeOverrides,
         youtube_api_key: String,
+        x_overrides: crate::config::XOverrides,
         metadata_tx: Option<mpsc::Sender<YoutubeMetadataUpdate>>,
         reaction_tx: Option<mpsc::Sender<Vec<YoutubeReaction>>>,
     ) -> Self {
@@ -114,6 +118,7 @@ impl SourceManager {
             reaction_tx,
             youtube_overrides,
             youtube_api_key,
+            x_overrides,
         }
     }
 
@@ -149,6 +154,12 @@ impl SourceManager {
                     metadata_tx,
                     reaction_tx,
                 );
+                tauri::async_runtime::spawn(async move {
+                    run_with_logging(&src, tx, child).await;
+                });
+            }
+            ChannelPlatform::X => {
+                let src = x::XSource::new(identifier, self.x_overrides.clone());
                 tauri::async_runtime::spawn(async move {
                     run_with_logging(&src, tx, child).await;
                 });

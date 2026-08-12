@@ -14,6 +14,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::{AppConfig, ChannelPlatform};
 use crate::model::{ChatMessage, Platform};
+use crate::sources::x::extract_broadcast_id;
 use crate::sources::youtube::{extract_video_id, is_channel_identifier};
 
 /// 接続中チャンネルに表示する補助タイトル。
@@ -432,6 +433,7 @@ fn platform_key(platform: Platform) -> &'static str {
     match platform {
         Platform::Twitch => "twitch",
         Platform::Youtube => "youtube",
+        Platform::X => "x",
     }
 }
 
@@ -443,6 +445,8 @@ fn enabled_scope_keys(config: &AppConfig) -> HashSet<String> {
         .map(|ch| match ch.platform {
             ChannelPlatform::Twitch => format!("twitch:{}", ch.identifier),
             ChannelPlatform::Youtube => format!("youtube:{}", extract_video_id(&ch.identifier)),
+            // XSource は ChatMessage.channel に正規化済み broadcast ID を入れる。
+            ChannelPlatform::X => format!("x:{}", extract_broadcast_id(&ch.identifier)),
         })
         .collect()
 }
@@ -471,6 +475,9 @@ fn enabled_metadata_keys(config: &AppConfig) -> HashSet<String> {
             }
             ChannelPlatform::Youtube => {
                 metadata_key(Platform::Youtube, &extract_video_id(&ch.identifier))
+            }
+            ChannelPlatform::X => {
+                metadata_key(Platform::X, &extract_broadcast_id(&ch.identifier))
             }
         })
         .collect()

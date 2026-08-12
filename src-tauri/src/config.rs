@@ -33,6 +33,8 @@ pub struct ChannelConfig {
 pub enum ChannelPlatform {
     Twitch,
     Youtube,
+    /// X (Twitter) ライブ配信。identifier は broadcast URL または broadcast ID。
+    X,
 }
 
 const MAX_OBS_ROWS: u16 = 1000;
@@ -471,6 +473,21 @@ pub struct YoutubeOverrides {
     pub paths: std::collections::HashMap<String, String>,
 }
 
+/// X (Twitter) ライブ配信の仕様変更を再ビルド無しで吸収するための上書き設定。
+///
+/// いずれも `None`/空のときは sources/x.rs 側の既定挙動を使う。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct XOverrides {
+    /// X Web クライアントの公開 Bearer トークンを差し替える。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bearer_token: Option<String>,
+    /// API エンドポイント URL の上書き(キー→URL)。空なら既定。
+    /// キー: guestActivateUrl / broadcastShowUrl / liveStatusUrl / accessChatUrl。
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub endpoints: std::collections::HashMap<String, String>,
+}
+
 /// チャット送信用の認証情報。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -518,6 +535,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub youtube_overrides: YoutubeOverrides,
     #[serde(default)]
+    pub x_overrides: XOverrides,
+    #[serde(default)]
     pub credentials: CredentialsConfig,
 }
 
@@ -535,6 +554,7 @@ impl Default for AppConfig {
             ui: UiConfig::default(),
             participation: ParticipationConfig::default(),
             youtube_overrides: YoutubeOverrides::default(),
+            x_overrides: XOverrides::default(),
             credentials: CredentialsConfig::default(),
         }
     }
@@ -807,6 +827,10 @@ mod tests {
                 client_version: Some("1.20240501.00.00".to_string()),
                 paths,
             },
+            x_overrides: XOverrides {
+                bearer_token: Some("test-bearer".to_string()),
+                endpoints: HashMap::new(),
+            },
         };
 
         let text = serde_json::to_string(&cfg).expect("serialize AppConfig");
@@ -958,6 +982,10 @@ mod tests {
             json["youtubeOverrides"]["paths"]["continuationPath"].as_str(),
             Some("contents.twoColumnWatchNextResults.conversationBar")
         );
+        assert_eq!(
+            json["xOverrides"]["bearerToken"].as_str(),
+            Some("test-bearer")
+        );
 
         let decoded: AppConfig = serde_json::from_str(&text).expect("deserialize AppConfig");
         assert_eq!(decoded, cfg);
@@ -1063,6 +1091,7 @@ mod tests {
         assert_eq!(cfg.credentials.youtube_api_key, "");
         assert_eq!(cfg.credentials.youtube_oauth_client_id, "");
         assert_eq!(cfg.youtube_overrides, YoutubeOverrides::default());
+        assert_eq!(cfg.x_overrides, XOverrides::default());
     }
 
     #[test]
@@ -1134,6 +1163,7 @@ mod tests {
         assert_eq!(cfg.participation, ParticipationConfig::default());
         assert_eq!(cfg.credentials, CredentialsConfig::default());
         assert_eq!(cfg.youtube_overrides, YoutubeOverrides::default());
+        assert_eq!(cfg.x_overrides, XOverrides::default());
     }
 
     #[test]

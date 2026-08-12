@@ -1185,6 +1185,7 @@
       <select id="test-platform" bind:value={testPlatform} class="platform-select">
         <option value="twitch">Twitch</option>
         <option value="youtube">YouTube</option>
+        <option value="x">X</option>
       </select>
       <button type="button" class="copy-btn" onclick={fillRandomTestComment}>ランダム</button>
     </div>

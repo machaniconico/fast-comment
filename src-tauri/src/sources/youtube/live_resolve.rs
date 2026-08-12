@@ -122,6 +122,8 @@ pub fn spawn_live_resolve_poller(
             source_tx,
             overrides.clone(),
             official_api_key,
+            // ここは YouTube 専用の spawn 経路なので X overrides は使われない。
+            crate::config::XOverrides::default(),
             Some(metadata_tx.clone()),
             Some(reaction_tx),
         );

@@ -110,6 +110,7 @@ impl AppState {
         let p = match ch.platform {
             config::ChannelPlatform::Twitch => "twitch",
             config::ChannelPlatform::Youtube => "youtube",
+            config::ChannelPlatform::X => "x",
         };
         format!("{p}:{}", ch.identifier)
     }
@@ -584,7 +585,7 @@ async fn update_config(
     state: State<'_, AppState>,
     mut new_config: AppConfig,
 ) -> Result<(), String> {
-    let (youtube_source_config_changed, youtube_oauth_client_changed) = {
+    let (youtube_source_config_changed, youtube_oauth_client_changed, x_source_config_changed) = {
         let current = state.config.lock().unwrap();
         (
             current.youtube_overrides != new_config.youtube_overrides
@@ -592,6 +593,7 @@ async fn update_config(
                     != new_config.credentials.youtube_api_key.trim(),
             current.credentials.youtube_oauth_client_id.trim()
                 != new_config.credentials.youtube_oauth_client_id.trim(),
+            current.x_overrides != new_config.x_overrides,
         )
     };
 
@@ -623,6 +625,9 @@ async fn update_config(
     if youtube_source_config_changed {
         stop_active_youtube_channels(&state);
     }
+    if x_source_config_changed {
+        stop_active_x_channels(&state);
+    }
     if youtube_oauth_client_changed {
         state.youtube_auth.clear_caches().await;
     }
@@ -650,6 +655,21 @@ fn stop_active_youtube_channels(state: &AppState) {
     let keys: Vec<String> = channels
         .keys()
         .filter(|key| key.starts_with("youtube:"))
+        .cloned()
+        .collect();
+    for key in keys {
+        if let Some(token) = channels.remove(&key) {
+            token.cancel();
+        }
+    }
+}
+
+/// X の overrides 変更時だけ既存タスクを止め、差分適用で再起動させる。
+fn stop_active_x_channels(state: &AppState) {
+    let mut channels = state.channels.lock().unwrap();
+    let keys: Vec<String> = channels
+        .keys()
+        .filter(|key| key.starts_with("x:"))
         .cloned()
         .collect();
     for key in keys {
@@ -1075,6 +1095,7 @@ fn inject_test_comment(
     let platform = match platform.as_str() {
         "twitch" => Platform::Twitch,
         "youtube" => Platform::Youtube,
+        "x" => Platform::X,
         other => return Err(format!("不正な platform です: {other}")),
     };
     let kind = match kind.as_deref().unwrap_or("normal") {
@@ -1140,6 +1161,7 @@ fn participant_platform(platform: Platform) -> &'static str {
     match platform {
         Platform::Twitch => "twitch",
         Platform::Youtube => "youtube",
+        Platform::X => "x",
     }
 }
 
@@ -1251,11 +1273,12 @@ fn spawn_one_channel(_app: &AppHandle, state: &AppState, ch: &ChannelConfig) {
         return;
     }
     let key = AppState::channel_key(ch);
-    let (overrides, youtube_api_key) = {
+    let (overrides, youtube_api_key, x_overrides) = {
         let config = state.config.lock().unwrap();
         (
             config.youtube_overrides.clone(),
             config.credentials.youtube_api_key.clone(),
+            config.x_overrides.clone(),
         )
     };
     let token = if ch.platform == ChannelPlatform::Youtube
@@ -1277,6 +1300,7 @@ fn spawn_one_channel(_app: &AppHandle, state: &AppState, ch: &ChannelConfig) {
             state.source_tx.clone(),
             overrides.clone(),
             youtube_api_key,
+            x_overrides,
             Some(state.metadata_tx.clone()),
             Some(state.reaction_tx.clone()),
         );

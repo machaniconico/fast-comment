@@ -77,6 +77,9 @@
     if (ch.platform === 'twitch') {
       return `https://www.twitch.tv/${encodeURIComponent(ch.identifier)}`;
     }
+    if (ch.platform === 'x') {
+      return `https://x.com/i/broadcasts/${encodeURIComponent(ch.identifier)}`;
+    }
     const id = ch.identifier;
     if (id.startsWith('@')) {
       return `https://www.youtube.com/@${encodeURIComponent(id.slice(1))}/live`;
@@ -212,6 +215,7 @@
 
   const TWITCH_HOSTS = new Set(['twitch.tv', 'm.twitch.tv']);
   const YOUTUBE_HOSTS = new Set(['youtube.com', 'm.youtube.com', 'music.youtube.com', 'youtu.be']);
+  const X_HOSTS = new Set(['x.com', 'twitter.com']);
   const YOUTUBE_PATH_ID_PREFIXES = new Set(['live', 'embed', 'shorts', 'v']);
   const YOUTUBE_VIDEO_ID_RE = /^[A-Za-z0-9_-]{11}$/;
   const YOUTUBE_CHANNEL_ID_RE = /^UC[A-Za-z0-9_-]{22}$/;
@@ -228,7 +232,7 @@
     'turbo', 'user', 'videos', 'wallet', 'whispers'
   ]);
   const SUPPORTED_SCHEMELESS_URL_RE =
-    /^(?:(?:www|m)\.twitch\.tv|twitch\.tv|(?:www|m|music)\.youtube\.com|youtube\.com|youtu\.be)(?::\d{1,5})?(?:[/?#].*)?$/i;
+    /^(?:(?:www|m)\.twitch\.tv|twitch\.tv|(?:www|m|music)\.youtube\.com|youtube\.com|youtu\.be|(?:www\.)?x\.com|(?:www\.)?twitter\.com)(?::\d{1,5})?(?:[/?#].*)?$/i;
 
   // スキーム無しの "twitch.tv/foo" / "youtu.be/xxx" 等も URL として拾う。
   function parseUrlLoose(input: string): URL | null {
@@ -324,6 +328,19 @@
     return null;
   }
 
+  // X の配信URL(https://x.com/i/broadcasts/{id})から broadcast ID を抽出する。
+  // Rust 側 sources/x.rs の extract_broadcast_id と同じ抽出ロジック(先頭の
+  // 英数字だけを拾う)なので、ここで抽出できなくても生入力をそのまま渡せば
+  // バックエンド側で同様に正規化される。
+  function extractXBroadcastId(url: URL): string | null {
+    const marker = '/i/broadcasts/';
+    const idx = url.pathname.indexOf(marker);
+    if (idx === -1) return null;
+    const rest = url.pathname.slice(idx + marker.length);
+    const match = /^[A-Za-z0-9]+/.exec(rest);
+    return match ? match[0] : null;
+  }
+
   function detectChannel(input: string): ChannelDetection {
     const raw = input.trim();
     const url = parseUrlLoose(raw);
@@ -375,10 +392,22 @@
       };
     }
 
+    if (X_HOSTS.has(host)) {
+      const id = extractXBroadcastId(url);
+      if (id) {
+        return { kind: 'detected', platform: 'x', identifier: id };
+      }
+      return {
+        kind: 'known-url',
+        platform: 'x',
+        message: 'Xのbroadcast IDが見つかりません。配信URL(.../i/broadcasts/xxxx)かbroadcast IDを手動入力してください。'
+      };
+    }
+
     return {
       kind: 'unsupported-url',
       host,
-      message: `未対応のURLです (${host})。Twitch/YouTubeの配信URLか識別子を入力してください。`
+      message: `未対応のURLです (${host})。Twitch/YouTube/Xの配信URLか識別子を入力してください。`
     };
   }
 
@@ -394,9 +423,11 @@
     if (detection.kind === 'detected') {
       const label = detection.platform === 'twitch'
         ? 'Twitch'
-        : detection.youtubeKind === 'channel'
-          ? 'YouTubeチャンネル'
-          : 'YouTube動画';
+        : detection.platform === 'x'
+          ? 'X'
+          : detection.youtubeKind === 'channel'
+            ? 'YouTubeチャンネル'
+            : 'YouTube動画';
       return { tone: 'ok', message: `${label} として自動判別:`, identifier: detection.identifier };
     }
     if (detection.kind === 'known-url' || detection.kind === 'unsupported-url') {
@@ -408,7 +439,7 @@
   async function onAddChannel() {
     addError = '';
     const raw = newIdentifier.trim();
-    if (!raw) { addError = 'URL か Twitchチャンネル名 / YouTube動画ID / YouTubeチャンネル指定を入力してください'; return; }
+    if (!raw) { addError = 'URL か Twitchチャンネル名 / YouTube動画ID / YouTubeチャンネル指定 / X broadcast IDを入力してください'; return; }
 
     // URL から判別できればそれを優先。生入力は手動選択 + 生ID/名として追加する。
     const det = detectChannel(raw);
@@ -442,18 +473,19 @@
       aria-label="プラットフォーム"
       onchange={(e) => {
         const value = (e.currentTarget as HTMLSelectElement).value;
-        if (value === 'twitch' || value === 'youtube') newPlatform = value;
+        if (value === 'twitch' || value === 'youtube' || value === 'x') newPlatform = value;
       }}
     >
       <option value="twitch">Twitch</option>
       <option value="youtube">YouTube</option>
+      <option value="x">X (Twitter)</option>
     </select>
     <input
       type="text"
       bind:value={newIdentifier}
-      placeholder="配信URLを貼り付け（または Twitchチャンネル名 / YouTube動画ID / @handle / チャンネルURL）"
+      placeholder="配信URLを貼り付け（または Twitchチャンネル名 / YouTube動画ID / @handle / チャンネルURL / X broadcast ID）"
       class="id-input"
-      aria-label="配信URL または チャンネル名 / 動画ID / YouTubeチャンネル指定"
+      aria-label="配信URL または チャンネル名 / 動画ID / YouTubeチャンネル指定 / X broadcast ID"
       onkeydown={(e) => e.key === 'Enter' && onAddChannel()}
     />
     <button class="add-btn" onclick={onAddChannel}>追加</button>
@@ -478,6 +510,7 @@
           class="chip"
           class:twitch={ch.platform === 'twitch'}
           class:youtube={ch.platform === 'youtube'}
+          class:x={ch.platform === 'x'}
           class:live={isLive}
           class:idle={isIdle}
           role="listitem"
@@ -607,6 +640,12 @@
     background: rgba(255,0,0,0.12);
   }
   .chip.youtube .chip-dot { background: #ff0000; }
+
+  .chip.x {
+    border-color: rgba(231,233,234,0.55);
+    background: rgba(231,233,234,0.12);
+  }
+  .chip.x .chip-dot { background: #e7e9ea; }
 
   .chip.live .chip-dot {
     animation: live-pulse 1.3s ease-in-out infinite;

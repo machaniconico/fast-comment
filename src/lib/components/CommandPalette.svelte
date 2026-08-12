@@ -35,6 +35,13 @@
       run: () => { store.setFilterPlatform('youtube'); ui.setTab('comments'); },
     },
     {
+      id: 'filter-x',
+      title: 'フィルタ: X',
+      keywords: ['x', 'twitter', 'filter', 'フィルタ', 'エックス'],
+      icon: '⚫',
+      run: () => { store.setFilterPlatform('x'); ui.setTab('comments'); },
+    },
+    {
       id: 'clear',
       title: '一覧をクリア',
       keywords: ['clear', 'クリア', 'delete', '削除', 'reset'],

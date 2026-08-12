@@ -547,18 +547,21 @@
   function platformOrder(platform: string): number {
     if (platform === 'youtube') return 0;
     if (platform === 'twitch') return 1;
-    return 2;
+    if (platform === 'x') return 2;
+    return 3;
   }
 
   function platformLabel(platform: string): string {
     if (platform === 'youtube') return 'YouTube';
     if (platform === 'twitch') return 'Twitch';
+    if (platform === 'x') return 'X';
     return platform;
   }
 
   function platformClass(platform: string): string {
     if (platform === 'youtube') return 'youtube';
     if (platform === 'twitch') return 'twitch';
+    if (platform === 'x') return 'x';
     return 'other';
   }
 
@@ -1302,6 +1305,7 @@
 
   .platform-fill.youtube { background: #ff5555; }
   .platform-fill.twitch { background: #9146ff; }
+  .platform-fill.x { background: #e7e9ea; }
   .platform-fill.other { background: #8b949e; }
 
   .emote-ranking-section {

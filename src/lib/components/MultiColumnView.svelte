@@ -6,6 +6,7 @@
   const columns: { platform: Platform; label: string; className: string }[] = [
     { platform: 'twitch', label: 'Twitch', className: 'twitch' },
     { platform: 'youtube', label: 'YouTube', className: 'youtube' },
+    { platform: 'x', label: 'X', className: 'x' },
   ];
 
   function platformCount(platform: Platform): number {
@@ -31,7 +32,7 @@
     flex: 1;
     min-height: 0;
     display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: repeat(3, minmax(0, 1fr));
     gap: 1px;
     background: rgba(255, 255, 255, 0.08);
     overflow: hidden;
@@ -72,6 +73,10 @@
     background: #ff4444;
   }
 
+  .platform-mark.x {
+    background: #e7e9ea;
+  }
+
   .column-title {
     min-width: 0;
     overflow: hidden;
@@ -96,7 +101,7 @@
   @media (max-width: 720px) {
     .multi-column-view {
       grid-template-columns: 1fr;
-      grid-template-rows: repeat(2, minmax(0, 1fr));
+      grid-template-rows: repeat(3, minmax(0, 1fr));
     }
   }
 </style>

@@ -272,6 +272,7 @@ export interface AppConfig {
   };
   participation: ParticipationConfig;
   youtubeOverrides?: { apiKey?: string; clientVersion?: string; paths?: Record<string, string> };
+  xOverrides?: { bearerToken?: string; endpoints?: Record<string, string> };
   // External API/chat credentials (Rust `CredentialsConfig`, serde camelCase).
   // Optional so older config.json without the field still deserializes cleanly.
   credentials?: {
@@ -397,13 +398,13 @@ export interface Participant {
 }
 
 export interface ChannelConfig {
-  platform: 'twitch' | 'youtube';
-  identifier: string; // Twitch: channel name, YouTube: videoId
+  platform: 'twitch' | 'youtube' | 'x';
+  identifier: string; // Twitch: channel name, YouTube: videoId, X: broadcast URL/ID
   enabled: boolean; // Rust ChannelConfig.enabled (serde default true)
 }
 
 export interface InjectTestCommentOptions {
-  platform: 'twitch' | 'youtube';
+  platform: 'twitch' | 'youtube' | 'x';
   name: string;
   text: string;
   kind?: 'normal' | 'superChat' | 'membership' | 'bits' | 'gift';

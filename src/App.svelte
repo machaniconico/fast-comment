@@ -586,6 +586,11 @@
           class:active={store.filterPlatform === 'youtube'}
           onclick={() => onFilterClick('youtube')}
         >YouTube</button>
+        <button
+          class="filter-btn x"
+          class:active={store.filterPlatform === 'x'}
+          onclick={() => onFilterClick('x')}
+        >X</button>
       </div>
 
       <!-- View mode -->
@@ -1227,6 +1232,7 @@
 
   .filter-btn.twitch.active { background: rgba(145,70,255,0.3); border-color: #9146ff; color: #d4aaff; }
   .filter-btn.youtube.active { background: rgba(255,0,0,0.2); border-color: #ff4444; color: #ff9999; }
+  .filter-btn.x.active { background: rgba(231,233,234,0.22); border-color: #e7e9ea; color: #e7e9ea; }
 
   .view-mode-btn {
     background: rgba(255,255,255,0.06);
