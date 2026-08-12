@@ -159,7 +159,7 @@ impl SourceManager {
                 });
             }
             ChannelPlatform::X => {
-                let src = x::XSource::new(identifier, self.x_overrides.clone());
+                let src = x::XSource::new(identifier, self.x_overrides.clone(), metadata_tx);
                 tauri::async_runtime::spawn(async move {
                     run_with_logging(&src, tx, child).await;
                 });

@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_util::sync::CancellationToken;
@@ -25,6 +25,7 @@ use tokio_util::sync::CancellationToken;
 use super::{Backoff, Source};
 use crate::config::XOverrides;
 use crate::model::{Author, ChatMessage, Fragment, MessageKind, Platform, Roles};
+use crate::stats::YoutubeMetadataUpdate;
 
 /// X Web クライアントに埋め込まれている公開 Bearer(シークレットではない)。
 const X_WEB_BEARER: &str = "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs=1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA";
@@ -73,6 +74,8 @@ struct ChatBootstrap {
     room_id: String,
     /// 配信者の Twitter user_id(broadcaster ロール判定用)。
     broadcaster_id: Option<String>,
+    /// 配信タイトル(チップ表示用)。
+    title: Option<String>,
 }
 
 #[derive(Debug)]
@@ -98,13 +101,20 @@ pub struct XSource {
     /// 正規化済み broadcast ID。
     broadcast_id: String,
     overrides: XOverrides,
+    /// チップの接続状態表示用。live フラグとタイトルのみ送る。
+    metadata_tx: Option<mpsc::Sender<YoutubeMetadataUpdate>>,
 }
 
 impl XSource {
-    pub fn new(identifier: String, overrides: XOverrides) -> Self {
+    pub fn new(
+        identifier: String,
+        overrides: XOverrides,
+        metadata_tx: Option<mpsc::Sender<YoutubeMetadataUpdate>>,
+    ) -> Self {
         XSource {
             broadcast_id: extract_broadcast_id(&identifier),
             overrides,
+            metadata_tx,
         }
     }
 
@@ -152,11 +162,13 @@ impl Source for XSource {
                         if cancel.is_cancelled() {
                             return Ok(());
                         }
+                        self.send_live_state(false, None).await;
                         if stable {
                             backoff.reset();
                         }
                     }
                     Err(e) => {
+                        self.send_live_state(false, None).await;
                         if e.stable {
                             backoff.reset();
                         }
@@ -254,6 +266,8 @@ impl XSource {
             .map_err(|e| XSessionError::new(e, false))?;
 
         tracing::info!("x:{} chatnow 接続・参加完了", self.broadcast_id);
+        // チップに「接続中」を出す。X には視聴者数の取得手段が無いため live のみ。
+        self.send_live_state(true, boot.title.clone()).await;
 
         let connected_at = Instant::now();
         // 「安定」判定はチャットの実受信のみで立てる。認証エラー通知や Ping 等の
@@ -373,6 +387,13 @@ impl XSource {
             })?
             .to_string();
         let broadcaster_id = id_string(broadcast.get("user_id"));
+        // Periscope 由来の "status" が配信タイトル。将来の変化に備え "title" も見る。
+        let title = broadcast
+            .get("status")
+            .or_else(|| broadcast.get("title"))
+            .and_then(Value::as_str)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
 
         // 3. ライブストリーム状態 → chatToken。media_key は API 応答由来。
         let url = format!(
@@ -434,7 +455,26 @@ impl XSource {
             access_token,
             room_id,
             broadcaster_id,
+            title,
         })
+    }
+
+    /// チップの接続状態表示用に live 状態を stats へ送る。
+    /// `full_snapshot: false` の部分更新なので、切断時も直前のタイトルは
+    /// stats 側の live=false 処理に従って整理される。
+    async fn send_live_state(&self, live: bool, title: Option<String>) {
+        let Some(tx) = &self.metadata_tx else { return };
+        let update = YoutubeMetadataUpdate {
+            platform: Platform::X,
+            channel: self.broadcast_id.clone(),
+            concurrent_viewers: None,
+            likes: None,
+            title,
+            live: Some(live),
+            reactions_delta: None,
+            full_snapshot: false,
+        };
+        let _ = tx.send(update).await;
     }
 
     /// 受信フレーム1件を `ChatMessage` へ正規化する。チャット以外(kind!=1、
@@ -598,7 +638,7 @@ mod tests {
 
     #[test]
     fn chat_frame_normalizes_to_message() {
-        let src = XSource::new("1yoJMWvbtbtxQ".to_string(), XOverrides::default());
+        let src = XSource::new("1yoJMWvbtbtxQ".to_string(), XOverrides::default(), None);
         let body = serde_json::json!({
             "type": 1,
             "body": "こんにちは",
@@ -635,7 +675,7 @@ mod tests {
     fn user_id_falls_back_to_numeric_sender_twitter_id() {
         // remoteID 欠落フレーム: sender.twitter_id(数値)を拾い、ハンドル変更でも
         // 同一人物を追跡できる ID を採用する。
-        let src = XSource::new("b1".to_string(), XOverrides::default());
+        let src = XSource::new("b1".to_string(), XOverrides::default(), None);
         let body = serde_json::json!({
             "type": 1,
             "body": "hi",
@@ -656,7 +696,7 @@ mod tests {
 
     #[test]
     fn non_chat_frames_are_ignored() {
-        let src = XSource::new("b1".to_string(), XOverrides::default());
+        let src = XSource::new("b1".to_string(), XOverrides::default(), None);
         // kind != 1。
         assert!(src.frame_to_chat(r#"{"kind":2,"payload":"{}"}"#, None).is_none());
         // ハート(type=2)。
