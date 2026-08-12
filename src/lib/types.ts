@@ -5,7 +5,7 @@
  * Fragment uses tagged union with `type` discriminant
  */
 
-export type Platform = 'twitch' | 'youtube' | 'x';
+export type Platform = 'twitch' | 'youtube' | 'x' | 'niconico';
 
 export type MessageKind = 'normal' | 'superChat' | 'membership' | 'bits' | 'gift' | 'system';
 

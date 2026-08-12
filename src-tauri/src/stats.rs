@@ -14,6 +14,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::{AppConfig, ChannelPlatform};
 use crate::model::{ChatMessage, Platform};
+use crate::sources::niconico::extract_live_id;
 use crate::sources::x::extract_broadcast_id;
 use crate::sources::youtube::{extract_video_id, is_channel_identifier};
 
@@ -434,6 +435,7 @@ fn platform_key(platform: Platform) -> &'static str {
         Platform::Twitch => "twitch",
         Platform::Youtube => "youtube",
         Platform::X => "x",
+        Platform::Niconico => "niconico",
     }
 }
 
@@ -447,6 +449,10 @@ fn enabled_scope_keys(config: &AppConfig) -> HashSet<String> {
             ChannelPlatform::Youtube => format!("youtube:{}", extract_video_id(&ch.identifier)),
             // XSource は ChatMessage.channel に正規化済み broadcast ID を入れる。
             ChannelPlatform::X => format!("x:{}", extract_broadcast_id(&ch.identifier)),
+            // NiconicoSource も同様に正規化済み lv 番組 ID を入れる。
+            ChannelPlatform::Niconico => {
+                format!("niconico:{}", extract_live_id(&ch.identifier))
+            }
         })
         .collect()
 }
@@ -478,6 +484,9 @@ fn enabled_metadata_keys(config: &AppConfig) -> HashSet<String> {
             }
             ChannelPlatform::X => {
                 metadata_key(Platform::X, &extract_broadcast_id(&ch.identifier))
+            }
+            ChannelPlatform::Niconico => {
+                metadata_key(Platform::Niconico, &extract_live_id(&ch.identifier))
             }
         })
         .collect()

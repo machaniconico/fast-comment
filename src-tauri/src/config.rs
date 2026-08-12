@@ -35,6 +35,8 @@ pub enum ChannelPlatform {
     Youtube,
     /// X (Twitter) ライブ配信。identifier は broadcast URL または broadcast ID。
     X,
+    /// ニコニコ生放送。identifier は番組URL または lv 番組ID。
+    Niconico,
 }
 
 const MAX_OBS_ROWS: u16 = 1000;
@@ -488,6 +490,18 @@ pub struct XOverrides {
     pub endpoints: std::collections::HashMap<String, String>,
 }
 
+/// ニコニコ生放送の仕様変更を再ビルド無しで吸収するための上書き設定。
+///
+/// いずれも空のときは sources/niconico.rs 側の既定挙動を使う。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct NiconicoOverrides {
+    /// URL の上書き(キー→URL)。空なら既定。
+    /// キー: watchPageBaseUrl (既定 https://live.nicovideo.jp/watch/)。
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub endpoints: std::collections::HashMap<String, String>,
+}
+
 /// チャット送信用の認証情報。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -537,6 +551,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub x_overrides: XOverrides,
     #[serde(default)]
+    pub niconico_overrides: NiconicoOverrides,
+    #[serde(default)]
     pub credentials: CredentialsConfig,
 }
 
@@ -555,6 +571,7 @@ impl Default for AppConfig {
             participation: ParticipationConfig::default(),
             youtube_overrides: YoutubeOverrides::default(),
             x_overrides: XOverrides::default(),
+            niconico_overrides: NiconicoOverrides::default(),
             credentials: CredentialsConfig::default(),
         }
     }
@@ -831,6 +848,7 @@ mod tests {
                 bearer_token: Some("test-bearer".to_string()),
                 endpoints: HashMap::new(),
             },
+            niconico_overrides: NiconicoOverrides::default(),
         };
 
         let text = serde_json::to_string(&cfg).expect("serialize AppConfig");

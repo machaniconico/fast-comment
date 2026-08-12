@@ -111,6 +111,7 @@ impl AppState {
             config::ChannelPlatform::Twitch => "twitch",
             config::ChannelPlatform::Youtube => "youtube",
             config::ChannelPlatform::X => "x",
+            config::ChannelPlatform::Niconico => "niconico",
         };
         format!("{p}:{}", ch.identifier)
     }
@@ -1096,6 +1097,7 @@ fn inject_test_comment(
         "twitch" => Platform::Twitch,
         "youtube" => Platform::Youtube,
         "x" => Platform::X,
+        "niconico" => Platform::Niconico,
         other => return Err(format!("不正な platform です: {other}")),
     };
     let kind = match kind.as_deref().unwrap_or("normal") {
@@ -1162,6 +1164,7 @@ fn participant_platform(platform: Platform) -> &'static str {
         Platform::Twitch => "twitch",
         Platform::Youtube => "youtube",
         Platform::X => "x",
+        Platform::Niconico => "niconico",
     }
 }
 
@@ -1273,12 +1276,13 @@ fn spawn_one_channel(_app: &AppHandle, state: &AppState, ch: &ChannelConfig) {
         return;
     }
     let key = AppState::channel_key(ch);
-    let (overrides, youtube_api_key, x_overrides) = {
+    let (overrides, youtube_api_key, x_overrides, niconico_overrides) = {
         let config = state.config.lock().unwrap();
         (
             config.youtube_overrides.clone(),
             config.credentials.youtube_api_key.clone(),
             config.x_overrides.clone(),
+            config.niconico_overrides.clone(),
         )
     };
     let token = if ch.platform == ChannelPlatform::Youtube
@@ -1301,6 +1305,7 @@ fn spawn_one_channel(_app: &AppHandle, state: &AppState, ch: &ChannelConfig) {
             overrides.clone(),
             youtube_api_key,
             x_overrides,
+            niconico_overrides,
             Some(state.metadata_tx.clone()),
             Some(state.reaction_tx.clone()),
         );

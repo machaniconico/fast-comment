@@ -12,6 +12,8 @@ pub enum Platform {
     Youtube,
     /// X (Twitter) ライブ配信 (broadcasts)。
     X,
+    /// ニコニコ生放送。
+    Niconico,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

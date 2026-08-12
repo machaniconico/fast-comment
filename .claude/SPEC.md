@@ -126,6 +126,17 @@ trait Source {
 - 金額系イベント(投げ銭等)の概念が無いため `MessageKind::Normal` のみ。Roles は broadcaster(配信者の user_id 一致)だけ判定。
 - 再接続は他 Source と同じ指数バックオフ。HTTP フロー失敗(配信未開始/終了)も不安定扱いでバックオフを伸ばし続け、配信開始待ちポーリングを兼ねる。
 
+### 4.4 ニコニコ生放送 (`niconico.rs`)
+- ログイン不要の視聴ページ経由で NDGR メッセージサーバー(2024年8月以降の新コメントサーバー)へ接続する。読み取り専用で、コメント投稿は非対応。
+- 手順: ①`GET https://live.nicovideo.jp/watch/{lvId}` → HTML 内 `<script id="embedded-data" data-props="...">` の JSON から `site.relive.webSocketUrl` を抽出(`program.status != ON_AIR` は即エラー=配信待ちポーリング) ②watch WebSocket へ接続し `startWatching` 送信(映像座席は要求しない) ③`seat` の keepIntervalSec 間隔で `keepSeat` 送信、アプリレベル `ping` には `pong`+`keepSeat` 応答 ④`messageServer` の viewUri(NDGR view API) を `?at=now` → `ReadyForNext.at` で追いかけ、`MessageSegment.uri` の ChunkedMessage ストリームからコメント受信
+- NDGR は **length-delimited Protobuf over HTTP chunked**。定義は n-air-app/nicolive-comment-protobuf のうち必要フィールドのみを prost derive で手書き(`niconico.rs` 内 `ndgr` モジュール)。未知フィールド/oneof variant は prost が自動スキップ = 寛容パース方針。拾うのは chat(1)/gift(8)/overflowed_chat(20) のみ。
+- 匿名(184)コメントは `hashed_user_id` を author.id に、先頭7文字を表示名に。生ID コメントは `raw_user_id`。コテハン(`name`)があれば優先。broadcaster 判定は embedded-data の `program.supplier.programProviderId` と raw_user_id の一致。
+- ギフトは `MessageKind::Gift` + `Amount{value: point, currency: "pt"}`。
+- watch WS の `statistics` から視聴者数を取得し、チップへ live 状態と共に反映(YoutubeMetadataUpdate 経由)。
+- `identifier` は番組 URL(`live.nicovideo.jp/watch/lvN` / `nico.ms/lvN`)または生の lv 番組 ID。`extract_live_id()` で正規化し、`ChatMessage.channel` には正規化済み lv ID を入れる。
+- **視聴ページ base URL は `config.rs` の `niconicoOverrides.endpoints`(キー: `watchPageBaseUrl`)から上書き可能**(再ビルド不要)。
+- 再接続は他 Source と同じ指数バックオフ。NDGR 購読が死んだらセッション全体を張り直す。サーバー `disconnect`/`error` メッセージも同様。
+
 ## 5. Bus 層 (`bus.rs`)
 
 - 内部: `tokio::sync::broadcast`（容量上限あり、lag は drop 容認=最新優先）。
@@ -232,7 +243,8 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
 - **P5 モデレーション + 設定UI仕上げ**
 - **P5+ 拡張UI(実装済み, §8.1)**: 弾幕オーバーレイ(デスクトップ窓 + danmaku テンプレ)、コメント投稿(Twitch/YouTube)、参加型/抽選、投げ銭パネル、ダッシュボード、タイマー/ゴール/エフェクト、マルチカラム、設定ポータビリティ、テンプレ編集UI、最前面ピン、追加OBSテンプレ8種
 - **P5++ X対応(実装済み, §4.3)**: X (Twitter) ライブ配信のチャット受信(ゲストトークン + chatnow WebSocket、読み取り専用・投稿非対応)
-- **P6(後)**: OAuth実モデレーション(実BAN/削除)、niconico等の追加Source、テンプレ編集のライブプレビュー強化
+- **P5+++ niconico対応(実装済み, §4.4)**: ニコニコ生放送のコメント受信(watch WS + NDGR Protobuf、読み取り専用・投稿非対応)
+- **P6(後)**: OAuth実モデレーション(実BAN/削除)、さらなる追加Source、テンプレ編集のライブプレビュー強化
 
 ## 12. 既知の制約・注意
 

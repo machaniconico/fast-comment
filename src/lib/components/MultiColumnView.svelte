@@ -77,6 +77,10 @@
     background: #1da1f2;
   }
 
+  .platform-mark.niconico {
+    background: #fcc800;
+  }
+
   .column-title {
     min-width: 0;
     overflow: hidden;

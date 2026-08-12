@@ -82,6 +82,7 @@ html, body {
 .platform-dot.twitch { background: #9146ff; }
 .platform-dot.youtube { background: #ff0000; }
 .platform-dot.x { background: #1da1f2; }
+.platform-dot.niconico { background: #fcc800; }
 
 .author {
   min-width: 0;

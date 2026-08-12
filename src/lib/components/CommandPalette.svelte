@@ -42,6 +42,13 @@
       run: () => { store.setFilterPlatform('x'); ui.setTab('comments'); },
     },
     {
+      id: 'filter-niconico',
+      title: 'フィルタ: ニコニコ生放送',
+      keywords: ['niconico', 'nico', 'filter', 'フィルタ', 'ニコニコ', 'ニコ生'],
+      icon: '🟡',
+      run: () => { store.setFilterPlatform('niconico'); ui.setTab('comments'); },
+    },
+    {
       id: 'clear',
       title: '一覧をクリア',
       keywords: ['clear', 'クリア', 'delete', '削除', 'reset'],

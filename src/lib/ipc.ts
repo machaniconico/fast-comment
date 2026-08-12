@@ -398,13 +398,13 @@ export interface Participant {
 }
 
 export interface ChannelConfig {
-  platform: 'twitch' | 'youtube' | 'x';
-  identifier: string; // Twitch: channel name, YouTube: videoId, X: broadcast URL/ID
+  platform: 'twitch' | 'youtube' | 'x' | 'niconico';
+  identifier: string; // Twitch: channel name, YouTube: videoId, X: broadcast URL/ID, niconico: lv番組ID/URL
   enabled: boolean; // Rust ChannelConfig.enabled (serde default true)
 }
 
 export interface InjectTestCommentOptions {
-  platform: 'twitch' | 'youtube' | 'x';
+  platform: 'twitch' | 'youtube' | 'x' | 'niconico';
   name: string;
   text: string;
   kind?: 'normal' | 'superChat' | 'membership' | 'bits' | 'gift';

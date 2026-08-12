@@ -548,13 +548,15 @@
     if (platform === 'youtube') return 0;
     if (platform === 'twitch') return 1;
     if (platform === 'x') return 2;
-    return 3;
+    if (platform === 'niconico') return 3;
+    return 4;
   }
 
   function platformLabel(platform: string): string {
     if (platform === 'youtube') return 'YouTube';
     if (platform === 'twitch') return 'Twitch';
     if (platform === 'x') return 'X';
+    if (platform === 'niconico') return 'ニコ生';
     return platform;
   }
 
@@ -562,6 +564,7 @@
     if (platform === 'youtube') return 'youtube';
     if (platform === 'twitch') return 'twitch';
     if (platform === 'x') return 'x';
+    if (platform === 'niconico') return 'niconico';
     return 'other';
   }
 
@@ -1306,6 +1309,7 @@
   .platform-fill.youtube { background: #ff5555; }
   .platform-fill.twitch { background: #9146ff; }
   .platform-fill.x { background: #1da1f2; }
+  .platform-fill.niconico { background: #fcc800; }
   .platform-fill.other { background: #8b949e; }
 
   .emote-ranking-section {
