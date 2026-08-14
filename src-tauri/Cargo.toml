@@ -60,9 +60,12 @@ keyring = { version = "3.6", default-features = false, features = ["apple-native
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "3.6", default-features = false, features = ["linux-native-sync-persistent", "crypto-rust"] }
 
+# ビルド時間優先の release。fat LTO + codegen-units=1 は毎ビルド3分超かかる
+# 割にサイズ数%しか稼げないため、thin LTO + 並列 + incremental にしている。
 [profile.release]
 opt-level = "s"
-lto = true
-codegen-units = 1
+lto = "thin"
+codegen-units = 16
+incremental = true
 panic = "abort"
 strip = true

@@ -249,8 +249,9 @@ if exist "%BUNDLE_DIR%\msi\*.msi" (
 )
 
 REM --- Step 2: Tauri build (also runs "pnpm build" via beforeBuildCommand)
+REM NSIS only: the MSI bundle is unused and WiX adds noticeable build time.
 echo [2/2] pnpm tauri build  ^(first run compiles all Rust crates; takes several minutes^)
-call pnpm tauri build
+call pnpm tauri build --bundles nsis
 if errorlevel 1 (
   echo [ERROR] tauri build failed. Review the output above for details.
   echo         Note: if MSVC was just installed, a reboot may be required before building.
