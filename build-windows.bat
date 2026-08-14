@@ -225,6 +225,9 @@ REM "access denied (os error 5)". Remove old bundle outputs first; if removal
 REM fails, the installer/app is still open. The setup exe launches after a
 REM successful build by default, so close it before the next rebuild.
 set "BUNDLE_DIR=src-tauri\target\release\bundle"
+REM Kill a leftover setup exe from the previous build's auto-launch so the
+REM cleanup below does not fail while it is still running.
+taskkill /f /im "fast-comment_*-setup.exe" >nul 2>nul && ping -n 2 127.0.0.1 >nul
 if exist "%BUNDLE_DIR%\nsis\*-setup.exe" (
   del /q "%BUNDLE_DIR%\nsis\*-setup.exe" >nul 2>nul
   if exist "%BUNDLE_DIR%\nsis\*-setup.exe" (
