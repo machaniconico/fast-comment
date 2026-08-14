@@ -90,6 +90,12 @@
   function skipCurrent() {
     void runControl(skipCurrentTts);
   }
+
+  // 画面ごと再読み込みする。コメント一覧を含む UI 状態が白紙に戻る
+  // (Rust 側の受信は生きたままで、重複除去も跨いで効くため過去分は再流入しない)。
+  function reloadApp() {
+    window.location.reload();
+  }
 </script>
 
 <section class="tts-queue-panel" aria-label="読み上げキュー">
@@ -108,11 +114,25 @@
   </div>
 
   <div class="controls" role="group" aria-label="読み上げキュー操作">
+    <button
+      class="control-btn"
+      onclick={reloadApp}
+      title="画面を再読み込み（コメント一覧もリセット）"
+    >
+      リロード
+    </button>
     <button class="control-btn" onclick={togglePaused} disabled={busy}>
       {queueState.paused ? '再開' : '一時停止'}
     </button>
     <button class="control-btn" onclick={skipCurrent} disabled={busy}>スキップ</button>
-    <button class="control-btn danger" onclick={clearQueue} disabled={busy}>全消し</button>
+    <button
+      class="control-btn danger"
+      onclick={clearQueue}
+      disabled={busy}
+      title="読み上げ待ちのキューを空にする（コメント一覧は消えません）"
+    >
+      TTS全消し
+    </button>
   </div>
 
   <div class="items" role="list" aria-label="読み上げ待ち項目">
