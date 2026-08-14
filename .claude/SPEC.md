@@ -117,14 +117,16 @@ trait Source {
   - パーサにバージョンタグを持たせ、将来の差し替えを容易に。
 
 ### 4.3 X (Twitter) ライブ配信 (`x.rs`)
-- ログイン不要のゲストトークンフロー(Periscope 由来 chatapi)で公開ブロードキャストのチャットを受信する。読み取り専用で、コメント投稿は非対応。
-- 手順: ①`POST https://api.x.com/1.1/guest/activate.json`(X Web の公開 Bearer) → guest_token ②`GET https://x.com/i/api/1.1/broadcasts/show.json?ids={broadcastId}` → media_key ③`GET https://x.com/i/api/1.1/live_video_stream/status/{media_key}?client=web&...` → chatToken ④`POST https://proxsee-cf.pscp.tv/api/v2/accessChatPublic` に chat_token → endpoint + access_token ⑤`{endpoint}/chatapi/v1/chatnow`(wss) へ接続し kind:3(認証) → kind:2(ルーム参加) を送信して受信開始
-- 受信フレームは `kind==1` のみがチャット。payload は二重 JSON ネスト(payload 文字列 → その中の body 文字列を再パース)。`body.type==1` が本文で、ハート/参加通知等は無視。
+- ログイン不要で公開ブロードキャストのライブチャットを受信する。読み取り専用で、コメント投稿は非対応。
+- **本文の取得経路は `GET https://api.x.com/live-chat?broadcastId={id}`(認証ヘッダ不要)の NDJSON ストリーム一択**(2026-08 実測)。X Web UI 自体がこのエンドポイントでチャット欄を描画している。旧 Periscope chatapi(chatnow WS / history / accessChatPublic / chatToken)には本文が流れないため一切使わない。
+- 手順: ①`POST https://api.x.com/1.1/guest/activate.json`(X Web の公開 Bearer)→ guest_token ②`GET https://x.com/i/api/1.1/broadcasts/show.json?ids={broadcastId}` → state / twitter_user_id / 配信者名 / タイトル / total_watching(視聴者数) ③live-chat ストリームへ接続し行単位で受信 ④show.json を30秒間隔で再取得し viewers 更新と配信終了(state ENDED/TIMED_OUT)検出
+- NDJSON 行: `{"userId":"...","chatType":1,"message":"...","ts":"<ナノ秒>","isBackfill":true}`。chatType 1 のみ本文(39 はモデレーション系メタで無視、種別はカウンタに残す)。接続直後は配信開始以降の過去チャットが isBackfill 付きで全量バックフィルされる → 直近20件だけ `skip_tts` を立てて emit し、超過分は捨てる(TTS 暴発防止)。再接続時の再送は `ts+userId` の dedup で吸収。
+- 行に username は含まれず、ゲストで解決する API も無い(実測: users/lookup=404 / GraphQL=403,404 / intent=SPA シェル)。配信者(`twitter_user_id` 一致。`user_id` は Periscope ID なので使わない)のみ show.json の名前で表示し、他は「ユーザー<ID下4桁>」。NG 等の同定は author.id=userId で機能する。ログイン cookie があれば GraphQL liveAtomsUserQuery で解決可能(将来オプション、未実装)。
 - YouTube と同じく固い struct deserialize はせず `serde_json::Value` のパス探索で寛容にパースし、欠落は None/既定値へ劣化。
 - `identifier` は broadcast URL(`https://x.com/i/broadcasts/{id}` / twitter.com 同形)または生の broadcast ID。`extract_broadcast_id()` で正規化し、`ChatMessage.channel` には正規化済み ID を入れる。
-- **Bearer とエンドポイント URL は `config.rs` の `xOverrides` から上書き可能**(再ビルド不要)。`xOverrides.bearerToken` と `xOverrides.endpoints`(キー: `guestActivateUrl` / `broadcastShowUrl` / `liveStatusUrl` / `accessChatUrl`)。未指定/空は既定値。
-- 金額系イベント(投げ銭等)の概念が無いため `MessageKind::Normal` のみ。Roles は broadcaster(配信者の user_id 一致)だけ判定。
-- 再接続は他 Source と同じ指数バックオフ。HTTP フロー失敗(配信未開始/終了)も不安定扱いでバックオフを伸ばし続け、配信開始待ちポーリングを兼ねる。
+- **Bearer とエンドポイント URL は `config.rs` の `xOverrides` から上書き可能**(再ビルド不要)。`xOverrides.bearerToken` と `xOverrides.endpoints`(キー: `guestActivateUrl` / `broadcastShowUrl` / `liveChatUrl`)。未指定/空は既定値。
+- 金額系イベント(投げ銭等)の概念が無いため `MessageKind::Normal` のみ。Roles は broadcaster だけ判定。
+- 再接続は他 Source と同じ指数バックオフ。HTTP フロー失敗(配信未開始/終了)も不安定扱いでバックオフを伸ばし続け、配信開始待ちポーリングを兼ねる。ストリーム無受信90秒は half-open とみなして張り直す。
 
 ### 4.4 ニコニコ生放送 (`niconico.rs`)
 - ログイン不要の視聴ページ経由で NDGR メッセージサーバー(2024年8月以降の新コメントサーバー)へ接続する。読み取り専用で、コメント投稿は非対応。
