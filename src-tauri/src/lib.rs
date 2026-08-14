@@ -594,7 +594,13 @@ async fn update_config(
                     != new_config.credentials.youtube_api_key.trim(),
             current.credentials.youtube_oauth_client_id.trim()
                 != new_config.credentials.youtube_oauth_client_id.trim(),
-            current.x_overrides != new_config.x_overrides,
+            // overrides に加え、名前解決 cookie の変更でも張り直す
+            // (新しい XAuth は再スポーン時に読み直される)。
+            current.x_overrides != new_config.x_overrides
+                || current.credentials.x_auth_token.trim()
+                    != new_config.credentials.x_auth_token.trim()
+                || current.credentials.x_csrf_token.trim()
+                    != new_config.credentials.x_csrf_token.trim(),
         )
     };
 
@@ -1276,12 +1282,22 @@ fn spawn_one_channel(_app: &AppHandle, state: &AppState, ch: &ChannelConfig) {
         return;
     }
     let key = AppState::channel_key(ch);
-    let (overrides, youtube_api_key, x_overrides, niconico_overrides) = {
+    let (overrides, youtube_api_key, x_overrides, x_auth, niconico_overrides) = {
         let config = state.config.lock().unwrap();
+        // X の名前解決 cookie は auth_token / ct0 の両方が揃って初めて有効。
+        let x_auth = {
+            let token = config.credentials.x_auth_token.trim();
+            let csrf = config.credentials.x_csrf_token.trim();
+            (!token.is_empty() && !csrf.is_empty()).then(|| sources::x::XAuth {
+                auth_token: token.to_string(),
+                csrf_token: csrf.to_string(),
+            })
+        };
         (
             config.youtube_overrides.clone(),
             config.credentials.youtube_api_key.clone(),
             config.x_overrides.clone(),
+            x_auth,
             config.niconico_overrides.clone(),
         )
     };
@@ -1305,6 +1321,7 @@ fn spawn_one_channel(_app: &AppHandle, state: &AppState, ch: &ChannelConfig) {
             overrides.clone(),
             youtube_api_key,
             x_overrides,
+            x_auth,
             niconico_overrides,
             Some(state.metadata_tx.clone()),
             Some(state.reaction_tx.clone()),

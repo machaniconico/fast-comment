@@ -20,20 +20,22 @@
 //! メタ(message に対象チャットの ts が入る)。行に username は含まれず、
 //! ゲストで userId→username を解決できる API も存在しない(users/lookup=404、
 //! GraphQL=403/404、intent/user=SPA シェル; いずれも実測 2026-08)。そのため
-//! 配信者(twitter_user_id 一致)のみ show.json の名前で表示し、他は
+//! 配信者(twitter_user_id 一致)は show.json の名前で表示し、他は既定で
 //! 「ユーザー<ID下4桁>」の匿名表示に劣化させる。NG 等は userId 基準で機能する。
-//! ログイン cookie があれば GraphQL liveAtomsUserQuery で解決できることは
-//! 確認済みだが、資格情報を預かるため本実装では扱わない(将来オプション)。
+//! `CredentialsConfig` に X のログイン cookie(auth_token / ct0)が設定されて
+//! いる場合のみ、GraphQL liveAtomsUserQuery をバッチで叩いて実名に差し替える
+//! (`name_resolver_task`)。cookie 失効時は匿名表示へ自動フォールバックし、
+//! チャット受信そのものは止めない。
 //!
 //! パースは固い struct deserialize をせず `serde_json::Value` のパス探索で
 //! 欠落を None に劣化させる(SPEC の YouTube パースと同方針)。URL/Bearer は
 //! `XOverrides` で再ビルド無しに上書きできる。
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
@@ -71,6 +73,18 @@ const BACKFILL_EMIT_MAX: usize = 20;
 /// バックフィル終端の合図(非バックフィル行)が来なくてもこの時間で吐き出す。
 /// 無コメント配信ではバックフィルの後に何も届かないため、タイマーが唯一の終端。
 const BACKFILL_FLUSH_AFTER: Duration = Duration::from_secs(5);
+/// userId→表示名解決に使う GraphQL(X Web UI がチャット欄で使うのと同じ)。
+/// queryId 込みの URL なので、変わったら overrides の userQueryUrl で差し替える。
+const USER_QUERY_URL: &str =
+    "https://x.com/i/api/graphql/n9VGEKZLhDHED8ouN0dxUw/liveAtomsUserQuery";
+/// 1回の liveAtomsUserQuery に載せる userId の上限。
+const NAME_RESOLVE_BATCH_MAX: usize = 50;
+/// 名前解決1回のタイムアウト。超えたら匿名のまま流す(チャットを遅らせない)。
+const NAME_RESOLVE_TIMEOUT: Duration = Duration::from_secs(4);
+/// 名前キャッシュの上限。超えたら全消しする(1配信の発言者数では届かない)。
+const NAME_CACHE_MAX: usize = 8192;
+/// 受信ループ → 名前解決タスク間のチャネル容量。解決が詰まった時の緩衝。
+const RESOLVE_QUEUE_CAPACITY: usize = 512;
 
 /// URL または生 ID から broadcast ID を取り出す。
 ///
@@ -91,6 +105,16 @@ pub fn extract_broadcast_id(input: &str) -> String {
     // URL でなければクエリ/フラグメント/末尾スラッシュだけ落として ID とみなす。
     let core = s.split(['?', '#']).next().unwrap_or(s).trim_end_matches('/');
     core.rsplit('/').next().unwrap_or(core).to_string()
+}
+
+/// X ログイン cookie(ユーザー名解決用)。`CredentialsConfig` 由来。
+/// live-chat 本文の受信には不要で、無くてもチャットは動く。
+#[derive(Clone)]
+pub struct XAuth {
+    /// auth_token cookie。
+    pub auth_token: String,
+    /// ct0 cookie(x-csrf-token ヘッダにも同じ値を入れる)。
+    pub csrf_token: String,
 }
 
 /// show.json から得る配信メタデータ。
@@ -133,6 +157,8 @@ pub struct XSource {
     /// 正規化済み broadcast ID。
     broadcast_id: String,
     overrides: XOverrides,
+    /// ユーザー名解決用のログイン cookie。None なら匿名表示で動く。
+    auth: Option<XAuth>,
     /// チップの接続状態表示用。live フラグ/タイトル/視聴者数を送る。
     metadata_tx: Option<mpsc::Sender<YoutubeMetadataUpdate>>,
 }
@@ -141,11 +167,13 @@ impl XSource {
     pub fn new(
         identifier: String,
         overrides: XOverrides,
+        auth: Option<XAuth>,
         metadata_tx: Option<mpsc::Sender<YoutubeMetadataUpdate>>,
     ) -> Self {
         XSource {
             broadcast_id: extract_broadcast_id(&identifier),
             overrides,
+            auth,
             metadata_tx,
         }
     }
@@ -291,6 +319,27 @@ impl XSource {
 
         self.send_live_state(true, show.title.clone(), show.viewers).await;
 
+        // 受信ループは同期処理に徹し、emit は名前解決タスク経由で broadcast へ
+        // 流す(cookie 未設定時は素通し)。FIFO の mpsc なので表示順は保たれる。
+        let (chat_tx, chat_rx) = mpsc::channel::<ChatMessage>(RESOLVE_QUEUE_CAPACITY);
+        let resolver = self.auth.clone().map(|auth| {
+            NameResolver::new(
+                client.clone(),
+                self.endpoint_url("userQueryUrl", USER_QUERY_URL),
+                self.bearer(),
+                auth,
+            )
+        });
+        if resolver.is_some() {
+            tracing::info!("x:{} ユーザー名解決 有効(cookie 設定あり)", self.broadcast_id);
+        }
+        tokio::spawn(name_resolver_task(
+            chat_rx,
+            tx.clone(),
+            resolver,
+            self.broadcast_id.clone(),
+        ));
+
         let mut stats = SessionStats::new(&self.broadcast_id);
         let mut seen = ChatDedup::new(DEDUP_CAPACITY);
         // NDJSON はチャンク境界が行境界と一致しない(実測: 行が分割されて届く)
@@ -320,7 +369,7 @@ impl XSource {
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => {
-                    self.flush_backfill(&mut backfill_buf, tx, &mut stats);
+                    self.flush_backfill(&mut backfill_buf, &chat_tx, &mut stats);
                     return Ok(true);
                 }
                 _ = heartbeat.tick() => {
@@ -329,7 +378,7 @@ impl XSource {
                 // バックフィル終端がこないまま無コメントが続くケースの吐き出し。
                 _ = tokio::time::sleep_until(backfill_deadline), if backfill_open => {
                     backfill_open = false;
-                    self.flush_backfill(&mut backfill_buf, tx, &mut stats);
+                    self.flush_backfill(&mut backfill_buf, &chat_tx, &mut stats);
                 }
                 _ = show_poll.tick() => {
                     match tokio::time::timeout(HTTP_TIMEOUT, self.fetch_show(&client)).await {
@@ -341,7 +390,7 @@ impl XSource {
                                     self.broadcast_id,
                                     next.state
                                 );
-                                self.flush_backfill(&mut backfill_buf, tx, &mut stats);
+                                self.flush_backfill(&mut backfill_buf, &chat_tx, &mut stats);
                                 return Ok(stats.is_stable());
                             }
                             self.send_live_state(true, next.title.clone(), next.viewers).await;
@@ -359,7 +408,7 @@ impl XSource {
                 }
                 // チャンク無受信が続いたら half-open とみなして張り直す。
                 _ = tokio::time::sleep_until(last_chunk + STREAM_IDLE_TIMEOUT) => {
-                    self.flush_backfill(&mut backfill_buf, tx, &mut stats);
+                    self.flush_backfill(&mut backfill_buf, &chat_tx, &mut stats);
                     return Err(XSessionError::new(
                         anyhow::anyhow!(
                             "ストリーム無受信 {}秒(half-open の疑い)",
@@ -384,7 +433,7 @@ impl XSource {
                                 self.handle_line(
                                     line,
                                     &show,
-                                    tx,
+                                    &chat_tx,
                                     &mut stats,
                                     &mut seen,
                                     &mut backfill_open,
@@ -393,7 +442,7 @@ impl XSource {
                             }
                         }
                         Some(Err(e)) => {
-                            self.flush_backfill(&mut backfill_buf, tx, &mut stats);
+                            self.flush_backfill(&mut backfill_buf, &chat_tx, &mut stats);
                             return Err(XSessionError::new(e, stats.is_stable()));
                         }
                         None => {
@@ -404,14 +453,14 @@ impl XSource {
                                 self.handle_line(
                                     &tail,
                                     &show,
-                                    tx,
+                                    &chat_tx,
                                     &mut stats,
                                     &mut seen,
                                     &mut backfill_open,
                                     &mut backfill_buf,
                                 );
                             }
-                            self.flush_backfill(&mut backfill_buf, tx, &mut stats);
+                            self.flush_backfill(&mut backfill_buf, &chat_tx, &mut stats);
                             tracing::info!("x:{} live-chat ストリーム終了", self.broadcast_id);
                             return Ok(stats.is_stable());
                         }
@@ -428,7 +477,7 @@ impl XSource {
         &self,
         line: &str,
         show: &ShowInfo,
-        tx: &broadcast::Sender<ChatMessage>,
+        chat_tx: &mpsc::Sender<ChatMessage>,
         stats: &mut SessionStats,
         seen: &mut ChatDedup,
         backfill_open: &mut bool,
@@ -486,41 +535,41 @@ impl XSource {
             // 非バックフィル行の到着 = バックフィル終端。貯め分を吐いてから
             // 通常運転へ切り替える。
             *backfill_open = false;
-            self.flush_backfill(backfill_buf, tx, stats);
+            self.flush_backfill(backfill_buf, chat_tx, stats);
         }
-        self.emit(chat, tx, stats);
+        self.emit(chat, chat_tx, stats);
     }
 
     /// バックフィルバッファを古い順に emit する(TTS は抑制)。
     fn flush_backfill(
         &self,
         buf: &mut VecDeque<ChatMessage>,
-        tx: &broadcast::Sender<ChatMessage>,
+        chat_tx: &mpsc::Sender<ChatMessage>,
         stats: &mut SessionStats,
     ) {
         while let Some(mut chat) = buf.pop_front() {
             chat.skip_tts = true;
-            self.emit(chat, tx, stats);
+            self.emit(chat, chat_tx, stats);
         }
     }
 
     fn emit(
         &self,
         chat: ChatMessage,
-        tx: &broadcast::Sender<ChatMessage>,
+        chat_tx: &mpsc::Sender<ChatMessage>,
         stats: &mut SessionStats,
     ) {
         stats.chats += 1;
         if stats.chats == 1 {
             tracing::info!("x:{} 初チャット受信", self.broadcast_id);
         }
-        // 購読者ゼロだと send は Err になる。無言のままだと
-        // 「受信はしているのに UI に届かない」を切り分けられない。
-        if tx.send(chat).is_err() {
-            stats.tx_send_fail += 1;
-            if stats.tx_send_fail == 1 {
+        // 名前解決タスクが GraphQL 待ちで詰まった時だけ満杯になり得る。
+        // ブロックすると受信ループごと止まるため、捨てて数える。
+        if chat_tx.try_send(chat).is_err() {
+            stats.queue_full += 1;
+            if stats.queue_full == 1 {
                 tracing::warn!(
-                    "x:{} tx.send 失敗(購読者なし) — パイプライン未接続の疑い",
+                    "x:{} 名前解決キュー満杯 — チャットを破棄",
                     self.broadcast_id
                 );
             }
@@ -712,6 +761,164 @@ fn anon_name(user_id: &str) -> String {
     format!("ユーザー{tail}")
 }
 
+/// 受信ループから渡されたチャットを(可能なら)実名に差し替えて broadcast へ
+/// 流すタスク。cookie 未設定なら素通し。FIFO 処理なので表示順は保たれる。
+/// 解決の失敗・タイムアウトは匿名のまま流し、チャット自体は決して止めない。
+async fn name_resolver_task(
+    mut rx: mpsc::Receiver<ChatMessage>,
+    tx: broadcast::Sender<ChatMessage>,
+    mut resolver: Option<NameResolver>,
+    broadcast_id: String,
+) {
+    let mut warned_no_subscriber = false;
+    while let Some(first) = rx.recv().await {
+        // キューに溜まっている分を吸い出してまとめて1クエリで解決する
+        // (バッチ待ち時間は入れない: 1件目の表示を遅らせない)。
+        let mut batch = vec![first];
+        while let Ok(m) = rx.try_recv() {
+            batch.push(m);
+            if batch.len() >= RESOLVE_QUEUE_CAPACITY {
+                break;
+            }
+        }
+        if let Some(r) = resolver.as_mut() {
+            let mut unknown: Vec<String> = Vec::new();
+            for m in &batch {
+                // 配信者は show.json の名前で解決済み。
+                if m.author.roles.broadcaster {
+                    continue;
+                }
+                if !r.cache.contains_key(&m.author.id) && !unknown.contains(&m.author.id) {
+                    unknown.push(m.author.id.clone());
+                }
+            }
+            if !unknown.is_empty() {
+                r.resolve_batch(&unknown).await;
+            }
+            for m in &mut batch {
+                if m.author.roles.broadcaster {
+                    continue;
+                }
+                if let Some(name) = r.cache.get(&m.author.id) {
+                    m.author.name = name.clone();
+                }
+            }
+            if r.disabled {
+                tracing::warn!(
+                    "x:{broadcast_id} 名前解決を無効化(cookie 失効?) — 匿名表示で継続"
+                );
+                resolver = None;
+            }
+        }
+        for m in batch {
+            // 購読者ゼロだと send は Err になる。無言のままだと
+            // 「受信はしているのに UI に届かない」を切り分けられない。
+            if tx.send(m).is_err() && !warned_no_subscriber {
+                warned_no_subscriber = true;
+                tracing::warn!(
+                    "x:{broadcast_id} tx.send 失敗(購読者なし) — パイプライン未接続の疑い"
+                );
+            }
+        }
+    }
+}
+
+/// userId→表示名の解決器。GraphQL liveAtomsUserQuery(要ログイン cookie)を
+/// バッチで叩いて cache に貯める。認証失敗(401/403)で自身を無効化する。
+struct NameResolver {
+    client: reqwest::Client,
+    url: String,
+    bearer: String,
+    auth: XAuth,
+    cache: HashMap<String, String>,
+    disabled: bool,
+}
+
+impl NameResolver {
+    fn new(client: reqwest::Client, url: String, bearer: String, auth: XAuth) -> Self {
+        NameResolver {
+            client,
+            url,
+            bearer,
+            auth,
+            cache: HashMap::new(),
+            disabled: false,
+        }
+    }
+
+    /// ids をまとめて解決し cache へ。失敗はログのみ(呼び出し側は匿名で続行)。
+    async fn resolve_batch(&mut self, ids: &[String]) {
+        if self.disabled {
+            return;
+        }
+        for chunk in ids.chunks(NAME_RESOLVE_BATCH_MAX) {
+            let variables = json!({ "userIds": chunk }).to_string();
+            let resp = self
+                .client
+                .get(&self.url)
+                .timeout(NAME_RESOLVE_TIMEOUT)
+                .query(&[("variables", variables.as_str())])
+                .header("authorization", format!("Bearer {}", self.bearer))
+                .header("x-csrf-token", &self.auth.csrf_token)
+                .header(
+                    "cookie",
+                    format!(
+                        "auth_token={}; ct0={}",
+                        self.auth.auth_token, self.auth.csrf_token
+                    ),
+                )
+                .send()
+                .await
+                .and_then(reqwest::Response::error_for_status);
+            match resp {
+                Ok(resp) => match resp.json::<Value>().await {
+                    Ok(v) => self.absorb(&v),
+                    Err(e) => tracing::debug!("liveAtomsUserQuery JSON パース失敗: {e:#}"),
+                },
+                Err(e) => {
+                    // cookie 失効は回復しない。以降のクエリを止めて匿名運転へ。
+                    if matches!(e.status().map(|s| s.as_u16()), Some(401) | Some(403)) {
+                        self.disabled = true;
+                        return;
+                    }
+                    tracing::debug!("liveAtomsUserQuery 失敗: {e:#}");
+                }
+            }
+        }
+        // 際限なく貯めない保険。1配信の発言者数では実質届かない。
+        if self.cache.len() > NAME_CACHE_MAX {
+            self.cache.clear();
+        }
+    }
+
+    /// liveAtomsUserQuery 応答から rest_id→表示名を取り込む。
+    /// 形: data.users[].result.{rest_id, core:{name, screen_name}}(実測)。
+    fn absorb(&mut self, v: &Value) {
+        let Some(users) = v.pointer("/data/users").and_then(Value::as_array) else {
+            return;
+        };
+        for u in users {
+            let Some(result) = u.get("result") else { continue };
+            let Some(id) = id_string(result.get("rest_id")) else { continue };
+            let name = result
+                .pointer("/core/name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    result
+                        .pointer("/core/screen_name")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                });
+            if let Some(n) = name {
+                self.cache.insert(id, n.to_string());
+            }
+        }
+    }
+}
+
 /// 直近チャット ID の FIFO 集合。再接続のたびに live-chat はバックフィルを
 /// 全量再送するため、既出 ID を弾いて二重表示を防ぐ。容量超過分は古い順に捨てる。
 struct ChatDedup {
@@ -762,8 +969,8 @@ struct SessionStats {
     dup: u64,
     /// JSON パース/正規化失敗の行数。
     parse_errors: u64,
-    /// broadcast channel への送信失敗数(購読者ゼロ)。
-    tx_send_fail: u64,
+    /// 名前解決キュー満杯で捨てたチャット数。
+    queue_full: u64,
     /// show.json 再取得の成功/失敗回数。
     show_polls: u64,
     show_errors: u64,
@@ -782,7 +989,7 @@ impl SessionStats {
             backfill_skipped: 0,
             dup: 0,
             parse_errors: 0,
-            tx_send_fail: 0,
+            queue_full: 0,
             show_polls: 0,
             show_errors: 0,
             non_chat: std::collections::HashMap::new(),
@@ -796,7 +1003,7 @@ impl SessionStats {
 
     fn summary(&self) -> String {
         format!(
-            "{}秒 行:{} chat:{} backfill:{}(切捨:{}) 重複:{} パース失敗:{} show(ok:{} err:{}) 送信失敗:{} 非チャット:{:?}",
+            "{}秒 行:{} chat:{} backfill:{}(切捨:{}) 重複:{} パース失敗:{} show(ok:{} err:{}) キュー溢れ:{} 非チャット:{:?}",
             self.started.elapsed().as_secs(),
             self.lines,
             self.chats,
@@ -806,7 +1013,7 @@ impl SessionStats {
             self.parse_errors,
             self.show_polls,
             self.show_errors,
-            self.tx_send_fail,
+            self.queue_full,
             self.non_chat,
         )
     }
@@ -903,7 +1110,7 @@ mod tests {
 
     #[test]
     fn chat_line_normalizes_to_message() {
-        let src = XSource::new("1yoJMWvbtbtxQ".to_string(), XOverrides::default(), None);
+        let src = XSource::new("1yoJMWvbtbtxQ".to_string(), XOverrides::default(), None, None);
         let show = show_info("999", "Host");
         let v: Value = serde_json::from_str(
             r#"{"userId":"1234567890","chatType":1,"message":"こんにちは","ts":"1700000000123000000"}"#,
@@ -922,7 +1129,7 @@ mod tests {
 
     #[test]
     fn broadcaster_gets_display_name_and_role() {
-        let src = XSource::new("b1".to_string(), XOverrides::default(), None);
+        let src = XSource::new("b1".to_string(), XOverrides::default(), None, None);
         let show = show_info("999", "Host");
         let v: Value = serde_json::from_str(
             r#"{"userId":"999","chatType":1,"message":"hi","ts":"1700000000000000000"}"#,
@@ -936,7 +1143,7 @@ mod tests {
     #[test]
     fn numeric_ts_and_user_id_are_accepted() {
         // ts / userId が数値で来る個体にも耐える(寛容パース)。
-        let src = XSource::new("b1".to_string(), XOverrides::default(), None);
+        let src = XSource::new("b1".to_string(), XOverrides::default(), None, None);
         let show = show_info("999", "Host");
         let v: Value = serde_json::from_str(
             r#"{"userId":42,"chatType":1,"message":"hi","ts":1700000000123}"#,
@@ -950,7 +1157,7 @@ mod tests {
 
     #[test]
     fn empty_message_or_missing_user_is_rejected() {
-        let src = XSource::new("b1".to_string(), XOverrides::default(), None);
+        let src = XSource::new("b1".to_string(), XOverrides::default(), None, None);
         let show = show_info("999", "Host");
         let v: Value =
             serde_json::from_str(r#"{"userId":"1","chatType":1,"message":"  ","ts":"1"}"#).unwrap();
@@ -974,6 +1181,139 @@ mod tests {
         assert!(!d.insert("a")); // 既出は false。
         assert!(d.insert("c")); // 容量2超過で最古の "a" が捨てられる。
         assert!(d.insert("a")); // "a" は捨てられたので再び新規扱い。
+    }
+
+    #[test]
+    fn name_resolver_absorbs_graphql_users() {
+        let mut r = NameResolver::new(
+            reqwest::Client::new(),
+            "http://127.0.0.1/q".to_string(),
+            "b".to_string(),
+            XAuth {
+                auth_token: "a".to_string(),
+                csrf_token: "c".to_string(),
+            },
+        );
+        // 実測形: data.users[].result.{rest_id, core:{name, screen_name}}。
+        // name 空は screen_name へフォールバック、rest_id 欠落はスキップ。
+        let v: Value = serde_json::from_str(
+            r#"{"data":{"users":[
+                {"result":{"rest_id":"1","core":{"name":"Alice","screen_name":"alice_x"}}},
+                {"result":{"rest_id":"2","core":{"name":"  ","screen_name":"bob_x"}}},
+                {"result":{"core":{"name":"NoId"}}}
+            ]}}"#,
+        )
+        .unwrap();
+        r.absorb(&v);
+        assert_eq!(r.cache.get("1").map(String::as_str), Some("Alice"));
+        assert_eq!(r.cache.get("2").map(String::as_str), Some("bob_x"));
+        assert_eq!(r.cache.len(), 2);
+    }
+
+    /// cookie 設定時の名前解決 E2E: live-chat 受信 → liveAtomsUserQuery
+    /// (cookie/csrf ヘッダ付き)→ 実名で emit。
+    #[tokio::test]
+    async fn resolves_usernames_via_graphql_when_cookie_is_set() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 16384];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let path = req.split_whitespace().nth(1).unwrap_or("").to_string();
+                    if path.starts_with("/activate") {
+                        let body = r#"{"guest_token":"g1"}"#;
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                            body.len(), body
+                        );
+                        let _ = stream.write_all(resp.as_bytes()).await;
+                    } else if path.starts_with("/show") {
+                        let body = r#"{"broadcasts":{"b1":{"state":"RUNNING","twitter_user_id":"99","user_display_name":"Host","status":"t","total_watching":"1"}}}"#;
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                            body.len(), body
+                        );
+                        let _ = stream.write_all(resp.as_bytes()).await;
+                    } else if path.starts_with("/live-chat") {
+                        let head = "HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\nconnection: close\r\n\r\n";
+                        let _ = stream.write_all(head.as_bytes()).await;
+                        let _ = stream
+                            .write_all(b"{\"userId\":\"7\",\"chatType\":1,\"message\":\"hello\",\"ts\":\"1700000000000001000\"}\n")
+                            .await;
+                        // クライアント側の検証が終わるまで接続を保つ。
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    } else if path.starts_with("/userquery") {
+                        // reqwest はヘッダ名を小文字で送る。cookie と csrf の実値を検証。
+                        let lower = req.to_lowercase();
+                        assert!(
+                            lower.contains("x-csrf-token: ct-test"),
+                            "csrf ヘッダがない: {req}"
+                        );
+                        assert!(
+                            lower.contains("auth_token=at-test"),
+                            "cookie がない: {req}"
+                        );
+                        assert!(path.contains("7"), "userIds に 7 がない: {path}");
+                        let body = r#"{"data":{"users":[{"result":{"rest_id":"7","core":{"name":"Seven","screen_name":"seven_x"}}}]}}"#;
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                            body.len(), body
+                        );
+                        let _ = stream.write_all(resp.as_bytes()).await;
+                    } else {
+                        let _ = stream
+                            .write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                            .await;
+                    }
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+
+        let mut overrides = XOverrides::default();
+        let base = format!("http://127.0.0.1:{port}");
+        overrides
+            .endpoints
+            .insert("guestActivateUrl".to_string(), format!("{base}/activate"));
+        overrides
+            .endpoints
+            .insert("broadcastShowUrl".to_string(), format!("{base}/show"));
+        overrides
+            .endpoints
+            .insert("liveChatUrl".to_string(), format!("{base}/live-chat"));
+        overrides
+            .endpoints
+            .insert("userQueryUrl".to_string(), format!("{base}/userquery"));
+
+        let (tx, mut rx) = broadcast::channel(16);
+        let cancel = CancellationToken::new();
+        let auth = XAuth {
+            auth_token: "at-test".to_string(),
+            csrf_token: "ct-test".to_string(),
+        };
+        let src = XSource::new("b1".to_string(), overrides, Some(auth), None);
+        let cancel_run = cancel.clone();
+        let run = tokio::spawn(async move { src.run(tx, cancel_run).await });
+
+        let m = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("チャットタイムアウト")
+            .expect("channel closed");
+        assert_eq!(m.plain_text(), "hello");
+        assert_eq!(m.author.id, "7");
+        assert_eq!(m.author.name, "Seven"); // GraphQL で実名に解決される。
+        assert!(!m.author.roles.broadcaster);
+
+        cancel.cancel();
+        let _ = run.await;
     }
 
     /// fake bootstrap HTTP + fake live-chat ストリームに対する結合テスト。
@@ -1067,7 +1407,7 @@ mod tests {
         let (tx, mut rx) = broadcast::channel(64);
         let (meta_tx, mut meta_rx) = mpsc::channel(8);
         let cancel = CancellationToken::new();
-        let src = XSource::new("b1".to_string(), overrides, Some(meta_tx));
+        let src = XSource::new("b1".to_string(), overrides, None, Some(meta_tx));
         let cancel_run = cancel.clone();
         let run = tokio::spawn(async move { src.run(tx, cancel_run).await });
 

@@ -102,6 +102,8 @@ pub struct SourceManager {
     youtube_api_key: String,
     /// X (Twitter) ライブ配信の overrides スナップショット。
     x_overrides: crate::config::XOverrides,
+    /// X のユーザー名解決用ログイン cookie。None なら匿名表示。
+    x_auth: Option<x::XAuth>,
     /// ニコニコ生放送の overrides スナップショット。
     niconico_overrides: crate::config::NiconicoOverrides,
 }
@@ -113,6 +115,7 @@ impl SourceManager {
         youtube_overrides: crate::config::YoutubeOverrides,
         youtube_api_key: String,
         x_overrides: crate::config::XOverrides,
+        x_auth: Option<x::XAuth>,
         niconico_overrides: crate::config::NiconicoOverrides,
         metadata_tx: Option<mpsc::Sender<YoutubeMetadataUpdate>>,
         reaction_tx: Option<mpsc::Sender<Vec<YoutubeReaction>>>,
@@ -124,6 +127,7 @@ impl SourceManager {
             youtube_overrides,
             youtube_api_key,
             x_overrides,
+            x_auth,
             niconico_overrides,
         }
     }
@@ -165,7 +169,12 @@ impl SourceManager {
                 });
             }
             ChannelPlatform::X => {
-                let src = x::XSource::new(identifier, self.x_overrides.clone(), metadata_tx);
+                let src = x::XSource::new(
+                    identifier,
+                    self.x_overrides.clone(),
+                    self.x_auth.clone(),
+                    metadata_tx,
+                );
                 tauri::async_runtime::spawn(async move {
                     run_with_logging(&src, tx, child).await;
                 });

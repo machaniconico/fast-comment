@@ -280,6 +280,8 @@ export interface AppConfig {
     twitchUsername?: string;
     youtubeApiKey?: string;
     youtubeOauthClientId?: string;
+    xAuthToken?: string;
+    xCsrfToken?: string;
   };
 }
 

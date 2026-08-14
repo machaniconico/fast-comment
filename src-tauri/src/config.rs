@@ -520,6 +520,15 @@ pub struct CredentialsConfig {
     /// refresh token自体はOSの資格情報ストアへ保存し、config.jsonには入れない。
     #[serde(default)]
     pub youtube_oauth_client_id: String,
+    /// X ライブチャットのユーザー名解決に使うログイン cookie(auth_token)。
+    /// live-chat の NDJSON に username が無く、ゲストで解決する API も無いため、
+    /// 設定時のみ GraphQL liveAtomsUserQuery で userId→表示名を引く。
+    /// 空なら「ユーザー<ID下4桁>」の匿名表示のまま動く(チャット受信は止まらない)。
+    #[serde(default)]
+    pub x_auth_token: String,
+    /// X の csrf トークン(ct0 cookie)。x_auth_token とペアで設定する。
+    #[serde(default)]
+    pub x_csrf_token: String,
 }
 
 /// アプリ全体設定のルート。
@@ -838,6 +847,8 @@ mod tests {
                 twitch_username: "FastCommentBot".to_string(),
                 youtube_api_key: "youtube-data-api-key".to_string(),
                 youtube_oauth_client_id: "desktop-client.apps.googleusercontent.com".to_string(),
+                x_auth_token: "x-auth-cookie".to_string(),
+                x_csrf_token: "x-ct0".to_string(),
             },
             youtube_overrides: YoutubeOverrides {
                 api_key: Some("test-api-key".to_string()),

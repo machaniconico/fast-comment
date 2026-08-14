@@ -118,6 +118,8 @@
   let credTwitchUsername: string = $state('');
   let credYoutubeApiKey: string = $state('');
   let credYoutubeOauthClientId: string = $state('');
+  let credXAuthToken: string = $state('');
+  let credXCsrfToken: string = $state('');
   let youtubeOauthStatus: YoutubeOauthStatus | null = $state(null);
   let youtubeOauthBusy: boolean = $state(false);
   let youtubeOauthMsg: string = $state('');
@@ -227,6 +229,8 @@
       credTwitchUsername = config.credentials?.twitchUsername ?? '';
       credYoutubeApiKey = config.credentials?.youtubeApiKey ?? '';
       credYoutubeOauthClientId = config.credentials?.youtubeOauthClientId ?? '';
+      credXAuthToken = config.credentials?.xAuthToken ?? '';
+      credXCsrfToken = config.credentials?.xCsrfToken ?? '';
       voicevoxSpeaker = ttsNum('voicevoxSpeaker', 1);
       maxLength = ttsNum('maxLength', MAX_LENGTH_DEFAULT);
       stripEmoji = ttsBool('stripEmoji', true);
@@ -905,6 +909,8 @@
       twitchUsername: credTwitchUsername.trim(),
       youtubeApiKey: credYoutubeApiKey.trim(),
       youtubeOauthClientId: credYoutubeOauthClientId.trim(),
+      xAuthToken: credXAuthToken.trim(),
+      xCsrfToken: credXCsrfToken.trim(),
     };
     try {
       await setConfig(config);
@@ -1377,6 +1383,33 @@
         spellcheck="false"
       />
     </div>
+    <div class="field-row">
+      <label for="cred-x-auth-token">X auth_token</label>
+      <input
+        id="cred-x-auth-token"
+        type="password"
+        bind:value={credXAuthToken}
+        class="id-input"
+        placeholder="x.com の auth_token cookie"
+        autocomplete="off"
+        spellcheck="false"
+      />
+    </div>
+    <div class="field-row">
+      <label for="cred-x-csrf-token">X ct0</label>
+      <input
+        id="cred-x-csrf-token"
+        type="password"
+        bind:value={credXCsrfToken}
+        class="id-input"
+        placeholder="x.com の ct0 cookie"
+        autocomplete="off"
+        spellcheck="false"
+      />
+    </div>
+    <p class="hint">
+      X コメントにユーザー名を表示するには、x.com にログインしたブラウザで F12 → アプリケーション → Cookie → https://x.com を開き、auth_token と ct0 の値を貼り付けて保存してください（X チャンネルは自動で再接続されます）。未設定でもコメントは受信でき、「ユーザー1234」表示になるだけです。
+    </p>
     <p class="hint">
       ⚠ トークンはこの PC の config.json に平文で保存されます。共有 PC では取り扱いに注意してください。
     </p>
