@@ -6,12 +6,19 @@
 //! 3. GET live_video_stream/status/{media_key} → chatToken
 //! 4. POST accessChatPublic (chat_token) → endpoint + access_token
 //! 5. {endpoint}/chatapi/v1/chatnow (wss) へ接続し kind:3(認証) → kind:2(参加) を送信
+//! 6. {endpoint}/chatapi/v1/history を cursor 保持で定期ポーリングしチャット本文を取得
 //!
-//! 受信フレームは kind==1 のみがチャットで、payload は二重 JSON ネスト
-//! (payload 文字列 → その中の body 文字列を再パース)。仕様変更に強いよう
-//! 固い struct デシリアライズはせず `serde_json::Value` のパス探索で欠落を
-//! None に劣化させる(SPEC の YouTube パースと同方針)。URL/Bearer は
-//! `XOverrides` で再ビルド無しに上書きできる。
+//! 現行の chatman ancillary クラスタは chatnow WS には presence(視聴者数、
+//! 外側 kind:2 / 内側 kind:4)しか流さず、チャット本文は WS では届かない(実測:
+//! ゲストでもログイン済みトークンでも occupancy のみ)。本文は history エンドポイントの
+//! POST ポーリングで得る。history の各メッセージは外側 kind:2 のエンベロープで、
+//! 内側 payload が WS チャット(kind:1)相当のため `{kind:1, payload}` に組み替えて
+//! WS と共通の正規化経路へ流す。
+//!
+//! チャットフレームの payload は二重 JSON ネスト(payload 文字列 → その中の body
+//! 文字列を再パース)。仕様変更に強いよう固い struct デシリアライズはせず
+//! `serde_json::Value` のパス探索で欠落を None に劣化させる(SPEC の YouTube
+//! パースと同方針)。URL/Bearer は `XOverrides` で再ビルド無しに上書きできる。
 
 use std::time::{Duration, Instant};
 
@@ -50,6 +57,11 @@ const IDLE_PONG_WAIT: Duration = Duration::from_secs(15);
 /// 出ないため、生きている間の証拠はこのハートビートだけになる。
 /// 短時間のテスト実行でも1回は出るよう 30 秒にしている。
 const HEARTBEAT_LOG_EVERY: Duration = Duration::from_secs(30);
+/// チャット本文取得のための history ポーリング間隔。低遅延重視だが、
+/// サーバ負荷と cursor 差分の粒度を考え 1.5 秒。初回 tick は即時に発火する。
+const HISTORY_POLL_INTERVAL: Duration = Duration::from_millis(1500);
+/// dedup で保持する直近チャット ID の上限(メモリ上限)。超過分は古い順に捨てる。
+const DEDUP_CAPACITY: usize = 4096;
 
 /// URL または生 ID から broadcast ID を取り出す。
 ///
@@ -315,6 +327,23 @@ impl XSource {
         );
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+        // チャット本文は chatnow WS ではなく history ポーリングで取得する
+        // (現行クラスタは WS に presence しか流さない)。history URL は
+        // accessChatPublic の endpoint 由来。配信終了で replay クラスタへ
+        // 切り替わる個体にも endpoint がそのまま追随する。overrides で差し替え可(テスト用)。
+        let history_url = self
+            .overrides
+            .endpoints
+            .get("historyUrl")
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{}/chatapi/v1/history", boot.endpoint));
+        let mut history_cursor = String::new();
+        let mut seen = ChatDedup::new(DEDUP_CAPACITY);
+        let mut history_poll = tokio::time::interval(HISTORY_POLL_INTERVAL);
+        history_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
         loop {
             let idle_deadline = match ping_sent_at {
                 Some(at) => at + IDLE_PONG_WAIT,
@@ -327,6 +356,19 @@ impl XSource {
                 }
                 _ = heartbeat.tick() => {
                     stats.log_progress();
+                }
+                _ = history_poll.tick() => {
+                    self.poll_history(
+                        &client,
+                        &history_url,
+                        &boot.access_token,
+                        &mut history_cursor,
+                        &mut seen,
+                        boot.broadcaster_id.as_deref(),
+                        tx,
+                        &mut stats,
+                    )
+                    .await;
                 }
                 _ = tokio::time::sleep_until(idle_deadline) => {
                     if ping_sent_at.is_some() {
@@ -369,6 +411,7 @@ impl XSource {
                                 boot.broadcaster_id.as_deref(),
                                 tx,
                                 &mut stats,
+                                &mut seen,
                             );
                         }
                         // chatman が opcode を変えても取りこぼさないよう Binary も同経路。
@@ -381,6 +424,7 @@ impl XSource {
                                         boot.broadcaster_id.as_deref(),
                                         tx,
                                         &mut stats,
+                                        &mut seen,
                                     );
                                 }
                                 Err(_) => {
@@ -577,9 +621,16 @@ impl XSource {
         broadcaster_id: Option<&str>,
         tx: &broadcast::Sender<ChatMessage>,
         stats: &mut SessionStats,
+        seen: &mut ChatDedup,
     ) {
         stats.frames_data += 1;
         if let Some(chat) = self.frame_to_chat(text, broadcaster_id) {
+            // WS 経由と history 経由、および history の cursor 境界で同じメッセージが
+            // 二重に来る。確定した ID で dedup し、UI への重複配送を防ぐ。
+            if !seen.insert(&chat.id) {
+                stats.frames_dup += 1;
+                return;
+            }
             stats.frames_chat += 1;
             if stats.frames_chat == 1 {
                 tracing::info!("x:{} 初チャット受信", self.broadcast_id);
@@ -706,6 +757,78 @@ impl XSource {
             skip_tts: false,
         })
     }
+
+    /// history エンドポイントを1回ポーリングし、得たチャット本文を共通経路へ流す。
+    /// 失敗は握りつぶして次回に委ねる(WS 側が生存監視・再接続を担うため、history の
+    /// 一時失敗ではセッションを落とさない)。cursor は呼び出し側が保持する。
+    #[allow(clippy::too_many_arguments)]
+    async fn poll_history(
+        &self,
+        client: &reqwest::Client,
+        url: &str,
+        access_token: &str,
+        cursor: &mut String,
+        seen: &mut ChatDedup,
+        broadcaster_id: Option<&str>,
+        tx: &broadcast::Sender<ChatMessage>,
+        stats: &mut SessionStats,
+    ) {
+        let req_body = json!({
+            "access_token": access_token,
+            "cursor": cursor.as_str(),
+            "limit": 100,
+        });
+        let resp = match client
+            .post(url)
+            .header("content-type", "application/json")
+            .json(&req_body)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+        {
+            Ok(r) => r,
+            Err(e) => {
+                stats.history_errors += 1;
+                // 初回だけ warn、以降は debug(復配信待ちで恒常的に失敗する枠もある)。
+                if stats.history_errors == 1 {
+                    tracing::warn!("x:{} history ポーリング失敗: {:#}", self.broadcast_id, e);
+                } else {
+                    tracing::debug!("x:{} history ポーリング失敗: {:#}", self.broadcast_id, e);
+                }
+                return;
+            }
+        };
+        let v: Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                stats.history_errors += 1;
+                tracing::debug!("x:{} history JSON パース失敗: {:#}", self.broadcast_id, e);
+                return;
+            }
+        };
+        stats.history_polls += 1;
+
+        if let Some(msgs) = v.get("messages").and_then(Value::as_array) {
+            stats.history_msgs += msgs.len() as u64;
+            for m in msgs {
+                // history メッセージは外側 kind:2 のエンベロープで、内側 payload が
+                // WS チャット(kind:1)相当。{kind:1, payload} に組み替えて handle_frame の
+                // 共通正規化・dedup 経路へ流す。payload が文字列でない個体は frame_to_chat
+                // 側で None に劣化する(寛容パース)。
+                let Some(payload) = m.get("payload") else {
+                    continue;
+                };
+                let framed = json!({ "kind": 1, "payload": payload }).to_string();
+                self.handle_frame(&framed, broadcaster_id, tx, stats, seen);
+            }
+        }
+        // cursor は前方カーソル(次回はこれ以降の新着のみを返す)。空文字は据え置く。
+        if let Some(c) = v.get("cursor").and_then(Value::as_str) {
+            if !c.is_empty() {
+                *cursor = c.to_string();
+            }
+        }
+    }
 }
 
 fn ws_text(s: &str) -> WsMessage {
@@ -721,6 +844,40 @@ fn id_string(v: Option<&Value>) -> Option<String> {
         }
         Value::Number(n) => Some(n.to_string()),
         _ => None,
+    }
+}
+
+/// 直近チャット ID の FIFO 集合。history ポーリングは cursor 境界で同じ
+/// メッセージを再度返すことがあり、また WS 経由と history 経由が同一メッセージを
+/// 出すこともあるため、既出 ID を弾いて二重表示を防ぐ。容量超過分は古い順に捨てる。
+struct ChatDedup {
+    set: std::collections::HashSet<String>,
+    order: std::collections::VecDeque<String>,
+    capacity: usize,
+}
+
+impl ChatDedup {
+    fn new(capacity: usize) -> Self {
+        ChatDedup {
+            set: std::collections::HashSet::new(),
+            order: std::collections::VecDeque::new(),
+            capacity,
+        }
+    }
+
+    /// 新規 ID なら登録して true、既出なら false を返す。
+    fn insert(&mut self, id: &str) -> bool {
+        if self.set.contains(id) {
+            return false;
+        }
+        self.set.insert(id.to_string());
+        self.order.push_back(id.to_string());
+        if self.order.len() > self.capacity {
+            if let Some(old) = self.order.pop_front() {
+                self.set.remove(&old);
+            }
+        }
+        true
     }
 }
 
@@ -741,6 +898,14 @@ struct SessionStats {
     rx_pong: u64,
     /// broadcast channel への送信失敗数(購読者ゼロ)。
     tx_send_fail: u64,
+    /// dedup で既出のため捨てたチャット数(history の cursor 境界重複など)。
+    frames_dup: u64,
+    /// history ポーリングの成功回数。
+    history_polls: u64,
+    /// history が返した生メッセージ総数(dedup 前)。
+    history_msgs: u64,
+    /// history ポーリングの失敗回数(通信/HTTP/JSON エラー)。
+    history_errors: u64,
     /// 非チャット判定の理由別件数。
     non_chat: std::collections::HashMap<&'static str, u64>,
 }
@@ -758,6 +923,10 @@ impl SessionStats {
             rx_ping: 0,
             rx_pong: 0,
             tx_send_fail: 0,
+            frames_dup: 0,
+            history_polls: 0,
+            history_msgs: 0,
+            history_errors: 0,
             non_chat: std::collections::HashMap::new(),
         }
     }
@@ -769,9 +938,13 @@ impl SessionStats {
 
     fn summary(&self) -> String {
         format!(
-            "{}秒 chat:{} text:{} binary:{}(非UTF8 {}) ping:{} pong:{} 送信失敗:{} 非チャット:{:?}",
+            "{}秒 chat:{} 重複:{} history(poll:{} msg:{} err:{}) text:{} binary:{}(非UTF8 {}) ping:{} pong:{} 送信失敗:{} 非チャット:{:?}",
             self.started.elapsed().as_secs(),
             self.frames_chat,
+            self.frames_dup,
+            self.history_polls,
+            self.history_msgs,
+            self.history_errors,
             self.rx_text,
             self.rx_binary,
             self.rx_binary_invalid_utf8,
@@ -1059,6 +1232,21 @@ mod tests {
                         format!(
                             r#"{{"endpoint":"http://127.0.0.1:{ws_port}","access_token":"at1","room_id":"b1"}}"#
                         )
+                    } else if path.starts_with("/history") {
+                        // history 経路の検証用。外側 kind:2 エンベロープ + 内側 kind:1。
+                        // uuid 固定なので、繰り返しポーリングされても dedup により
+                        // 1件だけ emit されることも兼ねて確認できる。
+                        let inner_body = serde_json::json!({
+                            "type": 1, "body": "history経由", "username": "h",
+                            "remoteID": "3", "uuid": "hist-1"
+                        })
+                        .to_string();
+                        let payload = serde_json::json!({
+                            "kind": 1, "sender": {}, "body": inner_body
+                        })
+                        .to_string();
+                        let msg = serde_json::json!({ "kind": 2, "payload": payload });
+                        serde_json::json!({ "messages": [msg], "cursor": "c1" }).to_string()
                     } else {
                         "{}".to_string()
                     };
@@ -1088,6 +1276,9 @@ mod tests {
         overrides
             .endpoints
             .insert("accessChatUrl".to_string(), format!("{base}/access"));
+        overrides
+            .endpoints
+            .insert("historyUrl".to_string(), format!("{base}/history"));
 
         let (tx, mut rx) = broadcast::channel(16);
         let cancel = CancellationToken::new();
@@ -1095,19 +1286,25 @@ mod tests {
         let cancel_run = cancel.clone();
         let run = tokio::spawn(async move { src.run(tx, cancel_run).await });
 
-        let m1 = tokio::time::timeout(Duration::from_secs(10), rx.recv())
-            .await
-            .expect("1件目タイムアウト")
-            .expect("channel closed");
-        let m2 = tokio::time::timeout(Duration::from_secs(10), rx.recv())
-            .await
-            .expect("2件目タイムアウト")
-            .expect("channel closed");
-        let texts = [m1.plain_text(), m2.plain_text()];
+        // WS Text / WS Binary / history の3経路それぞれ1件、計3件が届く。
+        // 到着順は非決定的なので集めてから内容を検証する。
+        let mut texts = Vec::new();
+        let mut first_platform = None;
+        for i in 0..3 {
+            let m = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+                .await
+                .unwrap_or_else(|_| panic!("{}件目タイムアウト", i + 1))
+                .expect("channel closed");
+            if first_platform.is_none() {
+                first_platform = Some(m.platform);
+                assert_eq!(m.channel, "b1");
+            }
+            texts.push(m.plain_text());
+        }
         assert!(texts.contains(&"text経由".to_string()), "texts={texts:?}");
         assert!(texts.contains(&"binary経由".to_string()), "texts={texts:?}");
-        assert_eq!(m1.platform, Platform::X);
-        assert_eq!(m1.channel, "b1");
+        assert!(texts.contains(&"history経由".to_string()), "texts={texts:?}");
+        assert_eq!(first_platform, Some(Platform::X));
 
         // Ping への Pong 応答(自動+手動の重複があり得るため 1 以上)。
         let pongs = tokio::time::timeout(Duration::from_secs(10), pong_rx.recv())
@@ -1167,5 +1364,38 @@ mod tests {
         assert!(src.frame_to_chat(&frame, None).is_none());
         // 壊れた JSON。
         assert!(src.frame_to_chat("not json", None).is_none());
+    }
+
+    #[test]
+    fn history_envelope_reframes_to_chat() {
+        // history メッセージ(外側 kind:2)の内側 payload を {kind:1, payload} に
+        // 組み替えると frame_to_chat が本文を取り出せること(poll_history の組み替え相当)。
+        let src = XSource::new("b1".to_string(), XOverrides::default(), None);
+        let inner_body = serde_json::json!({
+            "type": 1, "body": "やあ", "username": "dave", "remoteID": "7", "uuid": "h7"
+        })
+        .to_string();
+        let inner_payload = serde_json::json!({
+            "kind": 1, "sender": { "username": "dave" }, "body": inner_body
+        })
+        .to_string();
+        let history_msg = serde_json::json!({ "kind": 2, "payload": inner_payload });
+        let framed =
+            serde_json::json!({ "kind": 1, "payload": history_msg.get("payload").unwrap() })
+                .to_string();
+        let chat = src.frame_to_chat(&framed, None).expect("chat message");
+        assert_eq!(chat.plain_text(), "やあ");
+        assert_eq!(chat.author.id, "7");
+        assert_eq!(chat.id, "h7");
+    }
+
+    #[test]
+    fn dedup_rejects_repeats_and_evicts_oldest() {
+        let mut d = ChatDedup::new(2);
+        assert!(d.insert("a"));
+        assert!(d.insert("b"));
+        assert!(!d.insert("a")); // 既出は false。
+        assert!(d.insert("c")); // 容量2超過で最古の "a" が捨てられる。
+        assert!(d.insert("a")); // "a" は捨てられたので再び新規扱い。
     }
 }
