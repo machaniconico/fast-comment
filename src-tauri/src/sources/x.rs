@@ -62,6 +62,12 @@ const HEARTBEAT_LOG_EVERY: Duration = Duration::from_secs(30);
 const HISTORY_POLL_INTERVAL: Duration = Duration::from_millis(1500);
 /// dedup で保持する直近チャット ID の上限(メモリ上限)。超過分は古い順に捨てる。
 const DEDUP_CAPACITY: usize = 4096;
+/// history ポーリング1回の待ち上限。select! 内で await するため、これを超えると
+/// WS の Ping 応答・presence 受信・cancel の処理が滞る。IDLE_PONG_WAIT(15s)より
+/// 十分短くし、endpoint が blackhole しても false half-open を招かないようにする。
+const HISTORY_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
+/// history が連続でこの回数失敗したら warn を出す(恒久失敗の可視化)。成功でリセット。
+const HISTORY_ERROR_WARN_STREAK: u64 = 5;
 
 /// URL または生 ID から broadcast ID を取り出す。
 ///
@@ -338,7 +344,9 @@ impl XSource {
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
             .map(str::to_string)
-            .unwrap_or_else(|| format!("{}/chatapi/v1/history", boot.endpoint));
+            .unwrap_or_else(|| {
+                format!("{}/chatapi/v1/history", boot.endpoint.trim_end_matches('/'))
+            });
         let mut history_cursor = String::new();
         let mut seen = ChatDedup::new(DEDUP_CAPACITY);
         let mut history_poll = tokio::time::interval(HISTORY_POLL_INTERVAL);
@@ -358,17 +366,44 @@ impl XSource {
                     stats.log_progress();
                 }
                 _ = history_poll.tick() => {
-                    self.poll_history(
-                        &client,
-                        &history_url,
-                        &boot.access_token,
-                        &mut history_cursor,
-                        &mut seen,
-                        boot.broadcaster_id.as_deref(),
-                        tx,
-                        &mut stats,
+                    // poll_history の await が長引くと同じ select! の他アーム(WS 受信・
+                    // Pong 応答・cancel)が進まないため、endpoint の blackhole に備えて
+                    // 短くタイムアウトする。超過分は次回 tick で再試行。
+                    match tokio::time::timeout(
+                        HISTORY_REQUEST_TIMEOUT,
+                        self.poll_history(
+                            &client,
+                            &history_url,
+                            &boot.access_token,
+                            &mut history_cursor,
+                            &mut seen,
+                            boot.broadcaster_id.as_deref(),
+                            tx,
+                            &mut stats,
+                        ),
                     )
-                    .await;
+                    .await
+                    {
+                        Ok(PollOutcome::Continue) => {}
+                        Ok(PollOutcome::Reauth) => {
+                            // history だけ 401/403 のとき WS が生きていると再接続が
+                            // 起きずチャット0が続く。access_token を取り直すため
+                            // セッションごと張り直す。
+                            return Err(XSessionError::new(
+                                anyhow::anyhow!("history 認証失効、セッション再確立"),
+                                stats.is_stable(),
+                            ));
+                        }
+                        Err(_elapsed) => {
+                            stats.history_errors += 1;
+                            stats.history_streak_errors += 1;
+                            tracing::debug!(
+                                "x:{} history ポーリングが {}秒でタイムアウト",
+                                self.broadcast_id,
+                                HISTORY_REQUEST_TIMEOUT.as_secs()
+                            );
+                        }
+                    }
                 }
                 _ = tokio::time::sleep_until(idle_deadline) => {
                     if ping_sent_at.is_some() {
@@ -759,8 +794,9 @@ impl XSource {
     }
 
     /// history エンドポイントを1回ポーリングし、得たチャット本文を共通経路へ流す。
-    /// 失敗は握りつぶして次回に委ねる(WS 側が生存監視・再接続を担うため、history の
-    /// 一時失敗ではセッションを落とさない)。cursor は呼び出し側が保持する。
+    /// 一時失敗は握りつぶし次回に委ねるが、401/403(トークン失効)は PollOutcome::Reauth
+    /// を返してセッション再確立を促す(history だけ失効し WS が生きているとチャット0が
+    /// 続くため)。cursor は呼び出し側が保持する。
     #[allow(clippy::too_many_arguments)]
     async fn poll_history(
         &self,
@@ -772,7 +808,7 @@ impl XSource {
         broadcaster_id: Option<&str>,
         tx: &broadcast::Sender<ChatMessage>,
         stats: &mut SessionStats,
-    ) {
+    ) -> PollOutcome {
         let req_body = json!({
             "access_token": access_token,
             "cursor": cursor.as_str(),
@@ -789,35 +825,57 @@ impl XSource {
             Ok(r) => r,
             Err(e) => {
                 stats.history_errors += 1;
-                // 初回だけ warn、以降は debug(復配信待ちで恒常的に失敗する枠もある)。
-                if stats.history_errors == 1 {
-                    tracing::warn!("x:{} history ポーリング失敗: {:#}", self.broadcast_id, e);
+                stats.history_streak_errors += 1;
+                if matches!(e.status().map(|s| s.as_u16()), Some(401) | Some(403)) {
+                    tracing::warn!(
+                        "x:{} history 認証失効(status={:?})",
+                        self.broadcast_id,
+                        e.status()
+                    );
+                    return PollOutcome::Reauth;
+                }
+                // 恒久失敗を可視化する: 初回と連続 N 回到達時に warn、以降は debug。
+                if stats.history_streak_errors == 1
+                    || stats.history_streak_errors == HISTORY_ERROR_WARN_STREAK
+                {
+                    tracing::warn!(
+                        "x:{} history ポーリング失敗({}連続): {:#}",
+                        self.broadcast_id,
+                        stats.history_streak_errors,
+                        e
+                    );
                 } else {
                     tracing::debug!("x:{} history ポーリング失敗: {:#}", self.broadcast_id, e);
                 }
-                return;
+                return PollOutcome::Continue;
             }
         };
         let v: Value = match resp.json().await {
             Ok(v) => v,
             Err(e) => {
                 stats.history_errors += 1;
+                stats.history_streak_errors += 1;
                 tracing::debug!("x:{} history JSON パース失敗: {:#}", self.broadcast_id, e);
-                return;
+                return PollOutcome::Continue;
             }
         };
         stats.history_polls += 1;
+        stats.history_streak_errors = 0;
 
         if let Some(msgs) = v.get("messages").and_then(Value::as_array) {
             stats.history_msgs += msgs.len() as u64;
             for m in msgs {
-                // history メッセージは外側 kind:2 のエンベロープで、内側 payload が
-                // WS チャット(kind:1)相当。{kind:1, payload} に組み替えて handle_frame の
-                // 共通正規化・dedup 経路へ流す。payload が文字列でない個体は frame_to_chat
-                // 側で None に劣化する(寛容パース)。
                 let Some(payload) = m.get("payload") else {
                     continue;
                 };
+                // history メッセージは外側 kind:2 のエンベロープで、内側 payload が
+                // WS チャット(kind:1)相当の二重ネスト JSON「文字列」。{kind:1, payload} に
+                // 組み替えて handle_frame の共通正規化・dedup 経路へ流す。payload が
+                // 文字列でない(object)個体は組み替え不能なので、無言で落とさずカウントする。
+                if !payload.is_string() {
+                    stats.history_dropped += 1;
+                    continue;
+                }
                 let framed = json!({ "kind": 1, "payload": payload }).to_string();
                 self.handle_frame(&framed, broadcaster_id, tx, stats, seen);
             }
@@ -828,6 +886,7 @@ impl XSource {
                 *cursor = c.to_string();
             }
         }
+        PollOutcome::Continue
     }
 }
 
@@ -881,6 +940,14 @@ impl ChatDedup {
     }
 }
 
+/// history ポーリング1回の結果。認証失効はセッション張り直しで回復させる。
+enum PollOutcome {
+    /// 継続(成功・一時失敗を含む)。
+    Continue,
+    /// 認証失効(401/403)等。WS も含めこのセッションを再確立すべき。
+    Reauth,
+}
+
 /// 1 WS セッションの受信統計。Drop で必ずサマリを info ログへ残し、
 /// 「接続はできるがチャットが来ない」を現地で診断可能にする。
 /// opcode 別のカウンタは容疑の切り分け(Binary 配送 / Pong だけの生存 /
@@ -906,6 +973,10 @@ struct SessionStats {
     history_msgs: u64,
     /// history ポーリングの失敗回数(通信/HTTP/JSON エラー)。
     history_errors: u64,
+    /// history の連続失敗回数(成功でリセット)。恒久失敗の警告に使う。
+    history_streak_errors: u64,
+    /// payload が文字列でなく組み替え不能で捨てた history メッセージ数。
+    history_dropped: u64,
     /// 非チャット判定の理由別件数。
     non_chat: std::collections::HashMap<&'static str, u64>,
 }
@@ -927,6 +998,8 @@ impl SessionStats {
             history_polls: 0,
             history_msgs: 0,
             history_errors: 0,
+            history_streak_errors: 0,
+            history_dropped: 0,
             non_chat: std::collections::HashMap::new(),
         }
     }
@@ -938,13 +1011,14 @@ impl SessionStats {
 
     fn summary(&self) -> String {
         format!(
-            "{}秒 chat:{} 重複:{} history(poll:{} msg:{} err:{}) text:{} binary:{}(非UTF8 {}) ping:{} pong:{} 送信失敗:{} 非チャット:{:?}",
+            "{}秒 chat:{} 重複:{} history(poll:{} msg:{} err:{} drop:{}) text:{} binary:{}(非UTF8 {}) ping:{} pong:{} 送信失敗:{} 非チャット:{:?}",
             self.started.elapsed().as_secs(),
             self.frames_chat,
             self.frames_dup,
             self.history_polls,
             self.history_msgs,
             self.history_errors,
+            self.history_dropped,
             self.rx_text,
             self.rx_binary,
             self.rx_binary_invalid_utf8,
