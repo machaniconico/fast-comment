@@ -134,6 +134,126 @@ struct ShowInfo {
     state: String,
 }
 
+/// show.json 取得の実体。guest_token はキャッシュし、失効時のみ取り直す。
+#[derive(Clone)]
+struct ShowFetch {
+    broadcast_id: String,
+    bearer: String,
+    activate_url: String,
+    show_url: String,
+}
+
+impl ShowFetch {
+    /// guest_token を取得する。show.json は guest_token 必須。
+    async fn activate_guest(&self, client: &reqwest::Client) -> anyhow::Result<String> {
+        let v: Value = client
+            .post(&self.activate_url)
+            .timeout(HTTP_TIMEOUT)
+            .header("authorization", format!("Bearer {}", self.bearer))
+            .header("origin", "https://x.com")
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        v.get("guest_token")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!("guest_token が取得できない"))
+    }
+
+    /// 取得済みトークンで show.json を1回引く。
+    async fn show_once(
+        &self,
+        client: &reqwest::Client,
+        guest_token: &str,
+    ) -> anyhow::Result<ShowInfo> {
+        // ID は外部入力なので手組み連結せず .query() でエンコードさせる。
+        let v: Value = client
+            .get(&self.show_url)
+            .timeout(HTTP_TIMEOUT)
+            .query(&[("ids", self.broadcast_id.as_str())])
+            .header("authorization", format!("Bearer {}", self.bearer))
+            .header("x-guest-token", guest_token)
+            .header("origin", "https://x.com")
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let broadcast = v
+            .pointer(&format!("/broadcasts/{}", self.broadcast_id))
+            .cloned()
+            .unwrap_or(Value::Null);
+        if broadcast.is_null() {
+            anyhow::bail!("broadcast が見つからない(ID 誤りか削除済みの可能性)");
+        }
+        let state = broadcast
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        // live-chat の userId と同じ空間なのは twitter_user_id(user_id は
+        // Periscope ID なので使わない)。
+        let broadcaster_id = id_string(broadcast.get("twitter_user_id"));
+        let broadcaster_name = broadcast
+            .get("user_display_name")
+            .or_else(|| broadcast.get("username"))
+            .and_then(Value::as_str)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        // Periscope 由来の "status" が配信タイトル。将来の変化に備え "title" も見る。
+        let title = broadcast
+            .get("status")
+            .or_else(|| broadcast.get("title"))
+            .and_then(Value::as_str)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        // total_watching は文字列で返る("269")。数値で来ても受ける。
+        let viewers = broadcast.get("total_watching").and_then(|t| match t {
+            Value::String(s) => s.trim().parse::<u32>().ok(),
+            Value::Number(n) => n.as_u64().and_then(|n| u32::try_from(n).ok()),
+            _ => None,
+        });
+
+        Ok(ShowInfo {
+            broadcaster_id,
+            broadcaster_name,
+            title,
+            viewers,
+            state,
+        })
+    }
+
+    /// guest_token をキャッシュしつつ show.json を引く。失効(401/403)時のみ
+    /// 一度だけ取り直して再試行する(毎回 activate するとレート制限を招く)。
+    async fn fetch(
+        &self,
+        client: &reqwest::Client,
+        guest: &mut Option<String>,
+    ) -> anyhow::Result<ShowInfo> {
+        if guest.is_none() {
+            *guest = Some(self.activate_guest(client).await?);
+        }
+        let token = guest.clone().unwrap_or_default();
+        match self.show_once(client, &token).await {
+            Ok(info) => Ok(info),
+            Err(e) => {
+                let auth_expired = e
+                    .downcast_ref::<reqwest::Error>()
+                    .and_then(reqwest::Error::status)
+                    .is_some_and(|s| s.as_u16() == 401 || s.as_u16() == 403);
+                if !auth_expired {
+                    return Err(e);
+                }
+                let fresh = self.activate_guest(client).await?;
+                *guest = Some(fresh.clone());
+                self.show_once(client, &fresh).await
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 struct XSessionError {
     error: anyhow::Error,
@@ -212,12 +332,22 @@ impl Source for XSource {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + '_>> {
         Box::pin(async move {
             let mut backoff = Backoff::new();
+            // dedup は再接続を跨いで保持する。live-chat は接続のたびに直近
+            // チャットを全量バックフィルするため、セッションローカルにすると
+            // 再接続のたびに同じコメントが UI へ再流入する(実害: 一覧クリア後に
+            // 消したはずのコメントが復活する)。
+            let mut seen = ChatDedup::new(DEDUP_CAPACITY);
+            // guest_token も跨いで使い回す(数時間有効。毎回 activate しない)。
+            let mut guest_token: Option<String> = None;
             loop {
                 if cancel.is_cancelled() {
                     return Ok(());
                 }
 
-                match self.connect_and_listen(&tx, &cancel).await {
+                match self
+                    .connect_and_listen(&tx, &cancel, &mut seen, &mut guest_token)
+                    .await
+                {
                     Ok(stable) => {
                         if cancel.is_cancelled() {
                             return Ok(());
@@ -259,6 +389,8 @@ impl XSource {
         &self,
         tx: &broadcast::Sender<ChatMessage>,
         cancel: &CancellationToken,
+        seen: &mut ChatDedup,
+        guest: &mut Option<String>,
     ) -> Result<bool, XSessionError> {
         // ストリームを全体タイムアウトで殺さないよう Client には connect_timeout
         // のみ設定し、bootstrap 系は各リクエストに個別タイムアウトを付ける。
@@ -271,9 +403,10 @@ impl XSource {
         // HTTP フローは配信未開始/終了でも失敗するため、失敗は不安定扱いで
         // バックオフを伸ばし続ける(=配信開始待ちのポーリングを兼ねる)。
         // チャンネル削除/設定変更の cancel は bootstrap 中も効かせる。
+        let fetcher = self.show_fetch();
         let mut show = tokio::select! {
             _ = cancel.cancelled() => return Ok(true),
-            r = self.fetch_show(&client) => r.map_err(|e| XSessionError::new(e, false))?,
+            r = fetcher.fetch(&client, guest) => r.map_err(|e| XSessionError::new(e, false))?,
         };
         // ENDED/TIMED_OUT はストリーム接続前に止め、原因をログへ明示する。
         // ループ側の再接続は継続するので、同じ枠で再配信が始まれば自動で拾える。
@@ -341,7 +474,6 @@ impl XSource {
         ));
 
         let mut stats = SessionStats::new(&self.broadcast_id);
-        let mut seen = ChatDedup::new(DEDUP_CAPACITY);
         // NDJSON はチャンク境界が行境界と一致しない(実測: 行が分割されて届く)
         // ため、バイト列を貯めて改行単位で切り出す。
         let mut line_buf: Vec<u8> = Vec::new();
@@ -359,12 +491,26 @@ impl XSource {
             HEARTBEAT_LOG_EVERY,
         );
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // fetch_show 直後なので初回 tick は SHOW_POLL_INTERVAL 後。
-        let mut show_poll = tokio::time::interval_at(
-            tokio::time::Instant::now() + SHOW_POLL_INTERVAL,
-            SHOW_POLL_INTERVAL,
-        );
-        show_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // show.json ポーリングは別タスクで行い、結果だけ mpsc で受ける。
+        // select! のアーム内で HTTP を await すると、その間ストリームの読みが
+        // 止まりチャット表示が遅延するため(受信ループは受信に専念させる)。
+        let (show_tx, mut show_rx) = mpsc::channel::<anyhow::Result<ShowInfo>>(4);
+        {
+            let fetcher = fetcher.clone();
+            let poll_client = client.clone();
+            let mut poll_guest = guest.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(SHOW_POLL_INTERVAL).await;
+                    let r = fetcher.fetch(&poll_client, &mut poll_guest).await;
+                    // 送信失敗 = セッション終了(rx drop)。タスクも終える。
+                    if show_tx.send(r).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        let mut show_poller_alive = true;
 
         loop {
             tokio::select! {
@@ -380,9 +526,9 @@ impl XSource {
                     backfill_open = false;
                     self.flush_backfill(&mut backfill_buf, &chat_tx, &mut stats);
                 }
-                _ = show_poll.tick() => {
-                    match tokio::time::timeout(HTTP_TIMEOUT, self.fetch_show(&client)).await {
-                        Ok(Ok(next)) => {
+                maybe_show = show_rx.recv(), if show_poller_alive => {
+                    match maybe_show {
+                        Some(Ok(next)) => {
                             stats.show_polls += 1;
                             if matches!(next.state.as_str(), "ENDED" | "TIMED_OUT") {
                                 tracing::info!(
@@ -396,13 +542,14 @@ impl XSource {
                             self.send_live_state(true, next.title.clone(), next.viewers).await;
                             show = next;
                         }
-                        Ok(Err(e)) => {
+                        Some(Err(e)) => {
                             stats.show_errors += 1;
                             tracing::debug!("x:{} show 再取得失敗: {:#}", self.broadcast_id, e);
                         }
-                        Err(_elapsed) => {
-                            stats.show_errors += 1;
-                            tracing::debug!("x:{} show 再取得タイムアウト", self.broadcast_id);
+                        None => {
+                            // poller タスク消滅。recv() が即 None を返し続けて
+                            // busy loop になるのを防ぐためアームを畳む。
+                            show_poller_alive = false;
                         }
                     }
                 }
@@ -435,7 +582,7 @@ impl XSource {
                                     &show,
                                     &chat_tx,
                                     &mut stats,
-                                    &mut seen,
+                                    &mut *seen,
                                     &mut backfill_open,
                                     &mut backfill_buf,
                                 );
@@ -455,7 +602,7 @@ impl XSource {
                                     &show,
                                     &chat_tx,
                                     &mut stats,
-                                    &mut seen,
+                                    &mut *seen,
                                     &mut backfill_open,
                                     &mut backfill_buf,
                                 );
@@ -504,7 +651,7 @@ impl XSource {
             return;
         }
         let is_backfill = v.get("isBackfill").and_then(Value::as_bool).unwrap_or(false);
-        let Some(chat) = self.line_to_chat(&v, show) else {
+        let Some(mut chat) = self.line_to_chat(&v, show) else {
             stats.parse_errors += 1;
             if stats.parse_errors <= 5 {
                 tracing::info!(
@@ -522,6 +669,9 @@ impl XSource {
         }
         if is_backfill {
             stats.backfill_seen += 1;
+            // flush タイマー経過後に遅れて届いたバックフィルも読み上げない
+            // (通常経路で emit されるため、ここで立てないと TTS に流れる)。
+            chat.skip_tts = true;
         }
         if *backfill_open {
             if is_backfill {
@@ -637,83 +787,15 @@ impl XSource {
         })
     }
 
-    /// guest_token を取り、show.json から配信メタデータを得る。
-    async fn fetch_show(&self, client: &reqwest::Client) -> anyhow::Result<ShowInfo> {
-        let bearer = self.bearer();
-
-        // 1. ゲストトークン。show.json は guest_token 必須。
-        let v: Value = client
-            .post(self.endpoint_url("guestActivateUrl", GUEST_ACTIVATE_URL))
-            .timeout(HTTP_TIMEOUT)
-            .header("authorization", format!("Bearer {bearer}"))
-            .header("origin", "https://x.com")
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
-        let guest_token = v
-            .get("guest_token")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("guest_token が取得できない"))?
-            .to_string();
-
-        // 2. broadcast メタデータ。
-        // ID は外部入力なので手組み連結せず .query() でエンコードさせる。
-        let v: Value = client
-            .get(self.endpoint_url("broadcastShowUrl", BROADCAST_SHOW_URL))
-            .timeout(HTTP_TIMEOUT)
-            .query(&[("ids", self.broadcast_id.as_str())])
-            .header("authorization", format!("Bearer {bearer}"))
-            .header("x-guest-token", &guest_token)
-            .header("origin", "https://x.com")
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
-        let broadcast = v
-            .pointer(&format!("/broadcasts/{}", self.broadcast_id))
-            .cloned()
-            .unwrap_or(Value::Null);
-        if broadcast.is_null() {
-            anyhow::bail!("broadcast が見つからない(ID 誤りか削除済みの可能性)");
+    /// show.json 取得に必要な値のスナップショットを作る(ポーリングタスクへ
+    /// move するため、&self に縛られない所有型で切り出す)。
+    fn show_fetch(&self) -> ShowFetch {
+        ShowFetch {
+            broadcast_id: self.broadcast_id.clone(),
+            bearer: self.bearer(),
+            activate_url: self.endpoint_url("guestActivateUrl", GUEST_ACTIVATE_URL),
+            show_url: self.endpoint_url("broadcastShowUrl", BROADCAST_SHOW_URL),
         }
-        let state = broadcast
-            .get("state")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        // live-chat の userId と同じ空間なのは twitter_user_id(user_id は
-        // Periscope ID なので使わない)。
-        let broadcaster_id = id_string(broadcast.get("twitter_user_id"));
-        let broadcaster_name = broadcast
-            .get("user_display_name")
-            .or_else(|| broadcast.get("username"))
-            .and_then(Value::as_str)
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
-        // Periscope 由来の "status" が配信タイトル。将来の変化に備え "title" も見る。
-        let title = broadcast
-            .get("status")
-            .or_else(|| broadcast.get("title"))
-            .and_then(Value::as_str)
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
-        // total_watching は文字列で返る("269")。数値で来ても受ける。
-        let viewers = broadcast.get("total_watching").and_then(|t| match t {
-            Value::String(s) => s.trim().parse::<u32>().ok(),
-            Value::Number(n) => n.as_u64().and_then(|n| u32::try_from(n).ok()),
-            _ => None,
-        });
-
-        Ok(ShowInfo {
-            broadcaster_id,
-            broadcaster_name,
-            title,
-            viewers,
-            state,
-        })
     }
 
     /// チップの接続状態表示用に live 状態を stats へ送る。
@@ -1181,6 +1263,111 @@ mod tests {
         assert!(!d.insert("a")); // 既出は false。
         assert!(d.insert("c")); // 容量2超過で最古の "a" が捨てられる。
         assert!(d.insert("a")); // "a" は捨てられたので再び新規扱い。
+    }
+
+    /// 再接続でバックフィルが全量再送されても dedup が UI への再流入を防ぎ、
+    /// guest_token が再接続を跨いで再利用されること(全消し後の復活バグの回帰)。
+    #[tokio::test]
+    async fn reconnect_dedups_backfill_and_reuses_guest_token() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let activate_calls = Arc::new(AtomicUsize::new(0));
+        let chat_conns = Arc::new(AtomicUsize::new(0));
+        let activate_srv = activate_calls.clone();
+        let chat_srv = chat_conns.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let activate_calls = activate_srv.clone();
+                let chat_conns = chat_srv.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let path = req.split_whitespace().nth(1).unwrap_or("").to_string();
+                    if path.starts_with("/activate") {
+                        activate_calls.fetch_add(1, Ordering::SeqCst);
+                        let body = r#"{"guest_token":"g1"}"#;
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                            body.len(), body
+                        );
+                        let _ = stream.write_all(resp.as_bytes()).await;
+                    } else if path.starts_with("/show") {
+                        let body = r#"{"broadcasts":{"b1":{"state":"RUNNING","twitter_user_id":"99","user_display_name":"Host","status":"t"}}}"#;
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                            body.len(), body
+                        );
+                        let _ = stream.write_all(resp.as_bytes()).await;
+                    } else if path.starts_with("/live-chat") {
+                        let conn = chat_conns.fetch_add(1, Ordering::SeqCst);
+                        let head = "HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\nconnection: close\r\n\r\n";
+                        let _ = stream.write_all(head.as_bytes()).await;
+                        // どちらの接続も同じバックフィル2件を全量再送する(実仕様)。
+                        let _ = stream
+                            .write_all(b"{\"userId\":\"1\",\"chatType\":1,\"message\":\"bf1\",\"ts\":\"1700000000000000001\",\"isBackfill\":true}\n")
+                            .await;
+                        let _ = stream
+                            .write_all(b"{\"userId\":\"2\",\"chatType\":1,\"message\":\"bf2\",\"ts\":\"1700000000000000002\",\"isBackfill\":true}\n")
+                            .await;
+                        if conn > 0 {
+                            // 2回目: 新着を流して接続を保つ。
+                            let _ = stream
+                                .write_all(b"{\"userId\":\"3\",\"chatType\":1,\"message\":\"live3\",\"ts\":\"1700000000000000003\"}\n")
+                                .await;
+                            tokio::time::sleep(Duration::from_secs(8)).await;
+                        }
+                        // 1回目はここで close → クライアントは再接続する。
+                    }
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+
+        let mut overrides = XOverrides::default();
+        let base = format!("http://127.0.0.1:{port}");
+        overrides
+            .endpoints
+            .insert("guestActivateUrl".to_string(), format!("{base}/activate"));
+        overrides
+            .endpoints
+            .insert("broadcastShowUrl".to_string(), format!("{base}/show"));
+        overrides
+            .endpoints
+            .insert("liveChatUrl".to_string(), format!("{base}/live-chat"));
+
+        let (tx, mut rx) = broadcast::channel(16);
+        let cancel = CancellationToken::new();
+        let src = XSource::new("b1".to_string(), overrides, None, None);
+        let cancel_run = cancel.clone();
+        let run = tokio::spawn(async move { src.run(tx, cancel_run).await });
+
+        // 期待: bf1, bf2(1回目) → live3(2回目)。再送された bf1/bf2 は届かない。
+        let mut texts = Vec::new();
+        for i in 0..3 {
+            let m = tokio::time::timeout(Duration::from_secs(15), rx.recv())
+                .await
+                .unwrap_or_else(|_| panic!("{}件目タイムアウト", i + 1))
+                .expect("channel closed");
+            texts.push(m.plain_text());
+        }
+        assert_eq!(texts, vec!["bf1", "bf2", "live3"]);
+        // 重複が流れていればこの猶予内に受信されるはず。
+        let extra = tokio::time::timeout(Duration::from_millis(700), rx.recv()).await;
+        assert!(extra.is_err(), "バックフィルが再流入した: {extra:?}");
+        // guest_token は再接続を跨いで再利用される(activate は初回の1回だけ)。
+        assert_eq!(activate_calls.load(Ordering::SeqCst), 1);
+        assert!(chat_conns.load(Ordering::SeqCst) >= 2, "再接続が起きていない");
+
+        cancel.cancel();
+        let _ = run.await;
     }
 
     #[test]
