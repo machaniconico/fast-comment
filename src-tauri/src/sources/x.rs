@@ -85,6 +85,10 @@ const NAME_RESOLVE_TIMEOUT: Duration = Duration::from_secs(4);
 const NAME_CACHE_MAX: usize = 8192;
 /// 受信ループ → 名前解決タスク間のチャネル容量。解決が詰まった時の緩衝。
 const RESOLVE_QUEUE_CAPACITY: usize = 512;
+/// live-chat の NDJSON 受信バッファ上限。改行が来ないままこのサイズを超えたら
+/// 改行を送らない暴走/敵対エンドポイントとみなし、接続をエラー扱いにして張り直す
+/// (`liveChatUrl` は override 可能なので任意ホストになり得る=メモリ枯渇の防止)。
+const MAX_LINE_BUF_BYTES: usize = 1_048_576; // 1 MiB
 
 /// URL または生 ID から broadcast ID を取り出す。
 ///
@@ -499,9 +503,15 @@ impl XSource {
             let fetcher = fetcher.clone();
             let poll_client = client.clone();
             let mut poll_guest = guest.clone();
+            let poll_cancel = cancel.clone();
             tokio::spawn(async move {
                 loop {
-                    tokio::time::sleep(SHOW_POLL_INTERVAL).await;
+                    // cancel(チャンネル削除/再接続)時は sleep を待たず即終了し、
+                    // 取消後に無駄な show.json リクエストを撃たない。
+                    tokio::select! {
+                        _ = poll_cancel.cancelled() => break,
+                        _ = tokio::time::sleep(SHOW_POLL_INTERVAL) => {}
+                    }
                     let r = fetcher.fetch(&poll_client, &mut poll_guest).await;
                     // 送信失敗 = セッション終了(rx drop)。タスクも終える。
                     if show_tx.send(r).await.is_err() {
@@ -587,6 +597,19 @@ impl XSource {
                                     &mut backfill_buf,
                                 );
                             }
+                            // 全行を捌いた後に残るのは改行なしの末尾断片のみ。それが
+                            // 異常に大きい = 改行を送らない暴走/敵対ストリーム。バッファを
+                            // 捨てて張り直す(メモリ枯渇防止)。
+                            if line_buf.len() > MAX_LINE_BUF_BYTES {
+                                self.flush_backfill(&mut backfill_buf, &chat_tx, &mut stats);
+                                return Err(XSessionError::new(
+                                    anyhow::anyhow!(
+                                        "改行なしで受信バッファが {} バイト超過(異常ストリーム)",
+                                        MAX_LINE_BUF_BYTES
+                                    ),
+                                    stats.is_stable(),
+                                ));
+                            }
                         }
                         Some(Err(e)) => {
                             self.flush_backfill(&mut backfill_buf, &chat_tx, &mut stats);
@@ -651,6 +674,8 @@ impl XSource {
             return;
         }
         let is_backfill = v.get("isBackfill").and_then(Value::as_bool).unwrap_or(false);
+        // dedup の高水位判定に使う ts(ナノ秒)。id 生成と同じ値。
+        let ts_ns = parse_ts_ns(&v);
         let Some(mut chat) = self.line_to_chat(&v, show) else {
             stats.parse_errors += 1;
             if stats.parse_errors <= 5 {
@@ -662,8 +687,9 @@ impl XSource {
             }
             return;
         };
-        // 再接続のたびにバックフィルが全量再送されるため、確定 ID で弾く。
-        if !seen.insert(&chat.id) {
+        // 再接続のたびにバックフィルが全量再送される。確定 ID に加え、以前の
+        // セッションで観測した最大 ts の高水位マークで、容量に依存せず再送を弾く。
+        if !seen.admit(&chat.id, ts_ns, is_backfill) {
             stats.dup += 1;
             return;
         }
@@ -733,15 +759,8 @@ impl XSource {
             return None;
         }
         let user_id = id_string(v.get("userId"))?;
-        // ts はナノ秒の文字列(数値で来る個体にも耐える)。
-        let ts_raw = v
-            .get("ts")
-            .and_then(|t| match t {
-                Value::String(s) => s.trim().parse::<i64>().ok(),
-                Value::Number(n) => n.as_i64(),
-                _ => None,
-            })
-            .unwrap_or(0);
+        // ts はナノ秒(文字列/数値どちらも受ける)。dedup と共通のヘルパで取る。
+        let ts_raw = parse_ts_ns(v);
         let timestamp_ms = if ts_raw > 0 {
             normalize_epoch_ms(ts_raw)
         } else {
@@ -1001,12 +1020,22 @@ impl NameResolver {
     }
 }
 
-/// 直近チャット ID の FIFO 集合。再接続のたびに live-chat はバックフィルを
-/// 全量再送するため、既出 ID を弾いて二重表示を防ぐ。容量超過分は古い順に捨てる。
+/// 再接続時のバックフィル全量再送を弾いて二重表示を防ぐ dedup。
+///
+/// 二段構え:
+/// 1. **高水位マーク** `high_water_ts`: これまでに観測した最大 ts(ナノ秒)。
+///    バックフィル行のうち ts がこれ**未満**のものは、ID セットの容量に依存せず
+///    弾く。長時間配信で総数が `capacity` を超えても再送が漏れない(件数非依存)。
+///    厳密比較(`<`)なので、同一 ts の別ユーザーメッセージを誤って落とさない。
+/// 2. **ID の FIFO 集合**: 厳密な同一 ID 重複(同一セッション内の再送や、境界
+///    ts == high_water の1件)を弾く。容量超過分は古い順に捨てる。境界の1件は
+///    最新なので evict されず確実に残る。
 struct ChatDedup {
     set: std::collections::HashSet<String>,
     order: std::collections::VecDeque<String>,
     capacity: usize,
+    /// これまでに観測した最大 ts(ナノ秒)。0 は未観測。
+    high_water_ts: i64,
 }
 
 impl ChatDedup {
@@ -1015,11 +1044,20 @@ impl ChatDedup {
             set: std::collections::HashSet::new(),
             order: std::collections::VecDeque::new(),
             capacity,
+            high_water_ts: 0,
         }
     }
 
-    /// 新規 ID なら登録して true、既出なら false を返す。
-    fn insert(&mut self, id: &str) -> bool {
+    /// このチャットを UI へ流してよければ登録して true、既出/再送なら false。
+    ///
+    /// `ts_ns` は NDJSON の ts(ナノ秒、欠落は 0)、`is_backfill` は isBackfill フラグ。
+    fn admit(&mut self, id: &str, ts_ns: i64, is_backfill: bool) -> bool {
+        // 以前のセッションで観測した最大 ts より古いバックフィル再送は、ID セットの
+        // 容量に依存せず高水位マークで弾く(件数非依存)。境界(ts == high_water)の
+        // 1件のみ ID セット側で弾かれる。ts 欠落(0)行は高水位対象外=ID セットで処理。
+        if is_backfill && ts_ns > 0 && ts_ns < self.high_water_ts {
+            return false;
+        }
         if self.set.contains(id) {
             return false;
         }
@@ -1029,6 +1067,9 @@ impl ChatDedup {
             if let Some(old) = self.order.pop_front() {
                 self.set.remove(&old);
             }
+        }
+        if ts_ns > self.high_water_ts {
+            self.high_water_ts = ts_ns;
         }
         true
     }
@@ -1127,6 +1168,18 @@ fn truncate_chars(s: &str, max: usize) -> String {
         t.push('…');
     }
     t
+}
+
+/// NDJSON 行から ts(ナノ秒)を寛容に取り出す。欠落/不正は 0。
+/// dedup の高水位マークと id 生成の双方で同じ値を使うため関数に集約する。
+fn parse_ts_ns(v: &Value) -> i64 {
+    v.get("ts")
+        .and_then(|t| match t {
+            Value::String(s) => s.trim().parse::<i64>().ok(),
+            Value::Number(n) => n.as_i64(),
+            _ => None,
+        })
+        .unwrap_or(0)
 }
 
 /// 秒/ミリ秒/ナノ秒が混在しうる epoch 値をミリ秒へ寄せる。
@@ -1257,12 +1310,42 @@ mod tests {
 
     #[test]
     fn dedup_rejects_repeats_and_evicts_oldest() {
+        // 非バックフィル(ライブ)の厳密 ID 重複と容量超過 evict。ts=0 は高水位対象外。
         let mut d = ChatDedup::new(2);
-        assert!(d.insert("a"));
-        assert!(d.insert("b"));
-        assert!(!d.insert("a")); // 既出は false。
-        assert!(d.insert("c")); // 容量2超過で最古の "a" が捨てられる。
-        assert!(d.insert("a")); // "a" は捨てられたので再び新規扱い。
+        assert!(d.admit("a", 0, false));
+        assert!(d.admit("b", 0, false));
+        assert!(!d.admit("a", 0, false)); // 既出は false。
+        assert!(d.admit("c", 0, false)); // 容量2超過で最古の "a" が捨てられる。
+        assert!(d.admit("a", 0, false)); // "a" は捨てられたので再び新規扱い。
+    }
+
+    #[test]
+    fn dedup_high_water_blocks_backfill_resend_beyond_capacity() {
+        // 容量(2)をバックフィル件数(4)が超えても、高水位マークで再送を件数に
+        // 依存せず弾く(HIGH 指摘の回帰: 総数 > capacity で再接続時に古コメント再出現)。
+        let mut d = ChatDedup::new(2);
+        // セッション1: ts 昇順のバックフィル4件。容量超過で古い ID は evict される。
+        assert!(d.admit("x-10-u", 10, true));
+        assert!(d.admit("x-20-u", 20, true));
+        assert!(d.admit("x-30-u", 30, true)); // "x-10-u" が evict される。
+        assert!(d.admit("x-40-u", 40, true)); // high_water=40。"x-20-u" が evict。
+        // 再接続: 同じ4件が再送される。ID セットから消えているものも含め、
+        // 高水位(40)より古いバックフィルは全て弾かれる。
+        assert!(!d.admit("x-10-u", 10, true)); // 高水位で弾く(ID は既に evict 済み)。
+        assert!(!d.admit("x-20-u", 20, true)); // 同上。
+        assert!(!d.admit("x-30-u", 30, true)); // 同上。
+        assert!(!d.admit("x-40-u", 40, true)); // 境界(ts==high_water)は ID セットで弾く。
+        // 新しいライブ行(非バックフィル、ts>high_water)は通る。
+        assert!(d.admit("x-50-u", 50, false));
+    }
+
+    #[test]
+    fn dedup_high_water_allows_same_ts_distinct_users() {
+        // 同一 ts の別ユーザーは厳密比較(<)で誤ドロップしない。
+        let mut d = ChatDedup::new(16);
+        assert!(d.admit("x-100-a", 100, true)); // high_water=100。
+        assert!(d.admit("x-100-b", 100, true)); // ts==high_water だが別 ID なので通る。
+        assert!(!d.admit("x-100-a", 100, true)); // 同一 ID の再送は弾く。
     }
 
     /// 再接続でバックフィルが全量再送されても dedup が UI への再流入を防ぎ、
