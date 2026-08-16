@@ -1052,6 +1052,9 @@ impl ChatDedup {
     ///
     /// `ts_ns` は NDJSON の ts(ナノ秒、欠落は 0)、`is_backfill` は isBackfill フラグ。
     fn admit(&mut self, id: &str, ts_ns: i64, is_backfill: bool) -> bool {
+        // 前提: バックフィルは古い順(ts 昇順)に届く(実測。BACKFILL_EMIT_MAX の
+        // 新しい方を残す切り捨ても同じ前提に立つ)。新しい順で届くと初回の最新行が
+        // 高水位を上げて残りを落とすため、この不変条件が崩れたら要見直し。
         // 以前のセッションで観測した最大 ts より古いバックフィル再送は、ID セットの
         // 容量に依存せず高水位マークで弾く(件数非依存)。境界(ts == high_water)の
         // 1件のみ ID セット側で弾かれる。ts 欠落(0)行は高水位対象外=ID セットで処理。
