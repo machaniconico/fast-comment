@@ -2,11 +2,12 @@
   import { onMount, onDestroy } from 'svelte';
   import type {
     AppConfig, EffectRule, EffectsConfig, GoalsConfig, InjectTestCommentOptions, TtsDictEntry, TtsOptions,
-    TimerConfig, WelcomeConfig
+    TimerConfig, WelcomeConfig, YoutubeOauthStatus
   } from '../ipc';
   import {
     getConfig, setConfig, getObsUrl, getObsGoalsUrl, getObsTimerUrl, exportCommentsCsv, injectTestComment,
-    setTtsPaused, clearTtsQueue, skipCurrentTts, testTts
+    setTtsPaused, clearTtsQueue, skipCurrentTts, testTts, getYoutubeOauthStatus,
+    connectYoutubeOauth, disconnectYoutubeOauth, getGoalSkinInfo
   } from '../ipc';
   import { ui, SETTINGS_ANCHOR_IDS } from '../ui.svelte';
   import {
@@ -25,9 +26,10 @@
 
   interface Props {
     onConfigSaved?: (config: AppConfig) => void;
+    focus?: 'all' | 'goals' | 'danmaku';
   }
 
-  let { onConfigSaved }: Props = $props();
+  let { onConfigSaved, focus = 'all' }: Props = $props();
 
   function onThemeChange(event: Event) {
     theme.setTheme((event.currentTarget as HTMLSelectElement).value as AppearanceTheme);
@@ -49,6 +51,24 @@
     theme.setWrapComments((event.currentTarget as HTMLInputElement).checked);
   }
 
+  function onShowViewerBadgesChange(event: Event) {
+    theme.setShowViewerBadges((event.currentTarget as HTMLInputElement).checked);
+  }
+
+  function onShowCommentMilestonesChange(event: Event) {
+    theme.setShowCommentMilestones((event.currentTarget as HTMLInputElement).checked);
+  }
+
+  function onYoutubeMemberNameGreenChange(event: Event) {
+    if (!config) return;
+    config.ui.youtubeMemberNameGreen = (event.currentTarget as HTMLInputElement).checked;
+  }
+
+  function onTwitchNativeStyleChange(event: Event) {
+    if (!config) return;
+    config.ui.twitchNativeStyle = (event.currentTarget as HTMLInputElement).checked;
+  }
+
   let config: AppConfig | null = $state(null);
   let obsBaseUrl: string = $state('');
   let obsGoalsBaseUrl: string = $state('');
@@ -59,6 +79,10 @@
   let copiedGoalsObs: boolean = $state(false);
   let copiedTimerObs: boolean = $state(false);
   let copiedCsvPath: boolean = $state(false);
+  let goalSkinDirectory: string = $state('');
+  let goalSkinFiles: string[] = $state([]);
+  let goalSkinLoading: boolean = $state(false);
+  let goalSkinError: string = $state('');
 
   // NG / highlight lists
   let ngWords: string[] = $state([]);
@@ -89,9 +113,17 @@
   let testAmount: string = $state('500');
   let testCount: number = $state(1);
 
-  // Self-post (chat send) credentials.
+  // External API/chat credentials.
   let credTwitchOauth: string = $state('');
   let credTwitchUsername: string = $state('');
+  let credYoutubeApiKey: string = $state('');
+  let credYoutubeOauthClientId: string = $state('');
+  let credXAuthToken: string = $state('');
+  let credXCsrfToken: string = $state('');
+  let youtubeOauthStatus: YoutubeOauthStatus | null = $state(null);
+  let youtubeOauthBusy: boolean = $state(false);
+  let youtubeOauthMsg: string = $state('');
+  let youtubeOauthOk: boolean | null = $state(null);
 
   // Scroll to settings section when the command palette sets a settingsAnchor.
   // Gate on `config`: the tts/obs/moderation sections live inside {#if config},
@@ -105,7 +137,21 @@
     if (!config) return;
     const id = SETTINGS_ANCHOR_IDS[a];
     requestAnimationFrame(() => {
-      document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      const target = document.getElementById(id);
+      const container = target?.closest<HTMLElement>('.settings');
+      if (!target || !container) return;
+
+      // scrollIntoView also scrolls the document, which moves the fixed-height
+      // app header outside the WebView with no visible way to scroll it back.
+      // Move only the Settings pane and recover any document scroll left by an
+      // older build.
+      window.scrollTo(0, 0);
+      const top =
+        container.scrollTop
+        + target.getBoundingClientRect().top
+        - container.getBoundingClientRect().top
+        - 12;
+      container.scrollTo({ top: Math.max(0, top), behavior: 'smooth' });
     });
     ui.clearSettingsAnchor();
   });
@@ -181,6 +227,10 @@
       highlights = normalizeModerationEntries(config.moderation.highlights);
       credTwitchOauth = config.credentials?.twitchOauth ?? '';
       credTwitchUsername = config.credentials?.twitchUsername ?? '';
+      credYoutubeApiKey = config.credentials?.youtubeApiKey ?? '';
+      credYoutubeOauthClientId = config.credentials?.youtubeOauthClientId ?? '';
+      credXAuthToken = config.credentials?.xAuthToken ?? '';
+      credXCsrfToken = config.credentials?.xCsrfToken ?? '';
       voicevoxSpeaker = ttsNum('voicevoxSpeaker', 1);
       maxLength = ttsNum('maxLength', MAX_LENGTH_DEFAULT);
       stripEmoji = ttsBool('stripEmoji', true);
@@ -219,11 +269,18 @@
 
   onMount(async () => {
     hydrateConfig(await getConfig());
+    try {
+      youtubeOauthStatus = await getYoutubeOauthStatus();
+    } catch (e) {
+      youtubeOauthMsg = e instanceof Error ? e.message : String(e);
+      youtubeOauthOk = false;
+    }
 
     const url = await getObsUrl();
     obsBaseUrl = url ?? 'http://127.0.0.1:11180/?template=default';
     obsGoalsBaseUrl = await getObsGoalsUrl();
     obsTimerBaseUrl = await getObsTimerUrl();
+    await refreshGoalSkins();
 
     refreshSpeechVoices();
     if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
@@ -258,11 +315,21 @@
   });
 
   const danmakuObsUrl = $derived.by(() => {
-    return withDanmaku(obsUrl);
+    return withDanmaku(obsUrl, config?.obs ?? null);
   });
 
   const goalsObsUrl = $derived.by(() => {
-    return withGoalsParams(obsGoalsBaseUrl, config?.obs ?? null);
+    return withGoalsParams(obsGoalsBaseUrl, config?.obs ?? null, config?.goals ?? null);
+  });
+
+  const goalSkinOptions = $derived.by(() => {
+    const current = config?.goals.skin;
+    const files = [...goalSkinFiles];
+    if (typeof current === 'string' && current.startsWith('png:')) {
+      const currentFile = current.slice(4);
+      if (currentFile && !files.includes(currentFile)) files.unshift(currentFile);
+    }
+    return files;
   });
 
   const timerObsUrl = $derived.by(() => {
@@ -296,13 +363,13 @@
     }
   }
 
-  function withDanmaku(url: string): string {
+  function withDanmaku(url: string, obs: AppConfig['obs'] | null): string {
     try {
       const u = new URL(url);
       // 弾幕 app.js が解釈するクエリのみ引き継ぐ。max は積み上げ式の maxRows(既定8)
       // 由来で、弾幕の「同時に流れる最大本数」(app.js 既定240)とは別概念。引き継ぐと
       // 弾幕が極端に少なくなる(=またスカスカ)ので除外し、app.js の既定240に任せる。
-      const keepParams = new Set(['channel', 'dur', 'size', 'opacity', 'name', 'outline', 'only', 'ws']);
+      const keepParams = new Set(['channel', 'dur', 'opacity', 'name', 'outline', 'only', 'ws']);
       const kept = new URLSearchParams();
       for (const [key, value] of u.searchParams.entries()) {
         if (keepParams.has(key)) kept.append(key, value);
@@ -312,6 +379,7 @@
       }
       u.search = '';
       u.searchParams.set('template', 'danmaku');
+      u.searchParams.set('size', String(clampInt(obs?.danmakuFontSize, 30, 12, 96)));
       for (const [key, value] of kept.entries()) {
         u.searchParams.append(key, value);
       }
@@ -321,13 +389,32 @@
     }
   }
 
-  function withGoalsParams(url: string, obs: AppConfig['obs'] | null): string {
+  function withGoalsParams(
+    url: string,
+    obs: AppConfig['obs'] | null,
+    goals: GoalsConfig | null,
+  ): string {
     try {
       const u = new URL(url);
       u.searchParams.set('template', 'goals');
       u.searchParams.set('font', String(clampInt(obs?.fontScalePct, 100, 50, 200)));
       u.searchParams.set('bg', String(clampInt(obs?.bgOpacityPct, 0, 0, 100)));
       u.searchParams.set('pos', obs?.position === 'top' ? 'top' : 'bottom');
+      u.searchParams.set(
+        'layout',
+        goals?.layout === 'vertical' || goals?.layout === 'grid' ? goals.layout : 'horizontal',
+      );
+      const customSkin = customGoalSkinFile(goals?.skin);
+      if (customSkin) {
+        u.searchParams.set('skin', 'custom');
+        u.searchParams.set('image', `/skin/${customSkin}`);
+      } else {
+        u.searchParams.set(
+          'skin',
+          goals?.skin === 'solid' || goals?.skin === 'minimal' ? goals.skin : 'glass',
+        );
+        u.searchParams.delete('image');
+      }
       return u.toString();
     } catch {
       return url;
@@ -381,6 +468,7 @@
     if (!config) return;
     config.obs.template = (config.obs.template || 'default').trim() || 'default';
     config.obs.fontScalePct = clampInt(config.obs.fontScalePct, 100, 50, 200);
+    config.obs.danmakuFontSize = clampInt(config.obs.danmakuFontSize, 30, 12, 96);
     config.obs.maxRows = clampInt(config.obs.maxRows, 8, 1, 1000);
     config.obs.ttlMs = positiveInt(config.obs.ttlMs, 12000);
     config.obs.bgOpacityPct = clampInt(config.obs.bgOpacityPct, 0, 0, 100);
@@ -395,7 +483,40 @@
   }
 
   function defaultGoals(): GoalsConfig {
-    return { enabled: false, showInApp: false, comments: 0, viewers: 0, likes: 0, reactions: 0 };
+    return {
+      enabled: false,
+      showInApp: false,
+      layout: 'horizontal',
+      skin: 'glass',
+      showComments: true,
+      showViewers: true,
+      showLikes: true,
+      showReactions: true,
+      comments: 0,
+      viewers: 0,
+      likes: 0,
+      reactions: 0,
+    };
+  }
+
+  function customGoalSkinFile(value: unknown): string | null {
+    if (typeof value !== 'string') return null;
+    const match = /^png:([^/\\]+\.png)$/i.exec(value);
+    return match?.[1] ?? null;
+  }
+
+  async function refreshGoalSkins() {
+    goalSkinLoading = true;
+    goalSkinError = '';
+    try {
+      const info = await getGoalSkinInfo();
+      goalSkinDirectory = info.directory;
+      goalSkinFiles = info.files;
+    } catch (e) {
+      goalSkinError = e instanceof Error ? e.message : String(e);
+    } finally {
+      goalSkinLoading = false;
+    }
   }
 
   function normalizeGoalsConfig() {
@@ -404,6 +525,32 @@
     if (!editable.goals) editable.goals = defaultGoals();
     editable.goals.enabled = editable.goals.enabled === true;
     editable.goals.showInApp = editable.goals.showInApp === true;
+    editable.goals.layout =
+      editable.goals.layout === 'vertical' || editable.goals.layout === 'grid'
+        ? editable.goals.layout
+        : 'horizontal';
+    editable.goals.skin =
+      editable.goals.skin === 'solid'
+      || editable.goals.skin === 'minimal'
+      || customGoalSkinFile(editable.goals.skin)
+        ? editable.goals.skin
+        : 'glass';
+    editable.goals.showComments =
+      typeof editable.goals.showComments === 'boolean'
+        ? editable.goals.showComments
+        : Number(editable.goals.comments) > 0;
+    editable.goals.showViewers =
+      typeof editable.goals.showViewers === 'boolean'
+        ? editable.goals.showViewers
+        : Number(editable.goals.viewers) > 0;
+    editable.goals.showLikes =
+      typeof editable.goals.showLikes === 'boolean'
+        ? editable.goals.showLikes
+        : Number(editable.goals.likes) > 0;
+    editable.goals.showReactions =
+      typeof editable.goals.showReactions === 'boolean'
+        ? editable.goals.showReactions
+        : Number(editable.goals.reactions) > 0;
     editable.goals.comments = clampInt(editable.goals.comments, 0, 0, 4294967295);
     editable.goals.viewers = clampInt(editable.goals.viewers, 0, 0, 4294967295);
     editable.goals.likes = clampInt(editable.goals.likes, 0, 0, 4294967295);
@@ -760,9 +907,18 @@
     config.credentials = {
       twitchOauth: credTwitchOauth.trim(),
       twitchUsername: credTwitchUsername.trim(),
+      youtubeApiKey: credYoutubeApiKey.trim(),
+      youtubeOauthClientId: credYoutubeOauthClientId.trim(),
+      xAuthToken: credXAuthToken.trim(),
+      xCsrfToken: credXCsrfToken.trim(),
     };
     try {
       await setConfig(config);
+      try {
+        youtubeOauthStatus = await getYoutubeOauthStatus();
+      } catch {
+        // Saving succeeded; a credential-store status failure should not report save failure.
+      }
       setNotify(config.ui.notifySound, config.ui.notifyVolume);
       onConfigSaved?.(config);
       saveMsg = '保存しました';
@@ -773,6 +929,57 @@
     }
     if (saveMsgTimer !== null) clearTimeout(saveMsgTimer);
     saveMsgTimer = setTimeout(() => { saveMsg = ''; saveMsgTimer = null; }, 3000);
+  }
+
+  async function onConnectYoutubeOauth() {
+    if (youtubeOauthBusy) return;
+    const clientId = credYoutubeOauthClientId.trim();
+    if (!clientId) {
+      youtubeOauthMsg = 'OAuthクライアントIDを入力してください';
+      youtubeOauthOk = false;
+      return;
+    }
+    youtubeOauthBusy = true;
+    youtubeOauthMsg = 'ブラウザでGoogleアカウントを選び、許可してください…';
+    youtubeOauthOk = null;
+    try {
+      youtubeOauthStatus = await connectYoutubeOauth(clientId);
+      if (config) {
+        config.credentials = {
+          ...(config.credentials ?? {}),
+          youtubeOauthClientId: clientId,
+        };
+      }
+      youtubeOauthMsg = 'Googleアカウントに接続しました';
+      youtubeOauthOk = true;
+    } catch (e) {
+      youtubeOauthMsg = e instanceof Error ? e.message : String(e);
+      youtubeOauthOk = false;
+      try {
+        youtubeOauthStatus = await getYoutubeOauthStatus();
+      } catch {
+        // The original OAuth error is more useful than a follow-up status error.
+      }
+    } finally {
+      youtubeOauthBusy = false;
+    }
+  }
+
+  async function onDisconnectYoutubeOauth() {
+    if (youtubeOauthBusy) return;
+    youtubeOauthBusy = true;
+    youtubeOauthMsg = '';
+    youtubeOauthOk = null;
+    try {
+      youtubeOauthStatus = await disconnectYoutubeOauth();
+      youtubeOauthMsg = 'このPCのGoogle接続情報を削除しました';
+      youtubeOauthOk = true;
+    } catch (e) {
+      youtubeOauthMsg = e instanceof Error ? e.message : String(e);
+      youtubeOauthOk = false;
+    } finally {
+      youtubeOauthBusy = false;
+    }
   }
 
   function copyText(text: string, markCopied: () => void) {
@@ -853,8 +1060,12 @@
   }
 </script>
 
-<div class="settings">
-  <h2>設定</h2>
+<div
+  class="settings"
+  class:focus-goals={focus === 'goals'}
+  class:focus-danmaku={focus === 'danmaku'}
+>
+  <h2>{focus === 'goals' ? '目標設定' : focus === 'danmaku' ? '弾幕・OBS設定' : '設定'}</h2>
 
   <section id="settings-appearance">
     <h3>外観</h3>
@@ -898,6 +1109,44 @@
       <label for="appearance-wrap-comments">コメントを折り返す</label>
       <input id="appearance-wrap-comments" type="checkbox" checked={theme.wrapComments} onchange={onWrapCommentsChange} />
     </div>
+    <div class="field-row">
+      <label for="appearance-show-viewer-badges">初回・常連表示</label>
+      <input
+        id="appearance-show-viewer-badges"
+        type="checkbox"
+        checked={theme.showViewerBadges}
+        onchange={onShowViewerBadgesChange}
+      />
+    </div>
+    <div class="field-row">
+      <label for="appearance-show-comment-milestones">コメント達成表示</label>
+      <input
+        id="appearance-show-comment-milestones"
+        type="checkbox"
+        checked={theme.showCommentMilestones}
+        onchange={onShowCommentMilestonesChange}
+      />
+    </div>
+    <div class="field-row">
+      <label for="appearance-youtube-member-name-green">YouTubeメンバー名を緑色にする</label>
+      <input
+        id="appearance-youtube-member-name-green"
+        type="checkbox"
+        checked={config?.ui.youtubeMemberNameGreen !== false}
+        onchange={onYoutubeMemberNameGreenChange}
+        class="chk"
+      />
+    </div>
+    <div class="field-row">
+      <label for="appearance-twitch-native-style">Twitch本家風表示</label>
+      <input
+        id="appearance-twitch-native-style"
+        type="checkbox"
+        checked={config?.ui.twitchNativeStyle !== false}
+        onchange={onTwitchNativeStyleChange}
+        class="chk"
+      />
+    </div>
   </section>
 
   <section id="settings-portability">
@@ -908,6 +1157,29 @@
   <section id="settings-danmaku">
     <h3>弾幕（画面を流れるコメント）</h3>
     <DanmakuSettings />
+    {#if config}
+      <div class="obs-label">OBS弾幕オーバーレイ用URL</div>
+      <p class="hint">通常のコメント表示URLとは別に、OBSへブラウザソースとして追加してください。</p>
+      <div class="field-row">
+        <label for="obs-danmaku-font-size">OBS弾幕文字サイズ</label>
+        <input
+          id="obs-danmaku-font-size"
+          type="number"
+          min="12"
+          max="96"
+          step="1"
+          bind:value={config.obs.danmakuFontSize}
+          class="num-input"
+        />
+        <span class="hint-inline">px（12〜96）</span>
+      </div>
+      <div class="obs-row">
+        <input type="text" value={danmakuObsUrl} readonly class="obs-input" />
+        <button class="copy-btn" class:copied={copiedDanmakuObs} onclick={onCopyDanmakuObs}>
+          {copiedDanmakuObs ? 'コピー済' : 'コピー'}
+        </button>
+      </div>
+    {/if}
   </section>
 
   <!-- ── TTS ── -->
@@ -919,6 +1191,7 @@
       <select id="test-platform" bind:value={testPlatform} class="platform-select">
         <option value="twitch">Twitch</option>
         <option value="youtube">YouTube</option>
+        <option value="x">X</option>
       </select>
       <button type="button" class="copy-btn" onclick={fillRandomTestComment}>ランダム</button>
     </div>
@@ -949,6 +1222,7 @@
         <option value="superChat">Super Chat</option>
         <option value="membership">メンバーシップ</option>
         <option value="bits">Bits</option>
+        <option value="gift">YouTubeギフト</option>
       </select>
       <label for="test-amount" class="compact-label">金額</label>
       <input
@@ -979,13 +1253,110 @@
     </div>
   </section>
 
+  <section id="settings-youtube-low-latency">
+    <h3>YouTube低遅延受信</h3>
+    <p class="hint">
+      Google CloudでYouTube Data API v3を有効にしたAPIキーを設定すると、公式streamListでコメントを低遅延受信します。
+      未設定または公式接続に失敗した場合は、従来のInnerTube方式へ自動で切り替わります。
+    </p>
+    <div class="field-row">
+      <label for="cred-youtube-api-key">YouTube Data APIキー</label>
+      <input
+        id="cred-youtube-api-key"
+        type="password"
+        bind:value={credYoutubeApiKey}
+        class="id-input"
+        placeholder="AIza...（任意）"
+        autocomplete="off"
+        spellcheck="false"
+      />
+    </div>
+    <p class="hint">
+      APIキーはこのPCのconfig.jsonに平文で保存されます。空欄のままでも従来方式で利用できます。
+    </p>
+  </section>
+
   <section id="settings-posting">
     <h3>コメント投稿（送信）</h3>
     <p class="hint">
       コメント一覧の下にある「✍ 自分でコメントを投稿」から、配信チャットへ自分でコメントを送れます。
-      Twitch へ送るには chat:edit 権限付きの OAuth トークンと送信に使うユーザー名が必要です。
-      トークンは https://twitchtokengenerator.com などで取得できます。
-      （YouTube への投稿は未対応です。）
+      YouTubeは接続した配信者アカウント、Twitchは設定したアカウントとして投稿されます。
+    </p>
+
+    <div class="youtube-oauth-card">
+      <div class="oauth-card-head">
+        <span class="credential-subhead">YouTube</span>
+        <span
+          class="oauth-status"
+          class:oauth-status--connected={youtubeOauthStatus?.connected === true}
+          class:oauth-status--unknown={youtubeOauthStatus === null}
+        >
+          <span class="oauth-status-dot" aria-hidden="true"></span>
+          {youtubeOauthStatus?.connected
+            ? `${youtubeOauthStatus.channelTitle ?? 'Google接続済み'} で投稿`
+            : youtubeOauthStatus === null ? '確認中' : '未接続'}
+        </span>
+      </div>
+      <div class="field-row oauth-client-row">
+        <label for="cred-youtube-oauth-client-id">OAuthクライアントID</label>
+        <input
+          id="cred-youtube-oauth-client-id"
+          type="text"
+          bind:value={credYoutubeOauthClientId}
+          class="id-input"
+          placeholder="xxxxx.apps.googleusercontent.com"
+          autocomplete="off"
+          autocapitalize="off"
+          spellcheck="false"
+        />
+      </div>
+      <div class="field-row oauth-actions">
+        {#if youtubeOauthStatus?.connected}
+          <button
+            type="button"
+            class="copy-btn oauth-disconnect-btn"
+            onclick={onDisconnectYoutubeOauth}
+            disabled={youtubeOauthBusy}
+          >
+            接続解除
+          </button>
+        {:else}
+          <button
+            type="button"
+            class="export-btn youtube-connect-btn"
+            onclick={onConnectYoutubeOauth}
+            disabled={youtubeOauthBusy || credYoutubeOauthClientId.trim() === ''}
+          >
+            {youtubeOauthBusy ? '接続待ち…' : 'Googleに接続'}
+          </button>
+        {/if}
+        {#if youtubeOauthMsg}
+          <span
+            class="oauth-result"
+            class:oauth-result--ok={youtubeOauthOk === true}
+            class:oauth-result--error={youtubeOauthOk === false}
+            role="status"
+            aria-live="polite"
+          >{youtubeOauthMsg}</span>
+        {/if}
+      </div>
+      <p class="hint">
+        Google Cloudで「デスクトップアプリ」のOAuthクライアントを作成してIDを貼り付けます。
+        投稿権限はブラウザで許可し、更新トークンはconfig.jsonではなくOSの資格情報ストアへ保存します。
+      </p>
+      <details class="oauth-setup">
+        <summary>初回設定の手順</summary>
+        <ol>
+          <li>Google CloudでYouTube Data API v3を有効化</li>
+          <li>OAuth同意画面を設定し、種類「デスクトップアプリ」のクライアントを作成</li>
+          <li>クライアントIDを貼り付けて「Googleに接続」</li>
+        </ol>
+      </details>
+    </div>
+
+    <div class="credential-subhead twitch-credential-head">Twitch</div>
+    <p class="hint">
+      chat:edit 権限付きOAuthトークンと送信に使うユーザー名を設定します。
     </p>
     <div class="field-row">
       <label for="cred-twitch-username">Twitch ユーザー名</label>
@@ -1012,6 +1383,33 @@
         spellcheck="false"
       />
     </div>
+    <div class="field-row">
+      <label for="cred-x-auth-token">X auth_token</label>
+      <input
+        id="cred-x-auth-token"
+        type="password"
+        bind:value={credXAuthToken}
+        class="id-input"
+        placeholder="x.com の auth_token cookie"
+        autocomplete="off"
+        spellcheck="false"
+      />
+    </div>
+    <div class="field-row">
+      <label for="cred-x-csrf-token">X ct0</label>
+      <input
+        id="cred-x-csrf-token"
+        type="password"
+        bind:value={credXCsrfToken}
+        class="id-input"
+        placeholder="x.com の ct0 cookie"
+        autocomplete="off"
+        spellcheck="false"
+      />
+    </div>
+    <p class="hint">
+      X コメントにユーザー名を表示するには、x.com にログインしたブラウザで F12 → アプリケーション → Cookie → https://x.com を開き、auth_token と ct0 の値を貼り付けて保存してください（X チャンネルは自動で再接続されます）。未設定でもコメントは受信でき、「ユーザー1234」表示になるだけです。
+    </p>
     <p class="hint">
       ⚠ トークンはこの PC の config.json に平文で保存されます。共有 PC では取り扱いに注意してください。
     </p>
@@ -1301,15 +1699,6 @@
         {copiedGiftObs ? 'コピー済' : 'コピー'}
       </button>
     </div>
-    <div class="obs-label">弾幕オーバーレイ用URL</div>
-    <p class="hint">弾幕オーバーレイ（画面を流れるニコ生風）。通常のコメント表示URLとは別に、OBSへ追加のブラウザソースとして貼ってください</p>
-    <div class="obs-row">
-      <input type="text" value={danmakuObsUrl} readonly class="obs-input" />
-      <button class="copy-btn" class:copied={copiedDanmakuObs} onclick={onCopyDanmakuObs}>
-        {copiedDanmakuObs ? 'コピー済' : 'コピー'}
-      </button>
-    </div>
-    <p class="hint">OBSのブラウザソースにこのURLを貼り付けてください。</p>
     <div id="settings-obs-template-editor" class="template-editor-wrap">
       <h3>OBSテンプレート編集</h3>
       <TemplateEditor obsPort={config.obs.port} currentTemplate={config.obs.template} />
@@ -1328,6 +1717,42 @@
       <input id="goals-show-in-app" type="checkbox" bind:checked={config.goals.showInApp} class="chk" />
     </div>
     <div class="field-row">
+      <label for="goals-layout">OBSでの並び方</label>
+      <select id="goals-layout" bind:value={config.goals.layout} class="platform-select">
+        <option value="horizontal">横1列</option>
+        <option value="vertical">縦1列</option>
+        <option value="grid">2×2</option>
+      </select>
+    </div>
+    <div class="field-row">
+      <label for="goals-skin">OBSスキン</label>
+      <select id="goals-skin" bind:value={config.goals.skin} class="platform-select">
+        <option value="glass">グラス</option>
+        <option value="solid">ソリッド</option>
+        <option value="minimal">ミニマル</option>
+        {#if goalSkinOptions.length > 0}
+          <optgroup label="自作PNG">
+            {#each goalSkinOptions as file (file)}
+              <option value={`png:${file}`}>{file}</option>
+            {/each}
+          </optgroup>
+        {/if}
+      </select>
+      <button type="button" class="copy-btn" onclick={refreshGoalSkins} disabled={goalSkinLoading}>
+        {goalSkinLoading ? '読込中' : '再読込'}
+      </button>
+    </div>
+    <p class="hint">
+      自作スキンはPNGをskinフォルダへ入れて「再読込」してください。各ゲージの背景として使用します。
+      推奨解像度は660×260px（透過PNG対応）です。
+    </p>
+    {#if goalSkinDirectory}
+      <code class="skin-directory">{goalSkinDirectory}</code>
+    {/if}
+    {#if goalSkinError}
+      <p class="inline-error">{goalSkinError}</p>
+    {/if}
+    <div class="field-row">
       <label for="goals-comments">コメント</label>
       <input
         id="goals-comments"
@@ -1338,7 +1763,10 @@
         bind:value={config.goals.comments}
         class="num-input"
       />
-      <span class="hint-inline">（0で非表示）</span>
+      <label class="goal-visibility">
+        <input type="checkbox" bind:checked={config.goals.showComments} class="chk" />
+        表示
+      </label>
     </div>
     <div class="field-row">
       <label for="goals-viewers">視聴者</label>
@@ -1351,7 +1779,10 @@
         bind:value={config.goals.viewers}
         class="num-input"
       />
-      <span class="hint-inline">（0で非表示）</span>
+      <label class="goal-visibility">
+        <input type="checkbox" bind:checked={config.goals.showViewers} class="chk" />
+        表示
+      </label>
     </div>
     <div class="field-row">
       <label for="goals-likes">高評価</label>
@@ -1364,7 +1795,10 @@
         bind:value={config.goals.likes}
         class="num-input"
       />
-      <span class="hint-inline">（0で非表示）</span>
+      <label class="goal-visibility">
+        <input type="checkbox" bind:checked={config.goals.showLikes} class="chk" />
+        表示
+      </label>
     </div>
     <div class="field-row">
       <label for="goals-reactions">リアクション</label>
@@ -1377,7 +1811,10 @@
         bind:value={config.goals.reactions}
         class="num-input"
       />
-      <span class="hint-inline">（0で非表示）</span>
+      <label class="goal-visibility">
+        <input type="checkbox" bind:checked={config.goals.showReactions} class="chk" />
+        表示
+      </label>
     </div>
     <div class="obs-label">GoalsオーバーレイURL</div>
     <div class="obs-row">
@@ -1439,11 +1876,12 @@
 
   <!-- ── Effects ── -->
   <section id="settings-effects">
-    <h3>コメントエフェクト</h3>
+    <h3>アプリ内エフェクト</h3>
     <div class="field-row">
-      <label for="effects-enabled">有効化</label>
+      <label for="effects-enabled">エフェクトを有効化</label>
       <input id="effects-enabled" type="checkbox" bind:checked={config.effects.enabled} class="chk" />
     </div>
+    <p class="hint">キーワード一致とYouTubeの匿名リアクションを、アプリ上の短いアニメーションで表示します。</p>
 
     <div class="dict-editor">
       <div class="dict-header">
@@ -1778,6 +2216,16 @@
     box-sizing: border-box;
   }
 
+  .settings.focus-goals > section:not(#settings-goals),
+  .settings.focus-danmaku > section:not(#settings-danmaku) {
+    display: none;
+  }
+
+  .settings:not(.focus-goals):not(.focus-danmaku) > #settings-goals,
+  .settings:not(.focus-goals):not(.focus-danmaku) > #settings-danmaku {
+    display: none;
+  }
+
   h2 {
     font-size: 15px;
     font-weight: 700;
@@ -1835,6 +2283,102 @@
   .export-btn { background: #1976d2; color: #fff; padding: 7px 14px; }
   .save-btn:disabled, .export-btn:disabled, .copy-btn:disabled { opacity: 0.5; cursor: not-allowed; }
   .tts-paused { background: #2e7d32; }
+
+  .youtube-oauth-card {
+    position: relative;
+    margin-top: 10px;
+    padding: 10px 12px 11px;
+    overflow: hidden;
+    border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 5px;
+    background: rgba(255,255,255,0.025);
+  }
+
+  .youtube-oauth-card::before {
+    content: '';
+    position: absolute;
+    inset: 0 auto 0 0;
+    width: 3px;
+    background: #ff3d3d;
+  }
+
+  .oauth-card-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+  }
+
+  .credential-subhead {
+    color: #e6e6e6;
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+  }
+
+  .twitch-credential-head {
+    margin-top: 13px;
+  }
+
+  .oauth-status {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    color: #9e9e9e;
+    font-size: 11px;
+    font-weight: 600;
+    min-width: 0;
+    max-width: 62%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .oauth-status-dot {
+    flex-shrink: 0;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: #757575;
+    box-shadow: 0 0 0 2px rgba(117,117,117,0.16);
+  }
+
+  .oauth-status--connected { color: #81c784; }
+  .oauth-status--connected .oauth-status-dot {
+    background: #66bb6a;
+    box-shadow: 0 0 0 2px rgba(102,187,106,0.18);
+  }
+  .oauth-status--unknown { color: #757575; }
+
+  .oauth-client-row label { min-width: 126px; }
+  .oauth-actions { min-height: 30px; }
+  .youtube-connect-btn { background: #c62828; }
+  .oauth-disconnect-btn { background: #4b3434; }
+
+  .oauth-result {
+    color: #bdbdbd;
+    font-size: 11px;
+  }
+  .oauth-result--ok { color: #81c784; }
+  .oauth-result--error { color: #ef9a9a; }
+
+  .oauth-setup {
+    margin-top: 7px;
+    color: #8d8d8d;
+    font-size: 11px;
+  }
+
+  .oauth-setup summary {
+    width: fit-content;
+    cursor: pointer;
+    color: #a8a8a8;
+  }
+
+  .oauth-setup ol {
+    margin: 6px 0 0;
+    padding-left: 20px;
+    line-height: 1.7;
+  }
 
   .tts-control-panel {
     margin-top: 8px;
@@ -2024,6 +2568,33 @@
 
   .hint { font-size: 11px; color: #757575; margin: 4px 0 0; }
   .hint-inline { font-size: 11px; color: #757575; font-weight: 400; text-transform: none; letter-spacing: 0; }
+  .goal-visibility {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 72px;
+    color: #bdbdbd;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    user-select: none;
+  }
+  .goal-visibility:focus-within {
+    color: #ffffff;
+  }
+  .skin-directory {
+    display: block;
+    max-width: 100%;
+    margin: 6px 0 10px;
+    padding: 6px 8px;
+    overflow-wrap: anywhere;
+    border: 1px solid #383838;
+    border-radius: 4px;
+    color: #bdbdbd;
+    background: #191919;
+    font-size: 11px;
+    user-select: text;
+  }
   .tts-test-result { font-size: 12px; margin: 4px 0 0; }
   .tts-test-result--ok { color: #81c784; }
   .tts-test-result--error { color: #ef9a9a; }

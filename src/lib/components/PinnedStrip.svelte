@@ -5,6 +5,8 @@
   const PLATFORM_COLORS: Record<string, string> = {
     twitch: '#9146ff',
     youtube: '#ff0000',
+    x: '#1da1f2',
+    niconico: '#fcc800',
   };
 </script>
 

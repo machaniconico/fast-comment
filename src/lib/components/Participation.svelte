@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
+  import { listen } from '@tauri-apps/api/event';
   import type { Participant } from '../ipc';
   import {
     clearParticipants,
@@ -22,7 +23,6 @@
       const current = await getParticipants();
       if (!current) return;
       participants = current;
-      const { listen } = await import('@tauri-apps/api/event');
       const fn = await listen<Participant[]>('participants-updated', (event) => {
         participants = event.payload;
       });
@@ -94,7 +94,7 @@
       {:else}
         {#each waiting as p (p.platform + ':' + p.userId)}
           <div class="participant-row" role="listitem">
-            <span class="platform" class:twitch={p.platform === 'twitch'} class:youtube={p.platform === 'youtube'}>
+            <span class="platform" class:twitch={p.platform === 'twitch'} class:youtube={p.platform === 'youtube'} class:x={p.platform === 'x'} class:niconico={p.platform === 'niconico'}>
               {p.platform}
             </span>
             <span class="name">{p.name}</span>
@@ -114,7 +114,7 @@
       {:else}
         {#each picked as p (p.platform + ':' + p.userId)}
           <div class="participant-row picked" role="listitem">
-            <span class="platform" class:twitch={p.platform === 'twitch'} class:youtube={p.platform === 'youtube'}>
+            <span class="platform" class:twitch={p.platform === 'twitch'} class:youtube={p.platform === 'youtube'} class:x={p.platform === 'x'} class:niconico={p.platform === 'niconico'}>
               {p.platform}
             </span>
             <span class="name">{p.name}</span>
@@ -220,6 +220,8 @@
 
   .platform.twitch { color: #d4aaff; }
   .platform.youtube { color: #ff9999; }
+  .platform.x { color: #1da1f2; }
+  .platform.niconico { color: #fcc800; }
 
   .name {
     min-width: 0;

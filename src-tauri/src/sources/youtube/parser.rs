@@ -13,10 +13,12 @@ use std::sync::OnceLock;
 
 use serde_json::Value;
 
-use crate::model::{Amount, Author, Badge, ChatMessage, Fragment, MessageKind, Platform, Roles};
+use crate::model::{
+    Amount, Author, Badge, ChatMessage, Fragment, MessageKind, Platform, Roles, YoutubeReaction,
+};
 
 /// パーサのバージョン。レスポンス構造の解釈が変わったら上げる。
-pub const PARSER_VERSION: &str = "yt-1";
+pub const PARSER_VERSION: &str = "yt-3";
 
 static UNPARSED_LOG_DIR: OnceLock<PathBuf> = OnceLock::new();
 
@@ -41,10 +43,12 @@ const KEY_REACTION_MUTATIONS_PATH: &str = "reactionMutationsPath";
 /// 既定 `payload>emojiFountainDataEntity>reactionBuckets`。
 const KEY_REACTION_BUCKET_PATH: &str = "reactionBucketPath";
 
-const DEFAULT_ACTIONS_PATH: &[&str] =
-    &["continuationContents", "liveChatContinuation", "actions"];
-const DEFAULT_CONTINUATIONS_PATH: &[&str] =
-    &["continuationContents", "liveChatContinuation", "continuations"];
+const DEFAULT_ACTIONS_PATH: &[&str] = &["continuationContents", "liveChatContinuation", "actions"];
+const DEFAULT_CONTINUATIONS_PATH: &[&str] = &[
+    "continuationContents",
+    "liveChatContinuation",
+    "continuations",
+];
 const DEFAULT_CONTINUATION_DATA_KEYS: &[&str] = &[
     "invalidationContinuationData",
     "timedContinuationData",
@@ -56,6 +60,8 @@ const DEFAULT_REACTION_MUTATIONS_PATH: &[&str] =
     &["frameworkUpdates", "entityBatchUpdate", "mutations"];
 const DEFAULT_REACTION_BUCKET_PATH: &[&str] =
     &["payload", "emojiFountainDataEntity", "reactionBuckets"];
+const MAX_REACTION_EMOJI_UTF16_UNITS: usize = 32;
+const MAX_REACTION_TYPES_PER_POLL: usize = 64;
 
 /// `paths` のキー値(`>` 区切り)をキー列へ分割。欠落/空なら `default` を返す。
 fn split_path<'a>(
@@ -64,7 +70,11 @@ fn split_path<'a>(
     default: &'static [&'static str],
 ) -> Vec<&'a str> {
     match paths.get(key).map(String::as_str).filter(|s| !s.is_empty()) {
-        Some(s) => s.split('>').map(str::trim).filter(|p| !p.is_empty()).collect(),
+        Some(s) => s
+            .split('>')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .collect(),
         None => default.to_vec(),
     }
 }
@@ -76,7 +86,11 @@ fn split_lines<'a>(
     default: &'static [&'static str],
 ) -> Vec<&'a str> {
     match paths.get(key).map(String::as_str).filter(|s| !s.is_empty()) {
-        Some(s) => s.split('\n').map(str::trim).filter(|p| !p.is_empty()).collect(),
+        Some(s) => s
+            .split('\n')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .collect(),
         None => default.to_vec(),
     }
 }
@@ -131,7 +145,10 @@ pub fn extract_actions(resp: &Value, paths: &HashMap<String, String>) -> Vec<Val
 /// continuations への探索パスは `paths` の `continuationsPath`(`>` 区切り)、
 /// 入れ子の continuationData キー群は `continuationDataKeys`(改行区切り)で
 /// 差し替え可能。欠落/空のときは既定で現行どおり辿る。
-pub fn next_continuation(resp: &Value, paths: &HashMap<String, String>) -> (Option<String>, Option<u64>) {
+pub fn next_continuation(
+    resp: &Value,
+    paths: &HashMap<String, String>,
+) -> (Option<String>, Option<u64>) {
     let conts_path = split_path(paths, KEY_CONTINUATIONS_PATH, DEFAULT_CONTINUATIONS_PATH);
     let conts = dig_keys(resp, &conts_path).and_then(|v| v.as_array());
 
@@ -139,7 +156,11 @@ pub fn next_continuation(resp: &Value, paths: &HashMap<String, String>) -> (Opti
         return (None, None);
     };
 
-    let data_keys = split_lines(paths, KEY_CONTINUATION_DATA_KEYS, DEFAULT_CONTINUATION_DATA_KEYS);
+    let data_keys = split_lines(
+        paths,
+        KEY_CONTINUATION_DATA_KEYS,
+        DEFAULT_CONTINUATION_DATA_KEYS,
+    );
 
     for cont in conts {
         // 入れ子のキー名は複数パターンある。順に試す。
@@ -149,9 +170,7 @@ pub fn next_continuation(resp: &Value, paths: &HashMap<String, String>) -> (Opti
                     .get("continuation")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
-                let timeout = data
-                    .get("timeoutMs")
-                    .and_then(|v| v.as_u64());
+                let timeout = data.get("timeoutMs").and_then(|v| v.as_u64());
                 if token.is_some() {
                     return (token, timeout);
                 }
@@ -162,69 +181,144 @@ pub fn next_continuation(resp: &Value, paths: &HashMap<String, String>) -> (Opti
     (None, None)
 }
 
-/// レスポンス1回分に含まれる YouTube 絵文字リアクション増分を合算する。
+/// レスポンス1回分に含まれる YouTube 絵文字リアクション増分を種類別に返す。
 ///
 /// InnerTube の `frameworkUpdates.entityBatchUpdate.mutations[]` から
 /// `payload.emojiFountainDataEntity.reactionBuckets[]` を辿る。bucket 内は
 /// `reactions[].value` を優先し、`reactions` が無い/空のときだけ
 /// `reactionsData[].reactionCount` にフォールバックする。
 /// 探索パスは `paths` の `reactionMutationsPath` / `reactionBucketPath` で差し替え可能。
-pub fn extract_reactions_delta(resp: &Value, paths: &HashMap<String, String>) -> u32 {
+pub fn extract_reactions(
+    resp: &Value,
+    paths: &HashMap<String, String>,
+    channel: &str,
+) -> Vec<YoutubeReaction> {
+    extract_reaction_counts(resp, paths, channel).by_emoji
+}
+
+/// 統計用の総数と演出用の種類別リアクションを1回の走査で抽出する。
+///
+/// 絵文字IDが欠落・型不正でも、有効なcountは統計へ加算する。演出用データだけを
+/// 安全に捨てることで、InnerTubeの部分的な仕様変更時もGoals集計を維持する。
+#[derive(Debug, PartialEq, Eq)]
+pub struct ExtractedReactionCounts {
+    pub total_delta: u32,
+    pub by_emoji: Vec<YoutubeReaction>,
+}
+
+pub fn extract_reaction_counts(
+    resp: &Value,
+    paths: &HashMap<String, String>,
+    channel: &str,
+) -> ExtractedReactionCounts {
     let mutations_path = split_path(
         paths,
         KEY_REACTION_MUTATIONS_PATH,
         DEFAULT_REACTION_MUTATIONS_PATH,
     );
-    let bucket_path = split_path(paths, KEY_REACTION_BUCKET_PATH, DEFAULT_REACTION_BUCKET_PATH);
+    let bucket_path = split_path(
+        paths,
+        KEY_REACTION_BUCKET_PATH,
+        DEFAULT_REACTION_BUCKET_PATH,
+    );
     let Some(mutations) = dig_keys(resp, &mutations_path).and_then(|v| v.as_array()) else {
-        return 0;
+        return ExtractedReactionCounts {
+            total_delta: 0,
+            by_emoji: Vec::new(),
+        };
     };
 
-    let mut total = 0u32;
+    let mut reactions = Vec::<YoutubeReaction>::new();
+    let mut indexes = HashMap::<String, usize>::new();
+    let mut total_delta = 0u32;
     for mutation in mutations {
         let Some(buckets) = dig_keys(mutation, &bucket_path).and_then(|v| v.as_array()) else {
             continue;
         };
         for bucket in buckets {
-            total = total.saturating_add(sum_reaction_bucket(bucket));
+            append_reaction_bucket(
+                bucket,
+                channel,
+                &mut total_delta,
+                &mut reactions,
+                &mut indexes,
+            );
         }
     }
 
-    total
+    ExtractedReactionCounts {
+        total_delta,
+        by_emoji: reactions,
+    }
 }
 
-fn sum_reaction_bucket(bucket: &Value) -> u32 {
-    if let Some(reactions) = bucket
+/// 既存の Goals 累計向け合計値。
+pub fn extract_reactions_delta(resp: &Value, paths: &HashMap<String, String>) -> u32 {
+    extract_reaction_counts(resp, paths, "").total_delta
+}
+
+fn append_reaction_bucket(
+    bucket: &Value,
+    channel: &str,
+    total_delta: &mut u32,
+    output: &mut Vec<YoutubeReaction>,
+    indexes: &mut HashMap<String, usize>,
+) {
+    let (items, emoji_key, count_key) = if let Some(reactions) = bucket
         .get("reactions")
         .and_then(|v| v.as_array())
         .filter(|arr| !arr.is_empty())
     {
-        return reactions.iter().fold(0u32, |acc, reaction| {
-            acc.saturating_add(
-                reaction
-                    .get("value")
-                    .and_then(|v| v.as_u64())
-                    .map(saturating_u32)
-                    .unwrap_or(0),
-            )
-        });
-    }
+        (reactions.as_slice(), "key", "value")
+    } else if let Some(reactions) = bucket.get("reactionsData").and_then(|v| v.as_array()) {
+        (reactions.as_slice(), "unicodeEmojiId", "reactionCount")
+    } else {
+        return;
+    };
 
-    bucket
-        .get("reactionsData")
-        .and_then(|v| v.as_array())
-        .map(|reactions| {
-            reactions.iter().fold(0u32, |acc, reaction| {
-                acc.saturating_add(
-                    reaction
-                        .get("reactionCount")
-                        .and_then(|v| v.as_u64())
-                        .map(saturating_u32)
-                        .unwrap_or(0),
-                )
-            })
-        })
-        .unwrap_or(0)
+    for item in items {
+        let Some(count) = item.get(count_key).and_then(parse_reaction_count) else {
+            continue;
+        };
+        *total_delta = total_delta.saturating_add(count);
+
+        let Some(emoji) = item
+            .get(emoji_key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|emoji| is_bounded_reaction_emoji(emoji))
+        else {
+            continue;
+        };
+
+        if let Some(index) = indexes.get(emoji).copied() {
+            output[index].count = output[index].count.saturating_add(count);
+        } else if output.len() < MAX_REACTION_TYPES_PER_POLL {
+            indexes.insert(emoji.to_string(), output.len());
+            output.push(YoutubeReaction {
+                channel: channel.to_string(),
+                emoji: emoji.to_string(),
+                count,
+            });
+        }
+    }
+}
+
+fn is_bounded_reaction_emoji(emoji: &str) -> bool {
+    !emoji.is_empty()
+        && emoji
+            .encode_utf16()
+            .take(MAX_REACTION_EMOJI_UTF16_UNITS + 1)
+            .count()
+            <= MAX_REACTION_EMOJI_UTF16_UNITS
+}
+
+fn parse_reaction_count(value: &Value) -> Option<u32> {
+    value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|text| text.parse::<u64>().ok()))
+        .map(saturating_u32)
+        .filter(|count| *count > 0)
 }
 
 fn saturating_u32(value: u64) -> u32 {
@@ -244,6 +338,7 @@ pub fn is_chat_item_action(action: &Value) -> bool {
 /// - liveChatPaidMessageRenderer  : SuperChat
 /// - liveChatMembershipItemRenderer: メンバーシップ
 /// - liveChatPaidStickerRenderer  : SuperSticker
+/// - liveChat*Gift*Renderer / gift情報付き通知: Jewelsギフト(静的通知)
 pub fn parse_action(action: &Value, channel: &str) -> Option<ChatMessage> {
     // addChatItemAction.item の中に各種 renderer がぶら下がる。
     let item = dig_keys(action, &["addChatItemAction", "item"])?;
@@ -260,8 +355,140 @@ pub fn parse_action(action: &Value, channel: &str) -> Option<ChatMessage> {
     if let Some(r) = item.get("liveChatPaidStickerRenderer") {
         return parse_paid_sticker(r, channel);
     }
+    if let Some(r) = find_virtual_gift_renderer(item) {
+        return parse_virtual_gift_notice(r, channel);
+    }
 
     None
+}
+
+/// Jewelsギフトは新機能のため、renderer名だけでなく公式フィールド
+/// (`giftDetails` / `jewelsAmount`)と通知本文からも寛容に判定する。
+/// メンバーシップギフトは既存のMembership扱いと混同しない。
+fn find_virtual_gift_renderer(item: &Value) -> Option<&Value> {
+    let renderers = item.as_object()?;
+    renderers.iter().find_map(|(name, renderer)| {
+        let lower_name = name.to_ascii_lowercase();
+        let is_membership_gift =
+            lower_name.contains("membership") || lower_name.contains("sponsorship");
+        let direct_gift_renderer = lower_name.contains("gift") && !is_membership_gift;
+        let structured_gift = !is_membership_gift && contains_virtual_gift_field(renderer);
+        let generic_gift_notice =
+            lower_name.contains("viewerengagement") && contains_virtual_gift_text(renderer);
+
+        (direct_gift_renderer || structured_gift || generic_gift_notice).then_some(renderer)
+    })
+}
+
+fn contains_virtual_gift_field(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => map.iter().any(|(key, child)| {
+            matches!(
+                key.to_ascii_lowercase().as_str(),
+                "giftdetails" | "giftmetadata" | "giftname" | "gifturl" | "jewelsamount"
+            ) || contains_virtual_gift_field(child)
+        }),
+        Value::Array(values) => values.iter().any(contains_virtual_gift_field),
+        _ => false,
+    }
+}
+
+fn contains_virtual_gift_text(value: &Value) -> bool {
+    let lower = value.to_string().to_lowercase();
+    let mentions_gift =
+        lower.contains("gift") || lower.contains("jewel") || lower.contains("ギフト");
+    let mentions_membership = lower.contains("membership")
+        || lower.contains("sponsorship")
+        || lower.contains("メンバーシップ");
+    mentions_gift && !mentions_membership
+}
+
+fn parse_virtual_gift_notice(r: &Value, channel: &str) -> Option<ChatMessage> {
+    let mut author = parse_author(r);
+    if author.name.trim().is_empty() {
+        author.name = "ギフト送信者".to_string();
+    }
+    let gift_name = find_value_by_key(r, &["giftName", "altText"])
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && !is_placeholder_gift_text(value));
+    let jewels = find_value_by_key(r, &["jewelsAmount"]).and_then(parse_u64_value);
+    let combo = find_value_by_key(r, &["comboCount"]).and_then(parse_u64_value);
+
+    let text = if let Some(name) = gift_name {
+        let mut details = Vec::new();
+        if let Some(jewels) = jewels.filter(|value| *value > 0) {
+            details.push(format!("{jewels} Jewels"));
+        }
+        if let Some(combo) = combo.filter(|value| *value > 1) {
+            details.push(format!("×{combo}"));
+        }
+        Some(if details.is_empty() {
+            name.to_string()
+        } else {
+            format!("{name}（{}）", details.join("・"))
+        })
+    } else if let Some(jewels) = jewels.filter(|value| *value > 0) {
+        let combo = combo
+            .filter(|value| *value > 1)
+            .map(|value| format!("・×{value}"))
+            .unwrap_or_default();
+        Some(format!("{jewels} Jewels{combo}"))
+    } else {
+        let notice = ["message", "headerPrimaryText", "headerSubtext", "text"]
+            .iter()
+            .find_map(|key| r.get(*key).and_then(simple_text));
+        static_gift_notice(notice.as_deref())
+    }?;
+
+    Some(build_message(
+        r,
+        channel,
+        author,
+        vec![Fragment::text(text)],
+        MessageKind::Gift,
+        None,
+    ))
+}
+
+fn find_value_by_key<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a Value> {
+    match value {
+        Value::Object(map) => {
+            for key in keys {
+                if let Some(found) = map.get(*key) {
+                    return Some(found);
+                }
+            }
+            map.values()
+                .find_map(|child| find_value_by_key(child, keys))
+        }
+        Value::Array(values) => values
+            .iter()
+            .find_map(|child| find_value_by_key(child, keys)),
+        _ => None,
+    }
+}
+
+fn parse_u64_value(value: &Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+}
+
+fn static_gift_notice(display_message: Option<&str>) -> Option<String> {
+    let text = display_message.unwrap_or_default().trim();
+    if text.is_empty() || is_placeholder_gift_text(text) {
+        None
+    } else {
+        Some(text.to_string())
+    }
+}
+
+fn is_placeholder_gift_text(text: &str) -> bool {
+    matches!(
+        text.trim().to_ascii_lowercase().as_str(),
+        "gift" | "[gift]" | "ギフト" | "[ギフト]"
+    )
 }
 
 /// 通常テキストコメント。
@@ -359,7 +586,16 @@ fn build_message(
     let id = r
         .get("id")
         .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            if kind == MessageKind::Gift {
+                gift_fallback_id(r, channel, &author)
+            } else {
+                None
+            }
+        })
         .unwrap_or_else(ChatMessage::new_id);
 
     // timestampUsec はマイクロ秒文字列。ms に変換。
@@ -382,6 +618,47 @@ fn build_message(
         raw: None,
         skip_tts: false,
     }
+}
+
+/// InnerTubeでもid欠落時に同じギフト更新を同じ行へまとめる。
+/// comboCountや表示本文はキーに含めず、更新でキーが変わらないようにする。
+fn gift_fallback_id(r: &Value, channel: &str, author: &Author) -> Option<String> {
+    let gift_name = find_value_by_key(r, &["giftName", "altText"])
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && !is_placeholder_gift_text(value))
+        .unwrap_or_default();
+    let jewels = find_value_by_key(r, &["jewelsAmount"])
+        .and_then(parse_u64_value)
+        .filter(|value| *value > 0)
+        .map(|value| value.to_string())
+        .unwrap_or_default();
+    let timestamp = r
+        .get("timestampUsec")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .unwrap_or_default();
+    let author_id = author.id.trim();
+    let author_name = author.name.trim();
+
+    if gift_name.is_empty()
+        && jewels.is_empty()
+        && timestamp.is_empty()
+        && !r
+            .get("message")
+            .and_then(simple_text)
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false)
+    {
+        return None;
+    }
+    if author_id.is_empty() && author_name.is_empty() && timestamp.is_empty() {
+        return None;
+    }
+
+    Some(format!(
+        "youtube-gift:{channel}:{author_id}:{author_name}:{timestamp}:{gift_name}:{jewels}"
+    ))
 }
 
 /// 著者情報(名前/ID/色/バッジ/ロール)をレンダラから抽出。
@@ -600,8 +877,7 @@ fn split_currency_value(raw: &str) -> (String, f64) {
         .collect();
 
     let number: String = normalize_amount_number(
-        &raw
-            .chars()
+        &raw.chars()
             .filter(|c| c.is_ascii_digit() || *c == '.' || *c == ',')
             .collect::<String>(),
     );
@@ -643,10 +919,7 @@ fn normalize_amount_number(number: &str) -> String {
 
 fn normalize_comma_only_number(number: &str) -> String {
     let parts: Vec<&str> = number.split(',').collect();
-    if parts.len() > 1
-        && parts[0].len() <= 3
-        && parts[1..].iter().all(|part| part.len() == 3)
-    {
+    if parts.len() > 1 && parts[0].len() <= 3 && parts[1..].iter().all(|part| part.len() == 3) {
         return parts.concat();
     }
 
@@ -715,10 +988,10 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        dig, extract_actions, extract_reactions_delta, parse_action, parse_runs,
-        split_currency_value, Seg,
+        dig, extract_actions, extract_reaction_counts, extract_reactions_delta, parse_action,
+        parse_runs, split_currency_value, Seg,
     };
-    use crate::model::{Fragment, MessageKind};
+    use crate::model::{Fragment, MessageKind, YoutubeReaction};
 
     #[test]
     fn dig_returns_value_or_none_for_missing_path() {
@@ -742,18 +1015,16 @@ mod tests {
 
         assert_eq!(found, Some(42));
         assert!(dig(&payload, &[Seg::Key("outer"), Seg::Idx(1)]).is_none());
-        assert!(
-            dig(
-                &payload,
-                &[
-                    Seg::Key("outer"),
-                    Seg::Idx(0),
-                    Seg::Key("missing"),
-                    Seg::Key("leaf"),
-                ],
-            )
-            .is_none()
-        );
+        assert!(dig(
+            &payload,
+            &[
+                Seg::Key("outer"),
+                Seg::Idx(0),
+                Seg::Key("missing"),
+                Seg::Key("leaf"),
+            ],
+        )
+        .is_none());
         assert!(dig(&payload, &[Seg::Key("outer"), Seg::Key("inner")]).is_none());
     }
 
@@ -887,6 +1158,132 @@ mod tests {
     }
 
     #[test]
+    fn parse_action_keeps_jewels_gift_notice_as_static_comment() {
+        let action = json!({
+            "addChatItemAction": {
+                "item": {
+                    "liveChatGiftPurchaseAnnouncementRenderer": {
+                        "id": "gift-1",
+                        "timestampUsec": "2000000",
+                        "authorExternalChannelId": "gift-author-1",
+                        "authorName": { "simpleText": "Alice" },
+                        "giftDetails": {
+                            "giftName": "バラ",
+                            "jewelsAmount": 100,
+                            "comboCount": 3
+                        }
+                    }
+                }
+            }
+        });
+
+        let message = parse_action(&action, "video-1").expect("gift notice");
+        assert_eq!(message.kind, MessageKind::Gift);
+        assert_eq!(message.author.name, "Alice");
+        assert_eq!(message.plain_text(), "バラ（100 Jewels・×3）");
+    }
+
+    #[test]
+    fn parse_action_drops_empty_gift_candidate() {
+        let action = json!({
+            "addChatItemAction": {
+                "item": {
+                    "liveChatGiftPurchaseAnnouncementRenderer": {
+                        "id": "empty-gift-1",
+                        "timestampUsec": "2000000"
+                    }
+                }
+            }
+        });
+
+        assert!(parse_action(&action, "video-1").is_none());
+    }
+
+    #[test]
+    fn parse_action_drops_placeholder_gift_notice() {
+        let action = json!({
+            "addChatItemAction": {
+                "item": {
+                    "liveChatGiftPurchaseAnnouncementRenderer": {
+                        "id": "placeholder-gift-1",
+                        "authorName": { "simpleText": "Alice" },
+                        "message": { "simpleText": "[ギフト]" }
+                    }
+                }
+            }
+        });
+
+        assert!(parse_action(&action, "video-1").is_none());
+    }
+
+    #[test]
+    fn parse_action_reuses_stable_id_for_gift_combo_updates_without_id() {
+        let action = |combo_count| {
+            json!({
+                "addChatItemAction": {
+                    "item": {
+                        "liveChatGiftPurchaseAnnouncementRenderer": {
+                            "timestampUsec": "2000000",
+                            "authorExternalChannelId": "gift-author-1",
+                            "authorName": { "simpleText": "Alice" },
+                            "giftDetails": {
+                                "giftName": "バラ",
+                                "jewelsAmount": 100,
+                                "comboCount": combo_count
+                            }
+                        }
+                    }
+                }
+            })
+        };
+
+        let first = parse_action(&action(1), "video-1").expect("first gift");
+        let update = parse_action(&action(2), "video-1").expect("combo update");
+        assert_eq!(first.id, update.id);
+        assert_ne!(first.plain_text(), update.plain_text());
+    }
+
+    #[test]
+    fn parse_action_keeps_generic_jewels_gift_notice() {
+        let action = json!({
+            "addChatItemAction": {
+                "item": {
+                    "liveChatViewerEngagementMessageRenderer": {
+                        "id": "gift-generic-1",
+                        "timestampUsec": "3000000",
+                        "icon": { "iconType": "GIFT" },
+                        "message": {
+                            "runs": [{ "text": "Aliceさんがギフトを贈りました" }]
+                        }
+                    }
+                }
+            }
+        });
+
+        let message = parse_action(&action, "video-1").expect("generic gift notice");
+        assert_eq!(message.kind, MessageKind::Gift);
+        assert_eq!(message.plain_text(), "Aliceさんがギフトを贈りました");
+    }
+
+    #[test]
+    fn jewels_gift_fallback_does_not_capture_membership_gifts() {
+        let action = json!({
+            "addChatItemAction": {
+                "item": {
+                    "liveChatSponsorshipsGiftPurchaseAnnouncementRenderer": {
+                        "id": "membership-gift-1",
+                        "headerPrimaryText": {
+                            "runs": [{ "text": "メンバーシップギフトを贈りました" }]
+                        }
+                    }
+                }
+            }
+        });
+
+        assert!(parse_action(&action, "video-1").is_none());
+    }
+
+    #[test]
     fn extract_reactions_delta_sums_reactions_values() {
         let payload = json!({
             "frameworkUpdates": {
@@ -918,6 +1315,59 @@ mod tests {
         let paths: HashMap<String, String> = HashMap::new();
 
         assert_eq!(extract_reactions_delta(&payload, &paths), 12);
+    }
+
+    #[test]
+    fn extract_reactions_preserves_emoji_counts_and_merges_duplicates() {
+        let payload = json!({
+            "frameworkUpdates": {
+                "entityBatchUpdate": {
+                    "mutations": [
+                        {
+                            "payload": {
+                                "emojiFountainDataEntity": {
+                                    "reactionBuckets": [
+                                        {
+                                            "reactions": [
+                                                { "key": "😂", "value": 2 },
+                                                { "key": "", "value": 9 },
+                                                { "key": "❤", "value": 0 }
+                                            ]
+                                        },
+                                        {
+                                            "reactionsData": [
+                                                { "unicodeEmojiId": "😂", "reactionCount": 3 },
+                                                { "unicodeEmojiId": "🎉", "reactionCount": "4" },
+                                                { "unicodeEmojiId": 123, "reactionCount": 5 }
+                                            ]
+                                        }
+                                    ]
+                                }
+                            }
+                        }
+                    ]
+                }
+            }
+        });
+        let paths = HashMap::new();
+
+        let parsed = extract_reaction_counts(&payload, &paths, "video-1");
+        assert_eq!(parsed.total_delta, 23);
+        assert_eq!(
+            parsed.by_emoji,
+            vec![
+                YoutubeReaction {
+                    channel: "video-1".to_string(),
+                    emoji: "😂".to_string(),
+                    count: 5,
+                },
+                YoutubeReaction {
+                    channel: "video-1".to_string(),
+                    emoji: "🎉".to_string(),
+                    count: 4,
+                },
+            ]
+        );
     }
 
     #[test]

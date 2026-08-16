@@ -33,6 +33,8 @@
   const PLATFORM_COLORS: Record<string, string> = {
     twitch: '#9146ff',
     youtube: '#ff0000',
+    x: '#1da1f2',
+    niconico: '#fcc800',
   };
 
   const KIND_BG: Record<string, string> = {
@@ -50,6 +52,7 @@
   };
 
   let platformColor = $derived(PLATFORM_COLORS[message.platform] ?? '#888');
+  let isGift = $derived(message.kind === 'gift');
   let hasHighlightBadge = $derived(
     message.author.badges.some(b => b.kind === 'highlight')
   );
@@ -263,6 +266,8 @@
   class:wrap={wrap}
   class:highlighted={isHighlighted}
   class:highlight-badge={hasHighlightBadge}
+  class:gift={isGift}
+  class:twitch-native={message.platform === 'twitch'}
   style:background={kindBg}
   style:color={kindFg}
   role="listitem"
@@ -276,12 +281,12 @@
     {#if badge.imageUrl}
       <img class="badge-img" src={badge.imageUrl} alt={badge.label} title={badge.label} />
     {:else}
-      <span class="badge-text" title={badge.label}>{badge.kind[0]?.toUpperCase()}</span>
+      <span class="badge-text" data-kind={badge.kind} title={badge.label}>{badge.kind[0]?.toUpperCase()}</span>
     {/if}
   {/each}
 
   <!-- Viewer sequence badge: after platform/role badges so Host/Mod stay first. -->
-  {#if viewerSeq}
+  {#if theme.showViewerBadges && viewerSeq}
     <span
       class="viewer-badge"
       class:badge-first={viewerSeq === 1}
@@ -297,6 +302,7 @@
   <!-- Author name -->
   <span
     class="author-name"
+    class:youtube-member-name={message.platform === 'youtube' && message.author.roles.member && !hasKindStyle}
     style:color={!hasKindStyle && message.author.displayColor ? message.author.displayColor : undefined}
   >
     {message.author.name}
@@ -308,6 +314,10 @@
   <!-- Amount badge for SuperChat/Bits -->
   {#if message.amount}
     <span class="amount-badge">{message.amount.rawText}</span>
+  {/if}
+
+  {#if isGift}
+    <span class="gift-label" title="YouTubeギフト" aria-label="YouTubeギフト">GIFT</span>
   {/if}
 
   <!-- Fragments -->
@@ -385,6 +395,88 @@
     opacity: 1;
   }
 
+  :global(.app[data-twitch-native-style='true']) .comment-item.twitch-native {
+    gap: 3px;
+    border-bottom-color: transparent;
+    background: #18181b;
+    font-family: Inter, Roobert, "Segoe UI", sans-serif;
+  }
+
+  :global(.app[data-twitch-native-style='true']) .comment-item.twitch-native:hover {
+    background: #26262c;
+  }
+
+  :global(.app[data-theme='light'][data-twitch-native-style='true']) .comment-item.twitch-native {
+    background: #fff;
+    color: #0e0e10;
+  }
+
+  :global(.app[data-theme='light'][data-twitch-native-style='true']) .comment-item.twitch-native:hover {
+    background: #efeff1;
+  }
+
+  :global(.app[data-twitch-native-style='true']) .comment-item.twitch-native .platform-dot {
+    width: 4px;
+    height: 12px;
+    border-radius: 1px;
+  }
+
+  :global(.app[data-twitch-native-style='true']) .comment-item.twitch-native .author-name {
+    color: #adadb8;
+    font-weight: 700;
+  }
+
+  :global(.app[data-theme='light'][data-twitch-native-style='true'])
+    .comment-item.twitch-native
+    .author-name {
+    color: #53535f;
+  }
+
+  :global(.app[data-twitch-native-style='true']) .comment-item.twitch-native .sep {
+    margin-right: 1px;
+    opacity: 1;
+  }
+
+  :global(.app[data-twitch-native-style='true']) .comment-item.twitch-native .emote {
+    height: 22px;
+  }
+
+  :global(.app[data-twitch-native-style='true'])
+    .comment-item.twitch-native
+    .badge-text[data-kind='broadcaster'] {
+    background: #e91916;
+  }
+
+  :global(.app[data-twitch-native-style='true'])
+    .comment-item.twitch-native
+    .badge-text[data-kind='moderator'] {
+    background: #00ad03;
+  }
+
+  :global(.app[data-twitch-native-style='true'])
+    .comment-item.twitch-native
+    .badge-text[data-kind='vip'] {
+    background: #e005b9;
+  }
+
+  :global(.app[data-twitch-native-style='true'])
+    .comment-item.twitch-native
+    .badge-text[data-kind='subscriber'] {
+    background: #6441a5;
+  }
+
+  :global(.app[data-twitch-native-style='true'])
+    .comment-item.twitch-native
+    .badge-text[data-kind='founder'] {
+    background: #c89b3c;
+    color: #18181b;
+  }
+
+  :global(.app[data-twitch-native-style='true']) .comment-item.twitch-native .badge-text {
+    color: #fff;
+    font-weight: 800;
+  }
+
   /* Highlight stays within the 28px row: only color/border, no size change. */
   .comment-item.highlighted {
     border-left-color: rgba(0, 0, 0, 0.35);
@@ -399,6 +491,30 @@
   .comment-item.highlight-badge {
     border-left-color: #ff9800;
     background: rgba(255, 152, 0, 0.08);
+  }
+
+  /* Jewelsギフト: 通常コメントと同じ密度を保ち、静かな紫アクセントだけで判別する。 */
+  .comment-item.gift {
+    border-left-color: #b66cff;
+    background: rgba(182, 108, 255, 0.1);
+  }
+
+  .comment-item.gift .author-name {
+    color: #e1c4ff;
+    font-weight: 700;
+  }
+
+  .gift-label {
+    flex-shrink: 0;
+    padding: 1px 5px;
+    border: 1px solid rgba(205, 158, 255, 0.75);
+    border-radius: 3px;
+    background: #6f2da8;
+    color: #fff;
+    font-size: 9px;
+    font-weight: 800;
+    line-height: 13px;
+    letter-spacing: 0.06em;
   }
 
   .platform-dot {

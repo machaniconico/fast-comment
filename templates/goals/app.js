@@ -27,12 +27,33 @@ function applyParams() {
   const font = clampNumber(Number(params.get('font')), 100, 50, 200) / 100;
   const bg = clampNumber(Number(params.get('bg')), 82, 0, 100) / 100;
   const pos = (params.get('pos') || 'bottom').toLowerCase();
+  const requestedLayout = (params.get('layout') || 'horizontal').toLowerCase();
+  const layout = ['horizontal', 'vertical', 'grid'].includes(requestedLayout)
+    ? requestedLayout
+    : 'horizontal';
+  const requestedSkin = (params.get('skin') || 'glass').toLowerCase();
+  const customImage = params.get('image') || '';
+  const hasCustomSkin = requestedSkin === 'custom'
+    && /^\/skin\/[^/]+\.png$/i.test(customImage);
+  const skin = hasCustomSkin
+    ? 'custom'
+    : ['glass', 'solid', 'minimal'].includes(requestedSkin)
+      ? requestedSkin
+      : 'glass';
 
   document.documentElement.style.setProperty('--font-scale', String(font));
   document.documentElement.style.setProperty('--bg-alpha', bg.toFixed(2));
 
   overlay.classList.remove('top', 'bottom', 'left', 'right');
   overlay.classList.add(['top', 'bottom', 'left', 'right'].includes(pos) ? pos : 'bottom');
+  goalsRoot.classList.remove('layout-horizontal', 'layout-vertical', 'layout-grid');
+  goalsRoot.classList.add(`layout-${layout}`);
+  goalsRoot.classList.remove('skin-glass', 'skin-solid', 'skin-minimal', 'skin-custom');
+  goalsRoot.classList.add(`skin-${skin}`);
+  goalsRoot.style.setProperty(
+    '--custom-skin-image',
+    hasCustomSkin ? `url(${JSON.stringify(customImage)})` : 'none'
+  );
 }
 
 function connect() {
@@ -86,17 +107,21 @@ function retry() {
 
 function render(snapshot) {
   if (!snapshot || typeof snapshot !== 'object') return;
+  if (snapshot.goalsEnabled === false) {
+    goalsRoot.replaceChildren();
+    return;
+  }
   const goals = snapshot.goals || {};
+  const visible = snapshot.goalsVisible || {};
   const cards = [];
 
   for (const metric of METRICS) {
     if (only.size > 0 && !only.has(metric.key)) continue;
+    if (visible[metric.key] === false) continue;
     if (metric.key === 'likes' && snapshot.likesAvailable === false) continue;
     if (metric.key === 'reactions' && snapshot.reactionsAvailable === false) continue;
 
     const target = toCount(goals[metric.key]);
-    if (target === 0) continue;
-
     const current = toCount(snapshot[metric.key]);
     cards.push(createCard(metric, current, target));
   }

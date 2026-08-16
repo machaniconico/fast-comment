@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
+  import { TauriEvent } from '@tauri-apps/api/event';
   import type { Platform } from './lib/types';
   import CommentList from './lib/components/CommentList.svelte';
   import Dashboard from './lib/components/Dashboard.svelte';
@@ -28,7 +29,11 @@
     checkForUpdate,
     openReleaseUrl,
     getConfig,
+    setConfig,
+    getTtsQueueState,
     onTtsNotice,
+    onTtsQueueState,
+    setTtsPaused,
     toggleDanmakuOverlay,
     isDanmakuOverlayOpen,
     setAlwaysOnTop,
@@ -37,6 +42,7 @@
 
   let unlisten: (() => void) | null = null;
   let unlistenTtsNotice: (() => void) | null = null;
+  let unlistenTtsQueueState: (() => void) | null = null;
   let config: AppConfig | null = $state(null);
   let updateStatus = $state<UpdateStatus | null>(null);
   let updateDismissed = $state(false);
@@ -45,39 +51,24 @@
   let toolsOpen = $state(false);
   let toolsMenuEl: HTMLDivElement | null = null;
   let danmakuOpen = $state(false);
+  let goalsToggleSaving = $state(false);
+  let goalsToggleError = $state('');
+  let ttsPaused = $state(false);
+  let ttsToggleBusy = $state(false);
   let unlistenDanmakuState: (() => void) | null = null;
   let destroyed = false;
   const DANMAKU_LABEL = 'danmaku';
-
-  // ── Donation summary helpers ──────────────────────────────────────────────
-
-  const CURRENCY_SYMBOL: Record<string, string> = {
-    JPY: '¥', USD: '$', EUR: '€', GBP: '£',
-  };
-
-  function formatDonationAmount(currency: string, total: number): string {
-    if (currency.toLowerCase() === 'bits') {
-      return `${total.toLocaleString('ja-JP')} bits`;
-    }
-    const sym = CURRENCY_SYMBOL[currency] ?? currency + ' ';
-    return `${sym}${new Intl.NumberFormat('ja-JP').format(total)}`;
-  }
-
-  /** Entries to render: only currencies with count > 0. */
-  const donationEntries = $derived(
-    Object.entries(store.donationSummary.byCurrency).filter(([, t]) => t.count > 0)
-  );
-
-  const hasDonations = $derived(
-    donationEntries.length > 0 || store.donationSummary.memberships > 0
-  );
 
   function isDonationPanelEnabled(cfg: AppConfig | null): boolean {
     return cfg?.ui.showDonationPanel === true;
   }
 
-  function isGoalsBarEnabled(cfg: AppConfig | null): boolean {
-    return cfg?.goals?.enabled === true && cfg?.goals?.showInApp === true;
+  function isGoalsBarVisible(cfg: AppConfig | null): boolean {
+    return cfg?.goals?.showInApp === true;
+  }
+
+  function isGoalsFeatureEnabled(cfg: AppConfig | null): boolean {
+    return cfg?.goals?.enabled === true;
   }
 
   function isEffectsEnabled(cfg: AppConfig | null): boolean {
@@ -88,11 +79,24 @@
     return cfg?.welcome?.enabled === true;
   }
 
+  function isTtsConfigured(cfg: AppConfig | null): boolean {
+    return cfg?.tts?.backend !== undefined && cfg.tts.backend !== 'none';
+  }
+
   const showDonationPanel = $derived(isDonationPanelEnabled(config));
-  const showGoalsBar = $derived(isGoalsBarEnabled(config));
+  const showGoalsBar = $derived(isGoalsBarVisible(config));
+  const goalsFeatureEnabled = $derived(isGoalsFeatureEnabled(config));
   const showEffects = $derived(isEffectsEnabled(config));
   const showWelcome = $derived(isWelcomeEnabled(config));
-  const standaloneOpen = $derived(ui.showDashboard || ui.showRaffle || ui.showTimer);
+  const ttsConfigured = $derived(isTtsConfigured(config));
+  const standaloneOpen = $derived(
+    ui.showDashboard || ui.showRaffle || ui.showTimer || ui.toolSettingsView !== null
+  );
+  const showGoalsControls = $derived(
+    ui.activeTab === 'comments'
+      && !standaloneOpen
+      && (goalsFeatureEnabled || showGoalsBar)
+  );
 
   $effect(() => {
     if (!showDonationPanel && ui.activeTab === 'donations') ui.setTab('comments');
@@ -115,6 +119,17 @@
       if (destroyed) fn();
       else unlistenTtsNotice = fn;
     }
+    try {
+      const current = await getTtsQueueState();
+      if (!destroyed && current) ttsPaused = current.paused === true;
+      const fn = await onTtsQueueState((next) => {
+        if (!destroyed) ttsPaused = next.paused === true;
+      });
+      if (destroyed) fn();
+      else unlistenTtsQueueState = fn;
+    } catch (e) {
+      console.warn('[tts] queue state load failed', e);
+    }
     const initialDanmakuOpen = await isDanmakuOverlayOpen();
     if (!destroyed) danmakuOpen = initialDanmakuOpen;
     if (initialDanmakuOpen) {
@@ -133,6 +148,7 @@
     window.removeEventListener('keydown', onWindowKey);
     unlisten?.();
     unlistenTtsNotice?.();
+    unlistenTtsQueueState?.();
     unlistenDanmakuState?.();
     if (searchDebounce) clearTimeout(searchDebounce);
     if (ttsNoticeTimer) clearTimeout(ttsNoticeTimer);
@@ -237,6 +253,11 @@
     }
   }
 
+  function selectDanmakuSettings() {
+    ui.openToolSettings('danmaku');
+    closeToolsMenu();
+  }
+
   function isTauri(): boolean {
     return typeof window !== 'undefined'
       && !!(window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
@@ -244,10 +265,7 @@
 
   async function listenDanmakuDestroyed(): Promise<(() => void) | null> {
     if (!isTauri()) return null;
-    const [{ WebviewWindow }, { TauriEvent }] = await Promise.all([
-      import('@tauri-apps/api/webviewWindow'),
-      import('@tauri-apps/api/event'),
-    ]);
+    const { WebviewWindow } = await import('@tauri-apps/api/webviewWindow');
     const overlay = await WebviewWindow.getByLabel(DANMAKU_LABEL);
     if (!overlay) return null;
     return overlay.listen<null>(TauriEvent.WINDOW_DESTROYED, () => {
@@ -263,10 +281,34 @@
     closeToolsMenu();
   }
 
+  function selectGoalsSettings() {
+    ui.openToolSettings('goals');
+    closeToolsMenu();
+  }
+
   function toggleAlwaysOnTop() {
     const next = !ui.alwaysOnTop;
     ui.setAlwaysOnTop(next);
     void setAlwaysOnTop(next);
+  }
+
+  async function toggleTtsReading() {
+    if (!ttsConfigured || ttsToggleBusy) return;
+    const previous = ttsPaused;
+    const next = !previous;
+    ttsPaused = next;
+    ttsToggleBusy = true;
+    try {
+      await setTtsPaused(next);
+    } catch (e) {
+      ttsPaused = previous;
+      showTtsNotice({
+        level: 'error',
+        message: `読み上げの切り替えに失敗しました: ${e instanceof Error ? e.message : String(e)}`,
+      });
+    } finally {
+      ttsToggleBusy = false;
+    }
   }
 
   async function loadUpdateStatus() {
@@ -308,7 +350,25 @@
   }
 
   function onSettingsSaved(nextConfig: AppConfig) {
-    config = structuredClone(nextConfig);
+    config = structuredClone($state.snapshot(nextConfig));
+  }
+
+  async function toggleGoalsInApp(event: Event) {
+    if (!config || goalsToggleSaving) return;
+    const previous = $state.snapshot(config);
+    const next = structuredClone(previous);
+    next.goals.showInApp = (event.currentTarget as HTMLInputElement).checked;
+    config = next;
+    goalsToggleSaving = true;
+    goalsToggleError = '';
+    try {
+      await setConfig(next);
+    } catch (e) {
+      config = previous;
+      goalsToggleError = e instanceof Error ? e.message : String(e);
+    } finally {
+      goalsToggleSaving = false;
+    }
   }
 
   async function onUpdateDownloadClick(e: MouseEvent) {
@@ -331,13 +391,17 @@
   <Welcome config={config.welcome} />
 {/if}
 
-<Milestone />
+{#if theme.showCommentMilestones}
+  <Milestone />
+{/if}
 
 <div
   class="app"
   data-theme={theme.resolved}
   data-font-size={theme.fontSize}
   data-density={theme.density}
+  data-youtube-member-name-green={config?.ui.youtubeMemberNameGreen !== false}
+  data-twitch-native-style={config?.ui.twitchNativeStyle !== false}
 >
   {#if updateStatus?.updateAvailable && !updateDismissed}
     <div class="update-banner" role="status" aria-live="polite">
@@ -379,23 +443,28 @@
       {#if store.allMessages.length > 0}
         <Sparkline />
       {/if}
-      {#if hasDonations}
-        <div class="donation-summary">
-          {#each donationEntries as [currency, tally]}
-            <span class="donation-badge">
-              💰 {formatDonationAmount(currency, tally.total)} ({tally.count})
-            </span>
-          {/each}
-          {#if store.donationSummary.memberships > 0}
-            <span class="donation-badge donation-badge--member">
-              👑 {store.donationSummary.memberships}
-            </span>
-          {/if}
-        </div>
-      {/if}
     </div>
 
     <div class="header-actions">
+      <button
+        class="tts-toggle-btn"
+        class:enabled={ttsConfigured && !ttsPaused}
+        class:muted={ttsPaused}
+        disabled={!ttsConfigured || ttsToggleBusy}
+        title={!ttsConfigured ? '読み上げ方式が設定されていません' : ttsPaused ? '音声読み上げをON' : '音声読み上げをOFF'}
+        aria-label={!ttsConfigured ? '音声読み上げは設定で無効です' : ttsPaused ? '音声読み上げをON' : '音声読み上げをOFF'}
+        aria-pressed={ttsConfigured && !ttsPaused}
+        onclick={toggleTtsReading}
+      >
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M4 9v6h4l5 4V5L8 9H4Z" />
+          {#if ttsPaused || !ttsConfigured}
+            <path class="speaker-slash" d="m17 9 5 5m0-5-5 5" />
+          {:else}
+            <path class="speaker-waves" d="M16 9.5a4 4 0 0 1 0 5M18.5 7a7.5 7.5 0 0 1 0 10" />
+          {/if}
+        </svg>
+      </button>
       <button
         class="window-pin-btn"
         class:active={ui.alwaysOnTop}
@@ -463,6 +532,18 @@
               class:active={danmakuOpen}
               onclick={selectDanmaku}
             >弾幕オーバーレイ{danmakuOpen ? '（表示中）' : ''}</button>
+            <button
+              role="menuitem"
+              class="tools-menu-item"
+              class:active={ui.toolSettingsView === 'danmaku'}
+              onclick={selectDanmakuSettings}
+            >弾幕・OBS設定</button>
+            <button
+              role="menuitem"
+              class="tools-menu-item"
+              class:active={ui.toolSettingsView === 'goals'}
+              onclick={selectGoalsSettings}
+            >目標設定</button>
           </div>
         {/if}
       </div>
@@ -477,10 +558,6 @@
       </div>
     </div>
   </header>
-
-  {#if showGoalsBar}
-    <GoalsBar />
-  {/if}
 
   <!-- ── Channel add bar (URL paste → auto-detect) ── -->
   {#if ui.activeTab === 'comments' && !standaloneOpen}
@@ -509,6 +586,16 @@
           class:active={store.filterPlatform === 'youtube'}
           onclick={() => onFilterClick('youtube')}
         >YouTube</button>
+        <button
+          class="filter-btn x"
+          class:active={store.filterPlatform === 'x'}
+          onclick={() => onFilterClick('x')}
+        >X</button>
+        <button
+          class="filter-btn niconico"
+          class:active={store.filterPlatform === 'niconico'}
+          onclick={() => onFilterClick('niconico')}
+        >ニコ生</button>
       </div>
 
       <!-- View mode -->
@@ -570,7 +657,11 @@
 
   <!-- ── Main content ── -->
   <div class="main-content" role="tabpanel">
-    {#if ui.showTimer}
+    {#if ui.toolSettingsView === 'goals'}
+      <Settings focus="goals" onConfigSaved={onSettingsSaved} />
+    {:else if ui.toolSettingsView === 'danmaku'}
+      <Settings focus="danmaku" onConfigSaved={onSettingsSaved} />
+    {:else if ui.showTimer}
       <Timer />
     {:else if ui.showDashboard}
       <Dashboard />
@@ -605,6 +696,30 @@
     {#if ui.composerOpen}
       <CommentComposer {config} />
     {/if}
+  {/if}
+
+  <!-- ── In-app goals (kept at the bottom; hidden by default via showInApp=false) ── -->
+  {#if showGoalsControls}
+    <section class="goals-panel" aria-label="アプリ内の目標表示">
+      <div class="goals-panel-controls">
+        <span class="goals-panel-label">目標</span>
+        <label class="goals-panel-toggle">
+          <input
+            type="checkbox"
+            checked={showGoalsBar}
+            disabled={goalsToggleSaving}
+            onchange={toggleGoalsInApp}
+          />
+          <span>{goalsToggleSaving ? '保存中' : 'コメビュに表示'}</span>
+        </label>
+        {#if goalsToggleError}
+          <span class="goals-toggle-error" title={goalsToggleError}>保存失敗</span>
+        {/if}
+      </div>
+      {#if showGoalsBar}
+        <GoalsBar />
+      {/if}
+    </section>
   {/if}
 
   <CommandPalette />
@@ -861,6 +976,62 @@
     transition: color 0.15s, background 0.15s, border-color 0.15s, filter 0.15s;
   }
 
+  .tts-toggle-btn {
+    width: 26px;
+    height: 26px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    padding: 0;
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 4px;
+    color: #8b949e;
+    background: rgba(255,255,255,0.04);
+    cursor: pointer;
+    transition: color 0.15s, background 0.15s, border-color 0.15s;
+  }
+
+  .tts-toggle-btn svg {
+    width: 16px;
+    height: 16px;
+    fill: currentColor;
+  }
+
+  .tts-toggle-btn .speaker-waves,
+  .tts-toggle-btn .speaker-slash {
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.8;
+    stroke-linecap: round;
+  }
+
+  .tts-toggle-btn.enabled {
+    color: #ffffff;
+    background: rgba(88,166,255,0.18);
+    border-color: rgba(88,166,255,0.5);
+  }
+
+  .tts-toggle-btn.muted {
+    color: #fca5a5;
+  }
+
+  .tts-toggle-btn:hover:not(:disabled) {
+    color: #ffffff;
+    background: rgba(255,255,255,0.1);
+  }
+
+  .tts-toggle-btn:focus-visible {
+    outline: 2px solid #58a6ff;
+    outline-offset: 2px;
+  }
+
+  .tts-toggle-btn:disabled {
+    color: #555;
+    cursor: not-allowed;
+    opacity: 0.55;
+  }
+
   .window-pin-btn.active {
     color: #fff;
     background: rgba(88,166,255,0.18);
@@ -983,6 +1154,22 @@
     color: #52606d;
   }
 
+  .app[data-theme='light'] .tts-toggle-btn {
+    color: #52606d;
+    background: rgba(15,23,42,0.03);
+    border-color: rgba(15,23,42,0.12);
+  }
+
+  .app[data-theme='light'] .tts-toggle-btn.enabled {
+    color: #0f172a;
+    background: rgba(25,118,210,0.13);
+    border-color: rgba(25,118,210,0.38);
+  }
+
+  .app[data-theme='light'] .tts-toggle-btn.muted {
+    color: #b91c1c;
+  }
+
   .app[data-theme='light'] .window-pin-btn.active {
     color: #0f172a;
     background: rgba(25,118,210,0.13);
@@ -1050,6 +1237,8 @@
 
   .filter-btn.twitch.active { background: rgba(145,70,255,0.3); border-color: #9146ff; color: #d4aaff; }
   .filter-btn.youtube.active { background: rgba(255,0,0,0.2); border-color: #ff4444; color: #ff9999; }
+  .filter-btn.x.active { background: rgba(29,161,242,0.22); border-color: #1da1f2; color: #1da1f2; }
+  .filter-btn.niconico.active { background: rgba(252,200,0,0.22); border-color: #fcc800; color: #fcc800; }
 
   .view-mode-btn {
     background: rgba(255,255,255,0.06);
@@ -1182,6 +1371,81 @@
   .clear-btn:hover { color: #f44336; }
 
   /* Main content */
+  .goals-panel {
+    flex-shrink: 0;
+    background: #171a1f;
+    border-bottom: 1px solid rgba(255,255,255,0.08);
+  }
+
+  .goals-panel :global(.goals-bar) {
+    border-bottom: 0;
+  }
+
+  .goals-panel-controls {
+    min-height: 27px;
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 8px;
+    padding: 3px 10px;
+    color: #8b949e;
+    font-size: 11px;
+  }
+
+  .goals-panel-label {
+    margin-right: auto;
+    color: #aeb6c2;
+    font-weight: 800;
+  }
+
+  .goals-panel-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    min-height: 20px;
+    color: #c7cdd6;
+    font-weight: 600;
+    cursor: pointer;
+    user-select: none;
+  }
+
+  .goals-panel-toggle input {
+    width: 15px;
+    height: 15px;
+    margin: 0;
+    accent-color: #1976d2;
+    cursor: pointer;
+  }
+
+  .goals-panel-toggle input:disabled,
+  .goals-panel-toggle input:disabled + span {
+    cursor: wait;
+    opacity: 0.6;
+  }
+
+  .goals-panel-toggle:focus-within {
+    color: #ffffff;
+  }
+
+  .goals-toggle-error {
+    color: #fca5a5;
+    font-weight: 700;
+  }
+
+  .app[data-theme='light'] .goals-panel {
+    background: #eef2f6;
+    border-bottom-color: rgba(15,23,42,0.1);
+  }
+
+  .app[data-theme='light'] .goals-panel-label,
+  .app[data-theme='light'] .goals-panel-toggle {
+    color: #334155;
+  }
+
+  .app[data-theme='light'] .goals-toggle-error {
+    color: #b91c1c;
+  }
+
   .main-content {
     flex: 1;
     overflow: hidden;
@@ -1233,30 +1497,6 @@
     background: rgba(15, 23, 42, 0.06);
   }
 
-  /* Donation summary badges in header */
-  .donation-summary {
-    display: flex;
-    align-items: center;
-    gap: 4px;
-    overflow: hidden;
-    flex-shrink: 1;
-    min-width: 0;
-  }
-
-  .donation-badge {
-    background: rgba(255,255,255,0.08);
-    color: #ffd600;
-    font-size: 11px;
-    padding: 1px 6px;
-    border-radius: 10px;
-    white-space: nowrap;
-    flex-shrink: 0;
-  }
-
-  .donation-badge--member {
-    color: #9e9e9e;
-  }
-
   .app[data-font-size] :global(.comment-item) {
     font-size: var(--fc-comment-font-size);
   }
@@ -1270,6 +1510,15 @@
   .app[data-density='compact'] :global(.badge-img),
   .app[data-density='compact'] :global(.emote) {
     height: 18px;
+  }
+
+  .app[data-youtube-member-name-green='true'] :global(.author-name.youtube-member-name) {
+    color: #2ba640 !important;
+  }
+
+  .app[data-theme='light'][data-youtube-member-name-green='true']
+    :global(.author-name.youtube-member-name) {
+    color: #137333 !important;
   }
 
   .app[data-theme='light'] :global(.comment-item) {

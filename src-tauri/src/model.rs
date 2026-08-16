@@ -10,6 +10,10 @@ use serde::{Deserialize, Serialize};
 pub enum Platform {
     Twitch,
     Youtube,
+    /// X (Twitter) ライブ配信 (broadcasts)。
+    X,
+    /// ニコニコ生放送。
+    Niconico,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -23,6 +27,8 @@ pub enum MessageKind {
     Membership,
     /// Twitch Bits(cheer)
     Bits,
+    /// YouTube Jewelsギフト(メンバーシップギフトとは別)
+    Gift,
     /// システム/通知メッセージ
     System,
 }
@@ -97,6 +103,21 @@ pub struct Participant {
     pub picked: bool,
 }
 
+/// YouTube が1回の更新で通知した絵文字別リアクション増分。
+///
+/// リアクションは匿名で、チャットメッセージではないため `ChatMessage` へ混ぜず、
+/// UI の短命な演出専用バッチとして送る。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct YoutubeReaction {
+    /// 配信識別子(videoId)。複数配信の同時接続でも出所を失わない。
+    pub channel: String,
+    /// YouTube が返した Unicode 絵文字。未知の種類も固定マッピングせず保持する。
+    pub emoji: String,
+    /// この更新に含まれる同種リアクション件数。
+    pub count: u32,
+}
+
 /// 正規化済みコメント。Source → Bus → UI/OBS を一貫して流れる単一型。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -146,5 +167,24 @@ impl ChatMessage {
 
     pub fn new_id() -> String {
         uuid::Uuid::new_v4().to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::YoutubeReaction;
+
+    #[test]
+    fn youtube_reaction_serializes_for_camel_case_ipc() {
+        let reaction = YoutubeReaction {
+            channel: "video-1".to_string(),
+            emoji: "🎉".to_string(),
+            count: 3,
+        };
+
+        let value = serde_json::to_value(reaction).expect("serialize YouTube reaction");
+        assert_eq!(value["channel"], "video-1");
+        assert_eq!(value["emoji"], "🎉");
+        assert_eq!(value["count"], 3);
     }
 }

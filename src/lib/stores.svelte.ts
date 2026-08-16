@@ -226,8 +226,36 @@ class CommentStore {
     let donChanged = false;
     let highlightDelta = 0;
     const incoming: BufEntry[] = [];
+    let baseBuffer = this._buf;
+    let copiedForGiftUpdate = false;
 
     for (const msg of messages) {
+      if (msg.kind === 'gift') {
+        const existingIndex = baseBuffer.findIndex((entry) => entry.msg.id === msg.id);
+        if (existingIndex >= 0) {
+          if (!copiedForGiftUpdate) {
+            baseBuffer = baseBuffer.slice();
+            copiedForGiftUpdate = true;
+          }
+          const previous = baseBuffer[existingIndex]?.msg;
+          const uiMsg: UiChatMessage = previous?.viewerSeq === undefined
+            ? msg
+            : { ...msg, viewerSeq: previous.viewerSeq };
+          baseBuffer[existingIndex] = { msg: uiMsg, search: buildSearch(msg) };
+          continue;
+        }
+
+        const pendingIndex = incoming.findIndex((entry) => entry.msg.id === msg.id);
+        if (pendingIndex >= 0) {
+          const previous = incoming[pendingIndex]?.msg;
+          const uiMsg: UiChatMessage = previous?.viewerSeq === undefined
+            ? msg
+            : { ...msg, viewerSeq: previous.viewerSeq };
+          incoming[pendingIndex] = { msg: uiMsg, search: buildSearch(msg) };
+          continue;
+        }
+      }
+
       const key = viewerKey(msg);
       let uiMsg: UiChatMessage = msg;
       if (key) {
@@ -261,7 +289,7 @@ class CommentStore {
     if (donChanged) this._donations = { byCurrency, memberships };
     if (highlightDelta) this._highlightSeq += highlightDelta;
 
-    const combined = this._buf.concat(incoming);
+    const combined = baseBuffer.concat(incoming);
     if (combined.length > this._maxBuffer) {
       this._buf = combined.slice(combined.length - this._maxBuffer);
       this.pruneHiddenIds();

@@ -25,21 +25,63 @@ use axum::{
 };
 use serde::Deserialize;
 use tauri::{AppHandle, Emitter};
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 
-use crate::model::ChatMessage;
+use crate::model::{ChatMessage, YoutubeReaction};
 use crate::stats::{StatsSnapshot, TimerSnapshot};
 
 /// broadcast チャネルの容量。UI/OBS の購読者が遅れても最新が優先される。
 const BROADCAST_CAPACITY: usize = 4096;
 /// UI へのバッチ送出間隔(約 60fps = 16ms)。
 const UI_BATCH_INTERVAL_MS: u64 = 16;
+/// 1回のリアクションIPCに載せる種類数上限。表示用だけをdropし、統計には影響させない。
+const MAX_REACTION_ITEMS_PER_UI_BATCH: usize = 256;
 /// WS クライアントごとの送信キュー上限(溢れたら古いものから drop)。
 const WS_CLIENT_QUEUE: usize = 256;
+
+/// YouTube リアクションをUIへ1フレーム単位でまとめて送る。
+///
+/// Sourceごとの応答バッチをさらに16ms窓で平坦化し、複数配信から同時に届いても
+/// 1リアクション1 IPC にならないようにする。OBSコメントWebSocketには混ぜない。
+pub fn spawn_reaction_ui_forwarder(
+    mut rx: mpsc::Receiver<Vec<YoutubeReaction>>,
+    app: AppHandle,
+    cancel: CancellationToken,
+) {
+    tauri::async_runtime::spawn(async move {
+        let mut ticker = interval(Duration::from_millis(UI_BATCH_INTERVAL_MS));
+        let mut batch = Vec::<YoutubeReaction>::with_capacity(32);
+
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = ticker.tick() => {
+                    if !batch.is_empty() {
+                        if let Err(e) = app.emit("youtube-reactions", &batch) {
+                            tracing::warn!("YouTubeリアクションのUI emitに失敗: {e}");
+                        }
+                        batch.clear();
+                    }
+                }
+                incoming = rx.recv() => {
+                    match incoming {
+                        Some(reactions) => {
+                            let available = MAX_REACTION_ITEMS_PER_UI_BATCH.saturating_sub(batch.len());
+                            batch.extend(reactions.into_iter().take(available));
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+
+        tracing::info!("YouTube reaction forwarder 終了");
+    });
+}
 
 /// Bus のハンドル。正規化済みメッセージの投入と、UI/OBS への配信起動を担う。
 #[derive(Clone)]
@@ -121,14 +163,16 @@ impl Bus {
     /// - `GET /?template=<name>`: `templates_dir/<name>/index.html` を返す。
     ///   `template` 未指定時は `default`。`../` 等のトラバーサルは拒否する。
     /// - `GET /<name>/...`: テンプレの静的アセットを配信(ServeDir)。
+    /// - `GET /skin/<file>.png`: ユーザー作成のGoals背景スキンを配信。
     ///
     /// `cancel` 発火でサーバを graceful shutdown する。
     pub fn spawn_obs_server(
         &self,
         templates_dir: PathBuf,
+        goals_skin_dir: PathBuf,
         cancel: CancellationToken,
     ) -> Result<tauri::async_runtime::JoinHandle<()>, String> {
-        self.spawn_obs_server_on_port(templates_dir, self.obs_port, cancel)
+        self.spawn_obs_server_on_port(templates_dir, goals_skin_dir, self.obs_port, cancel)
     }
 
     /// 指定ポートで OBS overlay サーバ(axum)を起動する。
@@ -137,6 +181,7 @@ impl Bus {
     pub fn spawn_obs_server_on_port(
         &self,
         templates_dir: PathBuf,
+        goals_skin_dir: PathBuf,
         port: u16,
         cancel: CancellationToken,
     ) -> Result<tauri::async_runtime::JoinHandle<()>, String> {
@@ -172,19 +217,22 @@ impl Bus {
             // テンプレ静的配信。ディレクトリ直アクセス時は index.html を返す。
             let serve_dir =
                 ServeDir::new(&templates_dir).append_index_html_on_directories(true);
+            let skin_dir = ServeDir::new(&goals_skin_dir);
 
             let app = Router::new()
                 .route("/ws", get(ws_handler))
                 .route("/stats", get(stats_ws_handler))
                 .route("/timer", get(timer_ws_handler))
                 .route("/", get(template_index_handler))
+                .nest_service("/skin", skin_dir)
                 .fallback_service(serve_dir)
                 .layer(CorsLayer::permissive())
                 .with_state(state);
 
             tracing::info!(
-                "OBS overlay サーバ起動: http://{addr}/  (templates: {})",
-                templates_dir.display()
+                "OBS overlay サーバ起動: http://{addr}/  (templates: {}, skins: {})",
+                templates_dir.display(),
+                goals_skin_dir.display()
             );
 
             let shutdown = async move {

@@ -12,7 +12,7 @@ use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{ChannelConfig, ChannelPlatform, YoutubeOverrides};
-use crate::model::{ChatMessage, Platform};
+use crate::model::{ChatMessage, Platform, YoutubeReaction};
 use crate::sources::SourceManager;
 use crate::stats::YoutubeMetadataUpdate;
 
@@ -98,8 +98,10 @@ pub fn parse_channel_identifier(input: &str) -> Option<ChannelIdentifier> {
 pub fn spawn_live_resolve_poller(
     identifier: String,
     overrides: YoutubeOverrides,
+    official_api_key: String,
     source_tx: broadcast::Sender<ChatMessage>,
     metadata_tx: mpsc::Sender<YoutubeMetadataUpdate>,
+    reaction_tx: mpsc::Sender<Vec<YoutubeReaction>>,
     cancel: CancellationToken,
 ) {
     tauri::async_runtime::spawn(async move {
@@ -116,7 +118,17 @@ pub fn spawn_live_resolve_poller(
             }
         };
 
-        let manager = SourceManager::new(source_tx, overrides.clone(), Some(metadata_tx.clone()));
+        let manager = SourceManager::new(
+            source_tx,
+            overrides.clone(),
+            official_api_key,
+            // ここは YouTube 専用の spawn 経路なので X/niconico overrides は使われない。
+            crate::config::XOverrides::default(),
+            None,
+            crate::config::NiconicoOverrides::default(),
+            Some(metadata_tx.clone()),
+            Some(reaction_tx),
+        );
         let mut active_video_id: Option<String> = None;
         let mut active_cancel: Option<CancellationToken> = None;
         let mut live_state: Option<bool> = None;
@@ -233,6 +245,7 @@ async fn send_live_status(
         title: None,
         live: Some(live),
         reactions_delta: None,
+        full_snapshot: false,
     };
     tokio::select! {
         _ = cancel.cancelled() => false,

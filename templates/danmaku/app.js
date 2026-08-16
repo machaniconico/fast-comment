@@ -56,32 +56,14 @@
   // value={el, base, count, at} の Map。element 撤去時に掃除して肥大を防ぐ。
   const recentByText = new Map();
 
-  // ---- Lane(行)management ----
-  let viewportW = 0;
+  // ---- Display row management ----
   let laneHeight = 0;
   let laneCount = 1;
+  let nextLane = 0;
   // 表示縦帯(画面上半分/下半分/全体)。recomputeLanes で更新。
   let y0 = 0;
-  // 各レーンの直近投入コメントの記録 {t,w,s} または null。
-  // t=投入時刻(performance.now() ms), w=実幅 px, s=速度 px/秒。
-  let lanePrev = [];
-
-  // 文字幅の実測(レーンが空く時刻の計算に使う)。canvas measureText で概算。
-  let measureCtx = null;
-  try {
-    measureCtx = document.createElement('canvas').getContext('2d');
-  } catch (_e) {
-    measureCtx = null;
-  }
-
-  function measureWidth(text, fontSize) {
-    if (!measureCtx) return text.length * fontSize; // 全角主体を想定し安全側(広め)に推定
-    measureCtx.font = 'bold ' + fontSize + 'px sans-serif';
-    return measureCtx.measureText(text).width;
-  }
 
   function recomputeLanes() {
-    viewportW = window.innerWidth || 1920;
     const viewportH = window.innerHeight || 1080;
     laneHeight = Math.round(FONT_SIZE * 1.45);
     let y1;
@@ -97,45 +79,7 @@
     }
     const bandH = y1 - y0;
     laneCount = Math.max(1, Math.floor(bandH / laneHeight));
-    lanePrev = new Array(laneCount).fill(null);
-  }
-
-  // 相対速度を考慮した必要投入間隔(ms)。
-  // 前コメント prev と今回の速度 sNew(px/秒) を比較し、頭被り(すぐ後ろに被せる)と
-  // 追突(速い後続が遅い先行を追い越す)の両方を防ぐ最小間隔を返す。
-  function requiredGapMs(prev, sNew, durationSec, gapPx) {
-    if (!prev) return 0;
-    const base = prev.w + gapPx;
-    // A: 前コメントの末尾(右端)が画面右端から gapPx 入るまでの時間(頭被り防止)。
-    const A = base / prev.s;
-    // B: 追突防止。後続が前より速いとき、前を追い越さないために必要な間隔。
-    //    速さが同じか遅ければ追突しないので B=A。
-    const B = sNew > prev.s ? (base + (sNew - prev.s) * durationSec) / sNew : A;
-    return Math.max(A, B) * 1000;
-  }
-
-  // 各レーンの slack(= now - prev.t - requiredGapMs) を比較し、
-  // 空き(slack>=0)があれば slack 最大のレーンを選ぶ。
-  // 空きが無ければ高負荷劣化として slack 最大(最も早く空く)レーンに相乗りする。
-  function pickLane(sNew) {
-    const now = performance.now();
-    const gapPx = FONT_SIZE;
-    let best = 0;
-    let bestSlack = -Infinity;
-    for (let i = 0; i < laneCount; i++) {
-      const prev = lanePrev[i];
-      let slack;
-      if (prev === null) {
-        slack = Infinity;
-      } else {
-        slack = now - prev.t - requiredGapMs(prev, sNew, DURATION_SEC, gapPx);
-      }
-      if (slack > bestSlack) {
-        best = i;
-        bestSlack = slack;
-      }
-    }
-    return best;
+    nextLane %= laneCount;
   }
 
   function spawn(msg) {
@@ -166,7 +110,7 @@
     // E4: 流れるコメント(非gift/非system)のみ集約対象。
     //      既に同じ本文 core の弾幕が COALESCE_WINDOW_MS 内にあり DOM 接続中なら、
     //      その弾幕の textContent を書き換えて count++ し、新規 spawn を中断する。
-    //      lanePrev は触らない(配置済み要素のテキスト書き換えのみ)。
+    //      配置済み要素の位置は変更しない。
     if (COALESCE && !isGift) {
       const existing = recentByText.get(core);
       const now = performance.now();
@@ -187,11 +131,10 @@
     }
 
     const now = performance.now();
-    const w = measureWidth(text, FONT_SIZE);
-    // 等速。画面幅 + 自分の幅を DURATION_SEC で割った速度(px/秒)。
-    const newSpeed = (viewportW + w) / DURATION_SEC;
-    const lane = pickLane(newSpeed);
-    lanePrev[lane] = { t: now, w: w, s: newSpeed };
+    // 他コメントの位置・文字幅・文字サイズは参照しない単純な行順送り。
+    // 混雑時の重なりは許容し、重複判定や回避配置は行わない。
+    const lane = nextLane;
+    nextLane = (nextLane + 1) % laneCount;
 
     const el = document.createElement('div');
     el.className = 'danmaku-item';

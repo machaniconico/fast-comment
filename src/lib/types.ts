@@ -5,9 +5,9 @@
  * Fragment uses tagged union with `type` discriminant
  */
 
-export type Platform = 'twitch' | 'youtube';
+export type Platform = 'twitch' | 'youtube' | 'x' | 'niconico';
 
-export type MessageKind = 'normal' | 'superChat' | 'membership' | 'bits' | 'system';
+export type MessageKind = 'normal' | 'superChat' | 'membership' | 'bits' | 'gift' | 'system';
 
 export interface Roles {
   broadcaster: boolean;
@@ -51,6 +51,13 @@ export interface ChatMessage {
   amount?: Amount;
   timestampMs: number;
   raw?: unknown;
+}
+
+/** Anonymous YouTube reaction counts received in one backend polling update. */
+export interface YoutubeReaction {
+  channel: string;
+  emoji: string;
+  count: number;
 }
 
 /**

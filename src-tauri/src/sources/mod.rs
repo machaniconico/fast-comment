@@ -4,10 +4,13 @@
 //! 各 Source は `run()` の中で自前の指数バックオフ再接続を持ち、
 //! 正規化済み `ChatMessage` を `broadcast::Sender` へ流す。
 
+pub mod niconico;
 pub mod twitch;
 pub mod twitch_helix;
 pub mod twitch_send;
+pub mod x;
 pub mod youtube;
+pub mod youtube_send;
 
 use std::time::Duration;
 
@@ -15,7 +18,7 @@ use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{ChannelConfig, ChannelPlatform};
-use crate::model::ChatMessage;
+use crate::model::{ChatMessage, YoutubeReaction};
 use crate::stats::YoutubeMetadataUpdate;
 
 /// 接続元の共通インタフェース。
@@ -92,20 +95,40 @@ impl Default for Backoff {
 pub struct SourceManager {
     tx: broadcast::Sender<ChatMessage>,
     metadata_tx: Option<mpsc::Sender<YoutubeMetadataUpdate>>,
+    reaction_tx: Option<mpsc::Sender<Vec<YoutubeReaction>>>,
     /// YouTube overrides 等を渡すための設定スナップショット。
     youtube_overrides: crate::config::YoutubeOverrides,
+    /// 公式YouTube Data API streamList用。空ならInnerTubeのみ。
+    youtube_api_key: String,
+    /// X (Twitter) ライブ配信の overrides スナップショット。
+    x_overrides: crate::config::XOverrides,
+    /// X のユーザー名解決用ログイン cookie。None なら匿名表示。
+    x_auth: Option<x::XAuth>,
+    /// ニコニコ生放送の overrides スナップショット。
+    niconico_overrides: crate::config::NiconicoOverrides,
 }
 
 impl SourceManager {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         tx: broadcast::Sender<ChatMessage>,
         youtube_overrides: crate::config::YoutubeOverrides,
+        youtube_api_key: String,
+        x_overrides: crate::config::XOverrides,
+        x_auth: Option<x::XAuth>,
+        niconico_overrides: crate::config::NiconicoOverrides,
         metadata_tx: Option<mpsc::Sender<YoutubeMetadataUpdate>>,
+        reaction_tx: Option<mpsc::Sender<Vec<YoutubeReaction>>>,
     ) -> Self {
         SourceManager {
             tx,
             metadata_tx,
+            reaction_tx,
             youtube_overrides,
+            youtube_api_key,
+            x_overrides,
+            x_auth,
+            niconico_overrides,
         }
     }
 
@@ -122,7 +145,9 @@ impl SourceManager {
         let child = cancel.clone();
         let identifier = ch.identifier.clone();
         let overrides = self.youtube_overrides.clone();
+        let youtube_api_key = self.youtube_api_key.clone();
         let metadata_tx = self.metadata_tx.clone();
+        let reaction_tx = self.reaction_tx.clone();
 
         match ch.platform {
             ChannelPlatform::Twitch => {
@@ -132,7 +157,34 @@ impl SourceManager {
                 });
             }
             ChannelPlatform::Youtube => {
-                let src = youtube::YoutubeSource::new(identifier, overrides, metadata_tx);
+                let src = youtube::YoutubeSource::new(
+                    identifier,
+                    overrides,
+                    youtube_api_key,
+                    metadata_tx,
+                    reaction_tx,
+                );
+                tauri::async_runtime::spawn(async move {
+                    run_with_logging(&src, tx, child).await;
+                });
+            }
+            ChannelPlatform::X => {
+                let src = x::XSource::new(
+                    identifier,
+                    self.x_overrides.clone(),
+                    self.x_auth.clone(),
+                    metadata_tx,
+                );
+                tauri::async_runtime::spawn(async move {
+                    run_with_logging(&src, tx, child).await;
+                });
+            }
+            ChannelPlatform::Niconico => {
+                let src = niconico::NiconicoSource::new(
+                    identifier,
+                    self.niconico_overrides.clone(),
+                    metadata_tx,
+                );
                 tauri::async_runtime::spawn(async move {
                     run_with_logging(&src, tx, child).await;
                 });

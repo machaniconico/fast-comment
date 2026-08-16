@@ -3,7 +3,7 @@ use std::time::Duration;
 use reqwest::header::{ACCEPT, USER_AGENT};
 use serde::Serialize;
 use serde_json::Value;
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
 
 const LATEST_RELEASE_URL: &str =
     "https://api.github.com/repos/machaniconico/fast-comment/releases/latest";

@@ -33,6 +33,10 @@ pub struct ChannelConfig {
 pub enum ChannelPlatform {
     Twitch,
     Youtube,
+    /// X (Twitter) ライブ配信。identifier は broadcast URL または broadcast ID。
+    X,
+    /// ニコニコ生放送。identifier は番組URL または lv 番組ID。
+    Niconico,
 }
 
 const MAX_OBS_ROWS: u16 = 1000;
@@ -51,6 +55,9 @@ pub struct ObsConfig {
     /// OBS オーバーレイのフォント倍率(%)。既定 100。
     #[serde(default = "default_obs_font_scale_pct")]
     pub font_scale_pct: u16,
+    /// OBS弾幕オーバーレイの文字サイズ(px)。既定 30。
+    #[serde(default = "default_obs_danmaku_font_size")]
+    pub danmaku_font_size: u16,
     /// OBS オーバーレイの最大表示行数。既定 8。
     #[serde(default = "default_obs_max_rows")]
     pub max_rows: u16,
@@ -72,6 +79,7 @@ impl ObsConfig {
     pub fn normalize(&mut self) {
         self.max_rows = self.max_rows.clamp(1, MAX_OBS_ROWS);
         self.font_scale_pct = self.font_scale_pct.clamp(50, 200);
+        self.danmaku_font_size = self.danmaku_font_size.clamp(12, 96);
         self.bg_opacity_pct = self.bg_opacity_pct.clamp(0, 100);
         self.ttl_ms = self.ttl_ms.clamp(500, 600_000);
         if self.position != "top" && self.position != "bottom" {
@@ -86,6 +94,7 @@ impl Default for ObsConfig {
             port: default_obs_port(),
             template: default_obs_template(),
             font_scale_pct: default_obs_font_scale_pct(),
+            danmaku_font_size: default_obs_danmaku_font_size(),
             max_rows: default_obs_max_rows(),
             ttl_ms: default_obs_ttl_ms(),
             bg_opacity_pct: default_obs_bg_opacity_pct(),
@@ -96,7 +105,7 @@ impl Default for ObsConfig {
 }
 
 /// OBS 配信目標ゲージ(Goals overlay)設定。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GoalsConfig {
     /// Goals overlay を有効にするか。false のときは全ゲージを非表示扱いにする。
@@ -104,15 +113,49 @@ pub struct GoalsConfig {
     /// アプリ本体内にも GoalsBar を常設表示するか。既定 false。
     #[serde(default)]
     pub show_in_app: bool,
-    /// コメント数目標。0 は非表示。
+    /// OBS上の配置("horizontal" / "vertical" / "grid")。
+    #[serde(default = "default_goals_layout")]
+    pub layout: String,
+    /// OBS上の外観("glass" / "solid" / "minimal")。
+    #[serde(default = "default_goals_skin")]
+    pub skin: String,
+    /// 各ゲージの表示可否。None は旧設定との互換用で、目標値が1以上なら表示。
+    #[serde(default)]
+    pub show_comments: Option<bool>,
+    #[serde(default)]
+    pub show_viewers: Option<bool>,
+    #[serde(default)]
+    pub show_likes: Option<bool>,
+    #[serde(default)]
+    pub show_reactions: Option<bool>,
+    /// コメント数目標。0 は 0% として表示。
     pub comments: u32,
-    /// 視聴者数目標。0 は非表示。
+    /// 視聴者数目標。0 は 0% として表示。
     pub viewers: u32,
-    /// 高評価数目標。0 は非表示。
+    /// 高評価数目標。0 は 0% として表示。
     pub likes: u32,
-    /// YouTube 絵文字リアクション数目標。0 は非表示。
+    /// YouTube 絵文字リアクション数目標。0 は 0% として表示。
     #[serde(default)]
     pub reactions: u32,
+}
+
+impl Default for GoalsConfig {
+    fn default() -> Self {
+        GoalsConfig {
+            enabled: false,
+            show_in_app: false,
+            layout: default_goals_layout(),
+            skin: default_goals_skin(),
+            show_comments: Some(true),
+            show_viewers: Some(true),
+            show_likes: Some(true),
+            show_reactions: Some(true),
+            comments: 0,
+            viewers: 0,
+            likes: 0,
+            reactions: 0,
+        }
+    }
 }
 
 /// OBS タイマー/カウントダウン overlay 設定。
@@ -363,6 +406,12 @@ pub struct UiConfig {
     /// リングバッファの保持上限件数。既定 2000。
     #[serde(default = "default_max_buffer")]
     pub max_buffer: usize,
+    /// YouTubeメンバーの通常コメントで投稿者名を緑色にするか。既定 true。
+    #[serde(default = "default_true")]
+    pub youtube_member_name_green: bool,
+    /// Twitchの通常コメントを本家チャット風に表示するか。既定 true。
+    #[serde(default = "default_true")]
+    pub twitch_native_style: bool,
     /// 投げ銭を別タブで表示するか。既定 false。
     #[serde(default)]
     pub show_donation_panel: bool,
@@ -378,6 +427,8 @@ impl Default for UiConfig {
     fn default() -> Self {
         UiConfig {
             max_buffer: default_max_buffer(),
+            youtube_member_name_green: true,
+            twitch_native_style: true,
             show_donation_panel: false,
             notify_sound: false,
             notify_volume: default_notify_volume(),
@@ -424,6 +475,35 @@ pub struct YoutubeOverrides {
     pub paths: std::collections::HashMap<String, String>,
 }
 
+/// X (Twitter) ライブ配信の仕様変更を再ビルド無しで吸収するための上書き設定。
+///
+/// いずれも `None`/空のときは sources/x.rs 側の既定挙動を使う。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct XOverrides {
+    /// X Web クライアントの公開 Bearer トークンを差し替える。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bearer_token: Option<String>,
+    /// API エンドポイント URL の上書き(キー→URL)。空なら既定。
+    /// キー: guestActivateUrl / broadcastShowUrl / liveChatUrl / userQueryUrl
+    /// (sources/x.rs が実際に読むキー。liveChatUrl が本文ストリーム、userQueryUrl
+    /// が cookie 併用時のユーザー名解決。最も壊れやすい liveChatUrl はここで差替可)。
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub endpoints: std::collections::HashMap<String, String>,
+}
+
+/// ニコニコ生放送の仕様変更を再ビルド無しで吸収するための上書き設定。
+///
+/// いずれも空のときは sources/niconico.rs 側の既定挙動を使う。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct NiconicoOverrides {
+    /// URL の上書き(キー→URL)。空なら既定。
+    /// キー: watchPageBaseUrl (既定 https://live.nicovideo.jp/watch/)。
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub endpoints: std::collections::HashMap<String, String>,
+}
+
 /// チャット送信用の認証情報。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -434,6 +514,23 @@ pub struct CredentialsConfig {
     /// Twitch 投稿用ユーザー名。
     #[serde(default)]
     pub twitch_username: String,
+    /// YouTube Data API v3 の公式 streamList で使う API キー。
+    /// 空なら従来の無認証 InnerTube ポーリングへフォールバックする。
+    #[serde(default)]
+    pub youtube_api_key: String,
+    /// YouTube投稿用の「デスクトップアプリ」OAuthクライアントID。
+    /// refresh token自体はOSの資格情報ストアへ保存し、config.jsonには入れない。
+    #[serde(default)]
+    pub youtube_oauth_client_id: String,
+    /// X ライブチャットのユーザー名解決に使うログイン cookie(auth_token)。
+    /// live-chat の NDJSON に username が無く、ゲストで解決する API も無いため、
+    /// 設定時のみ GraphQL liveAtomsUserQuery で userId→表示名を引く。
+    /// 空なら「ユーザー<ID下4桁>」の匿名表示のまま動く(チャット受信は止まらない)。
+    #[serde(default)]
+    pub x_auth_token: String,
+    /// X の csrf トークン(ct0 cookie)。x_auth_token とペアで設定する。
+    #[serde(default)]
+    pub x_csrf_token: String,
 }
 
 /// アプリ全体設定のルート。
@@ -463,6 +560,10 @@ pub struct AppConfig {
     #[serde(default)]
     pub youtube_overrides: YoutubeOverrides,
     #[serde(default)]
+    pub x_overrides: XOverrides,
+    #[serde(default)]
+    pub niconico_overrides: NiconicoOverrides,
+    #[serde(default)]
     pub credentials: CredentialsConfig,
 }
 
@@ -480,6 +581,8 @@ impl Default for AppConfig {
             ui: UiConfig::default(),
             participation: ParticipationConfig::default(),
             youtube_overrides: YoutubeOverrides::default(),
+            x_overrides: XOverrides::default(),
+            niconico_overrides: NiconicoOverrides::default(),
             credentials: CredentialsConfig::default(),
         }
     }
@@ -548,6 +651,9 @@ fn default_obs_template() -> String {
 fn default_obs_font_scale_pct() -> u16 {
     100
 }
+fn default_obs_danmaku_font_size() -> u16 {
+    30
+}
 fn default_obs_max_rows() -> u16 {
     8
 }
@@ -559,6 +665,12 @@ fn default_obs_bg_opacity_pct() -> u16 {
 }
 fn default_obs_position() -> String {
     "bottom".to_string()
+}
+fn default_goals_layout() -> String {
+    "horizontal".to_string()
+}
+fn default_goals_skin() -> String {
+    "glass".to_string()
 }
 fn default_timer_duration_sec() -> u32 {
     300
@@ -640,6 +752,7 @@ mod tests {
                 port: 12000,
                 template: "compact".to_string(),
                 font_scale_pct: 125,
+                danmaku_font_size: 42,
                 max_rows: 12,
                 ttl_ms: 9000,
                 bg_opacity_pct: 35,
@@ -649,6 +762,12 @@ mod tests {
             goals: GoalsConfig {
                 enabled: true,
                 show_in_app: true,
+                layout: "grid".to_string(),
+                skin: "solid".to_string(),
+                show_comments: Some(true),
+                show_viewers: Some(false),
+                show_likes: Some(true),
+                show_reactions: Some(false),
                 comments: 100,
                 viewers: 50,
                 likes: 25,
@@ -714,6 +833,8 @@ mod tests {
             },
             ui: UiConfig {
                 max_buffer: 1234,
+                youtube_member_name_green: false,
+                twitch_native_style: false,
                 show_donation_panel: true,
                 notify_sound: true,
                 notify_volume: 0.8,
@@ -726,12 +847,21 @@ mod tests {
             credentials: CredentialsConfig {
                 twitch_oauth: "oauth:test-token".to_string(),
                 twitch_username: "FastCommentBot".to_string(),
+                youtube_api_key: "youtube-data-api-key".to_string(),
+                youtube_oauth_client_id: "desktop-client.apps.googleusercontent.com".to_string(),
+                x_auth_token: "x-auth-cookie".to_string(),
+                x_csrf_token: "x-ct0".to_string(),
             },
             youtube_overrides: YoutubeOverrides {
                 api_key: Some("test-api-key".to_string()),
                 client_version: Some("1.20240501.00.00".to_string()),
                 paths,
             },
+            x_overrides: XOverrides {
+                bearer_token: Some("test-bearer".to_string()),
+                endpoints: HashMap::new(),
+            },
+            niconico_overrides: NiconicoOverrides::default(),
         };
 
         let text = serde_json::to_string(&cfg).expect("serialize AppConfig");
@@ -739,6 +869,7 @@ mod tests {
 
         assert_eq!(json["obs"]["template"].as_str(), Some("compact"));
         assert_eq!(json["obs"]["fontScalePct"].as_u64(), Some(125));
+        assert_eq!(json["obs"]["danmakuFontSize"].as_u64(), Some(42));
         assert_eq!(json["obs"]["maxRows"].as_u64(), Some(12));
         assert_eq!(json["obs"]["ttlMs"].as_u64(), Some(9000));
         assert_eq!(json["obs"]["bgOpacityPct"].as_u64(), Some(35));
@@ -746,6 +877,10 @@ mod tests {
         assert_eq!(json["obs"]["showPlatform"].as_bool(), Some(false));
         assert_eq!(json["goals"]["enabled"].as_bool(), Some(true));
         assert_eq!(json["goals"]["showInApp"].as_bool(), Some(true));
+        assert_eq!(json["goals"]["layout"].as_str(), Some("grid"));
+        assert_eq!(json["goals"]["skin"].as_str(), Some("solid"));
+        assert_eq!(json["goals"]["showComments"].as_bool(), Some(true));
+        assert_eq!(json["goals"]["showViewers"].as_bool(), Some(false));
         assert_eq!(json["goals"]["comments"].as_u64(), Some(100));
         assert_eq!(json["goals"]["viewers"].as_u64(), Some(50));
         assert_eq!(json["goals"]["likes"].as_u64(), Some(25));
@@ -758,6 +893,11 @@ mod tests {
         assert_eq!(json["effects"]["rules"][0]["emoji"].as_str(), Some("🎉"));
         assert_eq!(json["effects"]["rules"][0]["count"].as_u64(), Some(24));
         assert_eq!(json["welcome"]["enabled"].as_bool(), Some(true));
+        assert_eq!(
+            json["ui"]["youtubeMemberNameGreen"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(json["ui"]["twitchNativeStyle"].as_bool(), Some(false));
         assert_eq!(
             json["welcome"]["greeting"].as_str(),
             Some("{name} さん、ようこそ！")
@@ -780,6 +920,14 @@ mod tests {
         assert_eq!(
             json["credentials"]["twitchUsername"].as_str(),
             Some("FastCommentBot")
+        );
+        assert_eq!(
+            json["credentials"]["youtubeApiKey"].as_str(),
+            Some("youtube-data-api-key")
+        );
+        assert_eq!(
+            json["credentials"]["youtubeOauthClientId"].as_str(),
+            Some("desktop-client.apps.googleusercontent.com")
         );
         assert_eq!(
             json["tts"]["options"]["bouyomiHost"].as_str(),
@@ -865,6 +1013,10 @@ mod tests {
             json["youtubeOverrides"]["paths"]["continuationPath"].as_str(),
             Some("contents.twoColumnWatchNextResults.conversationBar")
         );
+        assert_eq!(
+            json["xOverrides"]["bearerToken"].as_str(),
+            Some("test-bearer")
+        );
 
         let decoded: AppConfig = serde_json::from_str(&text).expect("deserialize AppConfig");
         assert_eq!(decoded, cfg);
@@ -882,6 +1034,11 @@ mod tests {
         assert_eq!(cfg.obs.template, "default");
         assert_eq!(cfg.obs.font_scale_pct, default_obs_font_scale_pct());
         assert_eq!(cfg.obs.font_scale_pct, 100);
+        assert_eq!(
+            cfg.obs.danmaku_font_size,
+            default_obs_danmaku_font_size()
+        );
+        assert_eq!(cfg.obs.danmaku_font_size, 30);
         assert_eq!(cfg.obs.max_rows, default_obs_max_rows());
         assert_eq!(cfg.obs.max_rows, 8);
         assert_eq!(cfg.obs.ttl_ms, default_obs_ttl_ms());
@@ -949,6 +1106,8 @@ mod tests {
         assert!(cfg.moderation.highlights.is_empty());
         assert_eq!(cfg.ui.max_buffer, default_max_buffer());
         assert_eq!(cfg.ui.max_buffer, 2000);
+        assert!(cfg.ui.youtube_member_name_green);
+        assert!(cfg.ui.twitch_native_style);
         assert!(!cfg.ui.show_donation_panel);
         // 通知設定は旧 config(キー欠落)でも default に劣化する(後方互換)。
         assert!(!cfg.ui.notify_sound);
@@ -960,7 +1119,10 @@ mod tests {
         assert_eq!(cfg.credentials, CredentialsConfig::default());
         assert_eq!(cfg.credentials.twitch_oauth, "");
         assert_eq!(cfg.credentials.twitch_username, "");
+        assert_eq!(cfg.credentials.youtube_api_key, "");
+        assert_eq!(cfg.credentials.youtube_oauth_client_id, "");
         assert_eq!(cfg.youtube_overrides, YoutubeOverrides::default());
+        assert_eq!(cfg.x_overrides, XOverrides::default());
     }
 
     #[test]
@@ -1026,10 +1188,13 @@ mod tests {
         assert_eq!(cfg.tts.options.max_length, default_max_read_len());
         assert!(cfg.tts.options.dictionary.is_empty());
         assert_eq!(cfg.ui.max_buffer, 321);
+        assert!(cfg.ui.youtube_member_name_green);
+        assert!(cfg.ui.twitch_native_style);
         assert!(!cfg.ui.show_donation_panel);
         assert_eq!(cfg.participation, ParticipationConfig::default());
         assert_eq!(cfg.credentials, CredentialsConfig::default());
         assert_eq!(cfg.youtube_overrides, YoutubeOverrides::default());
+        assert_eq!(cfg.x_overrides, XOverrides::default());
     }
 
     #[test]
@@ -1083,6 +1248,12 @@ mod tests {
         .expect("deserialize legacy goals config");
         assert!(legacy_goals.enabled);
         assert!(!legacy_goals.show_in_app);
+        assert_eq!(legacy_goals.layout, "horizontal");
+        assert_eq!(legacy_goals.skin, "glass");
+        assert_eq!(legacy_goals.show_comments, None);
+        assert_eq!(legacy_goals.show_viewers, None);
+        assert_eq!(legacy_goals.show_likes, None);
+        assert_eq!(legacy_goals.show_reactions, None);
         assert_eq!(legacy_goals.comments, 10);
         assert_eq!(legacy_goals.viewers, 20);
         assert_eq!(legacy_goals.likes, 30);
@@ -1091,6 +1262,12 @@ mod tests {
         let cfg = GoalsConfig {
             enabled: true,
             show_in_app: true,
+            layout: "vertical".to_string(),
+            skin: "minimal".to_string(),
+            show_comments: Some(false),
+            show_viewers: Some(true),
+            show_likes: Some(false),
+            show_reactions: Some(true),
             comments: 100,
             viewers: 50,
             likes: 25,
@@ -1099,6 +1276,9 @@ mod tests {
         let text = serde_json::to_string(&cfg).expect("serialize goals config");
         let json: serde_json::Value = serde_json::from_str(&text).expect("parse goals json");
         assert_eq!(json["showInApp"].as_bool(), Some(true));
+        assert_eq!(json["layout"].as_str(), Some("vertical"));
+        assert_eq!(json["skin"].as_str(), Some("minimal"));
+        assert_eq!(json["showComments"].as_bool(), Some(false));
         assert_eq!(json["reactions"].as_u64(), Some(12));
 
         let decoded: GoalsConfig = serde_json::from_str(&text).expect("deserialize goals config");

@@ -14,6 +14,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::{AppConfig, ChannelPlatform};
 use crate::model::{ChatMessage, Platform};
+use crate::sources::niconico::extract_live_id;
+use crate::sources::x::extract_broadcast_id;
 use crate::sources::youtube::{extract_video_id, is_channel_identifier};
 
 /// 接続中チャンネルに表示する補助タイトル。
@@ -47,6 +49,8 @@ pub struct StatsSnapshot {
     pub likes_available: bool,
     pub reactions: u32,
     pub reactions_available: bool,
+    pub goals_enabled: bool,
+    pub goals_visible: GoalsVisibilitySnapshot,
     #[serde(default)]
     pub channel_titles: Vec<ChannelTitle>,
     #[serde(default)]
@@ -80,7 +84,7 @@ impl Default for TimerSnapshot {
     }
 }
 
-/// 設定由来の目標値。0 は該当ゲージ非表示。
+/// 設定由来の目標値。0 は目標未設定として 0% のゲージを表示する。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct GoalsSnapshot {
@@ -88,6 +92,15 @@ pub struct GoalsSnapshot {
     pub viewers: u32,
     pub likes: u32,
     pub reactions: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct GoalsVisibilitySnapshot {
+    pub comments: bool,
+    pub viewers: bool,
+    pub likes: bool,
+    pub reactions: bool,
 }
 
 /// メタデータ poller から集約タスクへ渡す更新。
@@ -100,6 +113,8 @@ pub struct YoutubeMetadataUpdate {
     pub title: Option<String>,
     pub live: Option<bool>,
     pub reactions_delta: Option<u32>,
+    /// `None` を「取得値なし」として反映する完全なメタデータスナップショットか。
+    pub full_snapshot: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -122,6 +137,7 @@ impl Default for YoutubeMetadataUpdate {
             title: None,
             live: None,
             reactions_delta: None,
+            full_snapshot: false,
         }
     }
 }
@@ -132,6 +148,7 @@ impl YoutubeMetadataUpdate {
             || self.likes.is_some()
             || self.title.is_some()
             || self.live.is_some()
+            || self.full_snapshot
     }
 }
 
@@ -330,6 +347,8 @@ fn build_snapshot(
         likes_available: has_enabled_youtube(config),
         reactions,
         reactions_available: has_enabled_youtube(config),
+        goals_enabled: config.goals.enabled,
+        goals_visible: goals_visibility_from_config(config),
         channel_titles,
         channel_status,
         goals: goals_from_config(config),
@@ -415,6 +434,8 @@ fn platform_key(platform: Platform) -> &'static str {
     match platform {
         Platform::Twitch => "twitch",
         Platform::Youtube => "youtube",
+        Platform::X => "x",
+        Platform::Niconico => "niconico",
     }
 }
 
@@ -426,6 +447,12 @@ fn enabled_scope_keys(config: &AppConfig) -> HashSet<String> {
         .map(|ch| match ch.platform {
             ChannelPlatform::Twitch => format!("twitch:{}", ch.identifier),
             ChannelPlatform::Youtube => format!("youtube:{}", extract_video_id(&ch.identifier)),
+            // XSource は ChatMessage.channel に正規化済み broadcast ID を入れる。
+            ChannelPlatform::X => format!("x:{}", extract_broadcast_id(&ch.identifier)),
+            // NiconicoSource も同様に正規化済み lv 番組 ID を入れる。
+            ChannelPlatform::Niconico => {
+                format!("niconico:{}", extract_live_id(&ch.identifier))
+            }
         })
         .collect()
 }
@@ -454,6 +481,12 @@ fn enabled_metadata_keys(config: &AppConfig) -> HashSet<String> {
             }
             ChannelPlatform::Youtube => {
                 metadata_key(Platform::Youtube, &extract_video_id(&ch.identifier))
+            }
+            ChannelPlatform::X => {
+                metadata_key(Platform::X, &extract_broadcast_id(&ch.identifier))
+            }
+            ChannelPlatform::Niconico => {
+                metadata_key(Platform::Niconico, &extract_live_id(&ch.identifier))
             }
         })
         .collect()
@@ -487,12 +520,28 @@ fn goals_from_config(config: &AppConfig) -> GoalsSnapshot {
     }
 }
 
-fn resolve_viewers(concurrent_total: u32, unique_count: u32) -> u32 {
-    if concurrent_total > 0 {
-        concurrent_total
-    } else {
-        unique_count
+fn goals_visibility_from_config(config: &AppConfig) -> GoalsVisibilitySnapshot {
+    GoalsVisibilitySnapshot {
+        comments: config
+            .goals
+            .show_comments
+            .unwrap_or(config.goals.comments > 0),
+        viewers: config
+            .goals
+            .show_viewers
+            .unwrap_or(config.goals.viewers > 0),
+        likes: config.goals.show_likes.unwrap_or(config.goals.likes > 0),
+        reactions: config
+            .goals
+            .show_reactions
+            .unwrap_or(config.goals.reactions > 0),
     }
+}
+
+fn resolve_viewers(concurrent_total: u32, _unique_count: u32) -> u32 {
+    // UI/OBS ではこの値を「同時接続」と表示するため、取得不能・0人時に
+    // セッション累積のユニークコメント投稿者数へ置き換えない。
+    concurrent_total
 }
 
 /// ゲージ進捗率。UI 側は 100% を超えた値を強調表示できる。
@@ -545,9 +594,42 @@ mod tests {
     }
 
     #[test]
-    fn viewers_prefer_concurrent_when_available() {
+    fn viewers_use_only_concurrent_count() {
         assert_eq!(resolve_viewers(42, 7), 42);
-        assert_eq!(resolve_viewers(0, 7), 7);
+        assert_eq!(resolve_viewers(0, 7), 0);
+    }
+
+    #[test]
+    fn full_metadata_snapshot_clears_missing_viewer_count() {
+        let config = config_with_youtube("@example");
+        let mut metadata = HashMap::new();
+        let mut reactions = 0;
+        apply_metadata_update(
+            &mut metadata,
+            &mut reactions,
+            YoutubeMetadataUpdate {
+                channel: "@example".to_string(),
+                concurrent_viewers: Some(123),
+                full_snapshot: true,
+                ..YoutubeMetadataUpdate::default()
+            },
+            &config,
+        );
+        apply_metadata_update(
+            &mut metadata,
+            &mut reactions,
+            YoutubeMetadataUpdate {
+                channel: "@example".to_string(),
+                full_snapshot: true,
+                ..YoutubeMetadataUpdate::default()
+            },
+            &config,
+        );
+
+        let snapshot = build_snapshot(0, 0, 0, &HashMap::new(), &metadata, &config);
+
+        assert_eq!(snapshot.viewers, 0);
+        assert_eq!(snapshot.channel_status[0].viewers, None);
     }
 
     #[test]
@@ -565,6 +647,41 @@ mod tests {
         assert_eq!(goals.viewers, 20);
         assert_eq!(goals.likes, 30);
         assert_eq!(goals.reactions, 40);
+    }
+
+    #[test]
+    fn snapshot_exposes_goals_enabled_separately_from_zero_targets() {
+        let mut config = AppConfig::default();
+        config.goals.enabled = true;
+
+        let snapshot = build_snapshot(0, 0, 0, &HashMap::new(), &HashMap::new(), &config);
+
+        assert!(snapshot.goals_enabled);
+        assert_eq!(snapshot.goals.comments, 0);
+        assert_eq!(snapshot.goals.viewers, 0);
+        assert_eq!(snapshot.goals.likes, 0);
+        assert_eq!(snapshot.goals.reactions, 0);
+        assert!(snapshot.goals_visible.comments);
+        assert!(snapshot.goals_visible.viewers);
+        assert!(snapshot.goals_visible.likes);
+        assert!(snapshot.goals_visible.reactions);
+    }
+
+    #[test]
+    fn legacy_goal_visibility_follows_nonzero_targets() {
+        let mut config = AppConfig::default();
+        config.goals.show_comments = None;
+        config.goals.show_viewers = None;
+        config.goals.show_likes = None;
+        config.goals.show_reactions = None;
+        config.goals.comments = 10;
+
+        let visible = goals_visibility_from_config(&config);
+
+        assert!(visible.comments);
+        assert!(!visible.viewers);
+        assert!(!visible.likes);
+        assert!(!visible.reactions);
     }
 
     #[test]
@@ -666,6 +783,7 @@ mod tests {
                 title: Some("Live title".to_string()),
                 live: Some(true),
                 reactions_delta: None,
+                full_snapshot: true,
             },
         );
         merge_metadata_update(
@@ -739,6 +857,7 @@ mod tests {
                 title: Some("Live title".to_string()),
                 live: Some(true),
                 reactions_delta: None,
+                full_snapshot: true,
             },
             &config,
         );

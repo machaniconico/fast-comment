@@ -42,17 +42,22 @@
     if (!snapshot) return [];
 
     const goals = snapshot.goals ?? { comments: 0, viewers: 0, likes: 0, reactions: 0 };
+    const visible = snapshot.goalsVisible ?? {
+      comments: true,
+      viewers: true,
+      likes: true,
+      reactions: true,
+    };
     const nextCards: GoalCard[] = [];
 
     for (const metric of METRICS) {
+      if (visible[metric.key] === false) continue;
       if (metric.key === 'likes' && snapshot.likesAvailable === false) continue;
       if (metric.key === 'reactions' && snapshot.reactionsAvailable === false) continue;
 
       const target = toCount(goals[metric.key]);
-      if (target === 0) continue;
-
       const current = toCount(snapshot[metric.key]);
-      const percent = Math.floor((current * 100) / target);
+      const percent = target > 0 ? Math.floor((current * 100) / target) : 0;
       const width = Math.min(100, percent);
       nextCards.push({
         key: metric.key,

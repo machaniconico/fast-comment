@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte';
+  import { listen } from '@tauri-apps/api/event';
   import {
     clearParticipants,
     getParticipants,
@@ -41,7 +42,6 @@
       if (!current) return;
       participants = current;
 
-      const { listen } = await import('@tauri-apps/api/event');
       unlisten = await listen<Participant[]>('participants-updated', (event) => {
         participants = event.payload;
       });
@@ -386,7 +386,7 @@
       {:else}
         {#each participants as p (participantKey(p))}
           <div class="participant-row" class:picked={p.picked} role="listitem">
-            <span class="platform" class:twitch={p.platform === 'twitch'} class:youtube={p.platform === 'youtube'}>
+            <span class="platform" class:twitch={p.platform === 'twitch'} class:youtube={p.platform === 'youtube'} class:x={p.platform === 'x'} class:niconico={p.platform === 'niconico'}>
               {p.platform}
             </span>
             <span class="name">{p.name}</span>
@@ -714,6 +714,14 @@
 
   .platform.youtube {
     color: #ff9999;
+  }
+
+  .platform.x {
+    color: #1da1f2;
+  }
+
+  .platform.niconico {
+    color: #fcc800;
   }
 
   .name,

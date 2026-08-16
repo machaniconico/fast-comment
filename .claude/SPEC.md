@@ -14,7 +14,7 @@
 - **シェル**: Tauri 2.x (Rust)
 - **UI**: Svelte 5 + Vite + TypeScript
 - **Rust 非同期**: tokio
-- **接続**: tokio-tungstenite (Twitch IRC-WS), reqwest (YouTube InnerTube HTTP)
+- **接続**: tokio-tungstenite (Twitch IRC-WS), tonic (YouTube公式streamList gRPC), reqwest (YouTube InnerTube HTTPフォールバック)
 - **OBS配信サーバ**: axum (HTTP + WebSocket) + tower-http (静的テンプレ配信)
 - **ビルド/実行ターゲット**: **Windows**（WSLでは編集のみ、ビルドはWindows側）
 
@@ -23,7 +23,7 @@
 ```
 [Twitch IRC-WS] ┐
                 ├─> Source trait ──> 正規化(ChatMessage) ──> Bus(tokio broadcast)
-[YouTube InnerTube] ┘                                          │
+[YouTube streamList / InnerTube] ┘                             │
                                                   ┌────────────┼─────────────┐
                                                   ▼            ▼             ▼
                                           Tauri IPC(UI)   axum WS(OBS)    TTS dispatch
@@ -79,6 +79,14 @@ trait Source {
 - emotes タグ(`id:start-end,...`)から本文を Fragment 分割。
 
 ### 4.2 YouTube (`youtube/`) — 仕様変更耐性が最重要
+- **official_stream.rs**: `credentials.youtubeApiKey` が設定済みなら、YouTube Data API v3の
+  `liveChatMessages.streamList` (gRPC server streaming) を最優先する。`videos.list` で
+  `activeLiveChatId` を解決し、`nextPageToken` を引き継いで長時間接続する。
+  - Jewelsによる`giftEvent`はメンバーシップギフトと分け、`gift_name`を種類名として静的にコメント欄へ表示する（アニメーション再現は対象外）。種類名が欠落した場合は代替説明文、通知本文の順で劣化する。
+  - APIキー未設定、認証・quota・接続エラー、継続トークンなし終了時はInnerTubeへ自動フォールバック。
+  - 公式→InnerTube切替時は直近8192件のYouTubeメッセージIDで重複表示を抑止する。
+  - 公開 `streamList` には匿名リアクションが無いため、公式コメント受信中も reaction-only InnerTube sidecar を並行し、公式終了時は停止して通常フォールバックとの二重pollを防ぐ。
+  - APIキー変更保存時は接続中のYouTube Sourceを再起動し、新しい受信方式を即時反映する。
 - **innertube.rs**: リクエスト組み立て
   - 手順: ①live配信URL/videoIdから初期HTMLを取得 → `ytInitialData` と INNERTUBE_API_KEY, client version, 初期 continuation を抽出
   - ②`POST https://www.youtube.com/youtubei/v1/live_chat/get_live_chat?key=<API_KEY>` に context+continuation で繰り返しポーリング
@@ -96,14 +104,41 @@ trait Source {
     | `actionsPath` | アクション配列パス(`>`区切り) | `continuationContents>liveChatContinuation>actions` |
     | `continuationsPath` | continuation 配列パス(`>`区切り) | `continuationContents>liveChatContinuation>continuations` |
     | `continuationDataKeys` | continuation データキー候補(改行区切り) | `invalidationContinuationData` 他5種 |
+    | `reactionMutationsPath` | リアクション mutation 配列パス(`>`区切り) | `frameworkUpdates>entityBatchUpdate>mutations` |
+    | `reactionBucketPath` | mutation 内の bucket 配列パス(`>`区切り) | `payload>emojiFountainDataEntity>reactionBuckets` |
 - **parser.rs**: 寛容パース(アダプタの核)
   - `serde_json::Value` をパス探索で辿る。固い struct deserialize はしない。
   - ヘルパ `dig(value, &["a","b",0,"c"])` で Option を返す。途中欠落でも None で安全に劣化。
   - 対応アクション: `addChatItemAction` → `liveChatTextMessageRenderer`(通常), `liveChatPaidMessageRenderer`(SuperChat), `liveChatMembershipItemRenderer`(メンバー), `liveChatPaidStickerRenderer`(ステッカー)
+  - Jewelsギフトは専用renderer名・`giftDetails`/`jewelsAmount`・汎用通知本文を寛容に判定し、メンバーシップギフトを誤分類しない。
   - 著者バッジ(`authorBadges`)から member/moderator/owner を Roles へ。
   - `runs[]` を Fragment(text|emote) に変換(`emoji` は Emote)。
   - **解析できなかったアクションは `logs/yt-unparsed.jsonl` に1行追記**(原因究明用)。
   - パーサにバージョンタグを持たせ、将来の差し替えを容易に。
+
+### 4.3 X (Twitter) ライブ配信 (`x.rs`)
+- ログイン不要で公開ブロードキャストのライブチャットを受信する。読み取り専用で、コメント投稿は非対応。
+- **本文の取得経路は `GET https://api.x.com/live-chat?broadcastId={id}`(認証ヘッダ不要)の NDJSON ストリーム一択**(2026-08 実測)。X Web UI 自体がこのエンドポイントでチャット欄を描画している。旧 Periscope chatapi(chatnow WS / history / accessChatPublic / chatToken)には本文が流れないため一切使わない。
+- 手順: ①`POST https://api.x.com/1.1/guest/activate.json`(X Web の公開 Bearer)→ guest_token ②`GET https://x.com/i/api/1.1/broadcasts/show.json?ids={broadcastId}` → state / twitter_user_id / 配信者名 / タイトル / total_watching(視聴者数) ③live-chat ストリームへ接続し行単位で受信 ④show.json を30秒間隔で再取得し viewers 更新と配信終了(state ENDED/TIMED_OUT)検出
+- NDJSON 行: `{"userId":"...","chatType":1,"message":"...","ts":"<ナノ秒>","isBackfill":true}`。chatType 1 のみ本文(39 はモデレーション系メタで無視、種別はカウンタに残す)。接続直後は配信開始以降の過去チャットが isBackfill 付きで全量バックフィルされる → 直近20件だけ `skip_tts` を立てて emit し、超過分は捨てる(TTS 暴発防止)。再接続時の再送は `ts+userId` の dedup で吸収。
+- 行に username は含まれず、ゲストで解決する API も無い(実測: users/lookup=404 / GraphQL=403,404 / intent=SPA シェル)。配信者(`twitter_user_id` 一致。`user_id` は Periscope ID なので使わない)は show.json の名前で表示し、他は既定で「ユーザー<ID下4桁>」。NG 等の同定は author.id=userId で機能する。
+- **ユーザー名解決(オプション)**: `credentials.xAuthToken`(auth_token cookie)と `credentials.xCsrfToken`(ct0)の両方が設定されている場合、受信ループとは別の `name_resolver_task` が GraphQL `liveAtomsUserQuery` をバッチ(最大50 ID/回)で叩き、userId→表示名を解決して差し替える(mpsc FIFO 経由なので表示順は不変)。cookie 失効(401/403)は解決だけを止め匿名表示へフォールバック、チャット受信は継続。cookie 変更時は `update_config` が X チャンネルを自動で張り直す。queryId 込みの URL は `xOverrides.endpoints.userQueryUrl` で差し替え可。
+- YouTube と同じく固い struct deserialize はせず `serde_json::Value` のパス探索で寛容にパースし、欠落は None/既定値へ劣化。
+- `identifier` は broadcast URL(`https://x.com/i/broadcasts/{id}` / twitter.com 同形)または生の broadcast ID。`extract_broadcast_id()` で正規化し、`ChatMessage.channel` には正規化済み ID を入れる。
+- **Bearer とエンドポイント URL は `config.rs` の `xOverrides` から上書き可能**(再ビルド不要)。`xOverrides.bearerToken` と `xOverrides.endpoints`(キー: `guestActivateUrl` / `broadcastShowUrl` / `liveChatUrl` / `userQueryUrl`)。未指定/空は既定値。
+- 金額系イベント(投げ銭等)の概念が無いため `MessageKind::Normal` のみ。Roles は broadcaster だけ判定。
+- 再接続は他 Source と同じ指数バックオフ。HTTP フロー失敗(配信未開始/終了)も不安定扱いでバックオフを伸ばし続け、配信開始待ちポーリングを兼ねる。ストリーム無受信90秒は half-open とみなして張り直す。
+
+### 4.4 ニコニコ生放送 (`niconico.rs`)
+- ログイン不要の視聴ページ経由で NDGR メッセージサーバー(2024年8月以降の新コメントサーバー)へ接続する。読み取り専用で、コメント投稿は非対応。
+- 手順: ①`GET https://live.nicovideo.jp/watch/{lvId}` → HTML 内 `<script id="embedded-data" data-props="...">` の JSON から `site.relive.webSocketUrl` を抽出(`program.status != ON_AIR` は即エラー=配信待ちポーリング) ②watch WebSocket へ接続し `startWatching` 送信(映像座席は要求しない) ③`seat` の keepIntervalSec 間隔で `keepSeat` 送信、アプリレベル `ping` には `pong`+`keepSeat` 応答 ④`messageServer` の viewUri(NDGR view API) を `?at=now` → `ReadyForNext.at` で追いかけ、`MessageSegment.uri` の ChunkedMessage ストリームからコメント受信
+- NDGR は **length-delimited Protobuf over HTTP chunked**。定義は n-air-app/nicolive-comment-protobuf のうち必要フィールドのみを prost derive で手書き(`niconico.rs` 内 `ndgr` モジュール)。未知フィールド/oneof variant は prost が自動スキップ = 寛容パース方針。拾うのは chat(1)/gift(8)/overflowed_chat(20) のみ。
+- 匿名(184)コメントは `hashed_user_id` を author.id に、先頭7文字を表示名に。生ID コメントは `raw_user_id`。コテハン(`name`)があれば優先。broadcaster 判定は embedded-data の `program.supplier.programProviderId` と raw_user_id の一致。
+- ギフトは `MessageKind::Gift` + `Amount{value: point, currency: "pt"}`。
+- watch WS の `statistics` から視聴者数を取得し、チップへ live 状態と共に反映(YoutubeMetadataUpdate 経由)。
+- `identifier` は番組 URL(`live.nicovideo.jp/watch/lvN` / `nico.ms/lvN`)または生の lv 番組 ID。`extract_live_id()` で正規化し、`ChatMessage.channel` には正規化済み lv ID を入れる。
+- **視聴ページ base URL は `config.rs` の `niconicoOverrides.endpoints`(キー: `watchPageBaseUrl`)から上書き可能**(再ビルド不要)。
+- 再接続は他 Source と同じ指数バックオフ。NDGR 購読が死んだらセッション全体を張り直す。サーバー `disconnect`/`error` メッセージも同様。
 
 ## 5. Bus 層 (`bus.rs`)
 
@@ -159,12 +194,13 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
   - **端フェード**: 右端の出現(0→6%)と左端の消失(94→100%)を opacity アニメ(`danmaku-fade`)で柔らかく。移動アニメ(`danmaku-fly`)の linear タイミングは不変で、撤去は `animationName==='danmaku-fly'` 側のみ(2アニメでの二重/早期撤去を防ぐ)。全体不透明度(`?opacity=`/`--opacity`)と要素フェードは乗算合成。
   - **連投まとめ(×N)**: 同一本文(名前前置前の素の本文 `core` をキー)の連投を `COALESCE_WINDOW_MS`(1500ms)内なら1つの弾幕に集約し `×N` カウント表示(『草』『w』『888』のスパム抑制)。流れるコメント(非gift/非system)のみ対象。集約は既存要素のテキスト書き換えのみで `lanePrev`(追突防止状態)は触らない。撤去/間引き時に集約マップから掃除(OBSは `size<32` ガード)。デスクトップは設定トグル、OBS は `?coalesce=0` で無効化(既定 ON)。
   - **投げ銭固定強調弾幕**: SuperChat/Bits/メンバーは流さず画面上部に `PIN_SEC`(8秒)固定表示してフェード撤去(ニコ生 `ue` コマンド風・見逃し防止)。同時 `PIN_MAX`(6件)・最古から間引き・最新を上。半透明角丸ボックス+種別色。デスクトップは設定トグル(タイマは `onDestroy` で `clearTimeout` しリーク防止)、OBS は `?pin=0` で無効化(既定 ON、OFF時は従来通り流す)。
-- **コメント投稿** (`CommentComposer.svelte`, `sources/twitch_send.rs`): 自分でコメントを送信。Twitch は IRC で送信(実機ビルド検証済みは要確認)。**YouTube 投稿は未実装(スタブ)** — UI 上は選択不可/注意表示にする。
+- **コメント投稿** (`CommentComposer.svelte`, `sources/twitch_send.rs`, `sources/youtube_send.rs`): 自分でコメントを送信。Twitch は IRC、YouTube は公式Data API `liveChatMessages.insert` で送信する。YouTube認証はシステムブラウザ + loopback redirect + Authorization Code/PKCE、scopeは`youtube.force-ssl`。refresh tokenはOS資格情報ストア、access tokenは期限付きメモリキャッシュに保持し、受信ホットパスへ処理を追加しない。配信中の`liveChatId`は`liveBroadcasts.list`で解決して60秒キャッシュする。
 - **参加型配信の管理** (`Participation.svelte`, `Raffle.svelte`): キーワード(既定「参加」)での参加登録、先着/ランダム抽選、専用タブ。既定 OFF。
 - **投げ銭パネル** (`DonationPanel.svelte`): SuperChat/Bits/メンバーを通常コメントと分けて表示(アプリ内タブ / OBS `?only=gift`)。既定 OFF。
 - **配信振り返りダッシュボード** (`Dashboard.svelte`, `Sparkline.svelte`): コメント数・視聴者推移などの集計表示。
 - **タイマー/ゴール/エフェクト/マイルストーン** (`Timer.svelte`, `GoalsBar.svelte`, `Effects.svelte`, `Milestone.svelte`): 配信演出系。OBS テンプレ `timer`/`goals` と連動。
   - Goals はコメント、視聴者、高評価、リアクションを表示できる。リアクションは YouTube 絵文字リアクション累計で、YouTube のみ有効(`reactionsAvailable=false` で自動非表示)。
+  - アプリ内エフェクト有効時は、YouTube匿名リアクションの絵文字別増分を専用16msバッチIPCで受け、右端寄りに浮上・フェード表示する。初回pollはrolling windowの再送分なので、再接続時の重複を避けるため統計・演出とも更新しない。描画数は画面幅別の上限を設け、`prefers-reduced-motion` では演出を省略する。コメント/TTS/OBSには混ぜない。
 - **マルチカラム表示** (`MultiColumnView.svelte`): チャンネル/種別ごとの複数列ビュー。
 - **設定/モデレーションのポータビリティ** (`ConfigPortability.svelte`, `ModerationPortability.svelte`): 設定・NG/ハイライトのエクスポート/インポート。
 - **ウィンドウ最前面ピン**: メインウィンドウを最前面固定するトグル(`core:window:allow-set-always-on-top`)。
@@ -193,7 +229,8 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
 ## 10. 設定永続化 (`config.rs`)
 
 - 保存先: Tauri の app config dir に `config.json`。
-- 内容: channels[], obs{port}, tts{backend, options}, moderation{ngWords[], ngUsers[], highlights[]}, ui{maxBuffer, notifySound, notifyVolume}, youtubeOverrides{apiKey?, clientVersion?, paths?}。
+- 内容: channels[], obs{port}, tts{backend, options}, moderation{ngWords[], ngUsers[], highlights[]}, ui{maxBuffer, notifySound, notifyVolume}, youtubeOverrides{apiKey?, clientVersion?, paths?}, credentials{youtubeApiKey?, ...}。
+  - `credentials.youtubeApiKey`(空文字既定): 公式YouTube streamList用。空ならInnerTubeのみ。
   - `ui.notifySound`(bool 既定false) / `ui.notifyVolume`(f32 0.0〜1.0 既定0.5): キーワード通知の効果音設定。serde default でキー欠落の旧 config も後方互換。
   - `obs`: ポートに加え `maxRows` / `fontScalePct` / `ttlMs` / `bgOpacityPct` / `position` 等の見た目設定。範囲外値が入らないよう **Rust 側でも `normalize()` で clamp**(`maxRows` 1..=1000, `fontScalePct` 50..=200, `bgOpacityPct` 0..=100, `ttlMs` 500..=600000, `position`∈{top,bottom})。`normalize()` は config ロード時と `update_config` 適用時の両方で呼ぶ。上限定数は Rust 側に1箇所(`MAX_OBS_ROWS`)を置き UI/テンプレと値を揃える。
 - 起動時ロード、変更時保存。`config.json` をアプリ設定の正本とする。
@@ -207,12 +244,15 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
 - **P3 OBS**: axum WS + default テンプレ
 - **P4 TTS**: 3バックエンド + ルーティング
 - **P5 モデレーション + 設定UI仕上げ**
-- **P5+ 拡張UI(実装済み, §8.1)**: 弾幕オーバーレイ(デスクトップ窓 + danmaku テンプレ)、コメント投稿(Twitch)、参加型/抽選、投げ銭パネル、ダッシュボード、タイマー/ゴール/エフェクト、マルチカラム、設定ポータビリティ、テンプレ編集UI、最前面ピン、追加OBSテンプレ8種
-- **P6(後)**: OAuth実モデレーション(実BAN/削除)、YouTubeコメント投稿、niconico等の追加Source、テンプレ編集のライブプレビュー強化
+- **P5+ 拡張UI(実装済み, §8.1)**: 弾幕オーバーレイ(デスクトップ窓 + danmaku テンプレ)、コメント投稿(Twitch/YouTube)、参加型/抽選、投げ銭パネル、ダッシュボード、タイマー/ゴール/エフェクト、マルチカラム、設定ポータビリティ、テンプレ編集UI、最前面ピン、追加OBSテンプレ8種
+- **P5++ X対応(実装済み, §4.3)**: X (Twitter) ライブ配信のチャット受信(ゲストトークン + chatnow WebSocket、読み取り専用・投稿非対応)
+- **P5+++ niconico対応(実装済み, §4.4)**: ニコニコ生放送のコメント受信(watch WS + NDGR Protobuf、読み取り専用・投稿非対応)
+- **P6(後)**: OAuth実モデレーション(実BAN/削除)、さらなる追加Source、テンプレ編集のライブプレビュー強化
 
 ## 12. 既知の制約・注意
 
 - WSLでは Tauri ビルド不可(Linuxバイナリになる)。ビルドはWindows側。
 - YouTube InnerTube は非公式 → 仕様変更リスク。寛容パース+overrides+ログで吸収。
+- X chatapi も非公式(Periscope 由来) → 同リスク。寛容パース+`xOverrides` で吸収。
 - 実モデレーションはOAuth必須(P6)。
 - Tauri build にはアイコン(`src-tauri/icons/`)が必要。

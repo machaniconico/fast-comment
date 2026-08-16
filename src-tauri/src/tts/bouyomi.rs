@@ -24,6 +24,9 @@ use std::time::{Duration, Instant};
 use super::TtsBackend;
 
 const CMD_TALK: u16 = 0x0001;
+const CMD_PAUSE: u16 = 0x0010;
+const CMD_RESUME: u16 = 0x0020;
+const CMD_CLEAR: u16 = 0x0040;
 const CHARCODE_UTF8: u8 = 0;
 
 /// 接続〜送出のタイムアウト(stall 時に速やかに失敗し Web Speech へフォールバック)。
@@ -241,11 +244,8 @@ impl BouyomiBackend {
         buf.extend_from_slice(body);
         buf
     }
-}
 
-impl TtsBackend for BouyomiBackend {
-    async fn speak(&self, text: String) -> anyhow::Result<()> {
-        let packet = self.build_packet(&text);
+    async fn send_packet(&self, packet: Vec<u8>) -> anyhow::Result<()> {
         let addr_text = self.addr();
         tokio::task::spawn_blocking(move || {
             let addr = match resolve_first_addr(&addr_text) {
@@ -288,6 +288,28 @@ impl TtsBackend for BouyomiBackend {
         Ok(())
     }
 
+    async fn send_simple_command(&self, command: u16) -> anyhow::Result<()> {
+        self.send_packet(command.to_le_bytes().to_vec()).await
+    }
+
+    /// OFF時は現在の発話を止め、棒読みちゃん側に溜まった待ち行列も捨てる。
+    pub async fn pause_and_clear(&self) -> anyhow::Result<()> {
+        self.send_simple_command(CMD_PAUSE).await?;
+        self.send_simple_command(CMD_CLEAR).await
+    }
+
+    /// OFF解除時に棒読みちゃんを再開する。
+    pub async fn resume(&self) -> anyhow::Result<()> {
+        self.send_simple_command(CMD_RESUME).await
+    }
+}
+
+impl TtsBackend for BouyomiBackend {
+    async fn speak(&self, text: String) -> anyhow::Result<()> {
+        let packet = self.build_packet(&text);
+        self.send_packet(packet).await
+    }
+
     async fn available(&self) -> bool {
         // ポートへ接続できるかで簡易判定(短いタイムアウト)。
         let addr_text = self.addr();
@@ -301,5 +323,60 @@ impl TtsBackend for BouyomiBackend {
             .await,
             Ok(true)
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Read;
+    use std::net::TcpListener;
+
+    use super::BouyomiBackend;
+
+    fn backend_for(listener: &TcpListener) -> BouyomiBackend {
+        BouyomiBackend::new(
+            "127.0.0.1".to_string(),
+            listener.local_addr().unwrap().port(),
+            -1,
+            -1,
+            -1,
+            0,
+        )
+    }
+
+    fn receive_commands(listener: TcpListener, count: usize) -> Vec<[u8; 2]> {
+        (0..count)
+            .map(|_| {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut command = [0_u8; 2];
+                stream.read_exact(&mut command).unwrap();
+                command
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn pause_clears_bouyomi_queue_and_resume_reenables_it() {
+        let pause_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let pause_backend = backend_for(&pause_listener);
+        let pause_receiver = std::thread::spawn(move || receive_commands(pause_listener, 2));
+
+        pause_backend.pause_and_clear().await.unwrap();
+
+        assert_eq!(
+            pause_receiver.join().unwrap(),
+            vec![0x0010_u16.to_le_bytes(), 0x0040_u16.to_le_bytes()]
+        );
+
+        let resume_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let resume_backend = backend_for(&resume_listener);
+        let resume_receiver = std::thread::spawn(move || receive_commands(resume_listener, 1));
+
+        resume_backend.resume().await.unwrap();
+
+        assert_eq!(
+            resume_receiver.join().unwrap(),
+            vec![0x0020_u16.to_le_bytes()]
+        );
     }
 }

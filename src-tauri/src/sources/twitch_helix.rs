@@ -87,6 +87,7 @@ pub fn spawn_twitch_viewer_poller(
                             title: None,
                             live: values.live,
                             reactions_delta: None,
+                            full_snapshot: true,
                         };
                         tokio::select! {
                             _ = cancel.cancelled() => break,

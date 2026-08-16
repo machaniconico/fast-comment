@@ -7,8 +7,10 @@
  * - Safe to import in a plain browser (Tauri absent): all calls are no-ops.
  */
 
-import type { ChatMessage } from './types';
-import { getCurrentWindow } from '@tauri-apps/api/window';
+import type { ChatMessage, YoutubeReaction } from './types';
+import { invoke as tauriInvoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
+import { getCurrentWindow, primaryMonitor } from '@tauri-apps/api/window';
 
 // ---- Tauri availability guard ----
 // @tauri-apps/api throws when window.__TAURI_INTERNALS__ is absent (browser dev).
@@ -66,7 +68,6 @@ export async function startChatListener(): Promise<() => void> {
     console.info('[ipc] Tauri not detected — running in browser-only mode');
     return () => {};
   }
-  const { listen } = await import('@tauri-apps/api/event');
   const unlisten = await listen<ChatMessage[]>('chat', (event) => {
     _pending.push(...event.payload);
     scheduleFlusher();
@@ -83,7 +84,6 @@ export async function startChatListener(): Promise<() => void> {
 export async function startTtsSpeakListener(): Promise<() => void> {
   if (!isTauri()) return () => {};
   if (typeof window === 'undefined' || !('speechSynthesis' in window)) return () => {};
-  const { listen } = await import('@tauri-apps/api/event');
   const unlisten = await listen<TtsSpeakPayload | string>('tts-speak', (event) => {
     const payload = typeof event.payload === 'string'
       ? { text: event.payload, rate: 1, pitch: 1, volume: 1, voice: '' }
@@ -114,7 +114,6 @@ export async function startTtsSpeakListener(): Promise<() => void> {
 export async function startTtsCancelListener(): Promise<() => void> {
   if (!isTauri()) return () => {};
   if (typeof window === 'undefined' || !('speechSynthesis' in window)) return () => {};
-  const { listen } = await import('@tauri-apps/api/event');
   const unlisten = await listen('tts-cancel', () => {
     try {
       window.speechSynthesis.cancel();
@@ -143,7 +142,6 @@ export interface TtsQueueState {
 
 export async function onTtsNotice(cb: (notice: TtsNotice) => void): Promise<() => void> {
   if (!isTauri()) return () => {};
-  const { listen } = await import('@tauri-apps/api/event');
   const unlisten = await listen<TtsNotice>('tts-notice', (event) => {
     cb(event.payload);
   });
@@ -152,7 +150,6 @@ export async function onTtsNotice(cb: (notice: TtsNotice) => void): Promise<() =
 
 export async function onTtsQueueState(cb: (state: TtsQueueState) => void): Promise<() => void> {
   if (!isTauri()) return () => {};
-  const { listen } = await import('@tauri-apps/api/event');
   const unlisten = await listen<TtsQueueState>('tts-queue-state', (event) => {
     cb(event.payload);
   });
@@ -165,8 +162,21 @@ export async function onTtsQueueState(cb: (state: TtsQueueState) => void): Promi
  */
 export async function onStats(cb: (snapshot: StatsSnapshot) => void): Promise<() => void> {
   if (!isTauri()) return () => {};
-  const { listen } = await import('@tauri-apps/api/event');
   const unlisten = await listen<StatsSnapshot>('stats', (event) => {
+    cb(event.payload);
+  });
+  return unlisten;
+}
+
+/**
+ * Listen to frame-batched anonymous YouTube reaction increments.
+ * The backend already merges all source updates that arrive within 16ms.
+ */
+export async function onYoutubeReactions(
+  cb: (reactions: YoutubeReaction[]) => void
+): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  const unlisten = await listen<YoutubeReaction[]>('youtube-reactions', (event) => {
     cb(event.payload);
   });
   return unlisten;
@@ -198,7 +208,6 @@ function boundedNumber(value: unknown, fallback: number, min: number, max: numbe
 
 async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T | null> {
   if (!isTauri()) return null;
-  const { invoke: tauriInvoke } = await import('@tauri-apps/api/core');
   return tauriInvoke<T>(cmd, args);
 }
 
@@ -240,6 +249,7 @@ export interface AppConfig {
     port: number;
     template: string;
     fontScalePct: number;
+    danmakuFontSize: number;
     maxRows: number;
     ttlMs: number;
     bgOpacityPct: number;
@@ -252,17 +262,44 @@ export interface AppConfig {
   welcome: WelcomeConfig;
   tts: { backend: 'bouyomi' | 'voicevox' | 'webSpeech' | 'none'; options: TtsOptions };
   moderation: { ngWords: string[]; ngUsers: string[]; highlights: string[] };
-  ui: { maxBuffer: number; showDonationPanel: boolean; notifySound: boolean; notifyVolume: number };
+  ui: {
+    maxBuffer: number;
+    youtubeMemberNameGreen: boolean;
+    twitchNativeStyle: boolean;
+    showDonationPanel: boolean;
+    notifySound: boolean;
+    notifyVolume: number;
+  };
   participation: ParticipationConfig;
   youtubeOverrides?: { apiKey?: string; clientVersion?: string; paths?: Record<string, string> };
-  // Credentials for self-posting to chat (Rust `CredentialsConfig`, serde camelCase).
+  xOverrides?: { bearerToken?: string; endpoints?: Record<string, string> };
+  // External API/chat credentials (Rust `CredentialsConfig`, serde camelCase).
   // Optional so older config.json without the field still deserializes cleanly.
-  credentials?: { twitchOauth?: string; twitchUsername?: string };
+  credentials?: {
+    twitchOauth?: string;
+    twitchUsername?: string;
+    youtubeApiKey?: string;
+    youtubeOauthClientId?: string;
+    xAuthToken?: string;
+    xCsrfToken?: string;
+  };
+}
+
+export interface YoutubeOauthStatus {
+  configured: boolean;
+  connected: boolean;
+  channelTitle?: string | null;
 }
 
 export interface GoalsConfig {
   enabled: boolean;
   showInApp: boolean;
+  layout: 'horizontal' | 'vertical' | 'grid';
+  skin: 'glass' | 'solid' | 'minimal' | `png:${string}`;
+  showComments: boolean;
+  showViewers: boolean;
+  showLikes: boolean;
+  showReactions: boolean;
   comments: number;
   viewers: number;
   likes: number;
@@ -301,6 +338,13 @@ export interface GoalsSnapshot {
   reactions: number;
 }
 
+export interface GoalsVisibilitySnapshot {
+  comments: boolean;
+  viewers: boolean;
+  likes: boolean;
+  reactions: boolean;
+}
+
 export interface ChannelTitle {
   platform: string;
   identifier: string;
@@ -323,6 +367,8 @@ export interface StatsSnapshot {
   likesAvailable: boolean;
   reactions: number;
   reactionsAvailable: boolean;
+  goalsEnabled: boolean;
+  goalsVisible: GoalsVisibilitySnapshot;
   goals: GoalsSnapshot;
   updatedAt: number;
   // Per-channel stream titles (currently YouTube only). Optional for backward
@@ -354,16 +400,16 @@ export interface Participant {
 }
 
 export interface ChannelConfig {
-  platform: 'twitch' | 'youtube';
-  identifier: string; // Twitch: channel name, YouTube: videoId
+  platform: 'twitch' | 'youtube' | 'x' | 'niconico';
+  identifier: string; // Twitch: channel name, YouTube: videoId, X: broadcast URL/ID, niconico: lv番組ID/URL
   enabled: boolean; // Rust ChannelConfig.enabled (serde default true)
 }
 
 export interface InjectTestCommentOptions {
-  platform: 'twitch' | 'youtube';
+  platform: 'twitch' | 'youtube' | 'x' | 'niconico';
   name: string;
   text: string;
-  kind?: 'normal' | 'superChat' | 'membership' | 'bits';
+  kind?: 'normal' | 'superChat' | 'membership' | 'bits' | 'gift';
   amount?: number;
   count?: number;
 }
@@ -453,6 +499,15 @@ export async function writeTemplateFile(name: string, file: string, contents: st
   await invoke<void>('write_template_file', { name, file, contents });
 }
 
+export interface GoalSkinInfo {
+  directory: string;
+  files: string[];
+}
+
+export async function getGoalSkinInfo(): Promise<GoalSkinInfo> {
+  return (await invoke<GoalSkinInfo>('get_goal_skin_info')) ?? { directory: '', files: [] };
+}
+
 export async function getParticipants(): Promise<Participant[] | null> {
   return invoke<Participant[]>('get_participants');
 }
@@ -480,7 +535,7 @@ export async function injectTestComment(opts: InjectTestCommentOptions): Promise
 /**
  * Post a message to the live chat as the configured account.
  * Twitch sends via an authenticated one-shot IRC connection (Rust side).
- * YouTube is not yet supported (returns an error from the backend).
+ * YouTube sends through the official Data API using the connected Google account.
  * No-op in browser-only mode (Tauri absent).
  */
 export async function sendChatMessage(
@@ -489,6 +544,26 @@ export async function sendChatMessage(
   text: string,
 ): Promise<void> {
   await invoke<void>('send_chat_message', { platform, channel, text });
+}
+
+export async function getYoutubeOauthStatus(): Promise<YoutubeOauthStatus | null> {
+  return invoke<YoutubeOauthStatus>('get_youtube_oauth_status');
+}
+
+export async function connectYoutubeOauth(clientId: string): Promise<YoutubeOauthStatus> {
+  return (await invoke<YoutubeOauthStatus>('connect_youtube_oauth', { clientId })) ?? {
+    configured: false,
+    connected: false,
+    channelTitle: null,
+  };
+}
+
+export async function disconnectYoutubeOauth(): Promise<YoutubeOauthStatus> {
+  return (await invoke<YoutubeOauthStatus>('disconnect_youtube_oauth')) ?? {
+    configured: false,
+    connected: false,
+    channelTitle: null,
+  };
 }
 
 export async function checkForUpdate(): Promise<UpdateStatus | null> {
@@ -524,7 +599,6 @@ export async function openDanmakuOverlay(): Promise<void> {
   let x = 0;
   let y = 0;
   try {
-    const { primaryMonitor } = await import('@tauri-apps/api/window');
     const mon = await primaryMonitor();
     if (mon) {
       const sf = mon.scaleFactor || 1;

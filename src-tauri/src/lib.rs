@@ -28,16 +28,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::{broadcast, mpsc, watch, Notify};
 use tokio_util::sync::CancellationToken;
 
-use crate::bus::{is_valid_template_name, Bus};
+use crate::bus::{is_valid_template_name, spawn_reaction_ui_forwarder, Bus};
 use crate::config::{AppConfig, ChannelConfig, ChannelPlatform, TtsBackendKind};
 use crate::model::{
     Amount, Author, Badge, ChatMessage, Fragment, MessageKind, Participant, Platform, Roles,
+    YoutubeReaction,
 };
 use crate::moderation::{Moderator, Verdict};
+use crate::sources::youtube_send::{YoutubeAuth, YoutubeOauthStatus};
 use crate::sources::SourceManager;
 use crate::stats::{spawn_stats_aggregator, StatsSnapshot, TimerSnapshot, YoutubeMetadataUpdate};
 use crate::tts::{
@@ -65,6 +68,8 @@ pub struct AppState {
     bus: Bus,
     /// OBS テンプレートの配信元ディレクトリ。
     templates_dir: PathBuf,
+    /// ユーザー作成のGoals PNG背景を置く書き込み可能なディレクトリ。
+    goals_skin_dir: PathBuf,
     /// アプリ全体の停止トークン。
     app_cancel: CancellationToken,
     /// OBS サーバの現在の待受状態。
@@ -85,8 +90,12 @@ pub struct AppState {
     tts_clear_notify: Arc<tokio::sync::Notify>,
     /// YouTube メタデータ poller → stats 集約への bounded 送信端。
     metadata_tx: mpsc::Sender<YoutubeMetadataUpdate>,
+    /// YouTubeリアクション Source → 1フレームIPC forwarder の bounded 送信端。
+    reaction_tx: mpsc::Sender<Vec<YoutubeReaction>>,
     /// 参加型配信の参加者一覧。
     participants: Mutex<Vec<Participant>>,
+    /// YouTube投稿用OAuth状態。バックグラウンド処理は持たず、操作時だけ通信する。
+    youtube_auth: YoutubeAuth,
 }
 
 /// OBS サーバの再起動に必要な実行時ハンドル。
@@ -101,6 +110,8 @@ impl AppState {
         let p = match ch.platform {
             config::ChannelPlatform::Twitch => "twitch",
             config::ChannelPlatform::Youtube => "youtube",
+            config::ChannelPlatform::X => "x",
+            config::ChannelPlatform::Niconico => "niconico",
         };
         format!("{p}:{}", ch.identifier)
     }
@@ -224,7 +235,46 @@ fn get_config(state: State<'_, AppState>) -> Result<AppConfig, String> {
 #[tauri::command]
 fn set_tts_paused(app: AppHandle, state: State<'_, AppState>, paused: bool) {
     state.tts_paused.store(paused, Ordering::Relaxed);
+    if paused {
+        state.tts_clear.store(true, Ordering::Relaxed);
+        state.tts_clear_notify.notify_one();
+        clear_tts_queue_snapshot(&app, &state);
+        if let Err(e) = app.emit("tts-cancel", ()) {
+            tracing::warn!("TTSキャンセルイベント送信失敗: {e}");
+        }
+    }
     emit_current_tts_queue_state(&app, &state);
+
+    let tts_config = state.config.lock().unwrap().tts.clone();
+    if tts_config.backend == TtsBackendKind::Bouyomi {
+        let options = tts_config.options;
+        let backend = bouyomi::BouyomiBackend::new(
+            options.bouyomi_host,
+            options.bouyomi_port,
+            options.bouyomi_speed,
+            options.bouyomi_tone,
+            options.bouyomi_volume,
+            options.bouyomi_voice,
+        );
+        let app_for_notice = app.clone();
+        tauri::async_runtime::spawn(async move {
+            let result = if paused {
+                backend.pause_and_clear().await
+            } else {
+                backend.resume().await
+            };
+            if let Err(e) = result {
+                emit_tts_notice(
+                    &app_for_notice,
+                    "warn",
+                    format!(
+                        "棒読みちゃんの{}命令に失敗しました: {e}",
+                        if paused { "停止" } else { "再開" }
+                    ),
+                );
+            }
+        });
+    }
 }
 
 /// 現在の TTS 待ちキュー状態を取得する。
@@ -400,8 +450,6 @@ fn export_comments_csv(app: AppHandle, csv: String) -> Result<String, String> {
 }
 
 /// チャットへコメントを投稿する。
-// TODO(YouTube投稿): liveChatId 解決 → liveChatMessages.insert → quota 管理と
-// Google OAuth 設定を次フェーズで実装する。
 #[tauri::command]
 async fn send_chat_message(
     state: State<'_, AppState>,
@@ -443,12 +491,90 @@ async fn send_chat_message(
             .await
             .map_err(|e| e.to_string())
         }
-        "youtube" => Err(
-            "YouTube投稿は未対応です(YouTube Data API v3 + Google OAuth の設定が必要・次フェーズ)"
-                .into(),
-        ),
+        "youtube" => {
+            let (client_id, target_channel) = {
+                let cfg = state.config.lock().unwrap();
+                let target_channel = if channel.trim().is_empty() {
+                    cfg.channels
+                        .iter()
+                        .find(|ch| ch.platform == ChannelPlatform::Youtube && ch.enabled)
+                        .or_else(|| {
+                            cfg.channels
+                                .iter()
+                                .find(|ch| ch.platform == ChannelPlatform::Youtube)
+                        })
+                        .map(|ch| ch.identifier.clone())
+                        .unwrap_or_default()
+                } else {
+                    channel.trim().to_string()
+                };
+                (
+                    cfg.credentials.youtube_oauth_client_id.clone(),
+                    target_channel,
+                )
+            };
+            state
+                .youtube_auth
+                .send_message(&client_id, &target_channel, &text)
+                .await
+        }
         other => Err(format!("不明なplatformです: {other}")),
     }
+}
+
+/// YouTube投稿用Google OAuthの接続状態を取得する。
+#[tauri::command]
+async fn get_youtube_oauth_status(
+    state: State<'_, AppState>,
+) -> Result<YoutubeOauthStatus, String> {
+    let client_id = state
+        .config
+        .lock()
+        .unwrap()
+        .credentials
+        .youtube_oauth_client_id
+        .clone();
+    state.youtube_auth.status(&client_id).await
+}
+
+/// システムブラウザを開き、YouTube投稿権限をGoogleアカウントから取得する。
+#[tauri::command]
+async fn connect_youtube_oauth(
+    state: State<'_, AppState>,
+    client_id: String,
+) -> Result<YoutubeOauthStatus, String> {
+    let client_id = client_id.trim().to_string();
+    if client_id.is_empty() {
+        return Err("YouTube OAuth クライアントIDを設定してください".to_string());
+    }
+    // OAuthボタンはこの項目だけを保存する。他の未保存設定を巻き込まない。
+    let (next_config, changed) = {
+        let mut cfg = state.config.lock().unwrap();
+        let changed = cfg.credentials.youtube_oauth_client_id.trim() != client_id;
+        cfg.credentials.youtube_oauth_client_id = client_id.clone();
+        cfg.save(&state.config_dir).map_err(|e| e.to_string())?;
+        (cfg.clone(), changed)
+    };
+    let _ = state.config_tx.send(next_config);
+    if changed {
+        state.youtube_auth.clear_caches().await;
+    }
+    state.youtube_auth.connect(&client_id).await
+}
+
+/// このPCに保存したYouTube投稿用認証を削除する。
+#[tauri::command]
+async fn disconnect_youtube_oauth(
+    state: State<'_, AppState>,
+) -> Result<YoutubeOauthStatus, String> {
+    let client_id = state
+        .config
+        .lock()
+        .unwrap()
+        .credentials
+        .youtube_oauth_client_id
+        .clone();
+    state.youtube_auth.disconnect(&client_id).await
 }
 
 /// 設定全体を更新して保存する。moderation/tts/obs などの実行時状態も反映する。
@@ -460,6 +586,24 @@ async fn update_config(
     state: State<'_, AppState>,
     mut new_config: AppConfig,
 ) -> Result<(), String> {
+    let (youtube_source_config_changed, youtube_oauth_client_changed, x_source_config_changed) = {
+        let current = state.config.lock().unwrap();
+        (
+            current.youtube_overrides != new_config.youtube_overrides
+                || current.credentials.youtube_api_key.trim()
+                    != new_config.credentials.youtube_api_key.trim(),
+            current.credentials.youtube_oauth_client_id.trim()
+                != new_config.credentials.youtube_oauth_client_id.trim(),
+            // overrides に加え、名前解決 cookie の変更でも張り直す
+            // (新しい XAuth は再スポーン時に読み直される)。
+            current.x_overrides != new_config.x_overrides
+                || current.credentials.x_auth_token.trim()
+                    != new_config.credentials.x_auth_token.trim()
+                || current.credentials.x_csrf_token.trim()
+                    != new_config.credentials.x_csrf_token.trim(),
+        )
+    };
+
     // 保存。
     new_config.obs.normalize();
     new_config
@@ -485,6 +629,16 @@ async fn update_config(
     *state.config.lock().unwrap() = new_config;
     let _ = state.config_tx.send(committed_config.clone());
 
+    if youtube_source_config_changed {
+        stop_active_youtube_channels(&state);
+    }
+    if x_source_config_changed {
+        stop_active_x_channels(&state);
+    }
+    if youtube_oauth_client_changed {
+        state.youtube_auth.clear_caches().await;
+    }
+
     // チャンネル差分適用(コミット済み設定を参照する)。
     apply_channel_diff(&app, &state, &desired_channels);
 
@@ -500,6 +654,36 @@ async fn update_config(
     }
 
     Ok(())
+}
+
+/// YouTubeの受信方式に関わる設定変更時だけ既存タスクを止め、差分適用で再起動させる。
+fn stop_active_youtube_channels(state: &AppState) {
+    let mut channels = state.channels.lock().unwrap();
+    let keys: Vec<String> = channels
+        .keys()
+        .filter(|key| key.starts_with("youtube:"))
+        .cloned()
+        .collect();
+    for key in keys {
+        if let Some(token) = channels.remove(&key) {
+            token.cancel();
+        }
+    }
+}
+
+/// X の overrides 変更時だけ既存タスクを止め、差分適用で再起動させる。
+fn stop_active_x_channels(state: &AppState) {
+    let mut channels = state.channels.lock().unwrap();
+    let keys: Vec<String> = channels
+        .keys()
+        .filter(|key| key.starts_with("x:"))
+        .cloned()
+        .collect();
+    for key in keys {
+        if let Some(token) = channels.remove(&key) {
+            token.cancel();
+        }
+    }
 }
 
 /// チャンネルを1件追加して起動する。
@@ -735,6 +919,80 @@ fn write_template_file(
         .map_err(|e| format!("テンプレートファイル書き込み失敗 {}: {e}", path.display()))
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GoalSkinInfo {
+    directory: String,
+    files: Vec<String>,
+}
+
+/// ユーザー作成Goals PNGスキンの配置先とファイル一覧を返す。
+#[tauri::command]
+fn get_goal_skin_info(state: State<'_, AppState>) -> Result<GoalSkinInfo, String> {
+    fs::create_dir_all(&state.goals_skin_dir).map_err(|e| {
+        format!(
+            "skinフォルダの作成に失敗 {}: {e}",
+            state.goals_skin_dir.display()
+        )
+    })?;
+
+    let mut files = Vec::new();
+    let entries = fs::read_dir(&state.goals_skin_dir).map_err(|e| {
+        format!(
+            "skinフォルダの読み込みに失敗 {}: {e}",
+            state.goals_skin_dir.display()
+        )
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("skinファイル一覧の取得に失敗: {e}"))?;
+        if !entry
+            .file_type()
+            .map_err(|e| format!("skinファイル種別の取得に失敗: {e}"))?
+            .is_file()
+        {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if is_png_skin_file_name(&name) {
+            files.push(name);
+        }
+    }
+    files.sort_by_key(|name| name.to_lowercase());
+    Ok(GoalSkinInfo {
+        directory: state.goals_skin_dir.to_string_lossy().into_owned(),
+        files,
+    })
+}
+
+fn is_png_skin_file_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > 255 {
+        return false;
+    }
+    let path = std::path::Path::new(name);
+    path.parent().is_none_or(|parent| parent.as_os_str().is_empty())
+        && path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("png"))
+}
+
+#[cfg(test)]
+mod goal_skin_tests {
+    use super::is_png_skin_file_name;
+
+    #[test]
+    fn accepts_png_files_and_rejects_paths_or_other_extensions() {
+        assert!(is_png_skin_file_name("my-goals.png"));
+        assert!(is_png_skin_file_name("配信用スキン.PNG"));
+        assert!(!is_png_skin_file_name("../skin.png"));
+        assert!(!is_png_skin_file_name("nested/skin.png"));
+        assert!(!is_png_skin_file_name("skin.jpg"));
+        assert!(!is_png_skin_file_name(""));
+    }
+}
+
 fn validate_template_file_name(file: &str) -> Result<&str, String> {
     EDITABLE_TEMPLATE_FILES
         .iter()
@@ -844,6 +1102,8 @@ fn inject_test_comment(
     let platform = match platform.as_str() {
         "twitch" => Platform::Twitch,
         "youtube" => Platform::Youtube,
+        "x" => Platform::X,
+        "niconico" => Platform::Niconico,
         other => return Err(format!("不正な platform です: {other}")),
     };
     let kind = match kind.as_deref().unwrap_or("normal") {
@@ -851,6 +1111,7 @@ fn inject_test_comment(
         "superChat" => MessageKind::SuperChat,
         "membership" => MessageKind::Membership,
         "bits" => MessageKind::Bits,
+        "gift" => MessageKind::Gift,
         other => return Err(format!("不正な kind です: {other}")),
     };
     let count = count.unwrap_or(1).clamp(1, 20);
@@ -908,6 +1169,8 @@ fn participant_platform(platform: Platform) -> &'static str {
     match platform {
         Platform::Twitch => "twitch",
         Platform::Youtube => "youtube",
+        Platform::X => "x",
+        Platform::Niconico => "niconico",
     }
 }
 
@@ -967,6 +1230,7 @@ fn restart_obs_server_if_needed(state: &AppState, new_port: u16) -> Result<(), S
     let cancel = state.app_cancel.child_token();
     let _obs_task = state.bus.spawn_obs_server_on_port(
         state.templates_dir.clone(),
+        state.goals_skin_dir.clone(),
         new_port,
         cancel.clone(),
     )?;
@@ -1018,7 +1282,25 @@ fn spawn_one_channel(_app: &AppHandle, state: &AppState, ch: &ChannelConfig) {
         return;
     }
     let key = AppState::channel_key(ch);
-    let overrides = state.config.lock().unwrap().youtube_overrides.clone();
+    let (overrides, youtube_api_key, x_overrides, x_auth, niconico_overrides) = {
+        let config = state.config.lock().unwrap();
+        // X の名前解決 cookie は auth_token / ct0 の両方が揃って初めて有効。
+        let x_auth = {
+            let token = config.credentials.x_auth_token.trim();
+            let csrf = config.credentials.x_csrf_token.trim();
+            (!token.is_empty() && !csrf.is_empty()).then(|| sources::x::XAuth {
+                auth_token: token.to_string(),
+                csrf_token: csrf.to_string(),
+            })
+        };
+        (
+            config.youtube_overrides.clone(),
+            config.credentials.youtube_api_key.clone(),
+            config.x_overrides.clone(),
+            x_auth,
+            config.niconico_overrides.clone(),
+        )
+    };
     let token = if ch.platform == ChannelPlatform::Youtube
         && sources::youtube::is_channel_identifier(&ch.identifier)
     {
@@ -1026,8 +1308,10 @@ fn spawn_one_channel(_app: &AppHandle, state: &AppState, ch: &ChannelConfig) {
         sources::youtube::live_resolve::spawn_live_resolve_poller(
             ch.identifier.clone(),
             overrides.clone(),
+            youtube_api_key.clone(),
             state.source_tx.clone(),
             state.metadata_tx.clone(),
+            state.reaction_tx.clone(),
             token.clone(),
         );
         token
@@ -1035,7 +1319,12 @@ fn spawn_one_channel(_app: &AppHandle, state: &AppState, ch: &ChannelConfig) {
         let manager = SourceManager::new(
             state.source_tx.clone(),
             overrides.clone(),
+            youtube_api_key,
+            x_overrides,
+            x_auth,
+            niconico_overrides,
             Some(state.metadata_tx.clone()),
+            Some(state.reaction_tx.clone()),
         );
         manager.spawn_channel(ch)
     };
@@ -1119,7 +1408,7 @@ fn spawn_pipeline(app: AppHandle, cancel: CancellationToken) {
                     // 読み上げは単一の長命ワーカーへ bounded channel で渡す。
                     // バースト時は try_send が Full を返すので drop し、UI/OBS 配信は止めない
                     // (背圧/有界・SPEC 設計原則2)。
-                    if !msg.skip_tts {
+                    if !msg.skip_tts && !state.tts_paused.load(Ordering::Relaxed) {
                         if let Err(mpsc::error::TrySendError::Full(_)) =
                             try_enqueue_tts_message(&app, &state, msg.clone())
                         {
@@ -1271,6 +1560,7 @@ pub fn run() {
             let (timer_tx, _timer_rx) = watch::channel::<TimerSnapshot>(TimerSnapshot::default());
             let (config_tx, config_rx) = watch::channel::<AppConfig>(config.clone());
             let (metadata_tx, metadata_rx) = mpsc::channel::<YoutubeMetadataUpdate>(64);
+            let (reaction_tx, reaction_rx) = mpsc::channel::<Vec<YoutubeReaction>>(64);
 
             // 下流 Bus(パイプライン → UI/OBS)。
             let bus = Bus::new(obs_port, stats_tx.clone(), timer_tx.clone());
@@ -1282,6 +1572,13 @@ pub fn run() {
             let app_cancel = CancellationToken::new();
             let obs_cancel = app_cancel.child_token();
             let templates_dir = resolve_templates_dir(&handle);
+            let goals_skin_dir = config_dir.join("skin");
+            if let Err(e) = fs::create_dir_all(&goals_skin_dir) {
+                tracing::warn!(
+                    "Goals skinフォルダの作成に失敗 {}: {e}",
+                    goals_skin_dir.display()
+                );
+            }
 
             let state = AppState {
                 config: Mutex::new(config.clone()),
@@ -1291,6 +1588,7 @@ pub fn run() {
                 source_tx: source_tx.clone(),
                 bus: bus.clone(),
                 templates_dir: templates_dir.clone(),
+                goals_skin_dir: goals_skin_dir.clone(),
                 app_cancel: app_cancel.clone(),
                 obs_server: Mutex::new(ObsServerControl {
                     port: obs_port,
@@ -1304,7 +1602,10 @@ pub fn run() {
                 tts_clear: Arc::new(AtomicBool::new(false)),
                 tts_clear_notify: Arc::new(Notify::new()),
                 metadata_tx,
+                reaction_tx,
                 participants: Mutex::new(Vec::new()),
+                youtube_auth: YoutubeAuth::new()
+                    .expect("YouTube投稿用HTTPクライアントの作成に失敗しました"),
             };
             app.manage(state);
 
@@ -1324,7 +1625,8 @@ pub fn run() {
 
             // Bus の UI forwarder と OBS サーバを起動。
             bus.spawn_ui_forwarder(handle.clone(), app_cancel.clone());
-            if let Err(e) = bus.spawn_obs_server(templates_dir, obs_cancel) {
+            spawn_reaction_ui_forwarder(reaction_rx, handle.clone(), app_cancel.clone());
+            if let Err(e) = bus.spawn_obs_server(templates_dir, goals_skin_dir, obs_cancel) {
                 tracing::error!("{e}");
             }
 
@@ -1364,6 +1666,9 @@ pub fn run() {
             test_tts,
             export_comments_csv,
             send_chat_message,
+            get_youtube_oauth_status,
+            connect_youtube_oauth,
+            disconnect_youtube_oauth,
             update_config,
             add_channel,
             remove_channel,
@@ -1376,6 +1681,7 @@ pub fn run() {
             list_templates,
             read_template_file,
             write_template_file,
+            get_goal_skin_info,
             get_participants,
             pick_next_participant,
             pick_random_participant,
