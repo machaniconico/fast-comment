@@ -34,13 +34,21 @@ use crate::stats::{ViewerCountKind, YoutubeMetadataUpdate};
 const WATCH_PAGE_BASE_URL: &str = "https://live.nicovideo.jp/watch/";
 /// ブラウザ相当の UA。視聴ページはブラウザ以外の UA を弾くことがある。
 const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
-/// HTTP リクエスト(視聴ページ取得)の全体タイムアウト。
+/// 単発 HTTP リクエスト(視聴ページ取得)の全体タイムアウト。
+/// NDGR の view/segment は長時間開きっぱなしのストリームなので、これは付けない
+/// (Client 側に付けると、その時間ちょうどで必ずストリームが切れる)。
 const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
+/// HTTP 接続確立のタイムアウト。ストリームを殺さないので Client 側に付けてよい。
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 /// WebSocket ハンドシェイクのタイムアウト。
 const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 /// watch WS はサーバーから約30秒毎に ping が来る。この時間何も来なければ
 /// half-open とみなし再接続する。
 const WATCH_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+/// NDGR view ストリームの無通信タイムアウト。view は次窓を指す `next` を必ず
+/// 流してくるので、これだけ無音なら half-open とみなしてセッションを張り直す。
+/// 全体タイムアウトの代わりなので、正常な窓の長さより十分長く取る。
+const NDGR_IDLE_TIMEOUT: Duration = Duration::from_secs(180);
 /// seat メッセージが keepIntervalSec を運んでこなかった場合の既定値。
 const DEFAULT_KEEP_SEAT_SEC: u64 = 30;
 
@@ -431,9 +439,11 @@ impl NiconicoSource {
         tx: &broadcast::Sender<ChatMessage>,
         cancel: &CancellationToken,
     ) -> Result<bool, NiconicoSessionError> {
+        // NDGR ストリームを全体タイムアウトで殺さないよう Client には connect_timeout
+        // のみ設定し、視聴ページ取得側に個別タイムアウトを付ける(x.rs と同方針)。
         let client = reqwest::Client::builder()
             .user_agent(USER_AGENT)
-            .timeout(HTTP_TIMEOUT)
+            .connect_timeout(CONNECT_TIMEOUT)
             .build()
             .map_err(|e| NiconicoSessionError::new(e, false))?;
 
@@ -612,6 +622,7 @@ impl NiconicoSource {
         );
         let html = client
             .get(&url)
+            .timeout(HTTP_TIMEOUT)
             .send()
             .await?
             .error_for_status()?
@@ -696,13 +707,21 @@ async fn ndgr_view_loop(
         let mut stream = resp.bytes_stream();
         let mut buf = BytesMut::new();
         let mut next_at: Option<i64> = None;
+        let mut last_chunk = tokio::time::Instant::now();
 
         loop {
             let chunk = tokio::select! {
                 _ = cancel.cancelled() => return Ok(()),
+                _ = tokio::time::sleep_until(last_chunk + NDGR_IDLE_TIMEOUT) => {
+                    anyhow::bail!(
+                        "view ストリームが{}秒無通信",
+                        NDGR_IDLE_TIMEOUT.as_secs()
+                    );
+                }
                 c = stream.next() => c,
             };
             let Some(chunk) = chunk else { break };
+            last_chunk = tokio::time::Instant::now();
             buf.extend_from_slice(&chunk?);
             while let Some(entry) = try_take_message::<ndgr::ChunkedEntry>(&mut buf)? {
                 match entry.entry {
