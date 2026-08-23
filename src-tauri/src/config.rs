@@ -502,7 +502,7 @@ pub struct NiconicoOverrides {
     pub endpoints: std::collections::HashMap<String, String>,
 }
 
-/// チャット送信用の認証情報。
+/// チャット送信・外部API利用に使う認証情報。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct CredentialsConfig {
@@ -512,6 +512,14 @@ pub struct CredentialsConfig {
     /// Twitch 投稿用ユーザー名。
     #[serde(default)]
     pub twitch_username: String,
+    /// Twitch 同接取得用の App Access Token を client_credentials で自動取得するアプリのクライアントID。
+    /// チャット送信用の `twitch_oauth` とは別の認証情報。
+    #[serde(default)]
+    pub twitch_client_id: String,
+    /// Twitch 同接取得用の App Access Token を client_credentials で自動取得するアプリのクライアントシークレット。
+    /// チャット送信用の `twitch_oauth` とは別の認証情報。
+    #[serde(default)]
+    pub twitch_client_secret: String,
     /// YouTube Data API v3 の公式 streamList で使う API キー。
     /// 空なら従来の無認証 InnerTube ポーリングへフォールバックする。
     #[serde(default)]
@@ -845,6 +853,8 @@ mod tests {
             credentials: CredentialsConfig {
                 twitch_oauth: "oauth:test-token".to_string(),
                 twitch_username: "FastCommentBot".to_string(),
+                twitch_client_id: "twitch-client-id".to_string(),
+                twitch_client_secret: "twitch-client-secret".to_string(),
                 youtube_api_key: "youtube-data-api-key".to_string(),
                 youtube_oauth_client_id: "desktop-client.apps.googleusercontent.com".to_string(),
                 x_auth_token: "x-auth-cookie".to_string(),
@@ -918,6 +928,14 @@ mod tests {
         assert_eq!(
             json["credentials"]["twitchUsername"].as_str(),
             Some("FastCommentBot")
+        );
+        assert_eq!(
+            json["credentials"]["twitchClientId"].as_str(),
+            Some("twitch-client-id")
+        );
+        assert_eq!(
+            json["credentials"]["twitchClientSecret"].as_str(),
+            Some("twitch-client-secret")
         );
         assert_eq!(
             json["credentials"]["youtubeApiKey"].as_str(),
@@ -1117,6 +1135,8 @@ mod tests {
         assert_eq!(cfg.credentials, CredentialsConfig::default());
         assert_eq!(cfg.credentials.twitch_oauth, "");
         assert_eq!(cfg.credentials.twitch_username, "");
+        assert_eq!(cfg.credentials.twitch_client_id, "");
+        assert_eq!(cfg.credentials.twitch_client_secret, "");
         assert_eq!(cfg.credentials.youtube_api_key, "");
         assert_eq!(cfg.credentials.youtube_oauth_client_id, "");
         assert_eq!(cfg.youtube_overrides, YoutubeOverrides::default());

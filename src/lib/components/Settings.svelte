@@ -7,7 +7,7 @@
   import {
     getConfig, setConfig, getObsUrl, getObsGoalsUrl, getObsTimerUrl, exportCommentsCsv, injectTestComment,
     setTtsPaused, clearTtsQueue, skipCurrentTts, testTts, getYoutubeOauthStatus,
-    connectYoutubeOauth, disconnectYoutubeOauth, getGoalSkinInfo
+    connectYoutubeOauth, disconnectYoutubeOauth, getGoalSkinInfo, openUrl
   } from '../ipc';
   import { ui, SETTINGS_ANCHOR_IDS } from '../ui.svelte';
   import {
@@ -50,6 +50,11 @@
 
   function onViewerDisplayChange(event: Event) {
     theme.setViewerDisplay((event.currentTarget as HTMLSelectElement).value as AppearanceViewerDisplay);
+  }
+
+  // 外部サイトは既定ブラウザで開く。<a href> だと webview 自体が遷移してしまう。
+  function openExternal(url: string) {
+    void openUrl(url).catch((e) => console.warn('[Settings] open url failed', e));
   }
 
   function onWrapCommentsChange(event: Event) {
@@ -121,6 +126,8 @@
   // External API/chat credentials.
   let credTwitchOauth: string = $state('');
   let credTwitchUsername: string = $state('');
+  let credTwitchClientId: string = $state('');
+  let credTwitchClientSecret: string = $state('');
   let credYoutubeApiKey: string = $state('');
   let credYoutubeOauthClientId: string = $state('');
   let credXAuthToken: string = $state('');
@@ -232,6 +239,8 @@
       highlights = normalizeModerationEntries(config.moderation.highlights);
       credTwitchOauth = config.credentials?.twitchOauth ?? '';
       credTwitchUsername = config.credentials?.twitchUsername ?? '';
+      credTwitchClientId = config.credentials?.twitchClientId ?? '';
+      credTwitchClientSecret = config.credentials?.twitchClientSecret ?? '';
       credYoutubeApiKey = config.credentials?.youtubeApiKey ?? '';
       credYoutubeOauthClientId = config.credentials?.youtubeOauthClientId ?? '';
       credXAuthToken = config.credentials?.xAuthToken ?? '';
@@ -912,6 +921,8 @@
     config.credentials = {
       twitchOauth: credTwitchOauth.trim(),
       twitchUsername: credTwitchUsername.trim(),
+      twitchClientId: credTwitchClientId.trim(),
+      twitchClientSecret: credTwitchClientSecret.trim(),
       youtubeApiKey: credYoutubeApiKey.trim(),
       youtubeOauthClientId: credYoutubeOauthClientId.trim(),
       xAuthToken: credXAuthToken.trim(),
@@ -1395,6 +1406,66 @@
         spellcheck="false"
       />
     </div>
+    <p class="hint">
+      同接数の取得に使います。未設定でもチャット受信は動きますが、視聴者数は出ません。
+    </p>
+    <div class="field-row">
+      <label for="cred-twitch-client-id">Twitch クライアントID</label>
+      <input
+        id="cred-twitch-client-id"
+        type="text"
+        bind:value={credTwitchClientId}
+        class="id-input"
+        placeholder="アプリのクライアントID"
+        autocomplete="off"
+        autocapitalize="off"
+        spellcheck="false"
+      />
+    </div>
+    <div class="field-row">
+      <label for="cred-twitch-client-secret">Twitch クライアントシークレット</label>
+      <input
+        id="cred-twitch-client-secret"
+        type="password"
+        bind:value={credTwitchClientSecret}
+        class="id-input"
+        placeholder="アプリのクライアントシークレット"
+        autocomplete="off"
+        autocapitalize="off"
+        spellcheck="false"
+      />
+    </div>
+    <details class="oauth-setup">
+      <summary>初回設定の手順</summary>
+      <ol>
+        <li>
+          <button type="button" class="ext-link" onclick={() => openExternal('https://www.twitch.tv/settings/security')}>
+            twitch.tv/settings/security
+          </button>
+          で二段階認証(2FA)を有効化する（未設定だとアプリ登録できません）
+        </li>
+        <li>
+          <button type="button" class="ext-link" onclick={() => openExternal('https://dev.twitch.tv/console/apps')}>
+            dev.twitch.tv/console/apps
+          </button>
+          を開き「アプリケーションを登録」
+        </li>
+        <li>名前: 全 Twitch アプリで重複しない名前（例: fast-comment-自分の名前）</li>
+        <li>
+          OAuth リダイレクト URL: <code>http://localhost:3000</code> を入力して「追加」
+          （同接取得では使わないのでサーバーを立てる必要はありませんが、フォームの必須項目です）
+        </li>
+        <li>
+          カテゴリー: 任意。クライアントタイプ: <strong>機密 (Confidential)</strong>
+          ※公開 (Public) だとシークレットを発行できません。登録後に変更できないことがあるので、ここで必ず選んでください
+        </li>
+        <li>作成後「管理」を開き、クライアントIDをコピー。「新しい秘密鍵」でシークレットを生成してコピー（<strong>この場でしか見られません</strong>。無くしたら再生成）</li>
+        <li>上の2欄に貼り付けて保存。Twitch チャンネルが自動で再接続し、20秒ごとに同接を取り始めます</li>
+      </ol>
+      <p class="hint">
+        つまずいたときは <code>docs/TWITCH_VIEWER_COUNT.md</code> に詳しい手順とトラブルシュートがあります。
+      </p>
+    </details>
     <div class="field-row">
       <label for="cred-x-auth-token">X auth_token</label>
       <input
@@ -2390,6 +2461,27 @@
     margin: 6px 0 0;
     padding-left: 20px;
     line-height: 1.7;
+  }
+
+  .ext-link {
+    padding: 0;
+    border: none;
+    background: none;
+    color: #7fc8ff;
+    font: inherit;
+    text-decoration: underline;
+    cursor: pointer;
+  }
+
+  .ext-link:hover {
+    color: #a8dcff;
+  }
+
+  .oauth-setup code {
+    padding: 1px 4px;
+    border-radius: 3px;
+    background: rgba(255,255,255,0.08);
+    font-size: 0.95em;
   }
 
   .tts-control-panel {

@@ -278,6 +278,8 @@ export interface AppConfig {
   credentials?: {
     twitchOauth?: string;
     twitchUsername?: string;
+    twitchClientId?: string;
+    twitchClientSecret?: string;
     youtubeApiKey?: string;
     youtubeOauthClientId?: string;
     xAuthToken?: string;

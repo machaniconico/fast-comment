@@ -586,7 +586,12 @@ async fn update_config(
     state: State<'_, AppState>,
     mut new_config: AppConfig,
 ) -> Result<(), String> {
-    let (youtube_source_config_changed, youtube_oauth_client_changed, x_source_config_changed) = {
+    let (
+        youtube_source_config_changed,
+        youtube_oauth_client_changed,
+        x_source_config_changed,
+        twitch_viewer_auth_changed,
+    ) = {
         let current = state.config.lock().unwrap();
         (
             current.youtube_overrides != new_config.youtube_overrides
@@ -601,6 +606,12 @@ async fn update_config(
                     != new_config.credentials.x_auth_token.trim()
                 || current.credentials.x_csrf_token.trim()
                     != new_config.credentials.x_csrf_token.trim(),
+            current.credentials.twitch_oauth.trim()
+                != new_config.credentials.twitch_oauth.trim()
+                || current.credentials.twitch_client_id.trim()
+                    != new_config.credentials.twitch_client_id.trim()
+                || current.credentials.twitch_client_secret.trim()
+                    != new_config.credentials.twitch_client_secret.trim(),
         )
     };
 
@@ -634,6 +645,9 @@ async fn update_config(
     }
     if x_source_config_changed {
         stop_active_x_channels(&state);
+    }
+    if twitch_viewer_auth_changed {
+        stop_active_twitch_channels(&state);
     }
     if youtube_oauth_client_changed {
         state.youtube_auth.clear_caches().await;
@@ -677,6 +691,21 @@ fn stop_active_x_channels(state: &AppState) {
     let keys: Vec<String> = channels
         .keys()
         .filter(|key| key.starts_with("x:"))
+        .cloned()
+        .collect();
+    for key in keys {
+        if let Some(token) = channels.remove(&key) {
+            token.cancel();
+        }
+    }
+}
+
+/// Twitch の viewer_count 認証情報変更時だけ既存タスクを止め、差分適用で再起動させる。
+fn stop_active_twitch_channels(state: &AppState) {
+    let mut channels = state.channels.lock().unwrap();
+    let keys: Vec<String> = channels
+        .keys()
+        .filter(|key| key.starts_with("twitch:"))
         .cloned()
         .collect();
     for key in keys {
@@ -1282,7 +1311,14 @@ fn spawn_one_channel(_app: &AppHandle, state: &AppState, ch: &ChannelConfig) {
         return;
     }
     let key = AppState::channel_key(ch);
-    let (overrides, youtube_api_key, x_overrides, x_auth, niconico_overrides) = {
+    let (
+        overrides,
+        youtube_api_key,
+        x_overrides,
+        x_auth,
+        niconico_overrides,
+        twitch_viewer_auth,
+    ) = {
         let config = state.config.lock().unwrap();
         // X の名前解決 cookie は auth_token / ct0 の両方が揃って初めて有効。
         let x_auth = {
@@ -1293,12 +1329,22 @@ fn spawn_one_channel(_app: &AppHandle, state: &AppState, ch: &ChannelConfig) {
                 csrf_token: csrf.to_string(),
             })
         };
+        let twitch_viewer_auth = if ch.platform == ChannelPlatform::Twitch {
+            sources::twitch_helix::viewer_auth(
+                &config.credentials.twitch_oauth,
+                &config.credentials.twitch_client_id,
+                &config.credentials.twitch_client_secret,
+            )
+        } else {
+            None
+        };
         (
             config.youtube_overrides.clone(),
             config.credentials.youtube_api_key.clone(),
             config.x_overrides.clone(),
             x_auth,
             config.niconico_overrides.clone(),
+            twitch_viewer_auth,
         )
     };
     let token = if ch.platform == ChannelPlatform::Youtube
@@ -1345,16 +1391,13 @@ fn spawn_one_channel(_app: &AppHandle, state: &AppState, ch: &ChannelConfig) {
             token.clone(),
         );
     }
-    if ch.platform == ChannelPlatform::Twitch {
-        let oauth = state.config.lock().unwrap().credentials.twitch_oauth.clone();
-        if !oauth.trim().is_empty() {
-            sources::twitch_helix::spawn_twitch_viewer_poller(
-                ch.identifier.clone(),
-                oauth,
-                state.metadata_tx.clone(),
-                token.clone(),
-            );
-        }
+    if let Some(auth) = twitch_viewer_auth {
+        sources::twitch_helix::spawn_twitch_viewer_poller(
+            ch.identifier.clone(),
+            auth,
+            state.metadata_tx.clone(),
+            token.clone(),
+        );
     }
     let mut map = state.channels.lock().unwrap();
     // 同一キーの旧タスクが残っていれば確実にキャンセルしてからリーク無く差し替える(#18)。
