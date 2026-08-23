@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::broadcast;
@@ -19,6 +19,15 @@ use super::{Backoff, Source};
 use crate::model::{Amount, Author, Badge, ChatMessage, Fragment, MessageKind, Platform, Roles};
 
 const TWITCH_WS_URL: &str = "wss://irc-ws.chat.twitch.tv:443";
+/// こちらから投げる PING の間隔。サーバー PING は約5分間隔でしか来ないため、
+/// half-open を早く見つけるために自前でも叩く(サーバーは即 PONG を返す)。
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(60);
+/// 受信が完全に止まってから切断とみなすまでの時間。KEEPALIVE_INTERVAL の
+/// 数周期ぶんを見て、取りこぼしや一時的な詰まりで誤爆しないようにする。
+const IDLE_TIMEOUT: Duration = Duration::from_secs(180);
+/// 行アセンブラのバッファ上限。Twitch の1行はタグ込みでも数KBに収まるので、
+/// これを超えたら CRLF が来ない異常とみなして捨てる。
+const MAX_LINE_BUFFER: usize = 16 * 1024;
 static NICK_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug)]
@@ -140,12 +149,33 @@ impl TwitchSource {
         // 安定セッション判定: 接続後 30 秒以上経過、またはデータを1件でも受信。
         let connected_at = Instant::now();
         let mut received_data = false;
+        // IRC 行はフレーム境界で割れうるので、CRLF が揃うまで持ち越す。
+        let mut lines = LineAssembler::default();
+        let mut last_activity = tokio::time::Instant::now();
+        let mut keepalive = tokio::time::interval(KEEPALIVE_INTERVAL);
+        keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        keepalive.reset(); // interval は初回即発火のため1周期後から。
 
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => {
                     let _ = write.send(WsMessage::Close(None)).await;
                     return Ok(true); // キャンセルは正常終了扱い。
+                }
+                _ = keepalive.tick() => {
+                    write.send(irc_text("PING :fast-comment")).await.map_err(|e| {
+                        TwitchSessionError::new(
+                            e,
+                            session_is_stable(received_data, connected_at),
+                        )
+                    })?;
+                }
+                _ = tokio::time::sleep_until(last_activity + IDLE_TIMEOUT) => {
+                    // 自前 PING にも無反応 = half-open。張り直さないと無言で止まる。
+                    return Err(TwitchSessionError::new(
+                        anyhow::anyhow!("IRC が{}秒無通信", IDLE_TIMEOUT.as_secs()),
+                        session_is_stable(received_data, connected_at),
+                    ));
                 }
                 msg = read.next() => {
                     let msg = match msg {
@@ -161,13 +191,14 @@ impl TwitchSource {
                             return Ok(session_is_stable(received_data, connected_at));
                         }
                     };
+                    last_activity = tokio::time::Instant::now();
 
                     match msg {
                         WsMessage::Text(text) => {
                             received_data = true;
-                            // 1フレームに複数IRC行が来ることがある(CRLF区切り)。
-                            for line in text.split("\r\n").filter(|l| !l.is_empty()) {
-                                let handled = self.handle_line(line, tx);
+                            // 1フレームに複数行、逆に1行が複数フレームに割れる場合もある。
+                            for line in lines.push(&text) {
+                                let handled = self.handle_line(&line, tx);
                                 if handled.emitted_privmsg {
                                     received_data = true;
                                 }
@@ -179,6 +210,16 @@ impl TwitchSource {
                                             session_is_stable(received_data, connected_at),
                                         )
                                     })?;
+                                }
+                                if handled.reconnect {
+                                    // サーバーがエッジ再起動を予告してきた。閉じられるのを
+                                    // 待たず自分から張り直したほうが取りこぼしが少ない。
+                                    tracing::info!(
+                                        "twitch:{} RECONNECT 指示を受信、再接続する",
+                                        self.channel
+                                    );
+                                    let _ = write.send(WsMessage::Close(None)).await;
+                                    return Ok(session_is_stable(received_data, connected_at));
                                 }
                             }
                         }
@@ -222,6 +263,10 @@ impl TwitchSource {
                 if let Some(msg) = self.privmsg_to_chat(&parsed) {
                     result.emitted_privmsg = tx.send(msg).is_ok();
                 }
+            }
+            // エッジ再起動の予告。接続を張り直すまでコメントは届かない。
+            "RECONNECT" => {
+                result.reconnect = true;
             }
             _ => {
                 // JOIN/PART/USERSTATE/ROOMSTATE/NOTICE 等は今は無視。
@@ -331,6 +376,40 @@ struct HandleLineResult {
     reply: Option<String>,
     /// PRIVMSG を ChatMessage に正規化し、broadcast 送信に成功したか。
     emitted_privmsg: bool,
+    /// サーバーから RECONNECT を受け、セッションを張り直すべきか。
+    reconnect: bool,
+}
+
+/// WS テキストフレームを CRLF 区切りの IRC 行へ組み直す。
+///
+/// Twitch は 1 フレームに複数行を詰めてくる(実測: 最大7行)一方、行の途中で
+/// フレームが切れる可能性もある。CRLF が揃った分だけを返し、残りは持ち越す。
+#[derive(Default)]
+struct LineAssembler {
+    buf: String,
+}
+
+impl LineAssembler {
+    fn push(&mut self, frame: &str) -> Vec<String> {
+        self.buf.push_str(frame);
+        let mut out = Vec::new();
+        while let Some(idx) = self.buf.find("\r\n") {
+            let line: String = self.buf.drain(..idx + 2).collect();
+            let line = line.trim_end_matches("\r\n");
+            if !line.is_empty() {
+                out.push(line.to_string());
+            }
+        }
+        // CRLF が来ないまま肥大化したら異常。持ち越しを捨てて同期し直す。
+        if self.buf.len() > MAX_LINE_BUFFER {
+            tracing::warn!(
+                "twitch: 未完了行が {} バイトを超えたため破棄",
+                MAX_LINE_BUFFER
+            );
+            self.buf.clear();
+        }
+        out
+    }
 }
 
 /// IRCv3 1行をパースする。
@@ -763,5 +842,56 @@ mod tests {
             rx.try_recv(),
             Err(broadcast::error::TryRecvError::Empty)
         ));
+    }
+
+    #[test]
+    fn reconnect_command_requests_session_restart() {
+        // RECONNECT はサーバー閉じ待ちにせず、こちらから張り直す合図にする。
+        let (tx, _rx) = broadcast::channel(1);
+        let handled = source().handle_line(":tmi.twitch.tv RECONNECT", &tx);
+
+        assert!(handled.reconnect);
+        assert!(handled.reply.is_none());
+        assert!(!handled.emitted_privmsg);
+    }
+
+    #[test]
+    fn assembler_splits_multi_line_frame() {
+        // 実測どおり1フレームに複数行が詰まっていても全行取り出す。
+        let mut lines = LineAssembler::default();
+        let frame = ":tmi.twitch.tv 001 justinfan1 :Welcome, GLHF!\r\n\
+                     :tmi.twitch.tv 002 justinfan1 :Your host is tmi.twitch.tv\r\n";
+
+        assert_eq!(
+            lines.push(frame),
+            vec![
+                ":tmi.twitch.tv 001 justinfan1 :Welcome, GLHF!".to_string(),
+                ":tmi.twitch.tv 002 justinfan1 :Your host is tmi.twitch.tv".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn assembler_carries_line_split_across_frames() {
+        // 行の途中でフレームが切れても、CRLF が揃うまで持ち越して1行として返す。
+        let mut lines = LineAssembler::default();
+
+        assert!(lines.push(":user!user@user.tmi.twitch.tv PRIVMSG #ch :hel").is_empty());
+        assert_eq!(
+            lines.push("lo chat\r\n"),
+            vec![":user!user@user.tmi.twitch.tv PRIVMSG #ch :hello chat".to_string()]
+        );
+    }
+
+    #[test]
+    fn assembler_drops_oversized_incomplete_line() {
+        // CRLF が来ないまま肥大化したら、持ち越しを捨てて同期し直す。
+        let mut lines = LineAssembler::default();
+
+        assert!(lines.push(&"x".repeat(MAX_LINE_BUFFER + 1)).is_empty());
+        assert_eq!(
+            lines.push("PING :tmi.twitch.tv\r\n"),
+            vec!["PING :tmi.twitch.tv".to_string()]
+        );
     }
 }
