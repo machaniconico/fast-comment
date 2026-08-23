@@ -10,7 +10,7 @@ export type ResolvedTheme = 'dark' | 'light';
 export type AppearanceFontSize = 's' | 'm' | 'l';
 export type AppearanceDensity = 'comfortable' | 'compact';
 export type AppearanceTimeDisplay = 'seconds' | 'minutes' | 'off';
-export type AppearanceViewerDisplay = 'rotate' | 'totalRotate' | 'all';
+export type AppearanceViewerDisplay = 'rotate' | 'all';
 
 export interface AppearanceSnapshot {
   theme: AppearanceTheme;
@@ -60,7 +60,7 @@ function isTimeDisplay(value: unknown): value is AppearanceTimeDisplay {
 }
 
 function isViewerDisplay(value: unknown): value is AppearanceViewerDisplay {
-  return value === 'rotate' || value === 'totalRotate' || value === 'all';
+  return value === 'rotate' || value === 'all';
 }
 
 function parseAppearanceSnapshot(value: unknown): AppearanceSnapshot | null {
@@ -74,7 +74,8 @@ function parseAppearanceSnapshot(value: unknown): AppearanceSnapshot | null {
   const timeDisplayValue = value.timeDisplay === undefined
     ? DEFAULT_APPEARANCE.timeDisplay
     : value.timeDisplay;
-  const viewerDisplayValue = value.viewerDisplay === undefined
+  // 'totalRotate' は廃止。旧設定を読み込んでも全体が捨てられないよう既定へ寄せる。
+  const viewerDisplayValue = value.viewerDisplay === undefined || value.viewerDisplay === 'totalRotate'
     ? DEFAULT_APPEARANCE.viewerDisplay
     : value.viewerDisplay;
   const wrapCommentsValue = value.wrapComments === undefined

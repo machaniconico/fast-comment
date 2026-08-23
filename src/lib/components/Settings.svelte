@@ -1114,7 +1114,6 @@
       <label for="appearance-viewer-display">同接表示</label>
       <select id="appearance-viewer-display" value={theme.viewerDisplay} class="platform-select" onchange={onViewerDisplayChange}>
         <option value="rotate">配信ごとに切替</option>
-        <option value="totalRotate">合計＋内訳切替</option>
         <option value="all">すべて表示</option>
       </select>
     </div>

@@ -181,61 +181,6 @@
     <span class:paused={queueState.paused} class="status">
       {queueState.paused ? '一時停止中' : '動作中'}
     </span>
-    {#if viewerDisplay === 'all'}
-      {#if viewerEntries.length === 0}
-        <div class="metric viewers" title="同時接続数（視聴者数）">
-          <span class="metric-label">同接</span>
-          <strong aria-label={`同時接続数 ${viewersLabel}`}>{viewersLabel}</strong>
-        </div>
-      {:else}
-        <div class="metric viewers viewer-list all-viewers" aria-label="プラットフォーム別の視聴者数">
-          {#each viewerEntries as entry}
-            <span class="viewer-entry" title={entry.title}>
-              <span class="viewer-platform">{entry.shortLabel}</span>
-              <strong
-                class="viewer-value"
-                style:color={entry.color}
-                aria-label={viewerAriaLabel(entry)}
-              >{formatViewerCount(entry.viewers)}</strong>
-              {#if entry.viewersKind === 'cumulative'}
-                <span class="viewer-kind-suffix">来場</span>
-              {/if}
-            </span>
-          {/each}
-        </div>
-      {/if}
-    {:else if viewerDisplay === 'totalRotate'}
-      <div class="metric viewers" title="同時接続数（視聴者数）">
-        <span class="metric-label">同接</span>
-        <strong aria-label={`同時接続数 ${viewersLabel}`}>{viewersLabel}</strong>
-      </div>
-      {#if rotatedViewer}
-        <div class="metric viewers viewer-single" title={rotatedViewer.title}>
-          <span class="metric-label">{rotatedViewer.kindLabel}</span>
-          <strong
-            class="viewer-value"
-            style:color={rotatedViewer.color}
-            aria-label={viewerAriaLabel(rotatedViewer)}
-          >{formatViewerCount(rotatedViewer.viewers)}</strong>
-          <span class="viewer-name">{rotatedViewer.displayName}</span>
-        </div>
-      {/if}
-    {:else if rotatedViewer}
-      <div class="metric viewers viewer-single" title={rotatedViewer.title}>
-        <span class="metric-label">{rotatedViewer.kindLabel}</span>
-        <strong
-          class="viewer-value"
-          style:color={rotatedViewer.color}
-          aria-label={viewerAriaLabel(rotatedViewer)}
-        >{formatViewerCount(rotatedViewer.viewers)}</strong>
-        <span class="viewer-name">{rotatedViewer.displayName}</span>
-      </div>
-    {:else}
-      <div class="metric viewers" title="同時接続数（視聴者数）">
-        <span class="metric-label">同接</span>
-        <strong aria-label={`同時接続数 ${viewersLabel}`}>{viewersLabel}</strong>
-      </div>
-    {/if}
   </div>
 
   <div class="controls" role="group" aria-label="読み上げキュー操作">
@@ -260,19 +205,63 @@
     </button>
   </div>
 
-  <div class="items" role="list" aria-label="読み上げ待ち項目">
-    {#if visibleItems.length === 0}
-      <span class="empty">待ち項目なし</span>
-    {:else}
-      {#each visibleItems as item (item.id)}
-        <div class="item" role="listitem" title={item.preview}>
-          <span class="item-preview">{item.preview}</span>
+  <div class="bottom-row">
+    <div class="viewers-row">
+      {#if viewerDisplay === 'all'}
+        {#if viewerEntries.length === 0}
+          <div class="metric viewers" title="同時接続数（視聴者数）">
+            <span class="metric-label">同接</span>
+            <strong aria-label={`同時接続数 ${viewersLabel}`}>{viewersLabel}</strong>
+          </div>
+        {:else}
+          <div class="metric viewers viewer-list all-viewers" aria-label="プラットフォーム別の視聴者数">
+            {#each viewerEntries as entry}
+              <span class="viewer-entry" title={entry.title}>
+                <span class="viewer-platform">{entry.shortLabel}</span>
+                <strong
+                  class="viewer-value"
+                  style:color={entry.color}
+                  aria-label={viewerAriaLabel(entry)}
+                >{formatViewerCount(entry.viewers)}</strong>
+                {#if entry.viewersKind === 'cumulative'}
+                  <span class="viewer-kind-suffix">来場</span>
+                {/if}
+              </span>
+            {/each}
+          </div>
+        {/if}
+      {:else if rotatedViewer}
+        <div class="metric viewers viewer-single" title={rotatedViewer.title}>
+          <span class="metric-label">{rotatedViewer.kindLabel}</span>
+          <strong
+            class="viewer-value"
+            style:color={rotatedViewer.color}
+            aria-label={viewerAriaLabel(rotatedViewer)}
+          >{formatViewerCount(rotatedViewer.viewers)}</strong>
+          <span class="viewer-name">{rotatedViewer.displayName}</span>
         </div>
-      {/each}
-      {#if hiddenCount > 0}
-        <span class="more">+{hiddenCount}</span>
+      {:else}
+        <div class="metric viewers" title="同時接続数（視聴者数）">
+          <span class="metric-label">同接</span>
+          <strong aria-label={`同時接続数 ${viewersLabel}`}>{viewersLabel}</strong>
+        </div>
       {/if}
-    {/if}
+    </div>
+
+    <div class="items" role="list" aria-label="読み上げ待ち項目">
+      {#if visibleItems.length === 0}
+        <span class="empty">待ち項目なし</span>
+      {:else}
+        {#each visibleItems as item (item.id)}
+          <div class="item" role="listitem" title={item.preview}>
+            <span class="item-preview">{item.preview}</span>
+          </div>
+        {/each}
+        {#if hiddenCount > 0}
+          <span class="more">+{hiddenCount}</span>
+        {/if}
+      {/if}
+    </div>
   </div>
 
   {#if error}
@@ -281,12 +270,14 @@
 </section>
 
 <style>
+  /* 上段: TTS状態＋操作ボタン / 下段: 同接表示＋読み上げ待ち。
+     同接は「すべて表示」でも横に伸びられるよう、ボタンと同じ行に置かない。 */
   .tts-queue-panel {
     display: grid;
-    grid-template-columns: auto auto minmax(140px, 1fr);
+    grid-template-columns: minmax(0, auto) minmax(0, 1fr);
     align-items: center;
-    gap: 8px;
-    min-height: 36px;
+    column-gap: 8px;
+    row-gap: 2px;
     padding: 4px 8px;
     background: #151515;
     border-bottom: 1px solid rgba(255,255,255,0.06);
@@ -294,11 +285,35 @@
   }
 
   .summary {
+    grid-row: 1;
+    grid-column: 1;
     display: flex;
     align-items: center;
     gap: 6px;
+    min-height: 26px;
     min-width: 0;
     max-width: 100%;
+  }
+
+  /* 配信が増えて1行に収まらないときは、items を次の行へ送って同接を優先させる */
+  .bottom-row {
+    grid-row: 2;
+    grid-column: 1 / -1;
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    column-gap: 8px;
+    row-gap: 2px;
+    min-width: 0;
+    min-height: 20px;
+  }
+
+  /* 同接は自分の内容幅を使い、足りなくなったら items より先に詰める */
+  .viewers-row {
+    display: flex;
+    align-items: center;
+    flex: 0 1 auto;
+    min-width: 0;
   }
 
   .metric {
@@ -309,8 +324,6 @@
   }
 
   .metric.viewers {
-    padding-left: 6px;
-    border-left: 1px solid rgba(255,255,255,0.1);
     min-width: 0;
     max-width: 100%;
   }
@@ -322,6 +335,8 @@
 
   .viewer-single {
     flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
   }
 
   .viewer-value {
@@ -344,11 +359,12 @@
     gap: 4px;
     flex: 1 1 auto;
     min-width: 0;
-    overflow: hidden;
   }
 
+  /* 「すべて表示」は配信数が読めないので、切り捨てずに折り返して全件見せる */
   .all-viewers {
-    flex-wrap: nowrap;
+    flex-wrap: wrap;
+    row-gap: 2px;
   }
 
   .viewer-entry {
@@ -402,6 +418,9 @@
   }
 
   .controls {
+    grid-row: 1;
+    grid-column: 2;
+    justify-self: end;
     display: flex;
     align-items: center;
     gap: 4px;
@@ -439,6 +458,7 @@
     display: flex;
     align-items: center;
     gap: 4px;
+    flex: 1 1 auto;
     min-width: 0;
     overflow: hidden;
   }
@@ -476,6 +496,7 @@
   }
 
   .error {
+    grid-row: 3;
     grid-column: 1 / -1;
     margin: 0;
     color: #ff8f8f;
@@ -483,15 +504,6 @@
   }
 
   @media (max-width: 760px) {
-    .tts-queue-panel {
-      grid-template-columns: 1fr auto;
-      align-items: start;
-    }
-
-    .items {
-      grid-column: 1 / -1;
-    }
-
     .item {
       max-width: 160px;
     }
