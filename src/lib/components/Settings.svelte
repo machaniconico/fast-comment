@@ -15,7 +15,8 @@
     type AppearanceDensity,
     type AppearanceFontSize,
     type AppearanceTheme,
-    type AppearanceTimeDisplay
+    type AppearanceTimeDisplay,
+    type AppearanceViewerDisplay
   } from '../theme.svelte';
   import { buildCsv, setNotify, store } from '../stores.svelte';
   import ConfigPortability from './ConfigPortability.svelte';
@@ -45,6 +46,10 @@
 
   function onTimeDisplayChange(event: Event) {
     theme.setTimeDisplay((event.currentTarget as HTMLSelectElement).value as AppearanceTimeDisplay);
+  }
+
+  function onViewerDisplayChange(event: Event) {
+    theme.setViewerDisplay((event.currentTarget as HTMLSelectElement).value as AppearanceViewerDisplay);
   }
 
   function onWrapCommentsChange(event: Event) {
@@ -1103,6 +1108,14 @@
         <option value="off">なし</option>
         <option value="minutes">時:分</option>
         <option value="seconds">時:分:秒</option>
+      </select>
+    </div>
+    <div class="field-row">
+      <label for="appearance-viewer-display">同接表示</label>
+      <select id="appearance-viewer-display" value={theme.viewerDisplay} class="platform-select" onchange={onViewerDisplayChange}>
+        <option value="rotate">配信ごとに切替</option>
+        <option value="totalRotate">合計＋内訳切替</option>
+        <option value="all">すべて表示</option>
       </select>
     </div>
     <div class="field-row">

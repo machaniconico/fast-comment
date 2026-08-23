@@ -29,7 +29,7 @@ use tokio_util::sync::CancellationToken;
 use super::{Backoff, Source};
 use crate::config::NiconicoOverrides;
 use crate::model::{Amount, Author, ChatMessage, Fragment, MessageKind, Platform, Roles};
-use crate::stats::YoutubeMetadataUpdate;
+use crate::stats::{ViewerCountKind, YoutubeMetadataUpdate};
 
 const WATCH_PAGE_BASE_URL: &str = "https://live.nicovideo.jp/watch/";
 /// ブラウザ相当の UA。視聴ページはブラウザ以外の UA を弾くことがある。
@@ -659,6 +659,8 @@ impl NiconicoSource {
             platform: Platform::Niconico,
             channel: self.live_id.clone(),
             concurrent_viewers: viewers,
+            // `statistics.viewers` は同接ではなく来場者数（累計）。
+            viewers_kind: ViewerCountKind::Cumulative,
             likes: None,
             title,
             live: Some(live),

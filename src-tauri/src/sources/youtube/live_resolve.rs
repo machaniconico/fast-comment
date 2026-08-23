@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config::{ChannelConfig, ChannelPlatform, YoutubeOverrides};
 use crate::model::{ChatMessage, Platform, YoutubeReaction};
 use crate::sources::SourceManager;
-use crate::stats::YoutubeMetadataUpdate;
+use crate::stats::{ViewerCountKind, YoutubeMetadataUpdate};
 
 use super::{extract_video_id, is_video_id};
 
@@ -241,6 +241,7 @@ async fn send_live_status(
         platform: Platform::Youtube,
         channel: identifier.to_string(),
         concurrent_viewers: None,
+        viewers_kind: ViewerCountKind::Concurrent,
         likes: None,
         title: None,
         live: Some(live),

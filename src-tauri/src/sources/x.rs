@@ -42,7 +42,7 @@ use tokio_util::sync::CancellationToken;
 use super::{Backoff, Source};
 use crate::config::XOverrides;
 use crate::model::{Author, ChatMessage, Fragment, MessageKind, Platform, Roles};
-use crate::stats::YoutubeMetadataUpdate;
+use crate::stats::{ViewerCountKind, YoutubeMetadataUpdate};
 
 /// X Web クライアントに埋め込まれている公開 Bearer(シークレットではない)。
 const X_WEB_BEARER: &str = "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs=1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA";
@@ -807,6 +807,7 @@ impl XSource {
             platform: Platform::X,
             channel: self.broadcast_id.clone(),
             concurrent_viewers: viewers,
+            viewers_kind: ViewerCountKind::Concurrent,
             likes: None,
             title,
             live: Some(live),

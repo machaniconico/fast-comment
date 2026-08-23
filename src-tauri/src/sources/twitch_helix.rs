@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::model::Platform;
-use crate::stats::YoutubeMetadataUpdate;
+use crate::stats::{ViewerCountKind, YoutubeMetadataUpdate};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(20);
 const VALIDATE_URL: &str = "https://id.twitch.tv/oauth2/validate";
@@ -83,6 +83,7 @@ pub fn spawn_twitch_viewer_poller(
                             platform: Platform::Twitch,
                             channel: login.clone(),
                             concurrent_viewers: values.viewer_count,
+                            viewers_kind: ViewerCountKind::Concurrent,
                             likes: None,
                             title: None,
                             live: values.live,

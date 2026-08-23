@@ -10,12 +10,14 @@ export type ResolvedTheme = 'dark' | 'light';
 export type AppearanceFontSize = 's' | 'm' | 'l';
 export type AppearanceDensity = 'comfortable' | 'compact';
 export type AppearanceTimeDisplay = 'seconds' | 'minutes' | 'off';
+export type AppearanceViewerDisplay = 'rotate' | 'totalRotate' | 'all';
 
 export interface AppearanceSnapshot {
   theme: AppearanceTheme;
   fontSize: AppearanceFontSize;
   density: AppearanceDensity;
   timeDisplay: AppearanceTimeDisplay;
+  viewerDisplay: AppearanceViewerDisplay;
   wrapComments: boolean;
   showViewerBadges: boolean;
   showCommentMilestones: boolean;
@@ -27,6 +29,7 @@ const DEFAULT_APPEARANCE: AppearanceSnapshot = {
   fontSize: 'm',
   density: 'comfortable',
   timeDisplay: 'seconds',
+  viewerDisplay: 'rotate',
   wrapComments: false,
   showViewerBadges: false,
   showCommentMilestones: false,
@@ -56,6 +59,10 @@ function isTimeDisplay(value: unknown): value is AppearanceTimeDisplay {
   return value === 'seconds' || value === 'minutes' || value === 'off';
 }
 
+function isViewerDisplay(value: unknown): value is AppearanceViewerDisplay {
+  return value === 'rotate' || value === 'totalRotate' || value === 'all';
+}
+
 function parseAppearanceSnapshot(value: unknown): AppearanceSnapshot | null {
   if (!isRecord(value)) {
     return null;
@@ -67,6 +74,9 @@ function parseAppearanceSnapshot(value: unknown): AppearanceSnapshot | null {
   const timeDisplayValue = value.timeDisplay === undefined
     ? DEFAULT_APPEARANCE.timeDisplay
     : value.timeDisplay;
+  const viewerDisplayValue = value.viewerDisplay === undefined
+    ? DEFAULT_APPEARANCE.viewerDisplay
+    : value.viewerDisplay;
   const wrapCommentsValue = value.wrapComments === undefined
     ? DEFAULT_APPEARANCE.wrapComments
     : value.wrapComments;
@@ -82,6 +92,7 @@ function parseAppearanceSnapshot(value: unknown): AppearanceSnapshot | null {
     !isFontSize(fontSizeValue) ||
     !isDensity(densityValue) ||
     !isTimeDisplay(timeDisplayValue) ||
+    !isViewerDisplay(viewerDisplayValue) ||
     typeof wrapCommentsValue !== 'boolean' ||
     typeof showViewerBadgesValue !== 'boolean' ||
     typeof showCommentMilestonesValue !== 'boolean'
@@ -94,6 +105,7 @@ function parseAppearanceSnapshot(value: unknown): AppearanceSnapshot | null {
     fontSize: fontSizeValue,
     density: densityValue,
     timeDisplay: timeDisplayValue,
+    viewerDisplay: viewerDisplayValue,
     wrapComments: wrapCommentsValue,
     showViewerBadges: showViewerBadgesValue,
     showCommentMilestones: showCommentMilestonesValue,
@@ -105,6 +117,7 @@ class ThemeStore {
   fontSize: AppearanceFontSize = $state(DEFAULT_APPEARANCE.fontSize);
   density: AppearanceDensity = $state(DEFAULT_APPEARANCE.density);
   timeDisplay: AppearanceTimeDisplay = $state(DEFAULT_APPEARANCE.timeDisplay);
+  viewerDisplay: AppearanceViewerDisplay = $state(DEFAULT_APPEARANCE.viewerDisplay);
   wrapComments: boolean = $state(DEFAULT_APPEARANCE.wrapComments);
   showViewerBadges: boolean = $state(DEFAULT_APPEARANCE.showViewerBadges);
   showCommentMilestones: boolean = $state(DEFAULT_APPEARANCE.showCommentMilestones);
@@ -167,6 +180,11 @@ class ThemeStore {
     this.save();
   }
 
+  setViewerDisplay(value: AppearanceViewerDisplay): void {
+    this.viewerDisplay = value;
+    this.save();
+  }
+
   setWrapComments(value: boolean): void {
     this.wrapComments = value;
     this.save();
@@ -188,6 +206,7 @@ class ThemeStore {
       fontSize: this.fontSize,
       density: this.density,
       timeDisplay: this.timeDisplay,
+      viewerDisplay: this.viewerDisplay,
       wrapComments: this.wrapComments,
       showViewerBadges: this.showViewerBadges,
       showCommentMilestones: this.showCommentMilestones,
@@ -210,6 +229,7 @@ class ThemeStore {
     this.fontSize = next.fontSize;
     this.density = next.density;
     this.timeDisplay = next.timeDisplay;
+    this.viewerDisplay = next.viewerDisplay;
     this.wrapComments = next.wrapComments;
     this.showViewerBadges = next.showViewerBadges;
     this.showCommentMilestones = next.showCommentMilestones;
