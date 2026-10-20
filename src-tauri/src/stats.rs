@@ -27,6 +27,20 @@ pub struct ChannelTitle {
     pub title: String,
 }
 
+/// 視聴者数が同時接続数か累計来場者数かを表す種別。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ViewerCountKind {
+    Concurrent,
+    Cumulative,
+}
+
+impl Default for ViewerCountKind {
+    fn default() -> Self {
+        ViewerCountKind::Concurrent
+    }
+}
+
 /// 接続中チャンネルのライブ状態と表示メタデータ。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -35,6 +49,7 @@ pub struct ChannelStatus {
     pub identifier: String,
     pub title: Option<String>,
     pub viewers: Option<u32>,
+    pub viewers_kind: ViewerCountKind,
     pub live: Option<bool>,
 }
 
@@ -109,6 +124,7 @@ pub struct YoutubeMetadataUpdate {
     pub platform: Platform,
     pub channel: String,
     pub concurrent_viewers: Option<u32>,
+    pub viewers_kind: ViewerCountKind,
     pub likes: Option<u32>,
     pub title: Option<String>,
     pub live: Option<bool>,
@@ -122,6 +138,7 @@ struct MetadataState {
     platform: Option<Platform>,
     channel: String,
     concurrent_viewers: Option<u32>,
+    viewers_kind: ViewerCountKind,
     likes: Option<u32>,
     title: Option<String>,
     live: Option<bool>,
@@ -133,6 +150,7 @@ impl Default for YoutubeMetadataUpdate {
             platform: Platform::Youtube,
             channel: String::new(),
             concurrent_viewers: None,
+            viewers_kind: ViewerCountKind::Concurrent,
             likes: None,
             title: None,
             live: None,
@@ -293,6 +311,7 @@ fn build_snapshot(
         .fold(0u32, u32::saturating_add);
     let concurrent_total = metadata
         .values()
+        .filter(|m| m.viewers_kind == ViewerCountKind::Concurrent)
         .filter_map(|m| m.concurrent_viewers)
         .fold(0u32, u32::saturating_add);
     let viewers = resolve_viewers(concurrent_total, unique_count);
@@ -330,6 +349,7 @@ fn build_snapshot(
             identifier: metadata.channel.clone(),
             title: metadata.title.clone(),
             viewers: metadata.concurrent_viewers,
+            viewers_kind: metadata.viewers_kind,
             live: metadata.live,
         })
         .collect::<Vec<_>>();
@@ -381,6 +401,7 @@ fn merge_metadata_update(
     entry.platform = Some(update.platform);
     entry.channel = update.channel;
     entry.concurrent_viewers = update.concurrent_viewers;
+    entry.viewers_kind = update.viewers_kind;
     if let Some(v) = update.likes {
         entry.likes = Some(v);
     }
@@ -721,6 +742,7 @@ mod tests {
                 platform: Some(Platform::Youtube),
                 channel: "yt123".to_string(),
                 concurrent_viewers: Some(10),
+                viewers_kind: ViewerCountKind::Concurrent,
                 likes: Some(3),
                 title: Some("YouTube Live".to_string()),
                 live: Some(true),
@@ -732,6 +754,7 @@ mod tests {
                 platform: Some(Platform::Twitch),
                 channel: "twlogin".to_string(),
                 concurrent_viewers: Some(7),
+                viewers_kind: ViewerCountKind::Concurrent,
                 likes: None,
                 title: None,
                 live: Some(true),
@@ -746,6 +769,59 @@ mod tests {
         assert_eq!(snapshot.channel_titles.len(), 1);
         assert_eq!(snapshot.channel_titles[0].platform, "youtube");
         assert_eq!(snapshot.channel_status.len(), 2);
+    }
+
+    #[test]
+    fn cumulative_viewers_are_excluded_from_total_and_exposed_per_channel() {
+        let config = AppConfig {
+            channels: vec![
+                ChannelConfig {
+                    platform: ChannelPlatform::Youtube,
+                    identifier: "yt123".to_string(),
+                    enabled: true,
+                },
+                ChannelConfig {
+                    platform: ChannelPlatform::Niconico,
+                    identifier: "lv123".to_string(),
+                    enabled: true,
+                },
+            ],
+            ..AppConfig::default()
+        };
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            metadata_key(Platform::Youtube, "yt123"),
+            MetadataState {
+                platform: Some(Platform::Youtube),
+                channel: "yt123".to_string(),
+                concurrent_viewers: Some(10),
+                viewers_kind: ViewerCountKind::Concurrent,
+                live: Some(true),
+                ..MetadataState::default()
+            },
+        );
+        metadata.insert(
+            metadata_key(Platform::Niconico, "lv123"),
+            MetadataState {
+                platform: Some(Platform::Niconico),
+                channel: "lv123".to_string(),
+                concurrent_viewers: Some(99),
+                viewers_kind: ViewerCountKind::Cumulative,
+                live: Some(true),
+                ..MetadataState::default()
+            },
+        );
+
+        let snapshot = build_snapshot(0, 0, 0, &HashMap::new(), &metadata, &config);
+
+        assert_eq!(snapshot.viewers, 10);
+        let niconico = snapshot
+            .channel_status
+            .iter()
+            .find(|status| status.platform == "niconico")
+            .expect("ニコ生のチャンネル状態がある");
+        assert_eq!(niconico.viewers, Some(99));
+        assert_eq!(niconico.viewers_kind, ViewerCountKind::Cumulative);
     }
 
     #[test]
@@ -779,6 +855,7 @@ mod tests {
                 platform: Platform::Youtube,
                 channel: "@example".to_string(),
                 concurrent_viewers: Some(123),
+                viewers_kind: ViewerCountKind::Concurrent,
                 likes: Some(45),
                 title: Some("Live title".to_string()),
                 live: Some(true),
@@ -853,6 +930,7 @@ mod tests {
                 platform: Platform::Youtube,
                 channel: "@example".to_string(),
                 concurrent_viewers: Some(123),
+                viewers_kind: ViewerCountKind::Concurrent,
                 likes: Some(45),
                 title: Some("Live title".to_string()),
                 live: Some(true),

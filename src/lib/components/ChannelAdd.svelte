@@ -507,6 +507,20 @@
       newIdentifier = '';
     } catch (e) {
       addError = `追加に失敗しました: ${e instanceof Error ? e.message : String(e)}`;
+      return;
+    }
+
+    // X/ニコ生は配信ごとに URL を貼る運用なので、新しい配信を追加したら同じプラットフォームの前の接続は置き換える。
+    if (platform === 'x' || platform === 'niconico') {
+      const label = platform === 'x' ? 'X' : 'ニコ生';
+      for (const old of channels.filter((c) => c.platform === platform && !sameChannel(c, ch))) {
+        try {
+          await removeChannel(`${old.platform}:${old.identifier}`);
+          channels = channels.filter((c) => !sameChannel(c, old));
+        } catch (e) {
+          addError = `前の ${label} 接続の削除に失敗しました: ${e instanceof Error ? e.message : String(e)}`;
+        }
+      }
     }
   }
 </script>

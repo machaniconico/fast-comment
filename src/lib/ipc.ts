@@ -278,6 +278,8 @@ export interface AppConfig {
   credentials?: {
     twitchOauth?: string;
     twitchUsername?: string;
+    twitchClientId?: string;
+    twitchClientSecret?: string;
     youtubeApiKey?: string;
     youtubeOauthClientId?: string;
     xAuthToken?: string;
@@ -356,6 +358,7 @@ export interface ChannelStatus {
   identifier: string;
   title?: string | null;
   viewers?: number | null;
+  viewersKind?: 'concurrent' | 'cumulative' | null;
   live?: boolean | null;
 }
 

@@ -78,6 +78,8 @@ npm run build   # vite build
 
 設定はアプリ内の設定画面から行えます。永続化先はユーザーデータディレクトリ配下の `config.json` です。YouTube の仕様変更には `youtubeOverrides`（API キー / clientVersion / 抽出パス上書き）で再ビルド無しに対応できます。
 
+Twitch の同時接続数をヘッダーに表示するには、dev.twitch.tv に自分用のアプリを登録し、クライアントID / クライアントシークレットを設定画面に入れます。Twitch には視聴者数を返す無認証 API が無いためで、未設定でもチャット受信は動きます（数字が出ないだけ）。手順は [docs/TWITCH_VIEWER_COUNT.md](./docs/TWITCH_VIEWER_COUNT.md) を参照してください（アプリ内の 設定 → 認証情報 → Twitch にも同じ手順を畳んで置いてあります）。
+
 YouTubeへ運営コメントを投稿する場合は、Google CloudでYouTube Data API v3を有効にし、OAuthクライアントを種類「デスクトップアプリ」で作成します。設定画面にクライアントIDを貼り付けて「Googleに接続」を実行してください。クライアントシークレットは不要で、Googleの更新トークンは`config.json`ではなくOSの資格情報ストアへ保存されます。認証・配信探索・投稿はユーザー操作時だけ動作し、コメント受信ループへの常駐処理追加はありません。
 
 ## ロードマップ

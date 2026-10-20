@@ -2,6 +2,7 @@
   import type { UiChatMessage } from '../types';
   import { store, togglePin } from '../stores.svelte';
   import { getConfig, hideMessage as ipcHideMessage, setConfig, ttsSpeakText } from '../ipc';
+  import { PLATFORM_COLORS } from '../platform';
   import { theme, type AppearanceTimeDisplay } from '../theme.svelte';
   import type { ContextMenuItem } from './ContextMenu.svelte';
 
@@ -29,13 +30,6 @@
   }
 
   let { message, onOpenContextMenu }: Props = $props();
-
-  const PLATFORM_COLORS: Record<string, string> = {
-    twitch: '#9146ff',
-    youtube: '#ff0000',
-    x: '#1da1f2',
-    niconico: '#fcc800',
-  };
 
   const KIND_BG: Record<string, string> = {
     superChat: '#ffd600',

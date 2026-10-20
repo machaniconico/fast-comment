@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::YoutubeOverrides;
 use crate::model::Platform;
-use crate::stats::YoutubeMetadataUpdate;
+use crate::stats::{ViewerCountKind, YoutubeMetadataUpdate};
 
 use super::extract_video_id;
 
@@ -97,6 +97,7 @@ pub fn spawn_metadata_poller(
                         platform: Platform::Youtube,
                         channel: status_channel.clone(),
                         concurrent_viewers: values.concurrent_viewers,
+                        viewers_kind: ViewerCountKind::Concurrent,
                         likes: values.likes,
                         title: values.title,
                         live: None,

@@ -1,13 +1,7 @@
 <script lang="ts">
   import type { ChatMessage } from '../types';
   import { store, unpinMessage } from '../stores.svelte';
-
-  const PLATFORM_COLORS: Record<string, string> = {
-    twitch: '#9146ff',
-    youtube: '#ff0000',
-    x: '#1da1f2',
-    niconico: '#fcc800',
-  };
+  import { PLATFORM_COLORS } from '../platform';
 </script>
 
 {#if store.pinnedMessages.length > 0}
