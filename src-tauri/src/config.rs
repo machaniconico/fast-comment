@@ -485,7 +485,9 @@ pub struct XOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bearer_token: Option<String>,
     /// API エンドポイント URL の上書き(キー→URL)。空なら既定。
-    /// キー: guestActivateUrl / broadcastShowUrl / liveStatusUrl / accessChatUrl。
+    /// キー: guestActivateUrl / broadcastShowUrl / liveChatUrl / userQueryUrl
+    /// (sources/x.rs が実際に読むキー。liveChatUrl が本文ストリーム、userQueryUrl
+    /// が cookie 併用時のユーザー名解決。最も壊れやすい liveChatUrl はここで差替可)。
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub endpoints: std::collections::HashMap<String, String>,
 }

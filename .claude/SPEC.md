@@ -125,7 +125,7 @@ trait Source {
 - **ユーザー名解決(オプション)**: `credentials.xAuthToken`(auth_token cookie)と `credentials.xCsrfToken`(ct0)の両方が設定されている場合、受信ループとは別の `name_resolver_task` が GraphQL `liveAtomsUserQuery` をバッチ(最大50 ID/回)で叩き、userId→表示名を解決して差し替える(mpsc FIFO 経由なので表示順は不変)。cookie 失効(401/403)は解決だけを止め匿名表示へフォールバック、チャット受信は継続。cookie 変更時は `update_config` が X チャンネルを自動で張り直す。queryId 込みの URL は `xOverrides.endpoints.userQueryUrl` で差し替え可。
 - YouTube と同じく固い struct deserialize はせず `serde_json::Value` のパス探索で寛容にパースし、欠落は None/既定値へ劣化。
 - `identifier` は broadcast URL(`https://x.com/i/broadcasts/{id}` / twitter.com 同形)または生の broadcast ID。`extract_broadcast_id()` で正規化し、`ChatMessage.channel` には正規化済み ID を入れる。
-- **Bearer とエンドポイント URL は `config.rs` の `xOverrides` から上書き可能**(再ビルド不要)。`xOverrides.bearerToken` と `xOverrides.endpoints`(キー: `guestActivateUrl` / `broadcastShowUrl` / `liveChatUrl`)。未指定/空は既定値。
+- **Bearer とエンドポイント URL は `config.rs` の `xOverrides` から上書き可能**(再ビルド不要)。`xOverrides.bearerToken` と `xOverrides.endpoints`(キー: `guestActivateUrl` / `broadcastShowUrl` / `liveChatUrl` / `userQueryUrl`)。未指定/空は既定値。
 - 金額系イベント(投げ銭等)の概念が無いため `MessageKind::Normal` のみ。Roles は broadcaster だけ判定。
 - 再接続は他 Source と同じ指数バックオフ。HTTP フロー失敗(配信未開始/終了)も不安定扱いでバックオフを伸ばし続け、配信開始待ちポーリングを兼ねる。ストリーム無受信90秒は half-open とみなして張り直す。
 
