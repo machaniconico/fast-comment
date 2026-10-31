@@ -1,7 +1,7 @@
 <script lang="ts">
   import type { UiChatMessage } from '../types';
   import { store, togglePin } from '../stores.svelte';
-  import { getConfig, hideMessage as ipcHideMessage, setConfig, ttsSpeakText } from '../ipc';
+  import { copyTextToClipboard, getConfig, hideMessage as ipcHideMessage, setConfig, ttsSpeakText } from '../ipc';
   import { PLATFORM_COLORS } from '../platform';
   import { theme, type AppearanceTimeDisplay } from '../theme.svelte';
   import type { ContextMenuItem } from './ContextMenu.svelte';
@@ -149,9 +149,9 @@
   }
 
   async function copyText(text: string): Promise<boolean> {
-    if (!text || typeof navigator === 'undefined' || !navigator.clipboard?.writeText) return false;
+    if (!text) return false;
     try {
-      await navigator.clipboard.writeText(text);
+      await copyTextToClipboard(text);
       return true;
     } catch {
       return false;
