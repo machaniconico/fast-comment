@@ -301,6 +301,14 @@ fn skip_current_tts(app: AppHandle, state: State<'_, AppState>) -> Result<(), St
         .map_err(|e| format!("TTSキャンセルイベント送信失敗: {e}"))
 }
 
+/// WebView の Clipboard API を介さず OS のクリップボードへ書き込む。
+#[tauri::command]
+fn copy_text_to_clipboard(text: String) -> Result<(), String> {
+    arboard::Clipboard::new()
+        .and_then(|mut clipboard| clipboard.set_text(text))
+        .map_err(|e| format!("クリップボード書き込み失敗: {e}"))
+}
+
 /// 任意テキストを TTS キューへ直接投入する。UI/OBS には流さない。
 #[tauri::command]
 fn tts_speak_text(app: AppHandle, state: State<'_, AppState>, text: String) -> Result<(), String> {
@@ -1706,6 +1714,7 @@ pub fn run() {
             clear_tts_queue,
             skip_current_tts,
             tts_speak_text,
+            copy_text_to_clipboard,
             test_tts,
             export_comments_csv,
             send_chat_message,

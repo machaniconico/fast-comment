@@ -458,6 +458,14 @@ export async function ttsSpeakText(text: string): Promise<void> {
   await invoke<void>('tts_speak_text', { text });
 }
 
+export async function copyTextToClipboard(text: string): Promise<void> {
+  if (isTauri()) {
+    await invoke<void>('copy_text_to_clipboard', { text });
+    return;
+  }
+  await navigator.clipboard.writeText(text);
+}
+
 export async function testTts(): Promise<string> {
   return (await invoke<string>('test_tts')) ?? 'Tauri環境でのみテストできます';
 }
