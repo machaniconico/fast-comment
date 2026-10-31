@@ -65,6 +65,8 @@
   let displayedTime = $derived(formatTime(message.timestampMs, theme.timeDisplay));
 
   let pinned = $derived(store.isPinned(message.id));
+  let copied = $state(false);
+  let copiedTimer: ReturnType<typeof setTimeout> | undefined;
 
   function onHide() {
     store.hideMessage(message.id);
@@ -146,9 +148,14 @@
     return getMessageText().trim().match(/\S+/)?.[0] ?? '';
   }
 
-  function copyText(text: string) {
-    if (!text || typeof navigator === 'undefined' || !navigator.clipboard?.writeText) return;
-    void navigator.clipboard.writeText(text).catch(() => {});
+  async function copyText(text: string): Promise<boolean> {
+    if (!text || typeof navigator === 'undefined' || !navigator.clipboard?.writeText) return false;
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   async function appendModerationValue(kind: 'ngUsers' | 'ngWords', value: string) {
@@ -222,6 +229,15 @@
     openContextMenu(event.clientX, event.clientY);
   }
 
+  // 標準の単語選択は消さない(選択語をNGワードに追加する導線で使う)。
+  async function onDoubleClick(event: MouseEvent) {
+    if ((event.target as HTMLElement).closest('button')) return;
+    if (!(await copyText(getMessageText()))) return;
+    copied = true;
+    clearTimeout(copiedTimer);
+    copiedTimer = setTimeout(() => (copied = false), 400);
+  }
+
   function onMoreClick(event: MouseEvent) {
     const target = event.currentTarget as HTMLElement;
     const rect = target.getBoundingClientRect();
@@ -261,11 +277,13 @@
   class:highlighted={isHighlighted}
   class:highlight-badge={hasHighlightBadge}
   class:gift={isGift}
+  class:copied
   class:twitch-native={message.platform === 'twitch'}
   style:background={kindBg}
   style:color={kindFg}
   role="listitem"
   oncontextmenu={onContextMenu}
+  ondblclick={onDoubleClick}
 >
   <!-- Platform indicator -->
   <span class="platform-dot" style:background={platformColor} title={message.platform}></span>
@@ -509,6 +527,11 @@
     font-weight: 800;
     line-height: 13px;
     letter-spacing: 0.06em;
+  }
+
+  /* コピー完了の合図。行の高さを変えないよう inset の影だけで示す。 */
+  .comment-item.copied {
+    box-shadow: inset 0 0 0 1px #90caf9;
   }
 
   .platform-dot {
