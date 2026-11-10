@@ -13,6 +13,7 @@
 
 pub mod bus;
 pub mod config;
+pub mod listeners;
 pub mod model;
 pub mod moderation;
 pub mod sources;
@@ -56,6 +57,7 @@ const MAX_TEMPLATE_FILE_BYTES: usize = 1024 * 1024;
 pub struct AppState {
     /// 現在の設定。
     config: Mutex<AppConfig>,
+    listeners: Arc<listeners::ListenerStore>,
     /// stats 集約などへ設定変更を伝える watch 送信端。
     config_tx: watch::Sender<AppConfig>,
     /// Timer overlay へ基準スナップショットを配る watch 送信端。
@@ -96,6 +98,61 @@ pub struct AppState {
     participants: Mutex<Vec<Participant>>,
     /// YouTube投稿用OAuth状態。バックグラウンド処理は持たず、操作時だけ通信する。
     youtube_auth: YoutubeAuth,
+}
+
+#[tauri::command]
+async fn get_listener(
+    state: State<'_, AppState>,
+    platform: String,
+    author_id: String,
+) -> Result<Option<listeners::ListenerRecord>, String> {
+    Ok(state.listeners.get(&platform, &author_id))
+}
+
+#[tauri::command]
+async fn update_listener(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    platform: String,
+    author_id: String,
+    nickname: Option<String>,
+    label: Option<String>,
+    memo: Option<String>,
+    tts_muted: bool,
+) -> Result<listeners::ListenerRecord, String> {
+    let record = state
+        .listeners
+        .update(&platform, &author_id, nickname, label, memo, tts_muted);
+    app.emit("listener-updated", &record)
+        .map_err(|e| e.to_string())?;
+    Ok(record)
+}
+
+#[tauri::command]
+async fn list_listeners(
+    state: State<'_, AppState>,
+    query: Option<String>,
+    limit: u32,
+) -> Result<Vec<listeners::ListenerRecord>, String> {
+    Ok(state.listeners.list(query.as_deref(), limit))
+}
+
+#[tauri::command]
+async fn delete_listener(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    platform: String,
+    author_id: String,
+) -> Result<bool, String> {
+    let deleted = state.listeners.delete(&platform, &author_id);
+    if deleted {
+        app.emit(
+            "listener-updated",
+            serde_json::json!({"platform": platform, "authorId": author_id, "deleted": true}),
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(deleted)
 }
 
 /// OBS サーバの再起動に必要な実行時ハンドル。
@@ -149,6 +206,9 @@ fn try_enqueue_tts_message(
     state: &AppState,
     msg: ChatMessage,
 ) -> Result<(), mpsc::error::TrySendError<ChatMessage>> {
+    if !listeners::allows_tts(&msg) {
+        return Ok(());
+    }
     let item = TtsQueueItem::from_message(&msg);
     {
         let mut queue = state.tts_queue.lock().unwrap();
@@ -321,10 +381,13 @@ fn tts_speak_text(app: AppHandle, state: State<'_, AppState>, text: String) -> R
         .as_millis();
     let timestamp_ms = i64::try_from(epoch_millis).unwrap_or(i64::MAX);
     let msg = ChatMessage {
+        listener: None,
         id: format!("tts-text-{epoch_millis}"),
         platform: Platform::Youtube,
         channel: "system".to_string(),
         author: Author {
+            nickname: None,
+            avatar_url: None,
             id: String::new(),
             name: String::new(),
             display_color: None,
@@ -1173,10 +1236,13 @@ fn inject_test_comment(
     for i in 0..count {
         let value = amount.filter(|_| matches!(kind, MessageKind::SuperChat | MessageKind::Bits));
         let msg = ChatMessage {
+            listener: None,
             id: format!("test-{epoch_millis}-{i}"),
             platform,
             channel: "test".to_string(),
             author: Author {
+                nickname: None,
+                avatar_url: None,
                 id: format!("test{i}"),
                 name: author_name.to_string(),
                 display_color: None,
@@ -1440,6 +1506,7 @@ fn spawn_pipeline(app: AppHandle, cancel: CancellationToken) {
                     };
 
                     // 判定はロックを短く保持して取り出す(MutexGuard を await 跨ぎで持たない)。
+                    state.listeners.observe(&mut msg);
                     let verdict = state.moderator.lock().unwrap().judge(&msg);
                     match verdict {
                         Verdict::Hide => continue,
@@ -1459,7 +1526,7 @@ fn spawn_pipeline(app: AppHandle, cancel: CancellationToken) {
                     // 読み上げは単一の長命ワーカーへ bounded channel で渡す。
                     // バースト時は try_send が Full を返すので drop し、UI/OBS 配信は止めない
                     // (背圧/有界・SPEC 設計原則2)。
-                    if !msg.skip_tts && !state.tts_paused.load(Ordering::Relaxed) {
+                    if listeners::allows_tts(&msg) && !state.tts_paused.load(Ordering::Relaxed) {
                         if let Err(mpsc::error::TrySendError::Full(_)) =
                             try_enqueue_tts_message(&app, &state, msg.clone())
                         {
@@ -1632,6 +1699,7 @@ pub fn run() {
             }
 
             let state = AppState {
+                listeners: Arc::new(listeners::ListenerStore::load(&config_dir)),
                 config: Mutex::new(config.clone()),
                 config_tx,
                 timer_tx,
@@ -1658,7 +1726,25 @@ pub fn run() {
                 youtube_auth: YoutubeAuth::new()
                     .expect("YouTube投稿用HTTPクライアントの作成に失敗しました"),
             };
+            let listener_store = state.listeners.clone();
             app.manage(state);
+            let listener_cancel = app_cancel.clone();
+            tauri::async_runtime::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(5));
+                interval.tick().await;
+                loop {
+                    tokio::select! {
+                        _ = listener_cancel.cancelled() => break,
+                        _ = interval.tick() => {
+                            let store = listener_store.clone();
+                            match tauri::async_runtime::spawn_blocking(move || store.flush()).await {
+                                Ok(Ok(())) => {},
+                                result => tracing::error!("リスナー記録の保存失敗: {result:?}"),
+                            }
+                        }
+                    }
+                }
+            });
 
             if config.tts.backend == config::TtsBackendKind::Bouyomi {
                 let path = config.tts.options.bouyomi_path.trim().to_string();
@@ -1708,6 +1794,10 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            get_listener,
+            update_listener,
+            list_listeners,
+            delete_listener,
             get_config,
             get_tts_queue_state,
             set_tts_paused,
@@ -1743,6 +1833,15 @@ pub fn run() {
             check_for_update,
             open_url,
         ])
-        .run(tauri::generate_context!())
-        .expect("Tauri アプリの起動に失敗しました");
+        .build(tauri::generate_context!())
+        .expect("Tauri アプリの起動に失敗しました")
+        .run(|app, event| {
+            if matches!(event, tauri::RunEvent::Exit) {
+                let state = app.state::<AppState>();
+                state.app_cancel.cancel();
+                if let Err(e) = state.listeners.shutdown() {
+                    tracing::error!("終了時のリスナー記録の保存失敗: {e}");
+                }
+            }
+        });
 }

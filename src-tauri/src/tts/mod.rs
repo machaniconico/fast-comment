@@ -362,10 +362,13 @@ mod tests {
 
     fn message(author_name: &str, body: &str) -> ChatMessage {
         ChatMessage {
+            listener: None,
             id: "msg-1".to_string(),
             platform: Platform::Youtube,
             channel: "channel".to_string(),
             author: Author {
+                nickname: None,
+                avatar_url: None,
                 id: "author-1".to_string(),
                 name: author_name.to_string(),
                 display_color: None,

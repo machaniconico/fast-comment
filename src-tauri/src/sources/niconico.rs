@@ -868,10 +868,13 @@ fn chunked_to_chat(
             };
 
             Some(ChatMessage {
+                listener: None,
                 id,
                 platform: Platform::Niconico,
                 channel: live_id.to_string(),
                 author: Author {
+                    nickname: None,
+                    avatar_url: None,
                     id: author_id,
                     name,
                     display_color: None,
@@ -909,10 +912,13 @@ fn chunked_to_chat(
                 .unwrap_or_else(|| author_name.clone());
 
             Some(ChatMessage {
+                listener: None,
                 id,
                 platform: Platform::Niconico,
                 channel: live_id.to_string(),
                 author: Author {
+                    nickname: None,
+                    avatar_url: None,
                     id: author_id,
                     name: author_name,
                     display_color: None,

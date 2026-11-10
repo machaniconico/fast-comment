@@ -332,6 +332,7 @@ impl TwitchSource {
             .unwrap_or_else(now_ms);
 
         Some(ChatMessage {
+            listener: None,
             id: tags
                 .get("id")
                 .cloned()
@@ -339,6 +340,8 @@ impl TwitchSource {
             platform: Platform::Twitch,
             channel: self.channel.clone(),
             author: Author {
+                nickname: None,
+                avatar_url: None,
                 id: user_id,
                 name: display_name,
                 display_color: color,

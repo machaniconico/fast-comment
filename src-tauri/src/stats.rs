@@ -588,10 +588,13 @@ mod tests {
 
     fn msg(platform: Platform, channel: &str, id: &str, name: &str) -> ChatMessage {
         ChatMessage {
+            listener: None,
             id: ChatMessage::new_id(),
             platform,
             channel: channel.to_string(),
             author: Author {
+                nickname: None,
+                avatar_url: None,
                 id: id.to_string(),
                 name: name.to_string(),
                 display_color: None,

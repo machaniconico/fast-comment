@@ -186,6 +186,8 @@ fn to_chat_message(item: LiveChatMessage, video_id: &str) -> Option<ChatMessage>
         badges.push(text_badge("member", "メンバー"));
     }
     let mut author = Author {
+        nickname: None,
+        avatar_url: None,
         id: author_details
             .channel_id
             .or_else(|| snippet.author_channel_id.clone())
@@ -280,6 +282,7 @@ fn to_chat_message(item: LiveChatMessage, video_id: &str) -> Option<ChatMessage>
         .unwrap_or_else(ChatMessage::new_id);
 
     Some(ChatMessage {
+        listener: None,
         id,
         platform: Platform::Youtube,
         channel: video_id.to_string(),
@@ -818,10 +821,13 @@ mod tests {
 
     fn fixture_message(id: &str, text: &str, kind: MessageKind) -> ChatMessage {
         ChatMessage {
+            listener: None,
             id: id.to_string(),
             platform: Platform::Youtube,
             channel: "video-1".to_string(),
             author: Author {
+                nickname: None,
+                avatar_url: None,
                 id: "author-1".to_string(),
                 name: "Alice".to_string(),
                 display_color: None,

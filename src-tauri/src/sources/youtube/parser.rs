@@ -607,6 +607,7 @@ fn build_message(
         .unwrap_or_else(now_ms);
 
     ChatMessage {
+        listener: None,
         id,
         platform: Platform::Youtube,
         channel: channel.to_string(),
@@ -677,6 +678,8 @@ fn parse_author(r: &Value) -> Author {
     let (roles, badges) = parse_author_badges(r.get("authorBadges"));
 
     Author {
+        nickname: None,
+        avatar_url: None,
         id,
         name,
         display_color: None, // YouTube はユーザー色を持たない(バッジ色は別途)。

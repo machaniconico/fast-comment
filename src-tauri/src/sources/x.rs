@@ -784,10 +784,13 @@ impl XSource {
         let id = format!("x-{ts_raw}-{user_id}");
 
         Some(ChatMessage {
+            listener: None,
             id,
             platform: Platform::X,
             channel: self.broadcast_id.clone(),
             author: Author {
+                nickname: None,
+                avatar_url: None,
                 id: user_id,
                 name,
                 display_color: None,
