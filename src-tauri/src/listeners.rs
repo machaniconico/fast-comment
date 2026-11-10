@@ -10,6 +10,35 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+/// Per-listener overrides. Web Speech rate is 0.5..=2.0, pitch is 0.0..=2.0.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct TtsVoiceOverride {
+    pub voicevox_speaker: Option<u32>,
+    pub bouyomi_voice: Option<i32>,
+    pub web_speech_voice: Option<String>,
+    #[serde(deserialize_with = "deserialize_rate")]
+    pub rate: Option<f32>,
+    #[serde(deserialize_with = "deserialize_pitch")]
+    pub pitch: Option<f32>,
+}
+
+fn clamp_value(value: Option<f32>, min: f32, max: f32) -> Option<f32> {
+    value.filter(|v| !v.is_nan()).map(|v| v.clamp(min, max))
+}
+fn deserialize_rate<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<f32>, D::Error> {
+    Ok(clamp_value(Option::<f32>::deserialize(d)?, 0.5, 2.0))
+}
+fn deserialize_pitch<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<f32>, D::Error> {
+    Ok(clamp_value(Option::<f32>::deserialize(d)?, 0.0, 2.0))
+}
+impl TtsVoiceOverride {
+    pub fn normalize(&mut self) {
+        self.rate = clamp_value(self.rate, 0.5, 2.0);
+        self.pitch = clamp_value(self.pitch, 0.0, 2.0);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NameHistory {
@@ -17,8 +46,8 @@ pub struct NameHistory {
     pub changed_at_ms: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct ListenerRecord {
     pub platform: String,
     pub author_id: String,
@@ -32,6 +61,8 @@ pub struct ListenerRecord {
     pub last_seen_ms: u64,
     pub name_history: Vec<NameHistory>,
     pub tts_muted: bool,
+    #[serde(default)]
+    pub tts_voice: Option<TtsVoiceOverride>,
 }
 
 impl ListenerRecord {
@@ -49,6 +80,7 @@ impl ListenerRecord {
             last_seen_ms: 0,
             name_history: Vec::new(),
             tts_muted: false,
+            tts_voice: None,
         }
     }
 }
@@ -72,6 +104,7 @@ pub struct ListenerStore {
     records: Mutex<Records>,
     // Serializes periodic and exit saves, without blocking observe on disk I/O.
     saving: Mutex<()>,
+    flush_blocked: bool,
 }
 
 fn key(platform: &str, author_id: &str) -> String {
@@ -91,29 +124,56 @@ fn normalized(value: Option<String>, max: usize) -> Option<String> {
     })
 }
 
+// create_new prevents overwriting a backup, even when two loads share an epoch ms.
+fn backup_corrupt(path: &Path, backup: &Path) -> std::io::Result<()> {
+    let mut source = fs::File::open(path)?;
+    let mut target = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(backup)?;
+    std::io::copy(&mut source, &mut target)?;
+    target.sync_all()?;
+    drop(target);
+    drop(source);
+    fs::remove_file(path)
+}
+
 impl ListenerStore {
     pub fn load(dir: &Path) -> Self {
+        Self::load_with_backup(dir, backup_corrupt)
+    }
+
+    fn load_with_backup(
+        dir: &Path,
+        backup: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+    ) -> Self {
+        let mut flush_blocked = false;
         let path = dir.join("listeners.json");
         let entries = match fs::read(&path) {
             Ok(bytes) => match serde_json::from_slice::<HashMap<String, ListenerRecord>>(&bytes) {
                 Ok(entries) => entries,
                 Err(e) => {
                     tracing::error!("リスナー記録のJSONが壊れています・空で開始: {e}");
-                    if let Err(e) = fs::rename(&path, dir.join("listeners.json.bak")) {
-                        tracing::error!("リスナー記録の退避に失敗: {e}");
+                    if let Err(e) =
+                        backup(&path, &dir.join(format!("listeners.json.bak.{}", now_ms())))
+                    {
+                        flush_blocked = true;
+                        tracing::error!("リスナー記録の退避に失敗・保存を禁止: {e}");
                     }
                     HashMap::new()
                 }
             },
             Err(e) => {
                 if e.kind() != std::io::ErrorKind::NotFound {
-                    tracing::error!("リスナー記録の読込失敗: {e}");
+                    flush_blocked = true;
+                    tracing::error!("リスナー記録の読込失敗・保存を禁止: {e}");
                 }
                 HashMap::new()
             }
         };
         Self {
             path,
+            flush_blocked,
             records: Mutex::new(Records {
                 entries,
                 ..Records::default()
@@ -127,7 +187,7 @@ impl ListenerStore {
     }
 
     fn observe_at(&self, msg: &mut ChatMessage, now: u64) {
-        if msg.kind == MessageKind::System {
+        if msg.kind == MessageKind::System || msg.is_injected_test_comment() {
             return;
         }
         let platform = match msg.platform {
@@ -183,6 +243,7 @@ impl ListenerStore {
             is_first_ever,
             label: record.label.clone(),
             tts_muted: record.tts_muted,
+            tts_voice: record.tts_voice.clone(),
         });
         records.changed();
     }
@@ -214,6 +275,26 @@ impl ListenerStore {
         record.label = normalized(label, 200);
         record.memo = normalized(memo, 2000);
         record.tts_muted = tts_muted;
+        let result = record.clone();
+        records.changed();
+        result
+    }
+
+    pub fn set_voice(
+        &self,
+        platform: &str,
+        author_id: &str,
+        mut voice: Option<TtsVoiceOverride>,
+    ) -> ListenerRecord {
+        if let Some(voice) = &mut voice {
+            voice.normalize();
+        }
+        let mut records = self.records.lock().unwrap();
+        let record = records
+            .entries
+            .entry(key(platform, author_id))
+            .or_insert_with(|| ListenerRecord::new(platform, author_id));
+        record.tts_voice = voice;
         let result = record.clone();
         records.changed();
         result
@@ -258,6 +339,9 @@ impl ListenerStore {
     }
 
     pub fn flush(&self) -> anyhow::Result<()> {
+        if self.flush_blocked {
+            anyhow::bail!("リスナー記録の読込/退避失敗のため保存は禁止されています");
+        }
         let _saving = self.saving.lock().unwrap();
         let (snapshot, revision) = {
             let records = self.records.lock().unwrap();
@@ -521,12 +605,174 @@ mod tests {
         let store = dir.store();
         assert!(store.list(None, 10).is_empty());
         assert_eq!(
-            fs::read(dir.0.join("listeners.json.bak")).unwrap(),
+            fs::read(
+                fs::read_dir(&dir.0)
+                    .unwrap()
+                    .map(|e| e.unwrap().path())
+                    .find(|p| p
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with("listeners.json.bak."))
+                    .unwrap()
+            )
+            .unwrap(),
             b"{broken"
         );
         let mut msg = message();
         store.observe_at(&mut msg, 1);
         store.flush().unwrap();
         assert!(dir.store().get("twitch", "user").is_some());
+    }
+    #[test]
+    fn listeners_legacy_missing_and_unknown_fields_load_without_backup() {
+        let dir = TestDir::new();
+        let legacy = serde_json::json!({
+            "twitch:user": {"platform": "twitch", "authorId": "user", "name": "Alice",
+                "nickname": null, "label": null, "memo": null, "commentCount": 5,
+                "giftCount": 1, "firstSeenMs": 10, "lastSeenMs": 20,
+                "nameHistory": [], "ttsMuted": false},
+            "youtube:old": {"platform": "youtube", "authorId": "old", "futureField": true}
+        });
+        fs::write(
+            dir.0.join("listeners.json"),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+        let store = dir.store();
+        let record = store.get("twitch", "user").unwrap();
+        assert_eq!(record.comment_count, 5);
+        assert!(record.tts_voice.is_none());
+        assert_eq!(store.get("youtube", "old").unwrap().name_history, vec![]);
+        assert_eq!(fs::read_dir(&dir.0).unwrap().count(), 1);
+        assert_eq!(
+            serde_json::from_str::<ListenerRecord>("{}").unwrap(),
+            ListenerRecord::default()
+        );
+    }
+
+    #[test]
+    fn listener_voice_normalizes_persists_propagates_and_clears_independently() {
+        let dir = TestDir::new();
+        let store = dir.store();
+        store.update(
+            "twitch",
+            "user",
+            Some("Nick".into()),
+            Some("VIP".into()),
+            None,
+            true,
+        );
+        let record = store.set_voice(
+            "twitch",
+            "user",
+            Some(TtsVoiceOverride {
+                voicevox_speaker: Some(9),
+                bouyomi_voice: Some(2),
+                web_speech_voice: Some("voice".into()),
+                rate: Some(9.0),
+                pitch: Some(-2.0),
+            }),
+        );
+        let voice = record.tts_voice.as_ref().unwrap();
+        assert_eq!((voice.rate, voice.pitch), (Some(2.0), Some(0.0)));
+        let mut msg = message();
+        store.observe_at(&mut msg, 1);
+        assert_eq!(msg.listener.as_ref().unwrap().tts_voice, record.tts_voice);
+        assert!(msg.listener.as_ref().unwrap().tts_muted);
+        store.flush().unwrap();
+        let reloaded = dir.store();
+        assert_eq!(
+            reloaded.get("twitch", "user").unwrap().tts_voice,
+            record.tts_voice
+        );
+        let record = reloaded.set_voice("twitch", "user", None);
+        assert!(record.tts_voice.is_none());
+        assert_eq!(record.nickname.as_deref(), Some("Nick"));
+        assert_eq!(record.label.as_deref(), Some("VIP"));
+        assert_eq!(record.comment_count, 1);
+        assert!(record.tts_muted);
+        reloaded.flush().unwrap();
+        assert!(dir
+            .store()
+            .get("twitch", "user")
+            .unwrap()
+            .tts_voice
+            .is_none());
+    }
+
+    #[test]
+    fn listener_voice_clamps_json_and_nonfinite_values() {
+        for (input, rate, pitch) in [
+            (r#"{"rate":-9,"pitch":9}"#, 0.5, 2.0),
+            (r#"{"rate":9,"pitch":-9}"#, 2.0, 0.0),
+            (r#"{"rate":1.25,"pitch":1.5}"#, 1.25, 1.5),
+        ] {
+            let voice: TtsVoiceOverride = serde_json::from_str(input).unwrap();
+            assert_eq!((voice.rate, voice.pitch), (Some(rate), Some(pitch)));
+        }
+        let mut voice = TtsVoiceOverride {
+            rate: Some(f32::NAN),
+            pitch: Some(f32::INFINITY),
+            ..TtsVoiceOverride::default()
+        };
+        voice.normalize();
+        assert_eq!((voice.rate, voice.pitch), (None, Some(2.0)));
+    }
+
+    #[test]
+    fn listeners_read_error_blocks_flush_even_after_file_recovers() {
+        let dir = TestDir::new();
+        let path = dir.0.join("listeners.json");
+        fs::create_dir(&path).unwrap(); // Deterministic non-NotFound error on Windows and Unix.
+        let store = dir.store();
+        assert!(store.flush_blocked);
+        fs::remove_dir(&path).unwrap();
+        let original = br#"{"twitch:original":{"name":"Keep"}}"#;
+        fs::write(&path, original).unwrap();
+        store.observe_at(&mut message(), 1);
+        assert!(store.flush().is_err());
+        assert!(store.shutdown().is_err());
+        assert_eq!(fs::read(path).unwrap(), original);
+    }
+
+    #[test]
+    fn listeners_failed_backup_blocks_flush_and_keeps_original() {
+        let dir = TestDir::new();
+        let path = dir.0.join("listeners.json");
+        fs::write(&path, b"{broken").unwrap();
+        let store = ListenerStore::load_with_backup(&dir.0, |_, backup| {
+            // Simulate a same-millisecond collision using the real create_new path.
+            fs::write(backup, b"older backup")?;
+            backup_corrupt(&path, backup)
+        });
+        assert!(store.flush_blocked);
+        store.observe_at(&mut message(), 1);
+        assert!(store.flush().is_err());
+        assert!(store.shutdown().is_err());
+        assert_eq!(fs::read(path).unwrap(), b"{broken");
+        let backup = fs::read_dir(&dir.0)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("listeners.json.bak.")
+            })
+            .unwrap();
+        assert_eq!(fs::read(backup).unwrap(), b"older backup");
+    }
+
+    #[test]
+    fn listeners_injected_test_comments_are_never_observed() {
+        let dir = TestDir::new();
+        let store = dir.store();
+        let mut msg = message();
+        msg.id = "injected-test:123-0".into();
+        store.observe_at(&mut msg, 1);
+        assert!(msg.listener.is_none());
+        assert!(store.list(None, 100).is_empty());
+        assert!(!store.records.lock().unwrap().dirty);
     }
 }

@@ -10,8 +10,8 @@
  * - Wired to ipc.ts via onChatBatch + startChatListener (+ startTtsSpeakListener/startTtsCancelListener).
  */
 
-import type { ChatMessage, Platform, UiChatMessage } from './types';
-import { onChatBatch, startChatListener, startTtsSpeakListener, startTtsCancelListener, getConfig } from './ipc';
+import { isListenerDeleted, type ChatMessage, type ListenerUpdate, type Platform, type UiChatMessage } from './types';
+import { onChatBatch, startChatListener, startListenerUpdatedListener, startTtsSpeakListener, startTtsCancelListener, getConfig } from './ipc';
 
 const DEFAULT_MAX_BUFFER = 2000;
 /** Max pinned comments kept in the pinned strip (oldest dropped on overflow). */
@@ -216,6 +216,65 @@ class CommentStore {
   // Derived: monotonically increasing highlight-message count (notification trigger)
   readonly highlightCount: number = $derived(this._highlightSeq);
 
+  // Latest 'listener-updated' payload with a monotonically increasing receive number,
+  // so the user card can tell already-seen events from new ones.
+  lastListenerUpdate: { seq: number; update: ListenerUpdate } | null = $state(null);
+  private _listenerUpdateSeq = 0;
+
+  /** Session comments of one author, newest first (for the user card). */
+  sessionCommentsOf(platform: string, authorId: string, limit = 100): UiChatMessage[] {
+    const out: UiChatMessage[] = [];
+    for (let i = this._buf.length - 1; i >= 0 && out.length < limit; i -= 1) {
+      const msg = this._buf[i]?.msg;
+      if (msg && msg.platform === platform && msg.author.id === authorId) out.push(msg);
+    }
+    return out;
+  }
+
+  // Latest listener edit/deletion per author. Comments still waiting for the
+  // next IPC frame were built from the pre-edit record, so pushBatch re-applies
+  // this to every arriving message (otherwise they would show stale nickname/label).
+  private _listenerOverrides: Map<string, ListenerUpdate> = new Map();
+
+  /** Overlay the latest listener edit/deletion (if any) onto one message. */
+  private withListenerOverride(msg: UiChatMessage): UiChatMessage {
+    if (this._listenerOverrides.size === 0) return msg;
+    const update = this._listenerOverrides.get(`${msg.platform}\u0000${msg.author.id}`);
+    if (!update) return msg;
+    const deleted = isListenerDeleted(update);
+    const nickname = deleted ? undefined : update.nickname ?? undefined;
+    const label = deleted ? null : update.label;
+    const ttsMuted = deleted ? false : update.ttsMuted;
+    return {
+      ...msg,
+      author: { ...msg.author, nickname },
+      listener: msg.listener ? { ...msg.listener, label, ttsMuted } : msg.listener,
+    };
+  }
+
+  /** Reflect a listener edit/deletion onto buffered and not-yet-arrived messages of that author. */
+  applyListenerUpdate(update: ListenerUpdate): void {
+    this._listenerUpdateSeq += 1;
+    this.lastListenerUpdate = { seq: this._listenerUpdateSeq, update };
+    this._listenerOverrides.set(`${update.platform}\u0000${update.authorId}`, update);
+    const patch = (msg: UiChatMessage): UiChatMessage =>
+      msg.platform === update.platform && msg.author.id === update.authorId
+        ? this.withListenerOverride(msg)
+        : msg;
+    let changed = false;
+    const next = this._buf.map((entry) => {
+      const msg = patch(entry.msg);
+      if (msg === entry.msg) return entry;
+      changed = true;
+      return { msg, search: entry.search };
+    });
+    if (changed) {
+      this._buf = next;
+      this._msgs = next.map((e) => e.msg);
+    }
+    if (this._pinned.some((m) => patch(m) !== m)) this._pinned = this._pinned.map(patch);
+  }
+
   /** Push a batch into the ring buffer, evicting oldest on overflow. */
   pushBatch(messages: ChatMessage[]): void {
     // Accumulate the session donation tally (clone-on-write so the reactive
@@ -238,9 +297,9 @@ class CommentStore {
             copiedForGiftUpdate = true;
           }
           const previous = baseBuffer[existingIndex]?.msg;
-          const uiMsg: UiChatMessage = previous?.viewerSeq === undefined
+          const uiMsg: UiChatMessage = this.withListenerOverride(previous?.viewerSeq === undefined
             ? msg
-            : { ...msg, viewerSeq: previous.viewerSeq };
+            : { ...msg, viewerSeq: previous.viewerSeq });
           baseBuffer[existingIndex] = { msg: uiMsg, search: buildSearch(msg) };
           continue;
         }
@@ -248,20 +307,20 @@ class CommentStore {
         const pendingIndex = incoming.findIndex((entry) => entry.msg.id === msg.id);
         if (pendingIndex >= 0) {
           const previous = incoming[pendingIndex]?.msg;
-          const uiMsg: UiChatMessage = previous?.viewerSeq === undefined
+          const uiMsg: UiChatMessage = this.withListenerOverride(previous?.viewerSeq === undefined
             ? msg
-            : { ...msg, viewerSeq: previous.viewerSeq };
+            : { ...msg, viewerSeq: previous.viewerSeq });
           incoming[pendingIndex] = { msg: uiMsg, search: buildSearch(msg) };
           continue;
         }
       }
 
       const key = viewerKey(msg);
-      let uiMsg: UiChatMessage = msg;
+      let uiMsg: UiChatMessage = this.withListenerOverride(msg);
       if (key) {
         const seq = (this._viewerCounts.get(key) ?? 0) + 1;
         this._viewerCounts.set(key, seq);
-        uiMsg = { ...msg, viewerSeq: seq };
+        uiMsg = { ...uiMsg, viewerSeq: seq };
       }
       incoming.push({ msg: uiMsg, search: buildSearch(msg) });
 
@@ -425,15 +484,17 @@ class CommentStore {
     if (config) {
       this.setNotify(config.ui.notifySound ?? false, config.ui.notifyVolume ?? 0.5);
     }
-    const [unlistenChat, unlistenTts, unlistenTtsCancel] = await Promise.all([
+    const [unlistenChat, unlistenTts, unlistenTtsCancel, unlistenListener] = await Promise.all([
       startChatListener(),
       startTtsSpeakListener(),
       startTtsCancelListener(),
+      startListenerUpdatedListener((u) => this.applyListenerUpdate(u)),
     ]);
     return () => {
       unlistenChat();
       unlistenTts();
       unlistenTtsCancel();
+      unlistenListener();
     };
   }
 }

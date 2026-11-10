@@ -12,6 +12,7 @@
 //! Tauri コマンドで設定取得/更新・チャンネル追加削除・コメント非表示・OBS URL 取得を公開。
 
 pub mod bus;
+pub mod chatlog;
 pub mod config;
 pub mod listeners;
 pub mod model;
@@ -58,6 +59,7 @@ pub struct AppState {
     /// 現在の設定。
     config: Mutex<AppConfig>,
     listeners: Arc<listeners::ListenerStore>,
+    chatlog: chatlog::ChatLog,
     /// stats 集約などへ設定変更を伝える watch 送信端。
     config_tx: watch::Sender<AppConfig>,
     /// Timer overlay へ基準スナップショットを配る watch 送信端。
@@ -101,6 +103,36 @@ pub struct AppState {
 }
 
 #[tauri::command]
+fn get_comment_log_dir(state: State<'_, AppState>) -> String {
+    chatlog::log_dir(&state.config_dir)
+        .to_string_lossy()
+        .into_owned()
+}
+
+#[tauri::command]
+async fn open_comment_log_dir(state: State<'_, AppState>) -> Result<(), String> {
+    let dir = chatlog::log_dir(&state.config_dir);
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| e.to_string())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        #[cfg(target_os = "windows")]
+        let mut command = std::process::Command::new("explorer.exe");
+        #[cfg(target_os = "macos")]
+        let mut command = std::process::Command::new("open");
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        let mut command = std::process::Command::new("xdg-open");
+        command
+            .arg(dir)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
 async fn get_listener(
     state: State<'_, AppState>,
     platform: String,
@@ -123,8 +155,24 @@ async fn update_listener(
     let record = state
         .listeners
         .update(&platform, &author_id, nickname, label, memo, tts_muted);
-    app.emit("listener-updated", &record)
-        .map_err(|e| e.to_string())?;
+    if let Err(e) = app.emit("listener-updated", &record) {
+        tracing::warn!("listener-updated emit 失敗: {e}");
+    }
+    Ok(record)
+}
+
+#[tauri::command]
+async fn set_listener_voice(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    platform: String,
+    author_id: String,
+    voice: Option<listeners::TtsVoiceOverride>,
+) -> Result<listeners::ListenerRecord, String> {
+    let record = state.listeners.set_voice(&platform, &author_id, voice);
+    if let Err(e) = app.emit("listener-updated", &record) {
+        tracing::warn!("listener-updated emit 失敗: {e}");
+    }
     Ok(record)
 }
 
@@ -146,11 +194,12 @@ async fn delete_listener(
 ) -> Result<bool, String> {
     let deleted = state.listeners.delete(&platform, &author_id);
     if deleted {
-        app.emit(
+        if let Err(e) = app.emit(
             "listener-updated",
             serde_json::json!({"platform": platform, "authorId": author_id, "deleted": true}),
-        )
-        .map_err(|e| e.to_string())?;
+        ) {
+            tracing::warn!("listener-updated emit 失敗: {e}");
+        }
     }
     Ok(deleted)
 }
@@ -464,13 +513,15 @@ async fn test_tts(state: State<'_, AppState>) -> Result<String, String> {
 
             match backend.speak("読み上げテストです".to_string()).await {
                 Ok(()) => {
-                    let launch_note =
-                        if matches!(launch_outcome, bouyomi::LaunchOutcome::Launched) {
-                            " (自動起動しました)"
-                        } else {
-                            ""
-                        };
-                    Ok(format!("棒読みちゃんへ送出しました ({host}:{port}){launch_note}"))
+                    let launch_note = if matches!(launch_outcome, bouyomi::LaunchOutcome::Launched)
+                    {
+                        " (自動起動しました)"
+                    } else {
+                        ""
+                    };
+                    Ok(format!(
+                        "棒読みちゃんへ送出しました ({host}:{port}){launch_note}"
+                    ))
                 }
                 Err(e) => {
                     if let Some(detail) = bouyomi::connect_error_detail(&e) {
@@ -483,12 +534,14 @@ async fn test_tts(state: State<'_, AppState>) -> Result<String, String> {
                 }
             }
         }
-        TtsBackendKind::Voicevox => {
-            Ok("現在のバックエンドは VOICEVOX です。棒読みちゃんを選択するとテストできます".to_string())
-        }
-        TtsBackendKind::WebSpeech => {
-            Ok("現在のバックエンドは Web Speech です。棒読みちゃんを選択するとテストできます".to_string())
-        }
+        TtsBackendKind::Voicevox => Ok(
+            "現在のバックエンドは VOICEVOX です。棒読みちゃんを選択するとテストできます"
+                .to_string(),
+        ),
+        TtsBackendKind::WebSpeech => Ok(
+            "現在のバックエンドは Web Speech です。棒読みちゃんを選択するとテストできます"
+                .to_string(),
+        ),
         TtsBackendKind::None => {
             Ok("現在、読み上げはOFFです。棒読みちゃんを選択するとテストできます".to_string())
         }
@@ -677,8 +730,7 @@ async fn update_config(
                     != new_config.credentials.x_auth_token.trim()
                 || current.credentials.x_csrf_token.trim()
                     != new_config.credentials.x_csrf_token.trim(),
-            current.credentials.twitch_oauth.trim()
-                != new_config.credentials.twitch_oauth.trim()
+            current.credentials.twitch_oauth.trim() != new_config.credentials.twitch_oauth.trim()
                 || current.credentials.twitch_client_id.trim()
                     != new_config.credentials.twitch_client_id.trim()
                 || current.credentials.twitch_client_secret.trim()
@@ -688,6 +740,7 @@ async fn update_config(
 
     // 保存。
     new_config.obs.normalize();
+    new_config.log.normalize();
     new_config
         .save(&state.config_dir)
         .map_err(|e| e.to_string())?;
@@ -701,6 +754,8 @@ async fn update_config(
 
     // OBS ポート反映。ポートが変わった場合は旧サーバを停止し、新ポートで再 bind する。
     restart_obs_server_if_needed(&state, new_config.obs.port)?;
+
+    state.chatlog.configure(new_config.log.clone()).await?;
 
     // 差分計算用にチャンネル一覧を退避しておく。
     let desired_channels = new_config.channels.clone();
@@ -797,11 +852,7 @@ fn add_channel(
         let mut cfg = state.config.lock().unwrap();
         // 既存の同一キーがあれば重複追加しない。
         let key = AppState::channel_key(&channel);
-        if cfg
-            .channels
-            .iter()
-            .any(|c| AppState::channel_key(c) == key)
-        {
+        if cfg.channels.iter().any(|c| AppState::channel_key(c) == key) {
             return Err(format!("チャンネルは既に存在します: {key}"));
         }
         cfg.channels.push(channel.clone());
@@ -824,8 +875,7 @@ fn remove_channel(state: State<'_, AppState>, key: String) -> Result<(), String>
     // 設定から除去して保存。
     let next_config = {
         let mut cfg = state.config.lock().unwrap();
-        cfg.channels
-            .retain(|c| AppState::channel_key(c) != key);
+        cfg.channels.retain(|c| AppState::channel_key(c) != key);
         cfg.save(&state.config_dir).map_err(|e| e.to_string())?;
         cfg.clone()
     };
@@ -1071,7 +1121,8 @@ fn is_png_skin_file_name(name: &str) -> bool {
         return false;
     }
     let path = std::path::Path::new(name);
-    path.parent().is_none_or(|parent| parent.as_os_str().is_empty())
+    path.parent()
+        .is_none_or(|parent| parent.as_os_str().is_empty())
         && path
             .extension()
             .and_then(|ext| ext.to_str())
@@ -1237,7 +1288,7 @@ fn inject_test_comment(
         let value = amount.filter(|_| matches!(kind, MessageKind::SuperChat | MessageKind::Bits));
         let msg = ChatMessage {
             listener: None,
-            id: format!("test-{epoch_millis}-{i}"),
+            id: format!("injected-test:{epoch_millis}-{i}"),
             platform,
             channel: "test".to_string(),
             author: Author {
@@ -1385,14 +1436,7 @@ fn spawn_one_channel(_app: &AppHandle, state: &AppState, ch: &ChannelConfig) {
         return;
     }
     let key = AppState::channel_key(ch);
-    let (
-        overrides,
-        youtube_api_key,
-        x_overrides,
-        x_auth,
-        niconico_overrides,
-        twitch_viewer_auth,
-    ) = {
+    let (overrides, youtube_api_key, x_overrides, x_auth, niconico_overrides, twitch_viewer_auth) = {
         let config = state.config.lock().unwrap();
         // X の名前解決 cookie は auth_token / ct0 の両方が揃って初めて有効。
         let x_auth = {
@@ -1508,6 +1552,10 @@ fn spawn_pipeline(app: AppHandle, cancel: CancellationToken) {
                     // 判定はロックを短く保持して取り出す(MutexGuard を await 跨ぎで持たない)。
                     state.listeners.observe(&mut msg);
                     let verdict = state.moderator.lock().unwrap().judge(&msg);
+                    let log_config = state.config.lock().unwrap().log.clone();
+                    if log_config.enabled && (!matches!(verdict, Verdict::Hide) || log_config.include_hidden) {
+                        state.chatlog.try_send(msg.clone(), matches!(verdict, Verdict::Hide));
+                    }
                     match verdict {
                         Verdict::Hide => continue,
                         Verdict::Highlight => {
@@ -1549,7 +1597,11 @@ fn spawn_pipeline(app: AppHandle, cancel: CancellationToken) {
 /// 設定は都度スナップショットを取り `update_config` で反映する(バックエンド再構築は
 /// 各 speak 内で行うが、毎メッセージのタスク spawn / 再プローブは行わない)。
 /// `speak_message` は内部で speak→Err 時に Web Speech フォールバックする(#15 と整合)。
-fn spawn_tts_worker(app: AppHandle, mut rx: mpsc::Receiver<ChatMessage>, cancel: CancellationToken) {
+fn spawn_tts_worker(
+    app: AppHandle,
+    mut rx: mpsc::Receiver<ChatMessage>,
+    cancel: CancellationToken,
+) {
     tauri::async_runtime::spawn(async move {
         let initial_cfg = {
             let state = app.state::<AppState>();
@@ -1628,7 +1680,7 @@ fn resolve_templates_dir(app: &AppHandle) -> PathBuf {
     // 開発時フォールバック候補(cwd は dev 時 src-tauri/ になりがち)。
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     for candidate in [
-        cwd.join("templates"),         // cwd=リポジトリルートの場合
+        cwd.join("templates"),            // cwd=リポジトリルートの場合
         cwd.join("..").join("templates"), // cwd=src-tauri/ の場合(dev)
     ] {
         if candidate.exists() {
@@ -1700,6 +1752,7 @@ pub fn run() {
 
             let state = AppState {
                 listeners: Arc::new(listeners::ListenerStore::load(&config_dir)),
+                chatlog: chatlog::ChatLog::start(&config_dir, config.log.clone()),
                 config: Mutex::new(config.clone()),
                 config_tx,
                 timer_tx,
@@ -1796,9 +1849,12 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_listener,
             update_listener,
+            set_listener_voice,
             list_listeners,
             delete_listener,
             get_config,
+            get_comment_log_dir,
+            open_comment_log_dir,
             get_tts_queue_state,
             set_tts_paused,
             clear_tts_queue,
@@ -1839,6 +1895,9 @@ pub fn run() {
             if matches!(event, tauri::RunEvent::Exit) {
                 let state = app.state::<AppState>();
                 state.app_cancel.cancel();
+                if let Err(e) = tauri::async_runtime::block_on(state.chatlog.shutdown()) {
+                    tracing::error!("終了時のコメントログ保存失敗: {e}");
+                }
                 if let Err(e) = state.listeners.shutdown() {
                     tracing::error!("終了時のリスナー記録の保存失敗: {e}");
                 }

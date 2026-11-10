@@ -91,9 +91,9 @@ fn resolve_first_addr(addr_text: &str) -> Result<SocketAddr, BouyomiConnectError
     let mut addrs = addr_text
         .to_socket_addrs()
         .map_err(|e| BouyomiConnectError::new(format!("{addr_text}: {e}")))?;
-    addrs
-        .next()
-        .ok_or_else(|| BouyomiConnectError::new(format!("{addr_text}: 接続先アドレスを解決できません")))
+    addrs.next().ok_or_else(|| {
+        BouyomiConnectError::new(format!("{addr_text}: 接続先アドレスを解決できません"))
+    })
 }
 
 fn clear_launch_attempt() {
@@ -232,17 +232,32 @@ impl BouyomiBackend {
 
     /// Talk コマンドのバイト列を組み立てる。
     fn build_packet(&self, text: &str) -> Vec<u8> {
+        self.build_packet_with_voice(text, None)
+    }
+
+    fn build_packet_with_voice(&self, text: &str, voice: Option<i32>) -> Vec<u8> {
+        let voice = voice
+            .map(|v| v.clamp(i16::MIN as i32, i16::MAX as i32) as i16)
+            .unwrap_or(self.voice);
         let body = text.as_bytes();
         let mut buf = Vec::with_capacity(15 + body.len());
         buf.extend_from_slice(&CMD_TALK.to_le_bytes());
         buf.extend_from_slice(&self.speed.to_le_bytes());
         buf.extend_from_slice(&self.tone.to_le_bytes());
         buf.extend_from_slice(&self.volume.to_le_bytes());
-        buf.extend_from_slice(&self.voice.to_le_bytes());
+        buf.extend_from_slice(&voice.to_le_bytes());
         buf.push(CHARCODE_UTF8);
         buf.extend_from_slice(&(body.len() as i32).to_le_bytes());
         buf.extend_from_slice(body);
         buf
+    }
+
+    pub async fn speak_with_voice(&self, text: String, voice: Option<i32>) -> anyhow::Result<()> {
+        let packet = match voice {
+            Some(_) => self.build_packet_with_voice(&text, voice),
+            None => self.build_packet(&text),
+        };
+        self.send_packet(packet).await
     }
 
     async fn send_packet(&self, packet: Vec<u8>) -> anyhow::Result<()> {
@@ -306,8 +321,7 @@ impl BouyomiBackend {
 
 impl TtsBackend for BouyomiBackend {
     async fn speak(&self, text: String) -> anyhow::Result<()> {
-        let packet = self.build_packet(&text);
-        self.send_packet(packet).await
+        self.speak_with_voice(text, None).await
     }
 
     async fn available(&self) -> bool {
@@ -353,6 +367,26 @@ mod tests {
                 command
             })
             .collect()
+    }
+
+    #[test]
+    fn listener_voice_is_selected_in_bouyomi_packet() {
+        let backend = BouyomiBackend::new("localhost".into(), 50001, -1, -1, -1, 3);
+        for (override_voice, expected) in [
+            (None, 3_i16),
+            (Some(0), 0),
+            (Some(7), 7),
+            (Some(i32::MAX), i16::MAX),
+            (Some(i32::MIN), i16::MIN),
+        ] {
+            let packet = backend.build_packet_with_voice("hello", override_voice);
+            assert_eq!(i16::from_le_bytes([packet[8], packet[9]]), expected);
+            assert_eq!(&packet[15..], b"hello");
+        }
+        assert_eq!(
+            backend.build_packet("hello"),
+            backend.build_packet_with_voice("hello", None)
+        );
     }
 
     #[tokio::test]

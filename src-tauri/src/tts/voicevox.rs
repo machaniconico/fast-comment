@@ -40,11 +40,13 @@ impl VoicevoxBackend {
                 .unwrap_or_else(|_| Client::new()),
         }
     }
-}
 
-impl TtsBackend for VoicevoxBackend {
-    async fn speak(&self, text: String) -> anyhow::Result<()> {
-        let speaker = self.speaker.to_string();
+    pub async fn speak_with_speaker(
+        &self,
+        text: String,
+        speaker: Option<u32>,
+    ) -> anyhow::Result<()> {
+        let speaker = selected_speaker(self.speaker, speaker).to_string();
 
         // 1) audio_query
         let query_url = format!("{}/audio_query", self.base_url);
@@ -79,6 +81,16 @@ impl TtsBackend for VoicevoxBackend {
         }
         Ok(())
     }
+}
+
+fn selected_speaker(global: u32, listener: Option<u32>) -> u32 {
+    listener.unwrap_or(global)
+}
+
+impl TtsBackend for VoicevoxBackend {
+    async fn speak(&self, text: String) -> anyhow::Result<()> {
+        self.speak_with_speaker(text, None).await
+    }
 
     async fn available(&self) -> bool {
         // /version を叩けるかで判定。
@@ -96,8 +108,7 @@ impl TtsBackend for VoicevoxBackend {
 
 /// 依存追加を避けるための最小 base64 エンコーダ(標準アルファベット)。
 mod base64_encode {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
     /// バイト列を base64 文字列へ変換する。
     pub fn encode(data: &[u8]) -> String {
@@ -145,5 +156,15 @@ mod base64_encode {
                 assert_eq!(encode(input), expected);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn listener_voice_selects_speaker_for_both_voicevox_requests() {
+        assert_eq!(super::selected_speaker(3, None), 3);
+        assert_eq!(super::selected_speaker(3, Some(7)), 7);
+        assert_eq!(super::selected_speaker(3, Some(0)), 0);
     }
 }

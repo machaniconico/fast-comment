@@ -1,14 +1,16 @@
 <script lang="ts">
-  import { onMount, onDestroy } from 'svelte';
+  import { onMount, onDestroy, untrack } from 'svelte';
   import type {
     AppConfig, EffectRule, EffectsConfig, GoalsConfig, InjectTestCommentOptions, TtsDictEntry, TtsOptions,
-    TimerConfig, WelcomeConfig, YoutubeOauthStatus
+    TimerConfig, WelcomeConfig, YoutubeOauthStatus, ModerationAppended
   } from '../ipc';
   import {
     getConfig, setConfig, getObsUrl, getObsGoalsUrl, getObsTimerUrl, exportCommentsCsv, injectTestComment,
     setTtsPaused, clearTtsQueue, skipCurrentTts, testTts, getYoutubeOauthStatus,
-    connectYoutubeOauth, disconnectYoutubeOauth, getGoalSkinInfo, openUrl
+    connectYoutubeOauth, disconnectYoutubeOauth, getGoalSkinInfo, openUrl,
+    getCommentLogDir, openCommentLogDir, listListeners, deleteListener, MODERATION_APPENDED_EVENT
   } from '../ipc';
+  import { isListenerDeleted, safeAvatarUrl, type ListenerRecord, type ListenerUpdate } from '../types';
   import { ui, SETTINGS_ANCHOR_IDS } from '../ui.svelte';
   import {
     theme,
@@ -59,6 +61,10 @@
 
   function onWrapCommentsChange(event: Event) {
     theme.setWrapComments((event.currentTarget as HTMLInputElement).checked);
+  }
+
+  function onShowAvatarsChange(event: Event) {
+    theme.setShowAvatars((event.currentTarget as HTMLInputElement).checked);
   }
 
   function onShowViewerBadgesChange(event: Event) {
@@ -221,6 +227,26 @@
   let webSpeechVolume: number = $state(1);
   let webSpeechVoice: string = $state('');
   let ttsDictionary: TtsDictEntry[] = $state([]);
+  const READ_KIND_LABELS: [ReadKindKey, string][] = [
+    ['normal', '通常'], ['superChat', 'スーパーチャット'], ['membership', 'メンバー'],
+    ['bits', 'ビッツ'], ['gift', 'ギフト'], ['system', 'システム']
+  ];
+  type ReadKindKey = 'normal' | 'superChat' | 'membership' | 'bits' | 'gift' | 'system';
+  let nameFormat: string = $state('{name}');
+  let excludeUsersText: string = $state('');
+  let readKinds: Record<ReadKindKey, boolean> = $state({
+    normal: true, superChat: true, membership: true, bits: true, gift: true, system: true
+  });
+  let skipCommands: boolean = $state(false);
+  let logEnabled: boolean = $state(true);
+  let logRetentionDays: number = $state(30);
+  let logDir: string = $state('');
+  let logMsg: string = $state('');
+  let listenerQuery: string = $state('');
+  let listenerRows: ListenerRecord[] = $state([]);
+  let listenerLoading: boolean = $state(false);
+  let listenerMsg: string = $state('');
+  let listenerSeq = 0;
   let ttsPaused: boolean = $state(false);
   let ttsControlBusy: boolean = $state(false);
   let ttsControlMsg: string = $state('');
@@ -257,6 +283,12 @@
       webSpeechVoice = config.tts.options.webSpeechVoice ?? '';
       ttsDictionary = normalizeTtsDictionary(config.tts.options.dictionary);
       config.tts.options.dictionary = ttsDictionary;
+      nameFormat = config.tts.options.nameFormat ?? '{name}';
+      excludeUsersText = (config.tts.options.excludeUsers ?? []).join('\n');
+      for (const [k] of READ_KIND_LABELS) readKinds[k] = config.tts.options.readKinds?.[k] !== false;
+      skipCommands = ttsBool('skipCommands', false);
+      logEnabled = config.log?.enabled !== false;
+      logRetentionDays = typeof config.log?.retentionDays === 'number' ? config.log.retentionDays : 30;
       normalizeObsConfig(true);
       normalizeGoalsConfig();
       normalizeTimerConfig();
@@ -283,6 +315,7 @@
 
   onMount(async () => {
     hydrateConfig(await getConfig());
+    refreshLogDir();
     try {
       youtubeOauthStatus = await getYoutubeOauthStatus();
     } catch (e) {
@@ -675,12 +708,13 @@
   function normalizeTtsDictionary(entries: TtsOptions['dictionary']): TtsDictEntry[] {
     return (entries ?? []).map((entry) => ({
       from: typeof entry.from === 'string' ? entry.from : '',
-      to: typeof entry.to === 'string' ? entry.to : ''
+      to: typeof entry.to === 'string' ? entry.to : '',
+      regex: entry.regex === true
     }));
   }
 
   function addTtsDictionaryEntry() {
-    ttsDictionary = [...ttsDictionary, { from: '', to: '' }];
+    ttsDictionary = [...ttsDictionary, { from: '', to: '', regex: false }];
   }
 
   function removeTtsDictionaryEntry(index: number) {
@@ -690,6 +724,102 @@
   function syncTtsDictionaryToConfig() {
     if (!config) return;
     config.tts.options.dictionary = normalizeTtsDictionary(ttsDictionary);
+  }
+
+  function refreshLogDir() {
+    getCommentLogDir().then((d) => (logDir = d), () => (logDir = ''));
+  }
+
+  async function onOpenLogDir() {
+    logMsg = '';
+    try {
+      await openCommentLogDir();
+    } catch (e) {
+      logMsg = `フォルダを開けませんでした: ${String(e)}`;
+    }
+  }
+
+  const LISTENER_LIMIT = 200;
+  let listenerSearched = $state(false);
+  let listenerSeenSeq = 0;
+
+  // Keep the table in sync with edits/deletes made in the UserCard (each event applied once).
+  $effect(() => {
+    const ev = store.lastListenerUpdate;
+    untrack(() => {
+      if (!ev || ev.seq <= listenerSeenSeq) return;
+      listenerSeenSeq = ev.seq;
+      // A search is in flight: its response may predate this event, so replay it afterwards.
+      if (listenerLoading) pendingListenerUpdates.push(ev.update);
+      listenerRows = applyListenerUpdate(listenerRows, ev.update);
+    });
+  });
+
+  // Updates received while a search request is in flight (re-applied onto its response).
+  let pendingListenerUpdates: ListenerUpdate[] = [];
+
+  // NG entries added from the UserCard go straight to the config; mirror them into the form
+  // so saving the form does not write back the stale list.
+  function onModerationAppended(e: Event) {
+    const { kind, value } = (e as CustomEvent<ModerationAppended>).detail;
+    if (kind === 'ngUsers' && !ngUsers.includes(value)) ngUsers = [...ngUsers, value];
+    if (kind === 'ngWords' && !ngWords.includes(value)) ngWords = [...ngWords, value];
+  }
+  $effect(() => {
+    window.addEventListener(MODERATION_APPENDED_EVENT, onModerationAppended);
+    return () => window.removeEventListener(MODERATION_APPENDED_EVENT, onModerationAppended);
+  });
+
+  function applyListenerUpdate(rows: ListenerRecord[], u: ListenerUpdate): ListenerRecord[] {
+    const same = (x: ListenerRecord) => x.platform === u.platform && x.authorId === u.authorId;
+    if (!rows.some(same)) return rows;
+    return isListenerDeleted(u) ? rows.filter((x) => !same(x)) : rows.map((x) => (same(x) ? (u as ListenerRecord) : x));
+  }
+
+  async function searchListeners() {
+    const seq = ++listenerSeq;
+    listenerLoading = true;
+    listenerMsg = '';
+    pendingListenerUpdates = [];
+    try {
+      const rows = await listListeners(listenerQuery.trim() || null, LISTENER_LIMIT);
+      if (seq === listenerSeq) {
+        listenerRows = pendingListenerUpdates.reduce(applyListenerUpdate, rows);
+        pendingListenerUpdates = [];
+        listenerSearched = true;
+      }
+    } catch (e) {
+      if (seq === listenerSeq) listenerMsg = `取得に失敗: ${String(e)}`;
+    } finally {
+      if (seq === listenerSeq) listenerLoading = false;
+    }
+  }
+
+  function listenerAvatar(r: ListenerRecord): string {
+    return safeAvatarUrl(store.sessionCommentsOf(r.platform, r.authorId, 1)[0]?.author.avatarUrl) ?? '';
+  }
+
+  function openListener(r: ListenerRecord) {
+    ui.openUserCard({
+      platform: r.platform,
+      authorId: r.authorId,
+      name: r.name,
+      avatarUrl: listenerAvatar(r) || undefined
+    });
+  }
+
+  async function removeListener(r: ListenerRecord) {
+    if (!window.confirm(`${r.nickname || r.name} の記録を削除しますか?`)) return;
+    try {
+      await deleteListener(r.platform, r.authorId);
+      listenerRows = listenerRows.filter((x) => !(x.platform === r.platform && x.authorId === r.authorId));
+    } catch (e) {
+      listenerMsg = `削除に失敗: ${String(e)}`;
+    }
+  }
+
+  function fmtListenerDate(ms: number): string {
+    return ms ? new Date(ms).toLocaleString() : '-';
   }
 
   function parseModerationText(value: string): string[] {
@@ -911,6 +1041,15 @@
     setTtsNum('webSpeechVolume', webSpeechVolume);
     config.tts.options.webSpeechVoice = webSpeechVoice;
     syncTtsDictionaryToConfig();
+    config.tts.options.nameFormat = nameFormat.trim() || '{name}';
+    config.tts.options.excludeUsers = parseModerationText(excludeUsersText);
+    config.tts.options.readKinds = { ...readKinds };
+    setTtsBool('skipCommands', skipCommands);
+    config.log = {
+      ...config.log,
+      enabled: logEnabled,
+      retentionDays: Number.isFinite(logRetentionDays) && logRetentionDays >= 0 ? Math.trunc(logRetentionDays) : 30
+    };
     config.obs.ttlMs = ttlMsFromSeconds(obsTtlSeconds);
     normalizeObsConfig(false);
     normalizeGoalsConfig();
@@ -1139,6 +1278,15 @@
         type="checkbox"
         checked={theme.showViewerBadges}
         onchange={onShowViewerBadgesChange}
+      />
+    </div>
+    <div class="field-row">
+      <label for="appearance-show-avatars">アイコンを表示</label>
+      <input
+        id="appearance-show-avatars"
+        type="checkbox"
+        checked={theme.showAvatars}
+        onchange={onShowAvatarsChange}
       />
     </div>
     <div class="field-row">
@@ -1657,6 +1805,28 @@
       <input id="strip-emoji" type="checkbox" bind:checked={stripEmoji} class="chk" />
     </div>
 
+    <div class="field-row">
+      <label for="tts-name-format">名前の読み方</label>
+      <input id="tts-name-format" type="text" bind:value={nameFormat} class="id-input" placeholder="{'{name}'}" />
+      <span class="hint-inline">{'{name}'}=表示名(ニックネーム優先) / {'{rawName}'}=元の名前 / {'{label}'}=ラベル。例: {'{name}さん'}</span>
+    </div>
+    <div class="field-row">
+      <label for="tts-exclude-users">読み上げ除外ユーザー</label>
+      <textarea id="tts-exclude-users" rows="3" bind:value={excludeUsersText} class="id-input"></textarea>
+      <span class="hint-inline">1行1件</span>
+    </div>
+    <div class="field-row">
+      <span class="kinds-label">読み上げる種別</span>
+      {#each READ_KIND_LABELS as [key, label] (key)}
+        <label class="kind-check"><input type="checkbox" bind:checked={readKinds[key]} class="chk" /> {label}</label>
+      {/each}
+    </div>
+    <div class="field-row">
+      <label for="tts-skip-commands">コマンドを読まない</label>
+      <input id="tts-skip-commands" type="checkbox" bind:checked={skipCommands} class="chk" />
+      <span class="hint-inline">「!」で始まるコメントをスキップ</span>
+    </div>
+
     <div class="dict-editor">
       <div class="dict-header">
         <span>読み上げ辞書</span>
@@ -1683,10 +1853,88 @@
             class="id-input dict-input"
             placeholder="置換後"
           />
+          <label class="kind-check"><input type="checkbox" bind:checked={entry.regex} class="chk" /> 正規表現</label>
           <button type="button" class="copy-btn dict-delete" onclick={() => removeTtsDictionaryEntry(index)}>削除</button>
         </div>
       {/each}
     </div>
+  </section>
+
+  <section id="settings-comment-log">
+    <h3>コメントログ</h3>
+    <div class="field-row">
+      <label for="log-enabled">ログを保存する</label>
+      <input id="log-enabled" type="checkbox" bind:checked={logEnabled} class="chk" />
+    </div>
+    <div class="field-row">
+      <label for="log-retention">保持日数</label>
+      <input id="log-retention" type="number" min="0" max="3650" step="1" bind:value={logRetentionDays} class="num-input" />
+      <span class="hint-inline">（0で自動削除なし)</span>
+    </div>
+    <div class="field-row">
+      <label for="log-dir">保存先</label>
+      <input id="log-dir" type="text" readonly value={logDir} class="id-input" />
+      <button type="button" class="copy-btn" onclick={onOpenLogDir}>フォルダを開く</button>
+      {#if logMsg}<span class="hint-inline">{logMsg}</span>{/if}
+    </div>
+  </section>
+
+  <section id="settings-listeners">
+    <h3>リスナー管理</h3>
+    <div class="field-row">
+      <input
+        type="search"
+        bind:value={listenerQuery}
+        class="id-input"
+        placeholder="名前・ニックネーム・ラベルで検索"
+        aria-label="リスナー検索"
+        onkeydown={(e) => { if (e.key === 'Enter') void searchListeners(); }}
+      />
+      <button type="button" class="copy-btn" onclick={searchListeners} disabled={listenerLoading}>検索</button>
+    </div>
+    {#if listenerMsg}<p class="hint">{listenerMsg}</p>{/if}
+    {#if listenerRows.length > 0}
+      <div class="listener-table-wrap">
+        <table class="listener-table">
+          <thead>
+            <tr><th></th><th>名前</th><th>ニックネーム</th><th>ラベル</th><th>累計</th><th>最終来訪</th><th></th></tr>
+          </thead>
+          <tbody>
+            {#each listenerRows as r (r.platform + ':' + r.authorId)}
+              {@const av = listenerAvatar(r)}
+              <tr
+                class="listener-row"
+                tabindex="0"
+                role="button"
+                onclick={() => openListener(r)}
+                onkeydown={(e) => { if (e.target === e.currentTarget && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); openListener(r); } }}
+              >
+                <td>
+                  {#if av}<img class="listener-avatar" src={av} alt="" loading="lazy" referrerpolicy="no-referrer" />{/if}
+                </td>
+                <td>{r.name} <span class="hint-inline">{r.platform}</span></td>
+                <td>{r.nickname ?? ''}</td>
+                <td>{r.label ?? ''}</td>
+                <td>{r.commentCount}</td>
+                <td>{fmtListenerDate(r.lastSeenMs)}</td>
+                <td>
+                  <button type="button" class="copy-btn" onclick={(e) => { e.stopPropagation(); void removeListener(r); }}>削除</button>
+                </td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      </div>
+      {#if listenerRows.length >= LISTENER_LIMIT}
+        <p class="hint">先頭 {LISTENER_LIMIT} 件まで表示しています。検索語で絞り込んでください。</p>
+      {/if}
+    {:else if !listenerLoading}
+      <p class="hint">
+        {listenerSearched
+          ? '該当するリスナーはいません。'
+          : `検索すると記録済みのリスナーが表示されます(空欄で先頭 ${LISTENER_LIMIT} 件)。行クリックで詳細。`}
+      </p>
+    {/if}
   </section>
 
   <!-- ── OBS URL ── -->
@@ -2360,6 +2608,14 @@
     transition: opacity 0.15s;
   }
 
+  .kinds-label { font-size: 13px; color: #ccc; min-width: 90px; }
+  .kind-check { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; color: #ccc; min-width: 0; }
+  .listener-table-wrap { max-height: 320px; overflow: auto; margin-top: 6px; }
+  .listener-table { width: 100%; border-collapse: collapse; font-size: 12px; color: #ddd; }
+  .listener-table th, .listener-table td { text-align: left; padding: 3px 6px; border-bottom: 1px solid rgba(255,255,255,0.08); }
+  .listener-row { cursor: pointer; }
+  .listener-row:hover { background: rgba(255,255,255,0.06); }
+  .listener-avatar { width: 24px; height: 24px; border-radius: 50%; object-fit: cover; vertical-align: middle; }
   .copy-btn { background: #37474f; color: #fff; min-width: 60px; }
   .copy-btn.copied { background: #2e7d32; }
   .save-btn { background: #1976d2; color: #fff; padding: 7px 18px; }

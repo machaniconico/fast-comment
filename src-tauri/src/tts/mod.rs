@@ -19,13 +19,15 @@ pub mod voicevox;
 const TTS_UNLIMITED_HARD_CAP: usize = 500;
 const TTS_NOTICE_THROTTLE: std::time::Duration = std::time::Duration::from_secs(30);
 
+use regex::Regex;
 use serde::Serialize;
 use std::collections::VecDeque;
 use std::time::Instant;
 use tauri::{AppHandle, Emitter};
 
-use crate::config::{TtsBackendKind, TtsConfig, TtsOptions};
-use crate::model::{ChatMessage, Fragment};
+use crate::config::{TtsBackendKind, TtsConfig, TtsDictEntry, TtsOptions};
+use crate::listeners::TtsVoiceOverride;
+use crate::model::{ChatMessage, Fragment, MessageKind};
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -35,6 +37,22 @@ struct WebSpeechPayload {
     pitch: f32,
     volume: f32,
     voice: String,
+}
+
+impl WebSpeechPayload {
+    fn new(text: &str, opt: &TtsOptions, voice: Option<&TtsVoiceOverride>) -> Self {
+        let mut voice = voice.cloned().unwrap_or_default();
+        voice.normalize();
+        Self {
+            text: text.to_string(),
+            rate: voice.rate.unwrap_or(opt.web_speech_rate),
+            pitch: voice.pitch.unwrap_or(opt.web_speech_pitch),
+            volume: opt.web_speech_volume,
+            voice: voice
+                .web_speech_voice
+                .unwrap_or_else(|| opt.web_speech_voice.clone()),
+        }
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -97,6 +115,7 @@ pub trait TtsBackend {
 /// `AppHandle` は Web Speech フォールバック時に UI へイベントを送るために持つ。
 pub struct TtsDispatcher {
     config: TtsConfig,
+    dictionary: CompiledDictionary,
     app: AppHandle,
     bouyomi: bouyomi::BouyomiBackend,
     voicevox: voicevox::VoicevoxBackend,
@@ -108,7 +127,9 @@ impl TtsDispatcher {
     pub fn new(config: TtsConfig, app: AppHandle) -> Self {
         let bouyomi = Self::build_bouyomi(&config);
         let voicevox = Self::build_voicevox(&config, &app);
+        let dictionary = CompiledDictionary::new(&config.options.dictionary);
         TtsDispatcher {
+            dictionary,
             config,
             app,
             bouyomi,
@@ -129,6 +150,9 @@ impl TtsDispatcher {
         }
         if !Self::same_voicevox_config(&self.config, &config) {
             self.voicevox = Self::build_voicevox(&config, &self.app);
+        }
+        if self.config.options.dictionary != config.options.dictionary {
+            self.dictionary = CompiledDictionary::new(&config.options.dictionary);
         }
         self.config = config;
     }
@@ -164,15 +188,14 @@ impl TtsDispatcher {
 
     fn build_voicevox(config: &TtsConfig, app: &AppHandle) -> voicevox::VoicevoxBackend {
         let opt = &config.options;
-        voicevox::VoicevoxBackend::new(
-            opt.voicevox_url.clone(),
-            opt.voicevox_speaker,
-            app.clone(),
-        )
+        voicevox::VoicevoxBackend::new(opt.voicevox_url.clone(), opt.voicevox_speaker, app.clone())
     }
 
     /// 1メッセージを読み上げる。整形 → 優先バックエンド → 失敗時フォールバック。
     pub async fn speak_message(&mut self, msg: &ChatMessage) {
+        if !should_speak(msg, &self.config.options) {
+            return;
+        }
         let text = self.format_for_speech(msg);
         if text.trim().is_empty() {
             return;
@@ -180,27 +203,41 @@ impl TtsDispatcher {
 
         // TOCTOU と二重往復を避けるため、speak パスでは available() プローブを
         // 行わず直接 speak() を試み、Err なら Web Speech へフォールバックする。
+        let voice = msg
+            .listener
+            .as_ref()
+            .and_then(|info| info.tts_voice.as_ref());
         match self.config.backend {
             TtsBackendKind::None => {}
-            TtsBackendKind::WebSpeech => self.emit_webspeech(&text),
+            TtsBackendKind::WebSpeech => self.emit_webspeech(&text, voice),
             TtsBackendKind::Bouyomi => {
-                if let Err(e) = self.bouyomi.speak(text.clone()).await {
+                if let Err(e) = self
+                    .bouyomi
+                    .speak_with_voice(text.clone(), voice.and_then(|v| v.bouyomi_voice))
+                    .await
+                {
                     tracing::warn!("bouyomi 読み上げ失敗→Web Speech へ: {e}");
                     self.emit_backend_notice(
                         TtsBackendKind::Bouyomi,
-                        format!("棒読みちゃんで読み上げできないため Web Speech に切り替えました: {e}"),
+                        format!(
+                            "棒読みちゃんで読み上げできないため Web Speech に切り替えました: {e}"
+                        ),
                     );
-                    self.emit_webspeech(&text);
+                    self.emit_webspeech(&text, voice);
                 }
             }
             TtsBackendKind::Voicevox => {
-                if let Err(e) = self.voicevox.speak(text.clone()).await {
+                if let Err(e) = self
+                    .voicevox
+                    .speak_with_speaker(text.clone(), voice.and_then(|v| v.voicevox_speaker))
+                    .await
+                {
                     tracing::warn!("voicevox 読み上げ失敗→Web Speech へ: {e}");
                     self.emit_backend_notice(
                         TtsBackendKind::Voicevox,
                         format!("VOICEVOXで読み上げできないため Web Speech に切り替えました: {e}"),
                     );
-                    self.emit_webspeech(&text);
+                    self.emit_webspeech(&text, voice);
                 }
             }
         }
@@ -239,15 +276,8 @@ impl TtsDispatcher {
     }
 
     /// Web Speech 用に「読み上げテキスト」を UI へ送る(実再生は UI)。
-    fn emit_webspeech(&self, text: &str) {
-        let opt = &self.config.options;
-        let payload = WebSpeechPayload {
-            text: text.to_string(),
-            rate: opt.web_speech_rate,
-            pitch: opt.web_speech_pitch,
-            volume: opt.web_speech_volume,
-            voice: opt.web_speech_voice.clone(),
-        };
+    fn emit_webspeech(&self, text: &str, voice: Option<&TtsVoiceOverride>) {
+        let payload = WebSpeechPayload::new(text, &self.config.options, voice);
 
         if let Err(e) = self.app.emit("tts-speak", payload) {
             tracing::warn!("tts-speak emit 失敗: {e}");
@@ -256,10 +286,19 @@ impl TtsDispatcher {
 
     /// メッセージを読み上げ用テキストへ整形する。
     fn format_for_speech(&self, msg: &ChatMessage) -> String {
-        Self::format_for_speech_with_options(&self.config.options, msg)
+        Self::format_with_dictionary(&self.config.options, msg, &self.dictionary)
     }
 
+    #[cfg(test)]
     fn format_for_speech_with_options(opt: &TtsOptions, msg: &ChatMessage) -> String {
+        Self::format_with_dictionary(opt, msg, &CompiledDictionary::new(&opt.dictionary))
+    }
+
+    fn format_with_dictionary(
+        opt: &TtsOptions,
+        msg: &ChatMessage,
+        dictionary: &CompiledDictionary,
+    ) -> String {
         // 本文を組み立てる(絵文字除去オプション対応)。
         let mut body = String::new();
         for frag in &msg.fragments {
@@ -278,17 +317,18 @@ impl TtsDispatcher {
             body = omit_urls(&body);
         }
 
-        for entry in &opt.dictionary {
-            if !entry.from.is_empty() {
-                body = body.replace(&entry.from, &entry.to);
-            }
-        }
+        body = dictionary.apply(body);
 
-        // 名前の前置。
-        let mut text = if opt.read_name && !msg.author.name.is_empty() {
-            format!("{} {}", msg.author.name, body)
+        // 名前には辞書を適用せず、プレースホルダは一度だけ展開する。
+        let name = if opt.read_name {
+            format_name(msg, &opt.name_format)
         } else {
+            String::new()
+        };
+        let mut text = if name.trim().is_empty() {
             body
+        } else {
+            format!("{} {}", name, body)
         };
 
         // 長文カット(char 単位)。
@@ -307,6 +347,153 @@ impl TtsDispatcher {
 
         text
     }
+}
+
+/// 辞書のコンパイルは生成時と辞書更新時のみ。不正なパターンも再試行しない。
+struct CompiledDictionary(Vec<CompiledReplacement>);
+
+enum CompiledReplacement {
+    Literal { from: String, to: String },
+    Pattern { pattern: Regex, to: String },
+}
+
+impl CompiledDictionary {
+    fn new(entries: &[TtsDictEntry]) -> Self {
+        Self(entries.iter().filter_map(|entry| {
+            if entry.from.is_empty() {
+                return None;
+            }
+            if entry.regex {
+                match Regex::new(&entry.from) {
+                    Ok(pattern) => Some(CompiledReplacement::Pattern { pattern, to: entry.to.clone() }),
+                    Err(error) => {
+                        tracing::warn!(pattern = %entry.from, %error, "TTS 辞書の不正な正規表現を無視");
+                        None
+                    }
+                }
+            } else {
+                Some(CompiledReplacement::Literal { from: entry.from.clone(), to: entry.to.clone() })
+            }
+        }).collect())
+    }
+
+    fn apply(&self, mut body: String) -> String {
+        for entry in &self.0 {
+            body = match entry {
+                CompiledReplacement::Literal { from, to } => body.replace(from, to),
+                CompiledReplacement::Pattern { pattern, to } => {
+                    pattern.replace_all(&body, to.as_str()).into_owned()
+                }
+            };
+        }
+        body
+    }
+}
+
+/// コメントの読み上げ可否。手動テキストはユーザーミュートだけを尊重する。
+pub fn should_speak(msg: &ChatMessage, opt: &TtsOptions) -> bool {
+    if msg
+        .listener
+        .as_ref()
+        .is_some_and(|listener| listener.tts_muted)
+    {
+        return false;
+    }
+    // tts_speak_text 経由の手動・抽選・ウェルカムはコメント用フィルタの対象外。
+    // 明示的なユーザーミュートだけは上で尊重する。
+    if msg.kind == MessageKind::System && msg.id.starts_with("tts-text-") {
+        return true;
+    }
+    let enabled = match msg.kind {
+        MessageKind::Normal => opt.read_kinds.normal,
+        MessageKind::SuperChat => opt.read_kinds.super_chat,
+        MessageKind::Membership => opt.read_kinds.membership,
+        MessageKind::Bits => opt.read_kinds.bits,
+        MessageKind::Gift => opt.read_kinds.gift,
+        MessageKind::System => opt.read_kinds.system,
+    };
+    if !enabled
+        || (opt.skip_commands
+            && msg.fragments.iter().find_map(|fragment| match fragment {
+                Fragment::Text { text } => text.chars().next(),
+                Fragment::Emote { name, .. } => name.chars().next(),
+            }) == Some('!'))
+    {
+        return false;
+    }
+    if opt.exclude_users.is_empty() {
+        return true;
+    }
+    let name = msg.author.name.to_lowercase();
+    let id = msg.author.id.to_lowercase();
+    let nickname = msg.author.nickname.as_ref().map(|s| s.to_lowercase());
+    !opt.exclude_users.iter().any(|pattern| {
+        if pattern.trim().is_empty() {
+            return false;
+        }
+        let pattern = pattern.to_lowercase();
+        wildcard_matches(&pattern, &name)
+            || wildcard_matches(&pattern, &id)
+            || nickname
+                .as_ref()
+                .is_some_and(|nickname| wildcard_matches(&pattern, nickname))
+    })
+}
+
+/// 全体一致の glob。* 以外はすべてリテラルとして扱う。
+fn wildcard_matches(pattern: &str, value: &str) -> bool {
+    let mut parts = pattern.split('*');
+    let first = parts.next().unwrap_or_default();
+    let Some(mut rest) = value.strip_prefix(first) else {
+        return false;
+    };
+    let mut parts = parts.peekable();
+    if parts.peek().is_none() {
+        return rest.is_empty();
+    }
+    while let Some(part) = parts.next() {
+        if parts.peek().is_none() {
+            return rest.ends_with(part);
+        }
+        let Some(index) = rest.find(part) else {
+            return false;
+        };
+        rest = &rest[index + part.len()..];
+    }
+    true
+}
+
+fn format_name(msg: &ChatMessage, template: &str) -> String {
+    let mut out = String::new();
+    let mut rest = template;
+    while let Some(index) = rest.find('{') {
+        out.push_str(&rest[..index]);
+        rest = &rest[index..];
+        let (token, value) = if rest.starts_with("{name}") {
+            (
+                "{name}",
+                msg.author.nickname.as_deref().unwrap_or(&msg.author.name),
+            )
+        } else if rest.starts_with("{rawName}") {
+            ("{rawName}", msg.author.name.as_str())
+        } else if rest.starts_with("{label}") {
+            (
+                "{label}",
+                msg.listener
+                    .as_ref()
+                    .and_then(|listener| listener.label.as_deref())
+                    .unwrap_or(""),
+            )
+        } else {
+            out.push('{');
+            rest = &rest[1..];
+            continue;
+        };
+        out.push_str(value);
+        rest = &rest[token.len()..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// 本文中の URL を「URL省略」へ置換する(簡易: `http`/`https` で始まる連続非空白)。
@@ -395,18 +582,22 @@ mod tests {
             max_length: 10,
             dictionary: vec![
                 TtsDictEntry {
+                    regex: false,
                     from: "fast".to_string(),
                     to: "slow".to_string(),
                 },
                 TtsDictEntry {
+                    regex: false,
                     from: "slow comment".to_string(),
                     to: "読み上げ辞書".to_string(),
                 },
                 TtsDictEntry {
+                    regex: false,
                     from: "".to_string(),
                     to: "ignored".to_string(),
                 },
                 TtsDictEntry {
+                    regex: false,
                     from: "URL省略".to_string(),
                     to: "リンク".to_string(),
                 },
@@ -423,5 +614,368 @@ mod tests {
         options.max_length = 0;
         let text = TtsDispatcher::format_for_speech_with_options(&options, &msg);
         assert_eq!(text, "読み上げ辞書 リンク trailing");
+    }
+    #[test]
+    fn listener_voice_selects_webspeech_fields_independently_including_fallback() {
+        let opt = TtsOptions {
+            web_speech_voice: "global".into(),
+            web_speech_rate: 1.1,
+            web_speech_pitch: 0.8,
+            web_speech_volume: 0.6,
+            ..TtsOptions::default()
+        };
+        // Same builder is used for direct Web Speech and native backend failure fallback.
+        for voice in [None, Some(TtsVoiceOverride::default())] {
+            let payload = WebSpeechPayload::new("text", &opt, voice.as_ref());
+            assert_eq!(
+                (
+                    payload.voice.as_str(),
+                    payload.rate,
+                    payload.pitch,
+                    payload.volume
+                ),
+                ("global", 1.1, 0.8, 0.6)
+            );
+        }
+        let mut voice = TtsVoiceOverride {
+            web_speech_voice: Some("listener".into()),
+            rate: Some(1.5),
+            pitch: Some(1.2),
+            ..TtsVoiceOverride::default()
+        };
+        let payload = WebSpeechPayload::new("text", &opt, Some(&voice));
+        assert_eq!(
+            (
+                payload.voice.as_str(),
+                payload.rate,
+                payload.pitch,
+                payload.volume
+            ),
+            ("listener", 1.5, 1.2, 0.6)
+        );
+        voice.web_speech_voice = None;
+        voice.rate = None;
+        let payload = WebSpeechPayload::new("text", &opt, Some(&voice));
+        assert_eq!(
+            (payload.voice.as_str(), payload.rate, payload.pitch),
+            ("global", 1.1, 1.2)
+        );
+        voice.rate = Some(9.0);
+        voice.pitch = Some(-9.0);
+        let payload = WebSpeechPayload::new("text", &opt, Some(&voice));
+        assert_eq!((payload.rate, payload.pitch), (2.0, 0.0));
+    }
+
+    fn listener(label: Option<&str>, tts_muted: bool) -> crate::model::ListenerInfo {
+        crate::model::ListenerInfo {
+            comment_count: 1,
+            gift_count: 0,
+            first_seen_ms: 0,
+            prev_seen_ms: None,
+            is_first_ever: true,
+            label: label.map(str::to_string),
+            tts_muted,
+            tts_voice: None,
+        }
+    }
+
+    #[test]
+    fn tts_name_format_placeholders_and_missing_values() {
+        let mut msg = message("表示名", "本文");
+        let mut opt = TtsOptions {
+            name_format: "{name}/{rawName}/{label}".into(),
+            ..TtsOptions::default()
+        };
+        assert_eq!(
+            TtsDispatcher::format_for_speech_with_options(&opt, &msg),
+            "表示名/表示名/ 本文"
+        );
+        msg.author.nickname = Some("ニックネーム".into());
+        msg.listener = Some(listener(Some("常連"), false));
+        assert_eq!(
+            TtsDispatcher::format_for_speech_with_options(&opt, &msg),
+            "ニックネーム/表示名/常連 本文"
+        );
+        msg.listener = Some(listener(None, false));
+        opt.name_format = "  {label}  ".into();
+        assert_eq!(
+            TtsDispatcher::format_for_speech_with_options(&opt, &msg),
+            "本文"
+        );
+        opt.name_format = "{name}".into();
+        opt.read_name = false;
+        assert_eq!(
+            TtsDispatcher::format_for_speech_with_options(&opt, &msg),
+            "本文"
+        );
+        // 名前に含まれるプレースホルダ風文字列を再展開しない。
+        opt.read_name = true;
+        opt.name_format = "{name} {rawName}".into();
+        msg.author.nickname = Some("{rawName}".into());
+        assert_eq!(
+            TtsDispatcher::format_for_speech_with_options(&opt, &msg),
+            "{rawName} 表示名 本文"
+        );
+    }
+
+    #[test]
+    fn tts_excluded_users_match_names_ids_and_nicknames() {
+        let mut msg = message("Nightbot", "hello");
+        msg.author.nickname = Some("Helper".into());
+        for pattern in [
+            "nightBOT", "*BOT", "NIGHT*", "*ght*", "author-1", "HELP*", "*",
+        ] {
+            let opt = TtsOptions {
+                exclude_users: vec![pattern.into()],
+                ..TtsOptions::default()
+            };
+            assert!(!should_speak(&msg, &opt), "{pattern}");
+        }
+        for pattern in [
+            "bot", "Night", "*night", "bot*", "Night?ot", "Night.*", "other", "",
+        ] {
+            let opt = TtsOptions {
+                exclude_users: vec![pattern.into()],
+                ..TtsOptions::default()
+            };
+            assert!(should_speak(&msg, &opt), "{pattern}");
+        }
+        for (pattern, value, expected) in [
+            ("a*a", "a", false),
+            ("a**a", "aba", true),
+            ("*ab*bc", "abbc", true),
+            ("*ab*bc", "abc", false),
+            ("*猫", "黒猫", true),
+            ("", "", true),
+        ] {
+            assert_eq!(
+                wildcard_matches(pattern, value),
+                expected,
+                "{pattern}: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn tts_blank_exclusion_patterns_are_ignored() {
+        let mut msg = message("", "hello");
+        msg.author.id.clear();
+        for value in ["", " ", "\t", "　"] {
+            msg.author.name = value.into();
+            msg.author.nickname = Some(value.into());
+            let mut opt = TtsOptions {
+                exclude_users: vec!["".into(), " ".into(), "\t\n".into(), "　".into()],
+                ..TtsOptions::default()
+            };
+            assert!(should_speak(&msg, &opt), "blank author: {value:?}");
+            // 空行が混在していても有効なパターンは適用する。
+            opt.exclude_users.push("*".into());
+            assert!(!should_speak(&msg, &opt));
+        }
+    }
+
+    #[test]
+    fn tts_manual_text_bypasses_comment_filters_but_respects_mute() {
+        let mut msg = message("", "!抽選結果・ウェルカム・手動テキスト");
+        msg.id = "tts-text-123456".into();
+        msg.channel = "system".into();
+        msg.kind = MessageKind::System;
+        msg.author.id.clear();
+        let mut opt = TtsOptions::default();
+        opt.read_kinds.system = false;
+        assert!(should_speak(&msg, &opt));
+        opt.read_kinds.system = true;
+        opt.skip_commands = true;
+        assert!(should_speak(&msg, &opt));
+        for pattern in ["*", "", " "] {
+            opt.skip_commands = false;
+            opt.exclude_users = vec![pattern.into()];
+            assert!(should_speak(&msg, &opt), "{pattern:?}");
+        }
+        opt.read_kinds.system = false;
+        opt.skip_commands = true;
+        opt.exclude_users = vec!["*".into(), "".into(), " ".into()];
+        assert!(should_speak(&msg, &opt));
+        msg.listener = Some(listener(None, true));
+        assert!(!should_speak(&msg, &opt));
+        msg.listener = Some(listener(None, false));
+        assert!(should_speak(&msg, &opt));
+
+        // 通常の System 通知や通常コメントには引き続きフィルタを適用する。
+        msg.id = "system-notice".into();
+        assert!(!should_speak(&msg, &opt));
+        msg.id = "tts-text-123456".into();
+        msg.kind = MessageKind::Normal;
+        assert!(!should_speak(&msg, &opt));
+    }
+
+    #[test]
+    fn tts_manual_bypass_does_not_disable_individual_system_filters() {
+        let mut manual = message("", "!welcome");
+        manual.author.id.clear();
+        manual.id = "tts-text-123".into();
+        manual.kind = MessageKind::System;
+        let mut notice = manual.clone();
+        notice.id = "platform-notice".into();
+
+        let mut kind_filter = TtsOptions::default();
+        kind_filter.read_kinds.system = false;
+        let user_filter = TtsOptions {
+            exclude_users: vec!["*".into()],
+            ..TtsOptions::default()
+        };
+        let command_filter = TtsOptions {
+            skip_commands: true,
+            ..TtsOptions::default()
+        };
+        for opt in [kind_filter, user_filter, command_filter] {
+            assert!(should_speak(&manual, &opt));
+            assert!(!should_speak(&notice, &opt));
+            // フィルタを回避しても本文は通常どおり整形する。
+            assert_eq!(
+                TtsDispatcher::format_for_speech_with_options(&opt, &manual),
+                "!welcome"
+            );
+        }
+        // System 種別だけでは手動読み上げとして扱わない。
+        notice.fragments = vec![Fragment::text("welcome")];
+        assert!(should_speak(&notice, &TtsOptions::default()));
+    }
+
+    #[test]
+    fn tts_empty_dictionary_sources_never_insert_text() {
+        for regex in [false, true] {
+            let cache = CompiledDictionary::new(&[TtsDictEntry {
+                from: String::new(),
+                to: "unexpected".into(),
+                regex,
+            }]);
+            assert!(cache.0.is_empty());
+            for body in ["", "本文", "a b"] {
+                assert_eq!(cache.apply(body.into()), body);
+            }
+        }
+    }
+
+    #[test]
+    fn tts_each_message_kind_can_be_disabled_independently() {
+        let kinds = [
+            MessageKind::Normal,
+            MessageKind::SuperChat,
+            MessageKind::Membership,
+            MessageKind::Bits,
+            MessageKind::Gift,
+            MessageKind::System,
+        ];
+        for (index, kind) in kinds.iter().enumerate() {
+            let mut opt = TtsOptions::default();
+            let mut msg = message("name", "hello");
+            msg.kind = *kind;
+            assert!(should_speak(&msg, &opt));
+            match index {
+                0 => opt.read_kinds.normal = false,
+                1 => opt.read_kinds.super_chat = false,
+                2 => opt.read_kinds.membership = false,
+                3 => opt.read_kinds.bits = false,
+                4 => opt.read_kinds.gift = false,
+                _ => opt.read_kinds.system = false,
+            }
+            for candidate in kinds {
+                msg.kind = candidate;
+                assert_eq!(should_speak(&msg, &opt), candidate != *kind);
+            }
+        }
+    }
+
+    #[test]
+    fn tts_command_filter_and_listener_mute() {
+        let mut opt = TtsOptions::default();
+        assert!(should_speak(&message("name", "!help"), &opt));
+        opt.skip_commands = true;
+        assert!(!should_speak(&message("name", "!help"), &opt));
+        for body in ["hello!", " !help", "", "！help"] {
+            assert!(should_speak(&message("!author", body), &opt));
+        }
+        let mut msg = message("name", "!help");
+        msg.fragments.insert(
+            0,
+            Fragment::Text {
+                text: String::new(),
+            },
+        );
+        assert!(!should_speak(&msg, &opt));
+        msg = message("name", "hello");
+        msg.listener = Some(listener(None, true));
+        assert!(!should_speak(&msg, &opt));
+        msg.listener = Some(listener(None, false));
+        assert!(should_speak(&msg, &opt));
+    }
+
+    #[test]
+    fn tts_compiled_dictionary_captures_invalid_patterns_and_literals() {
+        let opt = TtsOptions {
+            name_format: "{name}/{rawName}/{label}".into(),
+            dictionary: vec![
+                TtsDictEntry {
+                    from: r"item-(\d+)".into(),
+                    to: "番号$1".into(),
+                    regex: true,
+                },
+                TtsDictEntry {
+                    from: "[".into(),
+                    to: "bad".into(),
+                    regex: true,
+                },
+                TtsDictEntry {
+                    from: ".".into(),
+                    to: "$1".into(),
+                    regex: false,
+                },
+                TtsDictEntry {
+                    from: "".into(),
+                    to: "ignored".into(),
+                    regex: false,
+                },
+                TtsDictEntry {
+                    from: "".into(),
+                    to: "ignored-regex".into(),
+                    regex: true,
+                },
+            ],
+            ..TtsOptions::default()
+        };
+        let cache = CompiledDictionary::new(&opt.dictionary);
+        assert_eq!(cache.0.len(), 2);
+        let mut msg = message("item-1", "item-12 item-34.[");
+        msg.author.nickname = Some("item-2".into());
+        msg.listener = Some(listener(Some("item-3"), false));
+        for _ in 0..2 {
+            assert_eq!(
+                TtsDispatcher::format_with_dictionary(&opt, &msg, &cache),
+                "item-2/item-1/item-3 番号12 番号34$1["
+            );
+        }
+    }
+
+    #[test]
+    fn tts_legacy_config_preserves_speech_and_defaults() {
+        let cfg: crate::config::AppConfig = serde_json::from_str(
+            r#"{
+            "tts": {"options": {"dictionary": [{"from":"fast", "to":"ファスト"}]}}
+        }"#,
+        )
+        .unwrap();
+        let opt = &cfg.tts.options;
+        assert_eq!(opt.name_format, "{name}");
+        assert!(opt.exclude_users.is_empty());
+        assert_eq!(opt.read_kinds, crate::config::TtsReadKinds::default());
+        assert!(!opt.skip_commands);
+        assert!(!opt.dictionary[0].regex);
+        let msg = message("fast", "fast https://example.com");
+        assert!(should_speak(&msg, opt));
+        assert_eq!(
+            TtsDispatcher::format_for_speech_with_options(opt, &msg),
+            "fast ファスト URL省略"
+        );
     }
 }

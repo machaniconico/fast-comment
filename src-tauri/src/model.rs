@@ -76,8 +76,14 @@ pub struct Author {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum Fragment {
-    Text { text: String },
-    Emote { id: String, name: String, url: String },
+    Text {
+        text: String,
+    },
+    Emote {
+        id: String,
+        name: String,
+        url: String,
+    },
 }
 
 impl Fragment {
@@ -122,7 +128,7 @@ pub struct YoutubeReaction {
     pub count: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ListenerInfo {
     pub comment_count: u64,
@@ -132,6 +138,8 @@ pub struct ListenerInfo {
     pub is_first_ever: bool,
     pub label: Option<String>,
     pub tts_muted: bool,
+    #[serde(default)]
+    pub tts_voice: Option<crate::listeners::TtsVoiceOverride>,
 }
 
 /// 正規化済みコメント。Source → Bus → UI/OBS を一貫して流れる単一型。
@@ -161,6 +169,11 @@ pub struct ChatMessage {
 }
 
 impl ChatMessage {
+    /// Reserved internal ID namespace assigned only by inject_test_comment.
+    pub fn is_injected_test_comment(&self) -> bool {
+        self.id.starts_with("injected-test:")
+    }
+
     /// 本文をプレーンテキストに連結(TTS/検索用)。
     /// emote は name で埋めて境界なし連結する既存挙動を維持する。
     pub fn plain_text(&self) -> String {
@@ -198,7 +211,8 @@ mod tests {
             "id": "old", "platform": "twitch", "channel": "channel",
             "author": {"id": "user", "name": "Alice"},
             "fragments": [], "kind": "normal", "timestampMs": 1
-        })).unwrap();
+        }))
+        .unwrap();
         assert!(msg.author.nickname.is_none());
         assert!(msg.author.avatar_url.is_none());
         assert!(msg.listener.is_none());

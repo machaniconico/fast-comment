@@ -1,7 +1,8 @@
 <script lang="ts">
-  import type { UiChatMessage } from '../types';
+  import { safeAvatarUrl, type UiChatMessage } from '../types';
   import { store, togglePin } from '../stores.svelte';
-  import { copyTextToClipboard, getConfig, hideMessage as ipcHideMessage, setConfig, ttsSpeakText } from '../ipc';
+  import { appendModerationValue, copyTextToClipboard, getListener, hideMessage as ipcHideMessage, ttsSpeakText, updateListener } from '../ipc';
+  import { ui } from '../ui.svelte';
   import { PLATFORM_COLORS } from '../platform';
   import { theme, type AppearanceTimeDisplay } from '../theme.svelte';
   import type { ContextMenuItem } from './ContextMenu.svelte';
@@ -62,6 +63,15 @@
   let viewerSeq = $derived(message.viewerSeq);
   let viewerBadgeText = $derived(formatViewerBadgeText(viewerSeq));
   let viewerBadgeLabel = $derived(formatViewerBadgeLabel(viewerSeq));
+  let displayName = $derived(
+    message.author.nickname ? `${message.author.nickname} (${message.author.name})` : message.author.name
+  );
+  let failedAvatarUrl = $state('');
+  let avatarUrl = $derived(
+    theme.showAvatars && message.author.avatarUrl !== failedAvatarUrl ? safeAvatarUrl(message.author.avatarUrl) : undefined
+  );
+  let listenerLabel = $derived(message.listener?.label ?? '');
+  let returnBadgeText = $derived(formatReturnBadge(message));
   let displayedTime = $derived(formatTime(message.timestampMs, theme.timeDisplay));
 
   let pinned = $derived(store.isPinned(message.id));
@@ -158,17 +168,37 @@
     }
   }
 
-  async function appendModerationValue(kind: 'ngUsers' | 'ngWords', value: string) {
-    const normalized = value.trim();
-    if (!normalized) return;
+  function openUserCard(notice = '') {
+    if (!message.author.id) return;
+    ui.openUserCard({
+      platform: message.platform,
+      authorId: message.author.id,
+      name: message.author.name,
+      avatarUrl: message.author.avatarUrl,
+    }, notice);
+  }
 
-    const config = await getConfig();
-    if (!config) return;
+  function onNameKeydown(event: KeyboardEvent) {
+    if (event.key !== 'Enter' && event.key !== ' ') return;
+    event.preventDefault();
+    openUserCard();
+  }
 
-    const current = config.moderation[kind] ?? [];
-    if (current.includes(normalized)) return;
-    config.moderation[kind] = [...current, normalized];
-    await setConfig(config);
+  async function toggleTtsMute() {
+    try {
+      const rec = await getListener(message.platform, message.author.id);
+      const saved = await updateListener(
+        message.platform,
+        message.author.id,
+        rec?.nickname ?? null,
+        rec?.label ?? null,
+        rec?.memo ?? null,
+        !(rec?.ttsMuted ?? message.listener?.ttsMuted ?? false),
+      );
+      if (!saved) throw new Error('保存されませんでした');
+    } catch (e) {
+      openUserCard(`読み上げミュートの切替に失敗: ${String(e)}`);
+    }
   }
 
   function speakNow() {
@@ -217,6 +247,15 @@
         },
       },
       { label: '今すぐ読み上げ', action: speakNow },
+      ...(message.author.id
+        ? [
+            { label: 'ユーザー情報', action: () => openUserCard() },
+            {
+              label: message.listener?.ttsMuted ? '読み上げミュート解除' : '読み上げミュート',
+              action: toggleTtsMute,
+            },
+          ]
+        : []),
     ];
   }
 
@@ -254,6 +293,17 @@
 
     const s = d.getSeconds().toString().padStart(2, '0');
     return `${h}:${m}:${s}`;
+  }
+
+  const DAY_MS = 24 * 60 * 60 * 1000;
+
+  function formatReturnBadge(msg: UiChatMessage): string {
+    const info = msg.listener;
+    if (!info) return '';
+    if (info.isFirstEver) return '初見';
+    if (info.prevSeenMs == null) return '';
+    const days = Math.floor((Date.now() - info.prevSeenMs) / DAY_MS);
+    return days >= 1 ? `${days}日ぶり` : '';
   }
 
   function formatViewerBadgeText(seq: number | undefined): string {
@@ -311,14 +361,39 @@
     </span>
   {/if}
 
+  {#if theme.showViewerBadges && returnBadgeText}
+    <span class="viewer-badge badge-return" title="前回の来訪からの経過">{returnBadgeText}</span>
+  {/if}
+
+  {#if avatarUrl}
+    <img
+      class="avatar"
+      src={avatarUrl}
+      alt=""
+      loading="lazy"
+      decoding="async"
+      referrerpolicy="no-referrer"
+      onerror={() => (failedAvatarUrl = avatarUrl ?? '')}
+    />
+  {/if}
+
   <!-- Author name -->
   <span
     class="author-name"
+    class:clickable={!!message.author.id}
+    role="button"
+    tabindex="0"
+    onclick={() => openUserCard()}
+    onkeydown={onNameKeydown}
     class:youtube-member-name={message.platform === 'youtube' && message.author.roles.member && !hasKindStyle}
     style:color={!hasKindStyle && message.author.displayColor ? message.author.displayColor : undefined}
   >
-    {message.author.name}
+    {displayName}
   </span>
+
+  {#if listenerLabel}
+    <span class="listener-label" title={listenerLabel}>{listenerLabel}</span>
+  {/if}
 
   <!-- Separator -->
   <span class="sep">:</span>
@@ -591,6 +666,38 @@
   .badge-regular {
     background: #26a69a;
     color: #061b18;
+  }
+
+  .avatar {
+    width: 18px;
+    height: 18px;
+    flex-shrink: 0;
+    border-radius: 50%;
+    object-fit: cover;
+  }
+
+  .badge-return {
+    background: #5c6bc0;
+    color: #fff;
+    white-space: nowrap;
+  }
+
+  .listener-label {
+    flex-shrink: 0;
+    max-width: 80px;
+    height: 16px;
+    padding: 0 5px;
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 0.16);
+    font-size: 10px;
+    line-height: 16px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .author-name.clickable {
+    cursor: pointer;
   }
 
   .author-name {

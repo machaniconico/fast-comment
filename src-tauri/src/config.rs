@@ -283,12 +283,44 @@ pub enum TtsBackendKind {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TtsDictEntry {
-    /// 置換前のプレーン文字列。空なら適用時にスキップする。
+    /// 置換前の文字列または正規表現。平文の空文字列はスキップする。
     #[serde(default)]
     pub from: String,
-    /// 置換後のプレーン文字列。
+    /// 置換後の文字列。regex=true の場合はキャプチャ参照を展開する。
     #[serde(default)]
     pub to: String,
+    /// 正規表現置換を使う(置換先では $1 等のキャプチャ参照が可能)。
+    #[serde(default)]
+    pub regex: bool,
+}
+
+/// 読み上げ対象のメッセージ種別。欠落した項目も従来どおり読む。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct TtsReadKinds {
+    pub normal: bool,
+    pub super_chat: bool,
+    pub membership: bool,
+    pub bits: bool,
+    pub gift: bool,
+    pub system: bool,
+}
+
+impl Default for TtsReadKinds {
+    fn default() -> Self {
+        Self {
+            normal: true,
+            super_chat: true,
+            membership: true,
+            bits: true,
+            gift: true,
+            system: true,
+        }
+    }
+}
+
+fn default_tts_name_format() -> String {
+    "{name}".to_string()
 }
 
 /// 読み上げの整形/エンジン調整パラメータ。
@@ -343,6 +375,17 @@ pub struct TtsOptions {
     /// 名前を読み上げるか。
     #[serde(default = "default_true")]
     pub read_name: bool,
+    /// 名前部の書式: {name} / {rawName} / {label}。
+    #[serde(default = "default_tts_name_format")]
+    pub name_format: String,
+    /// 表示名・ID・ニックネームの全体一致。* のみワイルドカード。
+    #[serde(default)]
+    pub exclude_users: Vec<String>,
+    #[serde(default)]
+    pub read_kinds: TtsReadKinds,
+    /// ! で始まる本文を読み上げない。
+    #[serde(default)]
+    pub skip_commands: bool,
     /// URL を「URL省略」等に置換するか。
     #[serde(default = "default_true")]
     pub omit_url: bool,
@@ -352,7 +395,7 @@ pub struct TtsOptions {
     /// 1メッセージあたりの最大読み上げ文字数(超過分はカット)。
     #[serde(default = "default_max_read_len")]
     pub max_length: usize,
-    /// 読み上げ本文に適用するユーザー定義のプレーン文字列置換辞書。
+    /// 読み上げ本文に適用するユーザー定義の文字列/正規表現置換辞書。
     #[serde(default)]
     pub dictionary: Vec<TtsDictEntry>,
 }
@@ -375,6 +418,10 @@ impl Default for TtsOptions {
             web_speech_volume: default_web_speech_volume(),
             web_speech_voice: default_web_speech_voice(),
             read_name: true,
+            name_format: default_tts_name_format(),
+            exclude_users: Vec::new(),
+            read_kinds: TtsReadKinds::default(),
+            skip_commands: false,
             omit_url: true,
             strip_emoji: true,
             max_length: default_max_read_len(),
@@ -541,10 +588,33 @@ pub struct CredentialsConfig {
     pub x_csrf_token: String,
 }
 
+/// コメントログの自動保存設定。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct LogConfig {
+    pub enabled: bool,
+    pub retention_days: u32,
+    pub include_hidden: bool,
+}
+
+impl Default for LogConfig {
+    fn default() -> Self {
+        Self { enabled: true, retention_days: 30, include_hidden: false }
+    }
+}
+
+impl LogConfig {
+    pub fn normalize(&mut self) {
+        self.retention_days = self.retention_days.min(3650);
+    }
+}
+
 /// アプリ全体設定のルート。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppConfig {
+    #[serde(default)]
+    pub log: LogConfig,
     #[serde(default)]
     pub channels: Vec<ChannelConfig>,
     #[serde(default)]
@@ -578,6 +648,7 @@ pub struct AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         AppConfig {
+            log: LogConfig::default(),
             channels: Vec::new(),
             obs: ObsConfig::default(),
             goals: GoalsConfig::default(),
@@ -615,6 +686,7 @@ impl AppConfig {
         let mut cfg: AppConfig = serde_json::from_str(&text)
             .map_err(|e| anyhow::anyhow!("設定ファイル解析失敗 {}: {e}", path.display()))?;
         cfg.obs.normalize();
+        cfg.log.normalize();
         Ok(cfg)
     }
 
@@ -742,6 +814,28 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
+    fn chatlog_legacy_defaults_and_normalization() {
+        let dir = std::env::temp_dir().join(format!("fast-comment-config-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.json"), "{}").unwrap();
+        let cfg = AppConfig::load(&dir).unwrap();
+        assert!(cfg.log.enabled);
+        assert_eq!(cfg.log.retention_days, 30);
+        assert!(!cfg.log.include_hidden);
+        std::fs::write(dir.join("config.json"), r#"{"log":{"retentionDays":4294967295}}"#).unwrap();
+        assert_eq!(AppConfig::load(&dir).unwrap().log.retention_days, 3650);
+        let mut log: LogConfig = serde_json::from_str(r#"{"retentionDays":0}"#).unwrap();
+        log.normalize();
+        assert_eq!(log.retention_days, 0);
+        assert!(log.enabled);
+        assert!(!log.include_hidden);
+        let value = serde_json::to_value(log).unwrap();
+        assert_eq!(value["retentionDays"], 0);
+        assert_eq!(value["includeHidden"], false);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn serde_roundtrip_keeps_camel_case_keys_and_values() {
         // camelCase の永続化キーと、各フィールド値の serde 往復を確認する。
         let mut paths = HashMap::new();
@@ -751,6 +845,7 @@ mod tests {
         );
 
         let cfg = AppConfig {
+            log: LogConfig::default(),
             channels: vec![ChannelConfig {
                 platform: ChannelPlatform::Youtube,
                 identifier: "https://www.youtube.com/watch?v=abc123".to_string(),
@@ -819,15 +914,21 @@ mod tests {
                     web_speech_volume: 0.6,
                     web_speech_voice: "Test Voice".to_string(),
                     read_name: false,
+                    name_format: default_tts_name_format(),
+                    exclude_users: Vec::new(),
+                    read_kinds: TtsReadKinds::default(),
+                    skip_commands: false,
                     omit_url: false,
                     strip_emoji: false,
                     max_length: 280,
                     dictionary: vec![
                         TtsDictEntry {
+                            regex: false,
                             from: "fast".to_string(),
                             to: "ファスト".to_string(),
                         },
                         TtsDictEntry {
+                            regex: false,
                             from: "comment".to_string(),
                             to: "コメント".to_string(),
                         },
@@ -1230,10 +1331,12 @@ mod tests {
         let options = TtsOptions {
             dictionary: vec![
                 TtsDictEntry {
+                    regex: false,
                     from: "FC".to_string(),
                     to: "ファストコメント".to_string(),
                 },
                 TtsDictEntry {
+                    regex: false,
                     from: "".to_string(),
                     to: "ignored".to_string(),
                 },
@@ -1253,6 +1356,34 @@ mod tests {
 
         let decoded: TtsOptions = serde_json::from_str(&text).expect("deserialize tts options");
         assert_eq!(decoded, options);
+    }
+
+    #[test]
+    fn tts_extended_options_roundtrip_and_partial_kind_defaults() {
+        let options: TtsOptions = serde_json::from_str(r#"{
+            "nameFormat": "{name} ({rawName}) {label}",
+            "excludeUsers": ["*bot", "User"],
+            "readKinds": {"superChat": false, "system": false},
+            "skipCommands": true,
+            "dictionary": [{"from": "(hello)", "to": "$1!", "regex": true}]
+        }"#).unwrap();
+        assert_eq!(options.name_format, "{name} ({rawName}) {label}");
+        assert_eq!(options.exclude_users, vec!["*bot", "User"]);
+        assert!(!options.read_kinds.super_chat);
+        assert!(!options.read_kinds.system);
+        assert!(options.read_kinds.normal);
+        assert!(options.read_kinds.membership);
+        assert!(options.read_kinds.bits);
+        assert!(options.read_kinds.gift);
+        assert!(options.skip_commands);
+        assert!(options.dictionary[0].regex);
+        let json = serde_json::to_value(&options).unwrap();
+        assert_eq!(json["readKinds"]["superChat"], false);
+        assert_eq!(json["nameFormat"], options.name_format);
+        assert_eq!(json["excludeUsers"][0], "*bot");
+        assert_eq!(json["skipCommands"], true);
+        assert_eq!(json["dictionary"][0]["regex"], true);
+        assert_eq!(serde_json::from_value::<TtsOptions>(json).unwrap(), options);
     }
 
     #[test]
