@@ -130,6 +130,7 @@ struct ShowInfo {
     broadcaster_id: Option<String>,
     /// 配信者の表示名(user_display_name、無ければ username)。
     broadcaster_name: Option<String>,
+    broadcaster_avatar_url: Option<String>,
     /// 配信タイトル(チップ表示用)。
     title: Option<String>,
     /// 現在の視聴者数(total_watching)。文字列で返るため寛容にパースする。
@@ -223,6 +224,7 @@ impl ShowFetch {
         Ok(ShowInfo {
             broadcaster_id,
             broadcaster_name,
+            broadcaster_avatar_url: profile_avatar_url(&broadcast),
             title,
             viewers,
             state,
@@ -790,7 +792,13 @@ impl XSource {
             channel: self.broadcast_id.clone(),
             author: Author {
                 nickname: None,
-                avatar_url: None,
+                avatar_url: profile_avatar_url(v).or_else(|| {
+                    if broadcaster {
+                        show.broadcaster_avatar_url.clone()
+                    } else {
+                        None
+                    }
+                }),
                 id: user_id,
                 name,
                 display_color: None,
@@ -852,6 +860,23 @@ fn id_string(v: Option<&Value>) -> Option<String> {
     }
 }
 
+/// Use only image URLs present in the payload, never synthesize one from a user ID.
+fn profile_avatar_url(value: &Value) -> Option<String> {
+    [
+        "/profile_image_url_https",
+        "/profile_image_url",
+        "/profileImageUrl",
+        "/profileImageUrlHttps",
+        "/legacy/profile_image_url_https",
+        "/avatar/image_url",
+    ]
+    .iter()
+    .filter_map(|path| value.pointer(path).and_then(Value::as_str))
+    .map(str::trim)
+    .find(|url| url.starts_with("https://") || url.starts_with("http://"))
+    .map(str::to_string)
+}
+
 /// username が解決できないユーザーの表示名。userId の下4桁で個体識別だけ
 /// できるようにする(NG 等の同定は author.id=userId 全体で行われる)。
 fn anon_name(user_id: &str) -> String {
@@ -889,10 +914,6 @@ async fn name_resolver_task(
         if let Some(r) = resolver.as_mut() {
             let mut unknown: Vec<String> = Vec::new();
             for m in &batch {
-                // 配信者は show.json の名前で解決済み。
-                if m.author.roles.broadcaster {
-                    continue;
-                }
                 if !r.cache.contains_key(&m.author.id) && !unknown.contains(&m.author.id) {
                     unknown.push(m.author.id.clone());
                 }
@@ -901,11 +922,13 @@ async fn name_resolver_task(
                 r.resolve_batch(&unknown).await;
             }
             for m in &mut batch {
-                if m.author.roles.broadcaster {
-                    continue;
+                if !m.author.roles.broadcaster {
+                    if let Some(name) = r.cache.get(&m.author.id) {
+                        m.author.name = name.clone();
+                    }
                 }
-                if let Some(name) = r.cache.get(&m.author.id) {
-                    m.author.name = name.clone();
+                if m.author.avatar_url.is_none() {
+                    m.author.avatar_url = r.avatars.get(&m.author.id).cloned();
                 }
             }
             if r.disabled {
@@ -936,6 +959,7 @@ struct NameResolver {
     bearer: String,
     auth: XAuth,
     cache: HashMap<String, String>,
+    avatars: HashMap<String, String>,
     disabled: bool,
 }
 
@@ -947,6 +971,7 @@ impl NameResolver {
             bearer,
             auth,
             cache: HashMap::new(),
+            avatars: HashMap::new(),
             disabled: false,
         }
     }
@@ -991,8 +1016,9 @@ impl NameResolver {
             }
         }
         // 際限なく貯めない保険。1配信の発言者数では実質届かない。
-        if self.cache.len() > NAME_CACHE_MAX {
+        if self.cache.len().max(self.avatars.len()) > NAME_CACHE_MAX {
             self.cache.clear();
+            self.avatars.clear();
         }
     }
 
@@ -1003,8 +1029,12 @@ impl NameResolver {
             return;
         };
         for u in users {
-            let Some(result) = u.get("result") else { continue };
-            let Some(id) = id_string(result.get("rest_id")) else { continue };
+            let Some(result) = u.get("result") else {
+                continue;
+            };
+            let Some(id) = id_string(result.get("rest_id")) else {
+                continue;
+            };
             let name = result
                 .pointer("/core/name")
                 .and_then(Value::as_str)
@@ -1017,6 +1047,9 @@ impl NameResolver {
                         .map(str::trim)
                         .filter(|s| !s.is_empty())
                 });
+            if let Some(url) = profile_avatar_url(result) {
+                self.avatars.insert(id.clone(), url);
+            }
             if let Some(n) = name {
                 self.cache.insert(id, n.to_string());
             }
@@ -1221,9 +1254,50 @@ mod tests {
         ShowInfo {
             broadcaster_id: Some(broadcaster_id.to_string()),
             broadcaster_name: Some(name.to_string()),
+            broadcaster_avatar_url: None,
             title: Some("t".to_string()),
             viewers: Some(1),
             state: "RUNNING".to_string(),
+        }
+    }
+
+    #[test]
+    fn avatars_only_come_from_payloads() {
+        let src = XSource::new("b1".into(), XOverrides::default(), None, None);
+        let mut show = show_info("99", "Host");
+        show.broadcaster_avatar_url = Some("https://example.com/host.jpg".into());
+        let mut line = json!({"userId": "1", "message": "hello", "ts": "1"});
+        assert!(src
+            .line_to_chat(&line, &show)
+            .unwrap()
+            .author
+            .avatar_url
+            .is_none());
+        line["profileImageUrl"] = json!("https://example.com/user.jpg");
+        assert_eq!(
+            src.line_to_chat(&line, &show)
+                .unwrap()
+                .author
+                .avatar_url
+                .as_deref(),
+            Some("https://example.com/user.jpg")
+        );
+        line["profileImageUrl"] = Value::Null;
+        line["userId"] = json!("99");
+        assert_eq!(
+            src.line_to_chat(&line, &show)
+                .unwrap()
+                .author
+                .avatar_url
+                .as_deref(),
+            Some("https://example.com/host.jpg")
+        );
+        for value in [
+            json!({}),
+            json!({"profileImageUrl": 12}),
+            json!({"profileImageUrl": "javascript:bad"}),
+        ] {
+            assert!(profile_avatar_url(&value).is_none());
         }
     }
 
@@ -1252,7 +1326,12 @@ mod tests {
 
     #[test]
     fn chat_line_normalizes_to_message() {
-        let src = XSource::new("1yoJMWvbtbtxQ".to_string(), XOverrides::default(), None, None);
+        let src = XSource::new(
+            "1yoJMWvbtbtxQ".to_string(),
+            XOverrides::default(),
+            None,
+            None,
+        );
         let show = show_info("999", "Host");
         let v: Value = serde_json::from_str(
             r#"{"userId":"1234567890","chatType":1,"message":"こんにちは","ts":"1700000000123000000"}"#,
@@ -1263,6 +1342,7 @@ mod tests {
         assert_eq!(msg.channel, "1yoJMWvbtbtxQ");
         assert_eq!(msg.author.id, "1234567890");
         assert_eq!(msg.author.name, "ユーザー7890");
+        assert!(msg.author.avatar_url.is_none());
         assert_eq!(msg.plain_text(), "こんにちは");
         assert_eq!(msg.timestamp_ms, 1_700_000_000_123); // ナノ秒 → ms
         assert_eq!(msg.id, "x-1700000000123000000-1234567890");
@@ -1287,10 +1367,9 @@ mod tests {
         // ts / userId が数値で来る個体にも耐える(寛容パース)。
         let src = XSource::new("b1".to_string(), XOverrides::default(), None, None);
         let show = show_info("999", "Host");
-        let v: Value = serde_json::from_str(
-            r#"{"userId":42,"chatType":1,"message":"hi","ts":1700000000123}"#,
-        )
-        .unwrap();
+        let v: Value =
+            serde_json::from_str(r#"{"userId":42,"chatType":1,"message":"hi","ts":1700000000123}"#)
+                .unwrap();
         let msg = src.line_to_chat(&v, &show).expect("chat message");
         assert_eq!(msg.author.id, "42");
         assert_eq!(msg.author.name, "ユーザー42");
@@ -1475,7 +1554,7 @@ mod tests {
         // name 空は screen_name へフォールバック、rest_id 欠落はスキップ。
         let v: Value = serde_json::from_str(
             r#"{"data":{"users":[
-                {"result":{"rest_id":"1","core":{"name":"Alice","screen_name":"alice_x"}}},
+                {"result":{"rest_id":"1","core":{"name":"Alice","screen_name":"alice_x"},"legacy":{"profile_image_url_https":"https://example.com/alice.jpg"}}},
                 {"result":{"rest_id":"2","core":{"name":"  ","screen_name":"bob_x"}}},
                 {"result":{"core":{"name":"NoId"}}}
             ]}}"#,
@@ -1485,6 +1564,11 @@ mod tests {
         assert_eq!(r.cache.get("1").map(String::as_str), Some("Alice"));
         assert_eq!(r.cache.get("2").map(String::as_str), Some("bob_x"));
         assert_eq!(r.cache.len(), 2);
+        assert_eq!(
+            r.avatars.get("1").map(String::as_str),
+            Some("https://example.com/alice.jpg")
+        );
+        assert!(!r.avatars.contains_key("2"));
     }
 
     /// cookie 設定時の名前解決 E2E: live-chat 受信 → liveAtomsUserQuery
@@ -1539,7 +1623,7 @@ mod tests {
                             "cookie がない: {req}"
                         );
                         assert!(path.contains("7"), "userIds に 7 がない: {path}");
-                        let body = r#"{"data":{"users":[{"result":{"rest_id":"7","core":{"name":"Seven","screen_name":"seven_x"}}}]}}"#;
+                        let body = r#"{"data":{"users":[{"result":{"rest_id":"7","core":{"name":"Seven","screen_name":"seven_x"},"legacy":{"profile_image_url_https":"https://example.com/seven.jpg"}}}]}}"#;
                         let resp = format!(
                             "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
                             body.len(), body
@@ -1586,6 +1670,7 @@ mod tests {
             .expect("channel closed");
         assert_eq!(m.plain_text(), "hello");
         assert_eq!(m.author.id, "7");
+        assert_eq!(m.author.avatar_url.as_deref(), Some("https://example.com/seven.jpg"));
         assert_eq!(m.author.name, "Seven"); // GraphQL で実名に解決される。
         assert!(!m.author.roles.broadcaster);
 

@@ -293,9 +293,7 @@ fn parse_watch_message(text: &str) -> WatchAction {
 ///
 /// データ不足なら Ok(None)(呼び出し側が続きの chunk を待つ)。長さプレフィクスや
 /// 本体が壊れている場合は Err(ストリーム全体を張り直す)。
-fn try_take_message<M: prost::Message + Default>(
-    buf: &mut BytesMut,
-) -> anyhow::Result<Option<M>> {
+fn try_take_message<M: prost::Message + Default>(buf: &mut BytesMut) -> anyhow::Result<Option<M>> {
     if buf.is_empty() {
         return Ok(None);
     }
@@ -874,7 +872,7 @@ fn chunked_to_chat(
                 channel: live_id.to_string(),
                 author: Author {
                     nickname: None,
-                    avatar_url: None,
+                    avatar_url: niconico_avatar_url(c.raw_user_id),
                     id: author_id,
                     name,
                     display_color: None,
@@ -918,7 +916,7 @@ fn chunked_to_chat(
                 channel: live_id.to_string(),
                 author: Author {
                     nickname: None,
-                    avatar_url: None,
+                    avatar_url: niconico_avatar_url(g.advertiser_user_id),
                     id: author_id,
                     name: author_name,
                     display_color: None,
@@ -938,6 +936,15 @@ fn chunked_to_chat(
             })
         }
     }
+}
+
+// Only raw account IDs identify public profiles; never interpret anonymous hashes as IDs.
+fn niconico_avatar_url(raw_user_id: Option<i64>) -> Option<String> {
+    let id = raw_user_id.filter(|id| *id > 0)?;
+    Some(format!(
+        "https://secure-dcdn.cdn.nimg.jp/nicoaccount/usericon/{}/{id}.jpg",
+        id / 10000
+    ))
 }
 
 fn ws_text(s: &str) -> WsMessage {
@@ -968,6 +975,32 @@ fn now_ms() -> i64 {
 mod tests {
     use super::*;
     use prost::Message;
+
+    #[test]
+    fn avatar_requires_public_positive_account_id() {
+        assert_eq!(
+            niconico_avatar_url(Some(123456)).as_deref(),
+            Some("https://secure-dcdn.cdn.nimg.jp/nicoaccount/usericon/12/123456.jpg")
+        );
+        for id in [None, Some(0), Some(-1)] {
+            assert!(niconico_avatar_url(id).is_none());
+        }
+        let anonymous = chat_message(
+            ndgr::Chat {
+                content: "184".into(),
+                name: None,
+                raw_user_id: None,
+                hashed_user_id: Some("123456".into()),
+            },
+            "anonymous",
+            1,
+        );
+        assert!(chunked_to_chat(&anonymous, "lv1", None)
+            .unwrap()
+            .author
+            .avatar_url
+            .is_none());
+    }
 
     #[test]
     fn extracts_live_id_from_urls_and_raw_ids() {
@@ -1110,6 +1143,10 @@ mod tests {
         assert_eq!(msg.platform, Platform::Niconico);
         assert_eq!(msg.channel, "lv123");
         assert_eq!(msg.id, "msg-1");
+        assert_eq!(
+            msg.author.avatar_url.as_deref(),
+            Some("https://secure-dcdn.cdn.nimg.jp/nicoaccount/usericon/0/4242.jpg")
+        );
         assert_eq!(msg.author.id, "4242");
         assert_eq!(msg.author.name, "4242");
         assert!(msg.author.roles.broadcaster);
@@ -1128,6 +1165,7 @@ mod tests {
             0,
         );
         let msg = chunked_to_chat(&m, "lv123", Some("aBcDeFgHiJk")).expect("chat");
+        assert!(msg.author.avatar_url.is_none());
         assert_eq!(msg.author.id, "aBcDeFgHiJk");
         assert_eq!(msg.author.name, "aBcDeFg");
         assert!(!msg.author.roles.broadcaster);

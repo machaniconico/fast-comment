@@ -187,7 +187,9 @@ fn to_chat_message(item: LiveChatMessage, video_id: &str) -> Option<ChatMessage>
     }
     let mut author = Author {
         nickname: None,
-        avatar_url: None,
+        avatar_url: author_details
+            .profile_image_url
+            .filter(|url| !url.trim().is_empty()),
         id: author_details
             .channel_id
             .or_else(|| snippet.author_channel_id.clone())
@@ -507,6 +509,8 @@ struct LiveChatMessageAuthorDetails {
     channel_id: Option<String>,
     #[prost(string, optional, tag = "103")]
     display_name: Option<String>,
+    #[prost(string, optional, tag = "104")]
+    profile_image_url: Option<String>,
     #[prost(bool, optional, tag = "5")]
     is_chat_owner: Option<bool>,
     #[prost(bool, optional, tag = "6")]
@@ -659,6 +663,7 @@ mod tests {
                 ..Default::default()
             }),
             author_details: Some(LiveChatMessageAuthorDetails {
+                profile_image_url: Some("https://example.com/host.jpg".to_string()),
                 display_name: Some("配信者".to_string()),
                 is_chat_owner: Some(true),
                 ..Default::default()
@@ -666,6 +671,10 @@ mod tests {
         };
 
         let message = to_chat_message(item, "video-1").expect("chat message");
+        assert_eq!(
+            message.author.avatar_url.as_deref(),
+            Some("https://example.com/host.jpg")
+        );
         assert_eq!(message.id, "message-1");
         assert_eq!(message.plain_text(), "こんにちは");
         assert_eq!(message.kind, MessageKind::Normal);

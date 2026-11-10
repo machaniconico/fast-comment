@@ -3,6 +3,7 @@
  * No dependencies. Plain ES2020 JS.
  *
  * URL params:
+ *   ?avatar=1           show author avatar (default 0)
  *   ?template=bubble
  *   ?channel=<id>
  *   ?max=30
@@ -14,6 +15,7 @@
 
   // ---- Config from URL params ----
   const params = new URLSearchParams(location.search);
+  const SHOW_AVATAR = params.get('avatar') === '1';
   const CHANNEL_FILTER = params.get('channel') || null;
   const MAX_CARDS = Math.min(positiveIntParam('max', 30), 30);
   const WS_URL   = buildWsUrl(params.get('ws') || 'ws://127.0.0.1:11180/ws');
@@ -87,7 +89,10 @@
 
     const author = document.createElement('span');
     author.className = 'author';
-    author.textContent = (msg.author && msg.author.name) || '';
+    appendAvatar(author, msg);
+    const name = document.createElement('span');
+    name.textContent = (msg.author && msg.author.name) || '';
+    author.appendChild(name);
     card.appendChild(author);
 
     const body = document.createElement('span');
@@ -113,6 +118,19 @@
     if (oldest && oldest.parentNode) {
       oldest.parentNode.removeChild(oldest);
     }
+  }
+
+  function appendAvatar(parent, msg) {
+    const url = msg.author && msg.author.avatarUrl;
+    if (!SHOW_AVATAR || typeof url !== 'string' || !/^https?:\/\//i.test(url)) return;
+    const img = document.createElement('img');
+    img.className = 'avatar';
+    img.alt = '';
+    img.loading = 'lazy';
+    img.referrerPolicy = 'no-referrer';
+    img.onerror = () => { img.style.display = 'none'; };
+    img.src = url;
+    parent.appendChild(img);
   }
 
   function positiveIntParam(name, fallback) {

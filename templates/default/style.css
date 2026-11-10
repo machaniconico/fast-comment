@@ -179,3 +179,12 @@ html, body {
   font-weight: 700;
   flex-shrink: 0;
 }
+
+.avatar {
+  width: calc(20px * var(--font-scale, 1));
+  height: calc(20px * var(--font-scale, 1));
+  border-radius: 50%;
+  object-fit: cover;
+  vertical-align: middle;
+  flex-shrink: 0;
+}
