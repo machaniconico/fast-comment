@@ -9,8 +9,9 @@
 
 import type { ChatMessage, ListenerRecord, ListenerUpdate, TtsVoiceOverride, YoutubeReaction } from './types';
 import { invoke as tauriInvoke } from '@tauri-apps/api/core';
-import { listen } from '@tauri-apps/api/event';
+import { emit, listen } from '@tauri-apps/api/event';
 import { getCurrentWindow, primaryMonitor } from '@tauri-apps/api/window';
+import { createTtsAudioPlayer } from './ttsAudio';
 
 // ---- Tauri availability guard ----
 // @tauri-apps/api throws when window.__TAURI_INTERNALS__ is absent (browser dev).
@@ -122,6 +123,42 @@ export async function startTtsCancelListener(): Promise<() => void> {
     }
   });
   return unlisten;
+}
+
+/**
+ * Listen to 'tts-audio' (base64 WAV from the VOICEVOX backend) and play it in
+ * order via a FIFO queue. 'tts-cancel' stops playback and clears the queue.
+ * Returns an unlisten function. No-op outside Tauri.
+ */
+export async function startTtsAudioListener(): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  if (typeof window === 'undefined' || typeof Audio === 'undefined') return () => {};
+  // Surface the first playback failure (autoplay block, decode error) through
+  // the existing 'tts-notice' banner so a silent VOICEVOX is visible.
+  let errorNotified = false;
+  const player = createTtsAudioPlayer(() => new Audio(), undefined, () => {
+    if (errorNotified) return;
+    errorNotified = true;
+    const notice: TtsNotice = {
+      level: 'warn',
+      message: 'VOICEVOX の音声を再生できませんでした（WebView の自動再生制限または音声データの異常）',
+    };
+    emit('tts-notice', notice).catch((e) => console.warn('[ttsAudio] notice emit failed', e));
+  });
+  // Register one at a time so a failure can release what was already registered.
+  const unlisteners: Array<() => void> = [];
+  try {
+    unlisteners.push(await listen<string>('tts-audio', (event) => player.enqueue(event.payload)));
+    unlisteners.push(await listen('tts-cancel', () => player.cancel()));
+  } catch (e) {
+    for (const un of unlisteners) un();
+    player.cancel();
+    throw e;
+  }
+  return () => {
+    for (const un of unlisteners) un();
+    player.cancel();
+  };
 }
 
 export interface TtsNotice {

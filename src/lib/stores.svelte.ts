@@ -11,7 +11,7 @@
  */
 
 import { isListenerDeleted, type ChatMessage, type ListenerUpdate, type Platform, type UiChatMessage } from './types';
-import { onChatBatch, startChatListener, startListenerUpdatedListener, startTtsSpeakListener, startTtsCancelListener, getConfig } from './ipc';
+import { onChatBatch, startChatListener, startListenerUpdatedListener, startTtsSpeakListener, startTtsCancelListener, startTtsAudioListener, getConfig } from './ipc';
 
 const DEFAULT_MAX_BUFFER = 2000;
 /** Max pinned comments kept in the pinned strip (oldest dropped on overflow). */
@@ -484,17 +484,26 @@ class CommentStore {
     if (config) {
       this.setNotify(config.ui.notifySound ?? false, config.ui.notifyVolume ?? 0.5);
     }
-    const [unlistenChat, unlistenTts, unlistenTtsCancel, unlistenListener] = await Promise.all([
+    // allSettled: if one listener fails to register, release the ones that did.
+    const results = await Promise.allSettled([
       startChatListener(),
       startTtsSpeakListener(),
       startTtsCancelListener(),
+      startTtsAudioListener(),
       startListenerUpdatedListener((u) => this.applyListenerUpdate(u)),
     ]);
+    const unlisteners: Array<() => void> = [];
+    let failure: unknown = null;
+    for (const r of results) {
+      if (r.status === 'fulfilled') unlisteners.push(r.value);
+      else if (failure === null) failure = r.reason ?? new Error('listener registration failed');
+    }
+    if (failure !== null) {
+      for (const un of unlisteners) un();
+      throw failure;
+    }
     return () => {
-      unlistenChat();
-      unlistenTts();
-      unlistenTtsCancel();
-      unlistenListener();
+      for (const un of unlisteners) un();
     };
   }
 }
