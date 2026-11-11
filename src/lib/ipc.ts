@@ -275,7 +275,59 @@ export interface LogConfig {
   includeHidden?: boolean;
 }
 
+export type VoicevoxEngineKind = 'voicevox' | 'aivisSpeech';
+
+/** Mirror of Rust `VoicevoxParams`; null = leave the engine default. */
+export interface VoicevoxParams {
+  speedScale: number | null;
+  pitchScale: number | null;
+  intonationScale: number | null;
+  volumeScale: number | null;
+  prePhonemeLength: number | null;
+  postPhonemeLength: number | null;
+}
+
+export interface TtsAutoSpeed {
+  enabled: boolean;
+  queueThreshold: number;
+  perQueued: number;
+  lengthThreshold: number;
+  perTenChars: number;
+  maxSpeed: number;
+}
+
+export interface TtsQueueLimits {
+  maxPending: number;
+  maxWaitSec: number;
+}
+
+export interface TtsTemplates {
+  all: string;
+  normal: string | null;
+  superChat: string | null;
+  membership: string | null;
+  bits: string | null;
+  gift: string | null;
+  system: string | null;
+}
+
+export interface TtsEngineSpeaker {
+  id: number;
+  name: string;
+  style: string;
+}
+
+export interface TtsEngineProbe {
+  version: string;
+  speakers: TtsEngineSpeaker[];
+}
+
 export interface TtsOptions {
+  voicevoxEngine?: VoicevoxEngineKind;
+  voicevoxParams?: VoicevoxParams;
+  autoSpeed?: TtsAutoSpeed;
+  queue?: TtsQueueLimits;
+  templates?: TtsTemplates;
   bouyomiHost?: string;
   bouyomiPort?: number;
   bouyomiSpeed?: number;
@@ -595,6 +647,12 @@ export async function copyTextToClipboard(text: string): Promise<void> {
 
 export async function testTts(): Promise<string> {
   return (await invoke<string>('test_tts')) ?? 'Tauri環境でのみテストできます';
+}
+
+export async function probeTtsEngine(engine: VoicevoxEngineKind, url: string): Promise<TtsEngineProbe> {
+  const res = await invoke<TtsEngineProbe>('probe_tts_engine', { engine, url });
+  if (!res) throw new Error('Tauri環境でのみ接続テストできます');
+  return res;
 }
 
 export async function addChannel(channel: ChannelConfig): Promise<void> {

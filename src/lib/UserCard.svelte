@@ -370,7 +370,7 @@
 
         <h3>読み上げの声(このリスナーのみ)</h3>
         <div class="uc-voice">
-          <label class="uc-field">VOICEVOX 話者ID
+          <label class="uc-field">VOICEVOX 系 話者ID
             <input type="number" min="0" step="1" bind:value={voicevoxSpeaker} placeholder="既定" disabled={!ready} />
           </label>
           <label class="uc-field">棒読みちゃん声質
@@ -379,10 +379,10 @@
           <label class="uc-field">Web Speech 音声名
             <input type="text" bind:value={webSpeechVoice} placeholder="既定" maxlength="200" disabled={!ready} />
           </label>
-          <label class="uc-field">速度(0.5〜2.0)
+          <label class="uc-field">速度(0.5〜2.0、VOICEVOX 系にも効く)
             <input type="number" min="0.5" max="2" step="0.1" bind:value={voiceRate} placeholder="1.0" disabled={!ready} />
           </label>
-          <label class="uc-field">音程(0.0〜2.0)
+          <label class="uc-field">音程(0.0〜2.0、VOICEVOX 系にも効く)
             <input type="number" min="0" max="2" step="0.1" bind:value={voicePitch} placeholder="1.0" disabled={!ready} />
           </label>
         </div>

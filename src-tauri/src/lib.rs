@@ -22,21 +22,20 @@ pub mod stats;
 pub mod tts;
 mod update;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::fs;
 use std::net::TcpStream;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
-use tokio::sync::{broadcast, mpsc, watch, Notify};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::bus::{is_valid_template_name, spawn_reaction_ui_forwarder, Bus};
-use crate::config::{AppConfig, ChannelConfig, ChannelPlatform, TtsBackendKind};
+use crate::config::{AppConfig, ChannelConfig, ChannelPlatform, TtsBackendKind, VoicevoxEngineKind};
 use crate::model::{
     Amount, Author, Badge, ChatMessage, Fragment, MessageKind, Participant, Platform, Roles,
     YoutubeReaction,
@@ -46,8 +45,9 @@ use crate::sources::youtube_send::{YoutubeAuth, YoutubeOauthStatus};
 use crate::sources::SourceManager;
 use crate::stats::{spawn_stats_aggregator, StatsSnapshot, TimerSnapshot, YoutubeMetadataUpdate};
 use crate::tts::{
-    bouyomi, emit_tts_queue_state, tts_queue_state, TtsBackend, TtsDispatcher, TtsNoticePayload,
-    TtsQueueItem, TtsQueueStatePayload,
+    bouyomi, voicevox,
+    worker::{run_tts_worker, TtsShared},
+    TtsBackend, TtsDispatcher, TtsNoticePayload, TtsQueueStatePayload,
 };
 use crate::update::{check_for_update, open_url};
 
@@ -82,16 +82,8 @@ pub struct AppState {
     channels: Mutex<HashMap<String, CancellationToken>>,
     /// モデレータ(手動非表示状態も保持)。
     moderator: Mutex<Moderator>,
-    /// 長命 TTS ワーカーへの bounded 送信端(溢れたら drop)。
-    tts_tx: mpsc::Sender<ChatMessage>,
-    /// UI 表示用の TTS 待ちキュースナップショット。
-    tts_queue: Mutex<VecDeque<TtsQueueItem>>,
-    /// TTS 一時停止中はワーカーが受信したメッセージを読み上げずに破棄する。
-    tts_paused: Arc<AtomicBool>,
-    /// TTS キュー全消し要求。rx はワーカー所有のためワーカー内で drain する。
-    tts_clear: Arc<AtomicBool>,
-    /// 空キュー時でも TTS 全消し要求をワーカーへ通知して clear flag を reset する。
-    tts_clear_notify: Arc<tokio::sync::Notify>,
+    /// ワーカーと操作コマンドが共有する唯一の読み上げキュー。
+    tts: Arc<TtsShared>,
     /// YouTube メタデータ poller → stats 集約への bounded 送信端。
     metadata_tx: mpsc::Sender<YoutubeMetadataUpdate>,
     /// YouTubeリアクション Source → 1フレームIPC forwarder の bounded 送信端。
@@ -231,54 +223,15 @@ fn emit_tts_notice(app: &AppHandle, level: &'static str, message: String) {
 }
 
 fn current_tts_queue_state(state: &AppState) -> TtsQueueStatePayload {
-    let paused = state.tts_paused.load(Ordering::Relaxed);
-    let queue = state.tts_queue.lock().unwrap();
-    tts_queue_state(paused, &queue)
+    state.tts.snapshot()
 }
 
-fn emit_current_tts_queue_state(app: &AppHandle, state: &AppState) {
-    emit_tts_queue_state(app, current_tts_queue_state(state));
-}
-
-fn remove_tts_queue_item(state: &AppState, id: &str) -> bool {
-    let mut queue = state.tts_queue.lock().unwrap();
-    if let Some(index) = queue.iter().position(|item| item.id == id) {
-        queue.remove(index);
-        true
-    } else {
-        false
-    }
-}
-
-fn try_enqueue_tts_message(
-    app: &AppHandle,
-    state: &AppState,
-    msg: ChatMessage,
-) -> Result<(), mpsc::error::TrySendError<ChatMessage>> {
+fn try_enqueue_tts_message(app: &AppHandle, state: &AppState, msg: ChatMessage) {
     if !listeners::allows_tts(&msg) {
-        return Ok(());
+        return;
     }
-    let item = TtsQueueItem::from_message(&msg);
-    {
-        let mut queue = state.tts_queue.lock().unwrap();
-        queue.push_back(item.clone());
-    }
-
-    match state.tts_tx.try_send(msg) {
-        Ok(()) => {
-            emit_current_tts_queue_state(app, state);
-            Ok(())
-        }
-        Err(e) => {
-            remove_tts_queue_item(state, &item.id);
-            Err(e)
-        }
-    }
-}
-
-fn clear_tts_queue_snapshot(app: &AppHandle, state: &AppState) {
-    state.tts_queue.lock().unwrap().clear();
-    emit_current_tts_queue_state(app, state);
+    let max_pending = state.config.lock().unwrap().tts.options.queue.max_pending as usize;
+    state.tts.enqueue(app, msg, max_pending);
 }
 
 fn emit_bouyomi_launch_notice(app: &AppHandle, outcome: bouyomi::LaunchOutcome) {
@@ -343,16 +296,7 @@ fn get_config(state: State<'_, AppState>) -> Result<AppConfig, String> {
 /// TTS 読み上げを一時停止/再開する。paused 中に届いたメッセージは保持せず破棄する。
 #[tauri::command]
 fn set_tts_paused(app: AppHandle, state: State<'_, AppState>, paused: bool) {
-    state.tts_paused.store(paused, Ordering::Relaxed);
-    if paused {
-        state.tts_clear.store(true, Ordering::Relaxed);
-        state.tts_clear_notify.notify_one();
-        clear_tts_queue_snapshot(&app, &state);
-        if let Err(e) = app.emit("tts-cancel", ()) {
-            tracing::warn!("TTSキャンセルイベント送信失敗: {e}");
-        }
-    }
-    emit_current_tts_queue_state(&app, &state);
+    state.tts.set_paused(&app, paused);
 
     let tts_config = state.config.lock().unwrap().tts.clone();
     if tts_config.backend == TtsBackendKind::Bouyomi {
@@ -392,22 +336,18 @@ fn get_tts_queue_state(state: State<'_, AppState>) -> TtsQueueStatePayload {
     current_tts_queue_state(&state)
 }
 
-/// 未送出の TTS キューを全消しし、WebSpeech の現在発話も即時停止させる。
+/// 未送出の TTS キューと合成を破棄し、UI の現在発話も即時停止させる。
 #[tauri::command]
 fn clear_tts_queue(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    state.tts_clear.store(true, Ordering::Relaxed);
-    state.tts_clear_notify.notify_one();
-    clear_tts_queue_snapshot(&app, &state);
-    app.emit("tts-cancel", ())
-        .map_err(|e| format!("TTSキャンセルイベント送信失敗: {e}"))
+    state.tts.clear(&app);
+    Ok(())
 }
 
-/// 現在の WebSpeech 発話を停止する。外部バックエンドの送信済み発話は停止できない。
+/// 再生中ならその発話を停止し、それ以外は合成中の一件を破棄する。
 #[tauri::command]
 fn skip_current_tts(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    emit_current_tts_queue_state(&app, &state);
-    app.emit("tts-cancel", ())
-        .map_err(|e| format!("TTSキャンセルイベント送信失敗: {e}"))
+    state.tts.skip_current(&app);
+    Ok(())
 }
 
 /// WebView の Clipboard API を介さず OS のクリップボードへ書き込む。
@@ -452,14 +392,8 @@ fn tts_speak_text(app: AppHandle, state: State<'_, AppState>, text: String) -> R
         injected_test: false,
     };
 
-    match try_enqueue_tts_message(&app, &state, msg) {
-        Ok(()) => Ok(()),
-        Err(mpsc::error::TrySendError::Full(_)) => {
-            tracing::debug!("TTS キュー満杯につき任意テキスト読み上げを drop");
-            Ok(())
-        }
-        Err(mpsc::error::TrySendError::Closed(_)) => Err("TTS キューが閉じています".to_string()),
-    }
+    try_enqueue_tts_message(&app, &state, msg);
+    Ok(())
 }
 
 /// 現在の TTS 設定で棒読みちゃんへ疎通テストの読み上げを送る。
@@ -547,6 +481,28 @@ async fn test_tts(state: State<'_, AppState>) -> Result<String, String> {
             Ok("現在、読み上げはOFFです。棒読みちゃんを選択するとテストできます".to_string())
         }
     }
+}
+
+/// VOICEVOX 互換エンジンの `/version` と `/speakers` を取得する(設定フォームの未保存値で接続テスト)。
+///
+/// `url` が空ならエンジン種別の既定 URL を使う。
+#[tauri::command]
+async fn probe_tts_engine(
+    engine: VoicevoxEngineKind,
+    url: String,
+) -> Result<voicevox::TtsEngineProbe, String> {
+    let url = match url.trim() {
+        "" => match engine {
+            VoicevoxEngineKind::Voicevox => "http://127.0.0.1:50021",
+            VoicevoxEngineKind::AivisSpeech => "http://127.0.0.1:10101",
+        }
+        .to_string(),
+        u => u.to_string(),
+    };
+    voicevox::VoicevoxClient::new(&url)
+        .probe()
+        .await
+        .map_err(|e| format!("エンジンに接続できません ({url}): {e}"))
 }
 
 /// 現在のコメントログ CSV を config dir 配下 `exports/` に書き出す。
@@ -764,8 +720,7 @@ async fn update_config(
     };
 
     // 保存。
-    new_config.obs.normalize();
-    new_config.log.normalize();
+    new_config.normalize_all();
     new_config
         .save(&state.config_dir)
         .map_err(|e| e.to_string())?;
@@ -1614,16 +1569,8 @@ fn spawn_pipeline(app: AppHandle, cancel: CancellationToken) {
 
                     register_participant_if_needed(&app, &state, &msg);
 
-                    // 読み上げは単一の長命ワーカーへ bounded channel で渡す。
-                    // バースト時は try_send が Full を返すので drop し、UI/OBS 配信は止めない
-                    // (背圧/有界・SPEC 設計原則2)。
-                    if listeners::allows_tts(&msg) && !state.tts_paused.load(Ordering::Relaxed) {
-                        if let Err(mpsc::error::TrySendError::Full(_)) =
-                            try_enqueue_tts_message(&app, &state, msg.clone())
-                        {
-                            tracing::debug!("TTS キュー満杯につき読み上げを drop");
-                        }
-                    }
+                    // 同期 I/O やネットワーク待ちをせず、有界キューに投入する。
+                    try_enqueue_tts_message(&app, &state, msg.clone());
 
                     // 下流(UI/OBS)へ。
                     bus.publish(msg);
@@ -1635,78 +1582,18 @@ fn spawn_pipeline(app: AppHandle, cancel: CancellationToken) {
 }
 
 /// 単一の長命 TTS ワーカーを起動する。
-///
-/// bounded mpsc を逐次に消費し、1つの `TtsDispatcher` を再利用する。
-/// 設定は都度スナップショットを取り `update_config` で反映する(バックエンド再構築は
-/// 各 speak 内で行うが、毎メッセージのタスク spawn / 再プローブは行わない)。
-/// `speak_message` は内部で speak→Err 時に Web Speech フォールバックする(#15 と整合)。
-fn spawn_tts_worker(
-    app: AppHandle,
-    mut rx: mpsc::Receiver<ChatMessage>,
-    cancel: CancellationToken,
-) {
-    tauri::async_runtime::spawn(async move {
-        let initial_cfg = {
-            let state = app.state::<AppState>();
-            // MutexGuard 一時値をブロック末尾まで生かさず束縛して即 drop させる
-            // (末尾式のままだと guard が state より後に落ちて E0597 になる)。
-            let cfg = state.config.lock().unwrap().tts.clone();
-            cfg
-        };
-        let mut dispatcher = TtsDispatcher::new(initial_cfg, app.clone());
-
-        loop {
-            let notify = {
-                let state = app.state::<AppState>();
-                state.tts_clear_notify.clone()
-            };
-            tokio::select! {
-                _ = cancel.cancelled() => break,
-                _ = notify.notified() => {
-                    while rx.try_recv().is_ok() {}
-                    let state = app.state::<AppState>();
-                    state.tts_clear.store(false, Ordering::Relaxed);
-                    clear_tts_queue_snapshot(&app, &state);
-                    continue;
-                }
-                recv = rx.recv() => {
-                    let msg = match recv {
-                        Some(m) => m,
-                        None => break,
-                    };
-                    {
-                        let state = app.state::<AppState>();
-                        if remove_tts_queue_item(&state, &msg.id) {
-                            emit_current_tts_queue_state(&app, &state);
-                        }
-                    }
-                    {
-                        let state = app.state::<AppState>();
-                        if state.tts_clear.swap(false, Ordering::Relaxed) {
-                            while rx.try_recv().is_ok() {}
-                            clear_tts_queue_snapshot(&app, &state);
-                            tracing::debug!("TTS キュー全消し要求につき読み上げを drop");
-                            continue;
-                        }
-                        if state.tts_paused.load(Ordering::Relaxed) {
-                            tracing::debug!("TTS 一時停止中につき読み上げを drop");
-                            continue;
-                        }
-                    }
-                    // 最新設定を反映してから読み上げる。
-                    let cfg = {
-                        let state = app.state::<AppState>();
-                        // 同上: MutexGuard 一時値を束縛して即 drop(E0597 回避)。
-                        let snapshot = state.config.lock().unwrap().tts.clone();
-                        snapshot
-                    };
-                    dispatcher.update_config(cfg);
-                    dispatcher.speak_message(&msg).await;
-                }
-            }
-        }
-        tracing::info!("TTS ワーカー終了");
-    });
+fn spawn_tts_worker(app: AppHandle, cancel: CancellationToken) {
+    let shared = app.state::<AppState>().tts.clone();
+    let config_app = app.clone();
+    let config_fn = move || {
+        let state = config_app.state::<AppState>();
+        let cfg = state.config.lock().unwrap().tts.clone();
+        cfg
+    };
+    let dispatcher = TtsDispatcher::new(config_fn());
+    tauri::async_runtime::spawn(run_tts_worker(
+        shared, Arc::new(app), dispatcher, config_fn, cancel,
+    ));
 }
 
 /// OBS テンプレートの配信元ディレクトリを解決する。
@@ -1765,8 +1652,7 @@ pub fn run() {
             // 内部 source broadcast(Source → パイプライン)。
             let (source_tx, _source_rx) = broadcast::channel::<ChatMessage>(4096);
 
-            // 長命 TTS ワーカー用 bounded channel(溢れたら drop)。
-            let (tts_tx, tts_rx) = mpsc::channel::<ChatMessage>(64);
+            let tts = Arc::new(TtsShared::default());
 
             // Goals stats 用 channel。
             let (stats_tx, _stats_rx) = watch::channel::<StatsSnapshot>(StatsSnapshot::default());
@@ -1811,11 +1697,7 @@ pub fn run() {
                 }),
                 channels: Mutex::new(HashMap::new()),
                 moderator: Mutex::new(moderator),
-                tts_tx,
-                tts_queue: Mutex::new(VecDeque::new()),
-                tts_paused: Arc::new(AtomicBool::new(false)),
-                tts_clear: Arc::new(AtomicBool::new(false)),
-                tts_clear_notify: Arc::new(Notify::new()),
+                tts,
                 metadata_tx,
                 reaction_tx,
                 participants: Mutex::new(Vec::new()),
@@ -1877,7 +1759,7 @@ pub fn run() {
             spawn_pipeline(handle.clone(), app_cancel.clone());
 
             // 単一の長命 TTS ワーカー起動。
-            spawn_tts_worker(handle.clone(), tts_rx, app_cancel.clone());
+            spawn_tts_worker(handle.clone(), app_cancel.clone());
 
             // 設定済みチャンネルを起動。
             {
@@ -1905,6 +1787,7 @@ pub fn run() {
             tts_speak_text,
             copy_text_to_clipboard,
             test_tts,
+            probe_tts_engine,
             export_comments_csv,
             send_chat_message,
             get_youtube_oauth_status,
