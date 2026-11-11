@@ -454,10 +454,12 @@ export async function exportCommentsCsv(csv: string): Promise<string | null> {
   return invoke<string>('export_comments_csv', { csv });
 }
 
-export async function setConfig(config: AppConfig): Promise<void> {
+/** Saves the config. Resolves with non-fatal warnings (e.g. chatlog could not be opened). */
+export async function setConfig(config: AppConfig): Promise<string[]> {
   // Rust command is `update_config(new_config)`; Tauri maps the snake_case
   // param `new_config` to the JS key `newConfig`.
-  await invoke<void>('update_config', { newConfig: config });
+  const res = await invoke<{ warnings?: string[] } | undefined>('update_config', { newConfig: config });
+  return res?.warnings ?? [];
 }
 
 export async function setTtsPaused(paused: boolean): Promise<void> {

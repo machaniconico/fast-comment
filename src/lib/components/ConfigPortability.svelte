@@ -175,12 +175,13 @@
     importing = true;
     status = null;
     try {
-      await setConfig(parsed.config);
+      const warnings = await setConfig(parsed.config);
       if (parsed.appearance !== undefined) {
         theme.applySnapshot(parsed.appearance);
       }
       onImported?.(parsed.config);
-      showSuccess('設定をインポートしました。外観設定も反映済みです。');
+      const base = '設定をインポートしました。外観設定も反映済みです。';
+      showSuccess(warnings.length > 0 ? `${base}(警告: ${warnings.join(' / ')})` : base);
     } catch (e) {
       showError(`インポートに失敗しました: ${e instanceof Error ? e.message : String(e)}`);
     } finally {

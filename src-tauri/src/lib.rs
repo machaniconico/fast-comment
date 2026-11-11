@@ -705,10 +705,25 @@ async fn disconnect_youtube_oauth(
 /// コメントログ設定を反映する。失敗(ログ用ディレクトリを開けない等)は警告のみで、
 /// 設定保存・通知・チャンネル差分適用は止めない。ChatLog 側は設定を確定したまま
 /// writer を未オープンで残すため、次回の configure で open を再試行する。
-async fn configure_chatlog_nonfatal(chatlog: &chatlog::ChatLog, config: config::LogConfig) {
-    if let Err(err) = chatlog.configure(config).await {
-        tracing::warn!("chatlog configure failed: {err}");
+/// 失敗時は UI 向けの警告メッセージを返す。
+async fn configure_chatlog_nonfatal(
+    chatlog: &chatlog::ChatLog,
+    config: config::LogConfig,
+) -> Option<String> {
+    match chatlog.configure(config).await {
+        Ok(()) => None,
+        Err(err) => {
+            tracing::warn!("chatlog configure failed: {err}");
+            Some(format!("コメントログを開けませんでした: {err}"))
+        }
     }
+}
+
+/// `update_config` の結果。保存自体は成功しており、警告だけを UI に伝える。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateConfigOutcome {
+    warnings: Vec<String>,
 }
 
 /// 設定全体を更新して保存する。moderation/tts/obs などの実行時状態も反映する。
@@ -719,7 +734,7 @@ async fn update_config(
     app: AppHandle,
     state: State<'_, AppState>,
     mut new_config: AppConfig,
-) -> Result<(), String> {
+) -> Result<UpdateConfigOutcome, String> {
     let (
         youtube_source_config_changed,
         youtube_oauth_client_changed,
@@ -765,7 +780,10 @@ async fn update_config(
     // OBS ポート反映。ポートが変わった場合は旧サーバを停止し、新ポートで再 bind する。
     restart_obs_server_if_needed(&state, new_config.obs.port)?;
 
-    configure_chatlog_nonfatal(&state.chatlog, new_config.log.clone()).await;
+    let mut warnings = Vec::new();
+    if let Some(w) = configure_chatlog_nonfatal(&state.chatlog, new_config.log.clone()).await {
+        warnings.push(w);
+    }
 
     // 差分計算用にチャンネル一覧を退避しておく。
     let desired_channels = new_config.channels.clone();
@@ -803,7 +821,7 @@ async fn update_config(
         ensure_bouyomi_launched_and_emit_notice(app.clone(), path, host, port, elevated).await;
     }
 
-    Ok(())
+    Ok(UpdateConfigOutcome { warnings })
 }
 
 /// YouTubeの受信方式に関わる設定変更時だけ既存タスクを止め、差分適用で再起動させる。
@@ -1968,12 +1986,13 @@ mod followup_tests {
                 ..config::LogConfig::default()
             },
         );
-        // 失敗しても戻り値は () で、呼び出し側(update_config)は続行する。
-        configure_chatlog_nonfatal(&log, enabled_log()).await;
+        // 失敗しても警告メッセージを返すだけで、呼び出し側(update_config)は続行する。
+        let warning = configure_chatlog_nonfatal(&log, enabled_log()).await;
+        assert!(warning.unwrap().contains("コメントログを開けませんでした"));
         // 実際に失敗経路を通っていること、かつワーカーは生存し再試行することを確認。
         assert!(log.configure(enabled_log()).await.is_err());
         std::fs::remove_file(dir.0.join("logs")).unwrap();
-        log.configure(enabled_log()).await.unwrap();
+        assert!(configure_chatlog_nonfatal(&log, enabled_log()).await.is_none());
         assert!(chatlog::log_dir(&dir.0).is_dir());
         log.shutdown().await.unwrap();
     }
