@@ -607,6 +607,7 @@ mod tests {
             timestamp_ms: 0,
             raw: None,
             skip_tts: false,
+            injected_test: false,
         }
     }
 

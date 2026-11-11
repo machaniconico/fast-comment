@@ -449,6 +449,7 @@ fn tts_speak_text(app: AppHandle, state: State<'_, AppState>, text: String) -> R
         timestamp_ms,
         raw: None,
         skip_tts: false,
+        injected_test: false,
     };
 
     match try_enqueue_tts_message(&app, &state, msg) {
@@ -701,6 +702,15 @@ async fn disconnect_youtube_oauth(
     state.youtube_auth.disconnect(&client_id).await
 }
 
+/// コメントログ設定を反映する。失敗(ログ用ディレクトリを開けない等)は警告のみで、
+/// 設定保存・通知・チャンネル差分適用は止めない。ChatLog 側は設定を確定したまま
+/// writer を未オープンで残すため、次回の configure で open を再試行する。
+async fn configure_chatlog_nonfatal(chatlog: &chatlog::ChatLog, config: config::LogConfig) {
+    if let Err(err) = chatlog.configure(config).await {
+        tracing::warn!("chatlog configure failed: {err}");
+    }
+}
+
 /// 設定全体を更新して保存する。moderation/tts/obs などの実行時状態も反映する。
 ///
 /// チャンネル一覧の差分適用(追加/削除)も行う。
@@ -755,7 +765,7 @@ async fn update_config(
     // OBS ポート反映。ポートが変わった場合は旧サーバを停止し、新ポートで再 bind する。
     restart_obs_server_if_needed(&state, new_config.obs.port)?;
 
-    state.chatlog.configure(new_config.log.clone()).await?;
+    configure_chatlog_nonfatal(&state.chatlog, new_config.log.clone()).await;
 
     // 差分計算用にチャンネル一覧を退避しておく。
     let desired_channels = new_config.channels.clone();
@@ -1250,14 +1260,29 @@ fn inject_test_comment(
     amount: Option<f64>,
     count: Option<u32>,
 ) -> Result<(), String> {
-    let platform = match platform.as_str() {
+    for msg in build_injected_test_messages(&platform, &name, &text, kind.as_deref(), amount, count)? {
+        let _ = state.source_tx.send(msg);
+    }
+    Ok(())
+}
+
+/// inject_test_comment が流すメッセージを組み立てる(テスト可能な純関数部分)。
+fn build_injected_test_messages(
+    platform: &str,
+    name: &str,
+    text: &str,
+    kind: Option<&str>,
+    amount: Option<f64>,
+    count: Option<u32>,
+) -> Result<Vec<ChatMessage>, String> {
+    let platform = match platform {
         "twitch" => Platform::Twitch,
         "youtube" => Platform::Youtube,
         "x" => Platform::X,
         "niconico" => Platform::Niconico,
         other => return Err(format!("不正な platform です: {other}")),
     };
-    let kind = match kind.as_deref().unwrap_or("normal") {
+    let kind = match kind.unwrap_or("normal") {
         "normal" => MessageKind::Normal,
         "superChat" => MessageKind::SuperChat,
         "membership" => MessageKind::Membership,
@@ -1284,9 +1309,10 @@ fn inject_test_comment(
         body
     };
 
+    let mut messages = Vec::with_capacity(count as usize);
     for i in 0..count {
         let value = amount.filter(|_| matches!(kind, MessageKind::SuperChat | MessageKind::Bits));
-        let msg = ChatMessage {
+        messages.push(ChatMessage {
             listener: None,
             id: format!("injected-test:{epoch_millis}-{i}"),
             platform,
@@ -1310,11 +1336,10 @@ fn inject_test_comment(
             timestamp_ms: timestamp_ms.saturating_add(i64::from(i)),
             raw: None,
             skip_tts: false,
-        };
-        let _ = state.source_tx.send(msg);
+            injected_test: true,
+        });
     }
-
-    Ok(())
+    Ok(messages)
 }
 
 // ============ 内部ヘルパ ============
@@ -1903,4 +1928,99 @@ pub fn run() {
                 }
             }
         });
+}
+
+#[cfg(test)]
+mod followup_tests {
+    use super::*;
+
+    struct TestDir(PathBuf);
+    impl TestDir {
+        fn new(tag: &str) -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("fast-comment-{tag}-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn enabled_log() -> config::LogConfig {
+        config::LogConfig {
+            enabled: true,
+            ..config::LogConfig::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn chatlog_configure_failure_is_nonfatal_and_retried() {
+        let dir = TestDir::new("chatlog-nonfatal");
+        // logs をファイルにしてログ用ディレクトリ作成を失敗させる。
+        std::fs::write(dir.0.join("logs"), b"not a dir").unwrap();
+        let log = chatlog::ChatLog::start(
+            &dir.0,
+            config::LogConfig {
+                enabled: false,
+                ..config::LogConfig::default()
+            },
+        );
+        // 失敗しても戻り値は () で、呼び出し側(update_config)は続行する。
+        configure_chatlog_nonfatal(&log, enabled_log()).await;
+        // 実際に失敗経路を通っていること、かつワーカーは生存し再試行することを確認。
+        assert!(log.configure(enabled_log()).await.is_err());
+        std::fs::remove_file(dir.0.join("logs")).unwrap();
+        log.configure(enabled_log()).await.unwrap();
+        assert!(chatlog::log_dir(&dir.0).is_dir());
+        log.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn config_save_failure_is_still_an_error() {
+        let dir = TestDir::new("config-save-fail");
+        let file = dir.0.join("not-a-dir");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(AppConfig::default().save(&file).is_err());
+    }
+
+    #[tokio::test]
+    async fn injected_test_flag_survives_broadcast_and_clone_but_not_serde() {
+        let msgs = build_injected_test_messages("twitch", "", "", None, None, Some(2)).unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert!(msgs.iter().all(|m| m.injected_test && m.is_injected_test_comment()));
+
+        let (tx, mut rx) = broadcast::channel::<ChatMessage>(4);
+        tx.send(msgs[0].clone()).unwrap();
+        let received = rx.recv().await.unwrap();
+        assert!(received.injected_test);
+        assert!(received.clone().injected_test);
+
+        let json = serde_json::to_value(&received).unwrap();
+        assert!(json.get("injectedTest").is_none());
+        assert!(json.get("injected_test").is_none());
+        let back: ChatMessage = serde_json::from_value(json).unwrap();
+        assert!(!back.injected_test);
+    }
+
+    #[tokio::test]
+    async fn injected_test_message_is_not_recorded_as_listener() {
+        let dir = TestDir::new("injected-listener");
+        let store = listeners::ListenerStore::load(&dir.0);
+        let msgs = build_injected_test_messages("youtube", "a", "b", None, None, None).unwrap();
+        let (tx, mut rx) = broadcast::channel::<ChatMessage>(4);
+        tx.send(msgs[0].clone()).unwrap();
+        let mut msg = rx.recv().await.unwrap();
+        store.observe(&mut msg);
+        assert!(msg.listener.is_none());
+        assert!(store.list(None, 100).is_empty());
+    }
+
+    #[test]
+    fn build_injected_test_messages_rejects_bad_input() {
+        assert!(build_injected_test_messages("bogus", "", "", None, None, None).is_err());
+        assert!(build_injected_test_messages("x", "", "", Some("bogus"), None, None).is_err());
+    }
 }

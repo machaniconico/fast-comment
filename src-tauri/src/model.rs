@@ -166,12 +166,15 @@ pub struct ChatMessage {
     /// 内部制御用: 表示はするが TTS には流さない。
     #[serde(skip)]
     pub skip_tts: bool,
+    /// 内部制御用: inject_test_comment が注入したテストコメント。シリアライズしない。
+    #[serde(skip)]
+    pub injected_test: bool,
 }
 
 impl ChatMessage {
-    /// Reserved internal ID namespace assigned only by inject_test_comment.
+    /// inject_test_comment が立てる内部フラグ(id 接頭辞は見ない)。
     pub fn is_injected_test_comment(&self) -> bool {
-        self.id.starts_with("injected-test:")
+        self.injected_test
     }
 
     /// 本文をプレーンテキストに連結(TTS/検索用)。

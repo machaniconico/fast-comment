@@ -618,6 +618,7 @@ fn build_message(
         timestamp_ms,
         raw: None,
         skip_tts: false,
+        injected_test: false,
     }
 }
 

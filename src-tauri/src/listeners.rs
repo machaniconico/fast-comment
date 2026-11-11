@@ -420,6 +420,7 @@ mod tests {
             timestamp_ms: 999,
             raw: None,
             skip_tts: false,
+            injected_test: false,
         }
     }
 
@@ -769,10 +770,21 @@ mod tests {
         let dir = TestDir::new();
         let store = dir.store();
         let mut msg = message();
-        msg.id = "injected-test:123-0".into();
+        msg.injected_test = true;
         store.observe_at(&mut msg, 1);
         assert!(msg.listener.is_none());
         assert!(store.list(None, 100).is_empty());
         assert!(!store.records.lock().unwrap().dirty);
+    }
+
+    #[test]
+    fn listeners_injected_test_prefix_without_flag_is_observed() {
+        let dir = TestDir::new();
+        let store = dir.store();
+        let mut msg = message();
+        msg.id = "injected-test:123-0".into();
+        store.observe_at(&mut msg, 1);
+        assert!(msg.listener.is_some());
+        assert_eq!(store.list(None, 100).len(), 1);
     }
 }

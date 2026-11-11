@@ -885,6 +885,7 @@ fn chunked_to_chat(
                 timestamp_ms,
                 raw: None,
                 skip_tts: false,
+                injected_test: false,
             })
         }
         ndgr::nicolive_message::Data::Gift(g) => {
@@ -933,6 +934,7 @@ fn chunked_to_chat(
                 timestamp_ms,
                 raw: None,
                 skip_tts: false,
+                injected_test: false,
             })
         }
     }

@@ -814,6 +814,7 @@ impl XSource {
             timestamp_ms,
             raw: None,
             skip_tts: false,
+            injected_test: false,
         })
     }
 

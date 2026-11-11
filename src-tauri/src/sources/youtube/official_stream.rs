@@ -299,6 +299,7 @@ fn to_chat_message(item: LiveChatMessage, video_id: &str) -> Option<ChatMessage>
             .unwrap_or_else(now_ms),
         raw: None,
         skip_tts: false,
+        injected_test: false,
     })
 }
 
@@ -849,6 +850,7 @@ mod tests {
             timestamp_ms: 0,
             raw: None,
             skip_tts: false,
+            injected_test: false,
         }
     }
 }
