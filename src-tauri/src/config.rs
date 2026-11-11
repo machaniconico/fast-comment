@@ -398,6 +398,22 @@ pub struct TtsOptions {
     /// 読み上げ本文に適用するユーザー定義の文字列/正規表現置換辞書。
     #[serde(default)]
     pub dictionary: Vec<TtsDictEntry>,
+
+    /// VOICEVOX 互換エンジンの種別(プリセット URL の切替に使う)。
+    #[serde(default)]
+    pub voicevox_engine: VoicevoxEngineKind,
+    /// VOICEVOX 音声パラメータの全体上書き(None は上書きしない)。
+    #[serde(default)]
+    pub voicevox_params: VoicevoxParams,
+    /// キュー長・文字数に応じた自動加速。
+    #[serde(default)]
+    pub auto_speed: TtsAutoSpeed,
+    /// キューの上限(件数・待機秒)。
+    #[serde(default)]
+    pub queue: TtsQueueLimits,
+    /// 読み上げテンプレート。
+    #[serde(default)]
+    pub templates: TtsTemplates,
 }
 
 impl Default for TtsOptions {
@@ -426,7 +442,170 @@ impl Default for TtsOptions {
             strip_emoji: true,
             max_length: default_max_read_len(),
             dictionary: Vec::new(),
+            voicevox_engine: VoicevoxEngineKind::default(),
+            voicevox_params: VoicevoxParams::default(),
+            auto_speed: TtsAutoSpeed::default(),
+            queue: TtsQueueLimits::default(),
+            templates: TtsTemplates::default(),
         }
+    }
+}
+
+/// VOICEVOX 互換エンジンの種別。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VoicevoxEngineKind {
+    #[default]
+    Voicevox,
+    AivisSpeech,
+}
+
+impl VoicevoxEngineKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            VoicevoxEngineKind::Voicevox => "voicevox",
+            VoicevoxEngineKind::AivisSpeech => "aivisSpeech",
+        }
+    }
+}
+
+impl Serialize for VoicevoxEngineKind {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+/// 未知の文字列・型は Voicevox に落とす(load 失敗を防ぐ)。
+impl<'de> Deserialize<'de> for VoicevoxEngineKind {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let v = serde_json::Value::deserialize(deserializer)?;
+        Ok(match v.as_str() {
+            Some("aivisSpeech") => VoicevoxEngineKind::AivisSpeech,
+            _ => VoicevoxEngineKind::Voicevox,
+        })
+    }
+}
+
+/// VOICEVOX 音声パラメータ。None は AudioQuery の値を上書きしない。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+pub struct VoicevoxParams {
+    pub speed_scale: Option<f32>,
+    pub pitch_scale: Option<f32>,
+    pub intonation_scale: Option<f32>,
+    pub volume_scale: Option<f32>,
+    pub pre_phoneme_length: Option<f32>,
+    pub post_phoneme_length: Option<f32>,
+}
+
+/// 自動加速設定。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct TtsAutoSpeed {
+    pub enabled: bool,
+    /// この件数を超えた待ちから加速する。
+    pub queue_threshold: u32,
+    /// 閾値超過 1 件あたりの加算。
+    pub per_queued: f32,
+    /// この文字数を超えると加速(0 で文字数項なし)。
+    pub length_threshold: u32,
+    /// 閾値超過 10 文字あたりの加算。
+    pub per_ten_chars: f32,
+    pub max_speed: f32,
+}
+
+impl Default for TtsAutoSpeed {
+    fn default() -> Self {
+        TtsAutoSpeed {
+            enabled: false,
+            queue_threshold: 2,
+            per_queued: 0.1,
+            length_threshold: 40,
+            per_ten_chars: 0.05,
+            max_speed: 1.6,
+        }
+    }
+}
+
+/// 読み上げキューの上限。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct TtsQueueLimits {
+    /// 待機件数の上限(1..=500)。超過時は古い順に捨てる。
+    pub max_pending: u32,
+    /// 待機秒数の上限。0 は無制限。
+    pub max_wait_sec: u32,
+}
+
+impl Default for TtsQueueLimits {
+    fn default() -> Self {
+        TtsQueueLimits {
+            max_pending: 64,
+            max_wait_sec: 0,
+        }
+    }
+}
+
+/// 読み上げテンプレート。種別別は None なら `all` を使い、`Some("")` は読まない。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct TtsTemplates {
+    pub all: String,
+    pub normal: Option<String>,
+    pub super_chat: Option<String>,
+    pub membership: Option<String>,
+    pub bits: Option<String>,
+    pub gift: Option<String>,
+    pub system: Option<String>,
+}
+
+impl Default for TtsTemplates {
+    fn default() -> Self {
+        TtsTemplates {
+            all: "{name} {text}".to_string(),
+            normal: None,
+            super_chat: None,
+            membership: None,
+            bits: None,
+            gift: None,
+            system: None,
+        }
+    }
+}
+
+fn clamp_opt(v: &mut Option<f32>, lo: f32, hi: f32) {
+    if let Some(x) = v {
+        *x = if x.is_finite() { x.clamp(lo, hi) } else { lo.max(0.0).min(hi) };
+        if !x.is_finite() {
+            *v = None;
+        }
+    }
+}
+
+fn clamp_f32(v: &mut f32, lo: f32, hi: f32, default: f32) {
+    *v = if v.is_finite() { v.clamp(lo, hi) } else { default };
+}
+
+impl TtsOptions {
+    /// 範囲外の値をクランプする(`AppConfig::load` と `update_config` から呼ぶ)。
+    pub fn normalize(&mut self) {
+        let p = &mut self.voicevox_params;
+        clamp_opt(&mut p.speed_scale, 0.5, 2.0);
+        clamp_opt(&mut p.pitch_scale, -0.15, 0.15);
+        clamp_opt(&mut p.intonation_scale, 0.0, 2.0);
+        clamp_opt(&mut p.volume_scale, 0.0, 2.0);
+        clamp_opt(&mut p.pre_phoneme_length, 0.0, 1.5);
+        clamp_opt(&mut p.post_phoneme_length, 0.0, 1.5);
+
+        let d = TtsAutoSpeed::default();
+        let a = &mut self.auto_speed;
+        a.queue_threshold = a.queue_threshold.min(500);
+        a.length_threshold = a.length_threshold.min(1000);
+        clamp_f32(&mut a.per_queued, 0.0, 1.0, d.per_queued);
+        clamp_f32(&mut a.per_ten_chars, 0.0, 1.0, d.per_ten_chars);
+        clamp_f32(&mut a.max_speed, 0.5, 2.0, d.max_speed);
+
+        self.queue.max_pending = self.queue.max_pending.clamp(1, 500);
+        self.queue.max_wait_sec = self.queue.max_wait_sec.min(86_400);
     }
 }
 
@@ -685,9 +864,15 @@ impl AppConfig {
             .map_err(|e| anyhow::anyhow!("設定ファイル読込失敗 {}: {e}", path.display()))?;
         let mut cfg: AppConfig = serde_json::from_str(&text)
             .map_err(|e| anyhow::anyhow!("設定ファイル解析失敗 {}: {e}", path.display()))?;
-        cfg.obs.normalize();
-        cfg.log.normalize();
+        cfg.normalize_all();
         Ok(cfg)
+    }
+
+    /// 範囲外値の丸め。ロード時と更新(保存前)の双方から呼ぶ。
+    pub fn normalize_all(&mut self) {
+        self.obs.normalize();
+        self.log.normalize();
+        self.tts.options.normalize();
     }
 
     /// `config.json` へ保存する(ディレクトリは必要なら作成)。
@@ -933,6 +1118,11 @@ mod tests {
                             to: "コメント".to_string(),
                         },
                     ],
+                    voicevox_engine: VoicevoxEngineKind::default(),
+                    voicevox_params: VoicevoxParams::default(),
+                    auto_speed: TtsAutoSpeed::default(),
+                    queue: TtsQueueLimits::default(),
+                    templates: TtsTemplates::default(),
                 },
             },
             moderation: ModerationConfig {
@@ -1384,6 +1574,107 @@ mod tests {
         assert_eq!(json["skipCommands"], true);
         assert_eq!(json["dictionary"][0]["regex"], true);
         assert_eq!(serde_json::from_value::<TtsOptions>(json).unwrap(), options);
+    }
+
+    #[test]
+    fn tts_pack_legacy_config_gets_defaults() {
+        let o: TtsOptions = serde_json::from_str(r#"{"readName": false}"#).unwrap();
+        assert_eq!(o.voicevox_engine, VoicevoxEngineKind::Voicevox);
+        assert_eq!(o.voicevox_params, VoicevoxParams::default());
+        assert!(o.voicevox_params.speed_scale.is_none());
+        assert!(!o.auto_speed.enabled);
+        assert_eq!(o.queue.max_pending, 64);
+        assert_eq!(o.queue.max_wait_sec, 0);
+        assert_eq!(o.templates.all, "{name} {text}");
+        assert!(o.templates.super_chat.is_none());
+    }
+
+    #[test]
+    fn tts_pack_roundtrip_camel_case() {
+        let mut o = TtsOptions::default();
+        o.voicevox_engine = VoicevoxEngineKind::AivisSpeech;
+        o.voicevox_params.speed_scale = Some(1.25);
+        o.auto_speed.enabled = true;
+        o.auto_speed.queue_threshold = 3;
+        o.queue.max_pending = 10;
+        o.templates.super_chat = Some("{name} {paidText}".to_string());
+        let json = serde_json::to_value(&o).unwrap();
+        assert_eq!(json["voicevoxEngine"], "aivisSpeech");
+        assert_eq!(json["voicevoxParams"]["speedScale"], 1.25);
+        assert_eq!(json["autoSpeed"]["queueThreshold"], 3);
+        assert_eq!(json["autoSpeed"]["enabled"], true);
+        assert_eq!(json["queue"]["maxPending"], 10);
+        assert_eq!(json["templates"]["superChat"], "{name} {paidText}");
+        assert_eq!(serde_json::from_value::<TtsOptions>(json).unwrap(), o);
+    }
+
+    #[test]
+    fn tts_pack_unknown_engine_falls_back_to_voicevox() {
+        for raw in [r#""coeiroink""#, "42", "null", r#""""#] {
+            let o: TtsOptions =
+                serde_json::from_str(&format!(r#"{{"voicevoxEngine": {raw}}}"#)).unwrap();
+            assert_eq!(o.voicevox_engine, VoicevoxEngineKind::Voicevox, "{raw}");
+        }
+    }
+
+    #[test]
+    fn tts_pack_normalize_all_clamps_update_path() {
+        // update_config は保存前に normalize_all を呼ぶ。ロードを経ずに範囲外値が丸まること。
+        let mut c = AppConfig::default();
+        c.tts.options.voicevox_params.speed_scale = Some(9.0);
+        c.tts.options.queue.max_pending = 0;
+        c.normalize_all();
+        assert_eq!(c.tts.options.voicevox_params.speed_scale, Some(2.0));
+        assert!(c.tts.options.queue.max_pending >= 1);
+    }
+
+    #[test]
+    fn tts_pack_normalize_clamps_out_of_range() {
+        let mut o: TtsOptions = serde_json::from_str(
+            r#"{
+                "voicevoxParams": {"speedScale": 9, "pitchScale": -5, "intonationScale": -1,
+                    "volumeScale": 99, "prePhonemeLength": -2, "postPhonemeLength": 50},
+                "autoSpeed": {"maxSpeed": 10, "perQueued": -1, "perTenChars": 5,
+                    "queueThreshold": 100000, "lengthThreshold": 100000},
+                "queue": {"maxPending": 0, "maxWaitSec": 4000000000}
+            }"#,
+        )
+        .unwrap();
+        o.normalize();
+        assert_eq!(o.voicevox_params.speed_scale, Some(2.0));
+        assert_eq!(o.voicevox_params.pitch_scale, Some(-0.15));
+        assert_eq!(o.voicevox_params.intonation_scale, Some(0.0));
+        assert_eq!(o.voicevox_params.volume_scale, Some(2.0));
+        assert_eq!(o.voicevox_params.pre_phoneme_length, Some(0.0));
+        assert_eq!(o.voicevox_params.post_phoneme_length, Some(1.5));
+        assert_eq!(o.auto_speed.max_speed, 2.0);
+        assert_eq!(o.auto_speed.per_queued, 0.0);
+        assert_eq!(o.auto_speed.per_ten_chars, 1.0);
+        assert_eq!(o.auto_speed.queue_threshold, 500);
+        assert_eq!(o.auto_speed.length_threshold, 1000);
+        assert_eq!(o.queue.max_pending, 1);
+        assert_eq!(o.queue.max_wait_sec, 86_400);
+        o.queue.max_pending = 9999;
+        o.normalize();
+        assert_eq!(o.queue.max_pending, 500);
+        // 既定値は normalize で変わらない。
+        let mut d = TtsOptions::default();
+        d.normalize();
+        assert_eq!(d, TtsOptions::default());
+    }
+
+    #[test]
+    fn tts_pack_template_null_vs_empty() {
+        let t: TtsTemplates =
+            serde_json::from_str(r#"{"normal": null, "bits": "", "gift": "x"}"#).unwrap();
+        assert_eq!(t.normal, None);
+        assert_eq!(t.super_chat, None);
+        assert_eq!(t.bits, Some(String::new()));
+        assert_eq!(t.gift.as_deref(), Some("x"));
+        assert_eq!(t.all, "{name} {text}");
+        let json = serde_json::to_value(&t).unwrap();
+        assert!(json["normal"].is_null());
+        assert_eq!(json["bits"], "");
     }
 
     #[test]

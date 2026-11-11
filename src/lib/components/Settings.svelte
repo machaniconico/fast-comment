@@ -6,10 +6,15 @@
   } from '../ipc';
   import {
     getConfig, setConfig, getObsUrl, getObsGoalsUrl, getObsTimerUrl, exportCommentsCsv, injectTestComment,
-    setTtsPaused, clearTtsQueue, skipCurrentTts, testTts, getYoutubeOauthStatus,
+    setTtsPaused, clearTtsQueue, skipCurrentTts, testTts, probeTtsEngine, getYoutubeOauthStatus,
     connectYoutubeOauth, disconnectYoutubeOauth, getGoalSkinInfo, openUrl,
     getCommentLogDir, openCommentLogDir, listListeners, deleteListener, MODERATION_APPENDED_EVENT
   } from '../ipc';
+  import {
+    urlForEngineChange, buildVoicevoxParams, buildAutoSpeed, buildQueueLimits, kindTemplate, allTemplate,
+    speakerLabel, PARAM_RANGES, type VoicevoxParamKey
+  } from '../ttsSettings';
+  import type { TtsEngineSpeaker, VoicevoxEngineKind } from '../ipc';
   import { isListenerDeleted, safeAvatarUrl, type ListenerRecord, type ListenerUpdate } from '../types';
   import { ui, SETTINGS_ANCHOR_IDS } from '../ui.svelte';
   import {
@@ -239,6 +244,36 @@
     normal: true, superChat: true, membership: true, bits: true, gift: true, system: true
   });
   let skipCommands: boolean = $state(false);
+  const DEFAULT_URL_VOICEVOX = 'http://127.0.0.1:50021';
+  let voicevoxEngine: VoicevoxEngineKind = $state('voicevox');
+  let voicevoxUrl: string = $state(DEFAULT_URL_VOICEVOX);
+  let probing: boolean = $state(false);
+  let probeMsg: string = $state('');
+  let probeOk: boolean | null = $state(null);
+  let probeSpeakers: TtsEngineSpeaker[] = $state([]);
+  const PARAM_LABELS: [VoicevoxParamKey, string][] = [
+    ['speedScale', '話速'], ['pitchScale', '音高'], ['intonationScale', '抑揚'],
+    ['volumeScale', '音量'], ['prePhonemeLength', '開始無音(秒)'], ['postPhonemeLength', '終了無音(秒)']
+  ];
+  let vvParams: Record<VoicevoxParamKey, number | null> = $state({
+    speedScale: null, pitchScale: null, intonationScale: null,
+    volumeScale: null, prePhonemeLength: null, postPhonemeLength: null
+  });
+  let autoSpeedEnabled: boolean = $state(false);
+  let autoQueueThreshold: number = $state(2);
+  let autoPerQueued: number = $state(0.1);
+  let autoLengthThreshold: number = $state(40);
+  let autoPerTenChars: number = $state(0.05);
+  let autoMaxSpeed: number = $state(1.6);
+  let queueMaxPending: number = $state(64);
+  let queueMaxWaitSec: number = $state(0);
+  let templateAll: string = $state('{name} {text}');
+  let templateOn: Record<ReadKindKey, boolean> = $state({
+    normal: false, superChat: false, membership: false, bits: false, gift: false, system: false
+  });
+  let templateText: Record<ReadKindKey, string> = $state({
+    normal: '', superChat: '', membership: '', bits: '', gift: '', system: ''
+  });
   let logEnabled: boolean = $state(true);
   let logRetentionDays: number = $state(30);
   let logDir: string = $state('');
@@ -288,6 +323,29 @@
       excludeUsersText = (config.tts.options.excludeUsers ?? []).join('\n');
       for (const [k] of READ_KIND_LABELS) readKinds[k] = config.tts.options.readKinds?.[k] !== false;
       skipCommands = ttsBool('skipCommands', false);
+      {
+        const o = config.tts.options;
+        voicevoxEngine = o.voicevoxEngine === 'aivisSpeech' ? 'aivisSpeech' : 'voicevox';
+        voicevoxUrl = o.voicevoxUrl ?? DEFAULT_URL_VOICEVOX;
+        for (const [k] of PARAM_LABELS) vvParams[k] = o.voicevoxParams?.[k] ?? null;
+        autoSpeedEnabled = o.autoSpeed?.enabled ?? false;
+        autoQueueThreshold = o.autoSpeed?.queueThreshold ?? 2;
+        autoPerQueued = o.autoSpeed?.perQueued ?? 0.1;
+        autoLengthThreshold = o.autoSpeed?.lengthThreshold ?? 40;
+        autoPerTenChars = o.autoSpeed?.perTenChars ?? 0.05;
+        autoMaxSpeed = o.autoSpeed?.maxSpeed ?? 1.6;
+        queueMaxPending = o.queue?.maxPending ?? 64;
+        queueMaxWaitSec = o.queue?.maxWaitSec ?? 0;
+        templateAll = o.templates?.all ?? '{name} {text}';
+        for (const [k] of READ_KIND_LABELS) {
+          const t = o.templates?.[k] ?? null;
+          templateOn[k] = t !== null;
+          templateText[k] = t ?? '';
+        }
+        probeSpeakers = [];
+        probeMsg = '';
+        probeOk = null;
+      }
       logEnabled = config.log?.enabled !== false;
       logRetentionDays = typeof config.log?.retentionDays === 'number' ? config.log.retentionDays : 30;
       normalizeObsConfig(true);
@@ -1023,6 +1081,41 @@
     }
   }
 
+  let probeSeq = 0;
+
+  function onVoicevoxEngineChange(e: Event) {
+    const next: VoicevoxEngineKind = (e.currentTarget as HTMLSelectElement).value === 'aivisSpeech' ? 'aivisSpeech' : 'voicevox';
+    voicevoxUrl = urlForEngineChange(voicevoxUrl, next);
+    voicevoxEngine = next;
+    probeSeq++;
+    probing = false;
+    probeSpeakers = [];
+    probeMsg = '';
+    probeOk = null;
+  }
+
+  async function onProbeTtsEngine() {
+    if (probing) return;
+    probing = true;
+    probeMsg = '';
+    probeOk = null;
+    const seq = ++probeSeq;
+    try {
+      const r = await probeTtsEngine(voicevoxEngine, voicevoxUrl.trim());
+      if (seq !== probeSeq) return;
+      probeSpeakers = r.speakers;
+      probeMsg = `接続 OK: ${r.version} / 話者 ${r.speakers.length} 件`;
+      probeOk = true;
+    } catch (e) {
+      if (seq !== probeSeq) return;
+      probeSpeakers = [];
+      probeMsg = e instanceof Error ? e.message : String(e);
+      probeOk = false;
+    } finally {
+      if (seq === probeSeq) probing = false;
+    }
+  }
+
   async function onSave() {
     if (!config) return;
     saving = true;
@@ -1046,6 +1139,23 @@
     config.tts.options.excludeUsers = parseModerationText(excludeUsersText);
     config.tts.options.readKinds = { ...readKinds };
     setTtsBool('skipCommands', skipCommands);
+    config.tts.options.voicevoxEngine = voicevoxEngine;
+    config.tts.options.voicevoxUrl = voicevoxUrl.trim() || urlForEngineChange('', voicevoxEngine);
+    config.tts.options.voicevoxParams = buildVoicevoxParams(vvParams);
+    config.tts.options.autoSpeed = buildAutoSpeed({
+      enabled: autoSpeedEnabled, queueThreshold: autoQueueThreshold, perQueued: autoPerQueued,
+      lengthThreshold: autoLengthThreshold, perTenChars: autoPerTenChars, maxSpeed: autoMaxSpeed
+    });
+    config.tts.options.queue = buildQueueLimits(queueMaxPending, queueMaxWaitSec);
+    config.tts.options.templates = {
+      all: allTemplate(templateAll),
+      normal: kindTemplate(templateOn.normal, templateText.normal),
+      superChat: kindTemplate(templateOn.superChat, templateText.superChat),
+      membership: kindTemplate(templateOn.membership, templateText.membership),
+      bits: kindTemplate(templateOn.bits, templateText.bits),
+      gift: kindTemplate(templateOn.gift, templateText.gift),
+      system: kindTemplate(templateOn.system, templateText.system)
+    };
     config.log = {
       ...config.log,
       enabled: logEnabled,
@@ -1658,7 +1768,7 @@
         <option value="none">読み上げOFF</option>
         <option value="webSpeech">Web Speech（内蔵）</option>
         <option value="bouyomi">棒読みちゃん</option>
-        <option value="voicevox">VOICEVOX</option>
+        <option value="voicevox">VOICEVOX 系(VOICEVOX / AivisSpeech)</option>
       </select>
     </div>
 
@@ -1682,7 +1792,7 @@
         {#if ttsControlMsg}<span class="hint-inline">{ttsControlMsg}</span>{/if}
       </div>
       <p class="hint">
-        一時停止中に届いたコメントは読み上げず破棄します。キュー全消し/スキップは未送出キューとWeb Speechの現在発話を止めます。棒読みちゃん/VOICEVOXは送信済みの1件をアプリ側からキャンセルできません。
+        一時停止中に届いたコメントは読み上げず破棄します。キュー全消し/スキップは未送出キューとWeb Speechの現在発話を止めます。VOICEVOX 系は再生中・合成中の1件も止められます。棒読みちゃんは送信済みの1件をアプリ側からキャンセルできません。
       </p>
     </div>
 
@@ -1726,6 +1836,41 @@
 
     {#if config.tts.backend === 'voicevox'}
     <div class="field-row">
+      <label for="tts-voicevox-engine">エンジン種別</label>
+      <select id="tts-voicevox-engine" bind:value={voicevoxEngine} onchange={onVoicevoxEngineChange} class="platform-select">
+        <option value="voicevox">VOICEVOX</option>
+        <option value="aivisSpeech">AivisSpeech</option>
+      </select>
+    </div>
+    <div class="field-row">
+      <label for="tts-voicevox-url">エンジン URL</label>
+      <input id="tts-voicevox-url" type="text" bind:value={voicevoxUrl} oninput={() => { probeSeq++; probing = false; probeSpeakers = []; probeMsg = ''; }} class="id-input" />
+    </div>
+    <div class="field-row">
+      <button type="button" id="tts-voicevox-probe" class="export-btn" onclick={onProbeTtsEngine} disabled={probing}>
+        {probing ? '接続中...' : '接続テスト'}
+      </button>
+    </div>
+    {#if probeMsg}
+      <p
+        class="tts-test-result"
+        class:tts-test-result--ok={probeOk === true}
+        class:tts-test-result--error={probeOk === false}
+      >
+        {probeMsg}
+      </p>
+    {/if}
+    {#if probeSpeakers.length > 0}
+    <div class="field-row">
+      <label for="tts-voicevox-speaker-select">話者一覧</label>
+      <select id="tts-voicevox-speaker-select" class="platform-select voice-select" bind:value={voicevoxSpeaker}>
+        {#each probeSpeakers as sp (sp.id)}
+          <option value={sp.id}>{speakerLabel(sp)}</option>
+        {/each}
+      </select>
+    </div>
+    {/if}
+    <div class="field-row">
       <label for="tts-voicevox-speaker">VOICEVOX 話者ID</label>
       <input
         id="tts-voicevox-speaker"
@@ -1735,6 +1880,63 @@
         bind:value={voicevoxSpeaker}
         class="num-input"
       />
+    </div>
+    {#each PARAM_LABELS as [key, label] (key)}
+    <div class="field-row">
+      <label for={`tts-vv-${key}`}>{label}</label>
+      <input
+        id={`tts-vv-${key}`}
+        type="number"
+        min={PARAM_RANGES[key][0]}
+        max={PARAM_RANGES[key][1]}
+        step="0.01"
+        placeholder="エンジン既定"
+        bind:value={vvParams[key]}
+        class="num-input"
+      />
+      <span class="hint-inline">{PARAM_RANGES[key][0]}〜{PARAM_RANGES[key][1]}。空欄でエンジン既定</span>
+    </div>
+    {/each}
+    {#if voicevoxEngine === 'aivisSpeech'}
+    <p class="hint">AivisSpeech では音高と抑揚を変えると音質が劣化することがあります。</p>
+    {/if}
+    <h4>自動加速(VOICEVOX 系のみ)</h4>
+    <div class="field-row">
+      <label for="tts-auto-enabled">自動加速を有効化</label>
+      <input id="tts-auto-enabled" type="checkbox" bind:checked={autoSpeedEnabled} class="chk" />
+      <span class="hint-inline">VOICEVOX 系のみ。Web Speech と棒読みちゃんには効きません</span>
+    </div>
+    <div class="field-row">
+      <label for="tts-auto-queue-threshold">待ち件数のしきい値</label>
+      <input id="tts-auto-queue-threshold" type="number" min="0" max="500" step="1" bind:value={autoQueueThreshold} class="num-input" />
+    </div>
+    <div class="field-row">
+      <label for="tts-auto-per-queued">1件あたりの加速</label>
+      <input id="tts-auto-per-queued" type="number" min="0" max="1" step="0.01" bind:value={autoPerQueued} class="num-input" />
+    </div>
+    <div class="field-row">
+      <label for="tts-auto-length-threshold">文字数のしきい値</label>
+      <input id="tts-auto-length-threshold" type="number" min="0" max="1000" step="1" bind:value={autoLengthThreshold} class="num-input" />
+      <span class="hint-inline">0 で文字数による加速なし</span>
+    </div>
+    <div class="field-row">
+      <label for="tts-auto-per-ten-chars">10文字あたりの加速</label>
+      <input id="tts-auto-per-ten-chars" type="number" min="0" max="1" step="0.01" bind:value={autoPerTenChars} class="num-input" />
+    </div>
+    <div class="field-row">
+      <label for="tts-auto-max-speed">最大速度</label>
+      <input id="tts-auto-max-speed" type="number" min="0.5" max="2" step="0.1" bind:value={autoMaxSpeed} class="num-input" />
+    </div>
+    <h4>待機上限</h4>
+    <div class="field-row">
+      <label for="tts-queue-max-pending">最大待ち件数</label>
+      <input id="tts-queue-max-pending" type="number" min="1" max="500" step="1" bind:value={queueMaxPending} class="num-input" />
+      <span class="hint-inline">超えると古い順に捨てます</span>
+    </div>
+    <div class="field-row">
+      <label for="tts-queue-max-wait">最大待ち時間(秒)</label>
+      <input id="tts-queue-max-wait" type="number" min="0" max="86400" step="1" bind:value={queueMaxWaitSec} class="num-input" />
+      <span class="hint-inline">0 で無制限</span>
     </div>
     {/if}
 
@@ -1814,6 +2016,26 @@
       <input id="tts-name-format" type="text" bind:value={nameFormat} class="id-input" placeholder="{'{name}'}" />
       <span class="hint-inline">{'{name}'}=表示名(ニックネーム優先) / {'{rawName}'}=元の名前 / {'{label}'}=ラベル。例: {'{name}さん'}</span>
     </div>
+    <div class="field-row">
+      <label for="tts-template-all">テンプレート全体</label>
+      <input id="tts-template-all" type="text" bind:value={templateAll} class="id-input" placeholder="{'{name} {text}'}" />
+    </div>
+    {#each READ_KIND_LABELS as [key, label] (key)}
+    <div class="field-row">
+      <label class="kind-check"><input id={`tts-template-on-${key}`} type="checkbox" bind:checked={templateOn[key]} class="chk" /> {label}を個別に指定</label>
+      <input
+        id={`tts-template-${key}`}
+        type="text"
+        bind:value={templateText[key]}
+        disabled={!templateOn[key]}
+        class="id-input"
+        placeholder="{'{name} {text}'}"
+      />
+    </div>
+    {/each}
+    <p class="hint">
+      {'{name}'}=名前の読み方を適用した結果 / {'{text}'}=整形済みの本文 / {'{paidText}'}=スパチャ等の金額表記。展開結果が空なら読みません。
+    </p>
     <div class="field-row">
       <label for="tts-exclude-users">読み上げ除外ユーザー</label>
       <textarea id="tts-exclude-users" rows="3" bind:value={excludeUsersText} class="id-input"></textarea>

@@ -1,15 +1,22 @@
 //! TTS(読み上げ)層 — 3バックエンドをアダプタ化する。
 //!
 //! - bouyomi  : 棒読みちゃん(TCP 127.0.0.1:50001 バイナリコマンド)
-//! - voicevox : VOICEVOX(HTTP /audio_query → /synthesis)
+//! - voicevox : VOICEVOX 互換エンジン(HTTP /audio_query → /synthesis)
 //! - webspeech: 実再生は UI 側(`speechSynthesis`)。Rust は読み上げ対象テキストを
-//!   イベントで UI に渡すだけ。
+//!   UI に渡すだけ。
 //!
-//! ルーティング: 読み上げ時は優先バックエンドへ直接 `speak()` し、失敗したら
-//! Web Speech へフォールバックする。読み上げ整形(名前/URL/絵文字/長文)もここで行う。
+//! ルーティング: `TtsDispatcher::speak` は優先バックエンドを試し、失敗したら
+//! Web Speech へフォールバックする。結果は [`SpeechOutput`] として返し、emit は
+//! 呼び出し側(ワーカー)が [`TtsSink`] 経由で行う。読み上げ整形(名前/URL/絵文字/
+//! 長文/テンプレート)もここで行う。
 
 pub mod bouyomi;
+pub mod params;
+pub mod queue;
+pub mod template;
 pub mod voicevox;
+pub mod wav;
+pub mod worker;
 
 /// max_length == 0(無制限)の場合に適用する安全上限。
 ///
@@ -22,21 +29,21 @@ const TTS_NOTICE_THROTTLE: std::time::Duration = std::time::Duration::from_secs(
 use regex::Regex;
 use serde::Serialize;
 use std::collections::VecDeque;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 
 use crate::config::{TtsBackendKind, TtsConfig, TtsDictEntry, TtsOptions};
 use crate::listeners::TtsVoiceOverride;
 use crate::model::{ChatMessage, Fragment, MessageKind};
 
-#[derive(Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct WebSpeechPayload {
-    text: String,
-    rate: f32,
-    pitch: f32,
-    volume: f32,
-    voice: String,
+pub struct WebSpeechPayload {
+    pub text: String,
+    pub rate: f32,
+    pub pitch: f32,
+    pub volume: f32,
+    pub voice: String,
 }
 
 impl WebSpeechPayload {
@@ -55,7 +62,7 @@ impl WebSpeechPayload {
     }
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct TtsNoticePayload {
     pub level: &'static str,
     pub message: String,
@@ -97,6 +104,68 @@ pub fn emit_tts_queue_state(app: &AppHandle, payload: TtsQueueStatePayload) {
     }
 }
 
+/// 読み上げ結果の送出先。本番は `AppHandle`、テストは記録実装を使う。
+pub trait TtsSink: Send + Sync {
+    fn audio(&self, wav_base64: String);
+    fn web_speech(&self, p: WebSpeechPayload);
+    fn cancel(&self);
+    fn notice(&self, level: &'static str, message: String);
+    fn queue_state(&self, p: TtsQueueStatePayload);
+}
+
+impl TtsSink for AppHandle {
+    fn audio(&self, wav_base64: String) {
+        if let Err(e) = self.emit("tts-audio", wav_base64) {
+            tracing::warn!("tts-audio emit 失敗: {e}");
+        }
+    }
+
+    fn web_speech(&self, p: WebSpeechPayload) {
+        if let Err(e) = self.emit("tts-speak", p) {
+            tracing::warn!("tts-speak emit 失敗: {e}");
+        }
+    }
+
+    fn cancel(&self) {
+        if let Err(e) = self.emit("tts-cancel", ()) {
+            tracing::warn!("tts-cancel emit 失敗: {e}");
+        }
+    }
+
+    fn notice(&self, level: &'static str, message: String) {
+        if let Err(e) = self.emit("tts-notice", TtsNoticePayload { level, message }) {
+            tracing::warn!("tts-notice emit 失敗: {e}");
+        }
+    }
+
+    fn queue_state(&self, p: TtsQueueStatePayload) {
+        emit_tts_queue_state(self, p);
+    }
+}
+
+/// `TtsDispatcher::speak` の結果。emit は呼び出し側が行う。
+#[derive(Debug, Clone, PartialEq)]
+pub enum SpeechOutput {
+    /// 読み上げ対象外、またはバックエンド無し。
+    Nothing,
+    /// 外部プロセス(棒読みちゃん)へ送信済み。UI への送出は不要。
+    Sent,
+    /// UI の Web Speech で再生させる。
+    WebSpeech(WebSpeechPayload),
+    /// UI で再生させる WAV(base64)。`duration` は WAV ヘッダから読めた時のみ。
+    Audio {
+        wav_base64: String,
+        duration: Option<Duration>,
+    },
+}
+
+/// 発話 1 件ごとの文脈。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SpeakContext {
+    /// 取り出し後のキュー残件数(自動加速に使う)。
+    pub pending: usize,
+}
+
 /// 読み上げバックエンドの共通インタフェース。
 #[allow(async_fn_in_trait)]
 pub trait TtsBackend {
@@ -112,28 +181,28 @@ pub trait TtsBackend {
 
 /// 設定に基づき読み上げを振り分けるディスパッチャ。
 ///
-/// `AppHandle` は Web Speech フォールバック時に UI へイベントを送るために持つ。
+/// `AppHandle` を持たず emit もしない。通知は `take_notices` で取り出す。
 pub struct TtsDispatcher {
     config: TtsConfig,
     dictionary: CompiledDictionary,
-    app: AppHandle,
     bouyomi: bouyomi::BouyomiBackend,
-    voicevox: voicevox::VoicevoxBackend,
+    voicevox: voicevox::VoicevoxClient,
+    notices: Vec<TtsNoticePayload>,
     last_bouyomi_notice: Option<Instant>,
     last_voicevox_notice: Option<Instant>,
 }
 
 impl TtsDispatcher {
-    pub fn new(config: TtsConfig, app: AppHandle) -> Self {
+    pub fn new(config: TtsConfig) -> Self {
         let bouyomi = Self::build_bouyomi(&config);
-        let voicevox = Self::build_voicevox(&config, &app);
+        let voicevox = Self::build_voicevox(&config);
         let dictionary = CompiledDictionary::new(&config.options.dictionary);
         TtsDispatcher {
             dictionary,
             config,
-            app,
             bouyomi,
             voicevox,
+            notices: Vec::new(),
             last_bouyomi_notice: None,
             last_voicevox_notice: None,
         }
@@ -148,8 +217,8 @@ impl TtsDispatcher {
         if !Self::same_bouyomi_config(&self.config, &config) {
             self.bouyomi = Self::build_bouyomi(&config);
         }
-        if !Self::same_voicevox_config(&self.config, &config) {
-            self.voicevox = Self::build_voicevox(&config, &self.app);
+        if self.config.options.voicevox_url != config.options.voicevox_url {
+            self.voicevox = Self::build_voicevox(&config);
         }
         if self.config.options.dictionary != config.options.dictionary {
             self.dictionary = CompiledDictionary::new(&config.options.dictionary);
@@ -168,12 +237,6 @@ impl TtsDispatcher {
             && a.bouyomi_voice == b.bouyomi_voice
     }
 
-    fn same_voicevox_config(a: &TtsConfig, b: &TtsConfig) -> bool {
-        let a = &a.options;
-        let b = &b.options;
-        a.voicevox_url == b.voicevox_url && a.voicevox_speaker == b.voicevox_speaker
-    }
-
     fn build_bouyomi(config: &TtsConfig) -> bouyomi::BouyomiBackend {
         let opt = &config.options;
         bouyomi::BouyomiBackend::new(
@@ -186,102 +249,109 @@ impl TtsDispatcher {
         )
     }
 
-    fn build_voicevox(config: &TtsConfig, app: &AppHandle) -> voicevox::VoicevoxBackend {
-        let opt = &config.options;
-        voicevox::VoicevoxBackend::new(opt.voicevox_url.clone(), opt.voicevox_speaker, app.clone())
+    fn build_voicevox(config: &TtsConfig) -> voicevox::VoicevoxClient {
+        voicevox::VoicevoxClient::new(&config.options.voicevox_url)
+    }
+
+    /// 溜まった通知(30 秒スロットル済み)を取り出す。
+    pub fn take_notices(&mut self) -> Vec<TtsNoticePayload> {
+        std::mem::take(&mut self.notices)
     }
 
     /// 1メッセージを読み上げる。整形 → 優先バックエンド → 失敗時フォールバック。
-    pub async fn speak_message(&mut self, msg: &ChatMessage) {
+    /// emit はせず、UI へ送るべき物を返す。
+    pub async fn speak(&mut self, msg: &ChatMessage, ctx: SpeakContext) -> SpeechOutput {
         if !should_speak(msg, &self.config.options) {
-            return;
+            return SpeechOutput::Nothing;
         }
         let text = self.format_for_speech(msg);
         if text.trim().is_empty() {
-            return;
+            return SpeechOutput::Nothing;
         }
 
         // TOCTOU と二重往復を避けるため、speak パスでは available() プローブを
-        // 行わず直接 speak() を試み、Err なら Web Speech へフォールバックする。
+        // 行わず直接合成を試み、Err なら Web Speech へフォールバックする。
         let voice = msg
             .listener
             .as_ref()
             .and_then(|info| info.tts_voice.as_ref());
         match self.config.backend {
-            TtsBackendKind::None => {}
-            TtsBackendKind::WebSpeech => self.emit_webspeech(&text, voice),
+            TtsBackendKind::None => SpeechOutput::Nothing,
+            TtsBackendKind::WebSpeech => self.webspeech(&text, voice),
             TtsBackendKind::Bouyomi => {
-                if let Err(e) = self
+                match self
                     .bouyomi
                     .speak_with_voice(text.clone(), voice.and_then(|v| v.bouyomi_voice))
                     .await
                 {
-                    tracing::warn!("bouyomi 読み上げ失敗→Web Speech へ: {e}");
-                    self.emit_backend_notice(
-                        TtsBackendKind::Bouyomi,
-                        format!(
-                            "棒読みちゃんで読み上げできないため Web Speech に切り替えました: {e}"
-                        ),
-                    );
-                    self.emit_webspeech(&text, voice);
+                    Ok(()) => SpeechOutput::Sent,
+                    Err(e) => {
+                        tracing::warn!("bouyomi 読み上げ失敗→Web Speech へ: {e}");
+                        self.push_backend_notice(
+                            TtsBackendKind::Bouyomi,
+                            format!(
+                                "棒読みちゃんで読み上げできないため Web Speech に切り替えました: {e}"
+                            ),
+                        );
+                        self.webspeech(&text, voice)
+                    }
                 }
             }
             TtsBackendKind::Voicevox => {
-                if let Err(e) = self
+                let opt = &self.config.options;
+                let factor =
+                    params::auto_speed_factor(&opt.auto_speed, ctx.pending, text.chars().count());
+                let resolved =
+                    params::resolve_voice_params(&opt.voicevox_params, voice, &opt.auto_speed, factor);
+                match self
                     .voicevox
-                    .speak_with_speaker(text.clone(), voice.and_then(|v| v.voicevox_speaker))
+                    .synthesize(
+                        &text,
+                        opt.voicevox_speaker,
+                        voice.and_then(|v| v.voicevox_speaker),
+                        &resolved,
+                    )
                     .await
                 {
-                    tracing::warn!("voicevox 読み上げ失敗→Web Speech へ: {e}");
-                    self.emit_backend_notice(
-                        TtsBackendKind::Voicevox,
-                        format!("VOICEVOXで読み上げできないため Web Speech に切り替えました: {e}"),
-                    );
-                    self.emit_webspeech(&text, voice);
+                    Ok(wav) => SpeechOutput::Audio {
+                        duration: wav::wav_duration(&wav),
+                        wav_base64: voicevox::base64_encode::encode(&wav),
+                    },
+                    Err(e) => {
+                        tracing::warn!("voicevox 読み上げ失敗→Web Speech へ: {e}");
+                        self.push_backend_notice(
+                            TtsBackendKind::Voicevox,
+                            format!(
+                                "VOICEVOXで読み上げできないため Web Speech に切り替えました: {e}"
+                            ),
+                        );
+                        self.webspeech(&text, voice)
+                    }
                 }
             }
         }
     }
 
-    fn emit_backend_notice(&mut self, backend: TtsBackendKind, message: String) {
+    fn push_backend_notice(&mut self, backend: TtsBackendKind, message: String) {
         let now = Instant::now();
-        let should_emit = {
-            let last_notice = match backend {
-                TtsBackendKind::Bouyomi => &mut self.last_bouyomi_notice,
-                TtsBackendKind::Voicevox => &mut self.last_voicevox_notice,
-                TtsBackendKind::None | TtsBackendKind::WebSpeech => return,
-            };
-            if last_notice
-                .map(|last| now.duration_since(last) <= TTS_NOTICE_THROTTLE)
-                .unwrap_or(false)
-            {
-                false
-            } else {
-                *last_notice = Some(now);
-                true
-            }
+        let last_notice = match backend {
+            TtsBackendKind::Bouyomi => &mut self.last_bouyomi_notice,
+            TtsBackendKind::Voicevox => &mut self.last_voicevox_notice,
+            TtsBackendKind::None | TtsBackendKind::WebSpeech => return,
         };
-
-        if !should_emit {
+        if last_notice.is_some_and(|last| now.duration_since(last) <= TTS_NOTICE_THROTTLE) {
             return;
         }
-
-        let payload = TtsNoticePayload {
+        *last_notice = Some(now);
+        self.notices.push(TtsNoticePayload {
             level: "warn",
             message,
-        };
-        if let Err(e) = self.app.emit("tts-notice", payload) {
-            tracing::warn!("tts-notice emit 失敗: {e}");
-        }
+        });
     }
 
-    /// Web Speech 用に「読み上げテキスト」を UI へ送る(実再生は UI)。
-    fn emit_webspeech(&self, text: &str, voice: Option<&TtsVoiceOverride>) {
-        let payload = WebSpeechPayload::new(text, &self.config.options, voice);
-
-        if let Err(e) = self.app.emit("tts-speak", payload) {
-            tracing::warn!("tts-speak emit 失敗: {e}");
-        }
+    /// Web Speech 用の「読み上げテキスト」(実再生は UI)。
+    fn webspeech(&self, text: &str, voice: Option<&TtsVoiceOverride>) -> SpeechOutput {
+        SpeechOutput::WebSpeech(WebSpeechPayload::new(text, &self.config.options, voice))
     }
 
     /// メッセージを読み上げ用テキストへ整形する。
@@ -319,19 +389,28 @@ impl TtsDispatcher {
 
         body = dictionary.apply(body);
 
-        // 名前には辞書を適用せず、プレースホルダは一度だけ展開する。
-        let name = if opt.read_name {
-            format_name(msg, &opt.name_format)
-        } else {
-            String::new()
-        };
-        let mut text = if name.trim().is_empty() {
+        // 手動 / 抽選 / ウェルカムはテンプレートを通さず `{text}` 固定。
+        let mut text = if is_manual_text(msg) {
             body
         } else {
-            format!("{} {}", name, body)
+            // 名前には辞書を適用せず、プレースホルダは一度だけ展開する。
+            let name = if opt.read_name {
+                format_name(msg, &opt.name_format)
+            } else {
+                String::new()
+            };
+            let paid_text = msg.amount.as_ref().map_or("", |a| a.raw_text.as_str());
+            template::render_template(
+                template::select_template(&opt.templates, msg.kind),
+                &template::TemplateVars {
+                    name: &name,
+                    text: &body,
+                    paid_text,
+                },
+            )
         };
 
-        // 長文カット(char 単位)。
+        // 長文カット(char 単位)。展開後に行う。
         // finite 指定(> 0)はユーザー意図として完全に尊重する。
         // 0(無制限)の場合も TTS_UNLIMITED_HARD_CAP を上限として適用し、
         // 巨大 IPC ペイロードを防ぐバックストップとする。
@@ -347,6 +426,11 @@ impl TtsDispatcher {
 
         text
     }
+}
+
+/// `tts_speak_text` 経由の手動・抽選・ウェルカム読み上げか。
+fn is_manual_text(msg: &ChatMessage) -> bool {
+    msg.kind == MessageKind::System && msg.id.starts_with("tts-text-")
 }
 
 /// 辞書のコンパイルは生成時と辞書更新時のみ。不正なパターンも再試行しない。
@@ -401,7 +485,7 @@ pub fn should_speak(msg: &ChatMessage, opt: &TtsOptions) -> bool {
     }
     // tts_speak_text 経由の手動・抽選・ウェルカムはコメント用フィルタの対象外。
     // 明示的なユーザーミュートだけは上で尊重する。
-    if msg.kind == MessageKind::System && msg.id.starts_with("tts-text-") {
+    if is_manual_text(msg) {
         return true;
     }
     let enabled = match msg.kind {
@@ -978,5 +1062,156 @@ mod tests {
             TtsDispatcher::format_for_speech_with_options(opt, &msg),
             "fast ファスト URL省略"
         );
+    }
+
+    fn superchat(author_name: &str, body: &str, raw_text: &str) -> ChatMessage {
+        let mut msg = message(author_name, body);
+        msg.kind = MessageKind::SuperChat;
+        msg.amount = Some(crate::model::Amount {
+            value: 500.0,
+            currency: "JPY".into(),
+            raw_text: raw_text.into(),
+        });
+        msg
+    }
+
+    #[test]
+    fn superchat_template_reads_paid_text() {
+        let mut opt = TtsOptions::default();
+        opt.templates.super_chat = Some("{name}さんから{paidText}、{text}".into());
+        let msg = superchat("太郎", "ありがとう", "¥500");
+        assert_eq!(
+            TtsDispatcher::format_for_speech_with_options(&opt, &msg),
+            "太郎さんから¥500、ありがとう"
+        );
+        // 金額が無ければ空で展開する。通常コメントは all を使う。
+        let mut no_amount = msg.clone();
+        no_amount.amount = None;
+        assert_eq!(
+            TtsDispatcher::format_for_speech_with_options(&opt, &no_amount),
+            "太郎さんから、ありがとう"
+        );
+        opt.templates.all = "{text}({paidText})".into();
+        assert_eq!(
+            TtsDispatcher::format_for_speech_with_options(&opt, &message("太郎", "やあ")),
+            "やあ()"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_kind_template_is_not_spoken() {
+        let mut config = TtsConfig {
+            backend: TtsBackendKind::WebSpeech,
+            ..TtsConfig::default()
+        };
+        config.options.templates.super_chat = Some(String::new());
+        let mut dispatcher = TtsDispatcher::new(config);
+        let msg = superchat("太郎", "ありがとう", "¥500");
+        assert_eq!(
+            dispatcher.speak(&msg, SpeakContext::default()).await,
+            SpeechOutput::Nothing
+        );
+        // 他の種別は引き続き all テンプレートで読む。
+        match dispatcher
+            .speak(&message("太郎", "こんにちは"), SpeakContext::default())
+            .await
+        {
+            SpeechOutput::WebSpeech(p) => assert_eq!(p.text, "太郎 こんにちは"),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn manual_text_ignores_templates() {
+        let mut msg = message("名前", "手動テキスト");
+        msg.id = "tts-text-1".into();
+        msg.kind = MessageKind::System;
+        let mut opt = TtsOptions::default();
+        opt.templates.all = "全体 {name} {text}".into();
+        opt.templates.system = Some(String::new());
+        assert_eq!(
+            TtsDispatcher::format_for_speech_with_options(&opt, &msg),
+            "手動テキスト"
+        );
+        // 手動以外の System はテンプレートを通す。
+        msg.id = "system-notice".into();
+        assert_eq!(TtsDispatcher::format_for_speech_with_options(&opt, &msg), "");
+        opt.templates.system = None;
+        assert_eq!(
+            TtsDispatcher::format_for_speech_with_options(&opt, &msg),
+            "全体 名前 手動テキスト"
+        );
+    }
+
+    #[tokio::test]
+    async fn voicevox_failure_returns_webspeech_output_and_notice() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let mut config = TtsConfig {
+            backend: TtsBackendKind::Voicevox,
+            ..TtsConfig::default()
+        };
+        config.options.voicevox_url = format!("http://127.0.0.1:{port}");
+        config.options.web_speech_voice = "global".into();
+        let mut dispatcher = TtsDispatcher::new(config);
+        let msg = message("太郎", "こんにちは");
+        match dispatcher.speak(&msg, SpeakContext::default()).await {
+            SpeechOutput::WebSpeech(p) => {
+                assert_eq!(p.text, "太郎 こんにちは");
+                assert_eq!(p.voice, "global");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        let notices = dispatcher.take_notices();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].level, "warn");
+        assert!(notices[0].message.contains("VOICEVOX"));
+        assert!(dispatcher.take_notices().is_empty());
+        // 30 秒以内の再失敗は通知しない(フォールバックはする)。
+        assert!(matches!(
+            dispatcher.speak(&msg, SpeakContext::default()).await,
+            SpeechOutput::WebSpeech(_)
+        ));
+        assert!(dispatcher.take_notices().is_empty());
+    }
+
+    #[tokio::test]
+    async fn listener_rate_reaches_fake_engine() {
+        let fake = voicevox::test_support::spawn_fake_engine().await;
+        let mut config = TtsConfig {
+            backend: TtsBackendKind::Voicevox,
+            ..TtsConfig::default()
+        };
+        config.options.voicevox_url = fake.url.clone();
+        config.options.voicevox_speaker = 3;
+        let mut dispatcher = TtsDispatcher::new(config);
+        let mut msg = message("太郎", "こんにちは");
+        let mut info = listener(None, false);
+        info.tts_voice = Some(TtsVoiceOverride {
+            voicevox_speaker: Some(8),
+            rate: Some(1.5),
+            pitch: Some(1.5),
+            ..TtsVoiceOverride::default()
+        });
+        msg.listener = Some(info);
+        match dispatcher.speak(&msg, SpeakContext::default()).await {
+            SpeechOutput::Audio { wav_base64, .. } => {
+                assert_eq!(wav_base64, voicevox::base64_encode::encode(b"RIFFfake"))
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(dispatcher.take_notices().is_empty());
+        let g = fake.state.lock().unwrap();
+        assert_eq!(
+            g.queries,
+            vec![("太郎 こんにちは".to_string(), "8".to_string())]
+        );
+        let (speaker, body) = &g.syntheses[0];
+        assert_eq!(speaker, "8");
+        assert!((body["speedScale"].as_f64().unwrap() - 1.5).abs() < 1e-6);
+        assert!((body["pitchScale"].as_f64().unwrap() - 0.075).abs() < 1e-6);
+        // 未設定のパラメータはエンジン値のまま。
+        assert_eq!(body["intonationScale"], serde_json::json!(1.0));
     }
 }
