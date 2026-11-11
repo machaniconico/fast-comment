@@ -113,6 +113,7 @@
 
   let saving: boolean = $state(false);
   let saveMsg: string = $state('');
+  let saveWarned: boolean = $state(false);
   let exportingCsv: boolean = $state(false);
   let csvExportPath: string = $state('');
   let csvExportMsg: string = $state('');
@@ -1067,8 +1068,10 @@
       xAuthToken: credXAuthToken.trim(),
       xCsrfToken: credXCsrfToken.trim(),
     };
+    saveWarned = false;
     try {
-      await setConfig(config);
+      const warnings = await setConfig(config);
+      saveWarned = warnings.length > 0;
       try {
         youtubeOauthStatus = await getYoutubeOauthStatus();
       } catch {
@@ -1076,14 +1079,15 @@
       }
       setNotify(config.ui.notifySound, config.ui.notifyVolume);
       onConfigSaved?.(config);
-      saveMsg = '保存しました';
+      saveMsg = saveWarned ? `保存しました(警告: ${warnings.join(' / ')})` : '保存しました';
     } catch (e) {
+      saveWarned = false;
       saveMsg = `保存に失敗しました: ${e instanceof Error ? e.message : String(e)}`;
     } finally {
       saving = false;
     }
     if (saveMsgTimer !== null) clearTimeout(saveMsgTimer);
-    saveMsgTimer = setTimeout(() => { saveMsg = ''; saveMsgTimer = null; }, 3000);
+    saveMsgTimer = setTimeout(() => { saveMsg = ''; saveMsgTimer = null; }, saveWarned ? 8000 : 3000);
   }
 
   async function onConnectYoutubeOauth() {
@@ -2534,7 +2538,7 @@
     <button class="save-btn" onclick={onSave} disabled={saving}>
       {saving ? '保存中...' : '設定を保存'}
     </button>
-    {#if saveMsg}<span class="save-ok">{saveMsg}</span>{/if}
+    {#if saveMsg}<span class={saveWarned ? 'save-warn' : 'save-ok'}>{saveMsg}</span>{/if}
   </div>
   {/if}
 </div>
@@ -2967,6 +2971,7 @@
   }
 
   .save-ok { color: #66bb6a; font-size: 12px; }
+  .save-warn { color: #ffb74d; font-size: 12px; min-width: 0; overflow-wrap: anywhere; }
 
   @media (max-width: 720px) {
     .dict-row {
