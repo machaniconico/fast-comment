@@ -2970,6 +2970,8 @@
     padding-top: 12px;
   }
 
+  /* 長い警告文でボタンが縮んで「設定を/保存」に割れないようにする */
+  .save-row .save-btn { flex-shrink: 0; white-space: nowrap; }
   .save-ok { color: #66bb6a; font-size: 12px; }
   .save-warn { color: #ffb74d; font-size: 12px; min-width: 0; overflow-wrap: anywhere; }
 
