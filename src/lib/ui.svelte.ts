@@ -80,7 +80,28 @@ function loadAlwaysOnTop(): boolean {
   }
 }
 
+/** Target of the user card (listener identity as shown on the comment). */
+export interface UserCardTarget {
+  platform: string;
+  authorId: string;
+  name: string;
+  avatarUrl?: string;
+}
+
 class UiStore {
+  userCard: UserCardTarget | null = $state(null);
+  // Initial status line for the card (e.g. a failure from a context-menu action).
+  userCardNotice: string = $state('');
+
+  openUserCard(target: UserCardTarget, notice = ''): void {
+    this.userCardNotice = notice;
+    this.userCard = target;
+  }
+
+  closeUserCard(): void {
+    this.userCard = null;
+  }
+
   activeTab: Tab = $state('comments');
   viewMode: ViewMode = $state('unified');
   showDashboard: boolean = $state(false);

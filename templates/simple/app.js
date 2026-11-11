@@ -3,6 +3,7 @@
  * No dependencies. Plain ES2020 JS.
  *
  * URL params:
+ *   ?avatar=1           show author avatar (default 0)
  *   ?template=simple
  *   ?channel=<id>
  *   ?max=8
@@ -19,6 +20,7 @@
   'use strict';
 
   const params = new URLSearchParams(location.search);
+  const SHOW_AVATAR = params.get('avatar') === '1';
   const CHANNEL_FILTER = params.get('channel') || null;
   const MAX_ROWS = positiveIntParam('max', 8);
   const TTL_MS = positiveIntParam('ttl', 12000);
@@ -94,6 +96,7 @@
     dot.className = 'platform-dot ' + (msg.platform || '');
     div.appendChild(dot);
 
+    appendAvatar(div, msg);
     const author = document.createElement('span');
     author.className = 'author';
     const color = msg.author && msg.author.displayColor;
@@ -167,6 +170,19 @@
     setTimeout(() => {
       if (el.parentNode) el.parentNode.removeChild(el);
     }, LEAVE_MS);
+  }
+
+  function appendAvatar(parent, msg) {
+    const url = msg.author && msg.author.avatarUrl;
+    if (!SHOW_AVATAR || typeof url !== 'string' || !/^https?:\/\//i.test(url)) return;
+    const img = document.createElement('img');
+    img.className = 'avatar';
+    img.alt = '';
+    img.loading = 'lazy';
+    img.referrerPolicy = 'no-referrer';
+    img.onerror = () => { img.style.display = 'none'; };
+    img.src = url;
+    parent.appendChild(img);
   }
 
   function positiveIntParam(name, fallback) {

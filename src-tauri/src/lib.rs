@@ -12,7 +12,9 @@
 //! Tauri コマンドで設定取得/更新・チャンネル追加削除・コメント非表示・OBS URL 取得を公開。
 
 pub mod bus;
+pub mod chatlog;
 pub mod config;
+pub mod listeners;
 pub mod model;
 pub mod moderation;
 pub mod sources;
@@ -56,6 +58,8 @@ const MAX_TEMPLATE_FILE_BYTES: usize = 1024 * 1024;
 pub struct AppState {
     /// 現在の設定。
     config: Mutex<AppConfig>,
+    listeners: Arc<listeners::ListenerStore>,
+    chatlog: chatlog::ChatLog,
     /// stats 集約などへ設定変更を伝える watch 送信端。
     config_tx: watch::Sender<AppConfig>,
     /// Timer overlay へ基準スナップショットを配る watch 送信端。
@@ -96,6 +100,108 @@ pub struct AppState {
     participants: Mutex<Vec<Participant>>,
     /// YouTube投稿用OAuth状態。バックグラウンド処理は持たず、操作時だけ通信する。
     youtube_auth: YoutubeAuth,
+}
+
+#[tauri::command]
+fn get_comment_log_dir(state: State<'_, AppState>) -> String {
+    chatlog::log_dir(&state.config_dir)
+        .to_string_lossy()
+        .into_owned()
+}
+
+#[tauri::command]
+async fn open_comment_log_dir(state: State<'_, AppState>) -> Result<(), String> {
+    let dir = chatlog::log_dir(&state.config_dir);
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| e.to_string())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        #[cfg(target_os = "windows")]
+        let mut command = std::process::Command::new("explorer.exe");
+        #[cfg(target_os = "macos")]
+        let mut command = std::process::Command::new("open");
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        let mut command = std::process::Command::new("xdg-open");
+        command
+            .arg(dir)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn get_listener(
+    state: State<'_, AppState>,
+    platform: String,
+    author_id: String,
+) -> Result<Option<listeners::ListenerRecord>, String> {
+    Ok(state.listeners.get(&platform, &author_id))
+}
+
+#[tauri::command]
+async fn update_listener(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    platform: String,
+    author_id: String,
+    nickname: Option<String>,
+    label: Option<String>,
+    memo: Option<String>,
+    tts_muted: bool,
+) -> Result<listeners::ListenerRecord, String> {
+    let record = state
+        .listeners
+        .update(&platform, &author_id, nickname, label, memo, tts_muted);
+    if let Err(e) = app.emit("listener-updated", &record) {
+        tracing::warn!("listener-updated emit 失敗: {e}");
+    }
+    Ok(record)
+}
+
+#[tauri::command]
+async fn set_listener_voice(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    platform: String,
+    author_id: String,
+    voice: Option<listeners::TtsVoiceOverride>,
+) -> Result<listeners::ListenerRecord, String> {
+    let record = state.listeners.set_voice(&platform, &author_id, voice);
+    if let Err(e) = app.emit("listener-updated", &record) {
+        tracing::warn!("listener-updated emit 失敗: {e}");
+    }
+    Ok(record)
+}
+
+#[tauri::command]
+async fn list_listeners(
+    state: State<'_, AppState>,
+    query: Option<String>,
+    limit: u32,
+) -> Result<Vec<listeners::ListenerRecord>, String> {
+    Ok(state.listeners.list(query.as_deref(), limit))
+}
+
+#[tauri::command]
+async fn delete_listener(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    platform: String,
+    author_id: String,
+) -> Result<bool, String> {
+    let deleted = state.listeners.delete(&platform, &author_id);
+    if deleted {
+        if let Err(e) = app.emit(
+            "listener-updated",
+            serde_json::json!({"platform": platform, "authorId": author_id, "deleted": true}),
+        ) {
+            tracing::warn!("listener-updated emit 失敗: {e}");
+        }
+    }
+    Ok(deleted)
 }
 
 /// OBS サーバの再起動に必要な実行時ハンドル。
@@ -149,6 +255,9 @@ fn try_enqueue_tts_message(
     state: &AppState,
     msg: ChatMessage,
 ) -> Result<(), mpsc::error::TrySendError<ChatMessage>> {
+    if !listeners::allows_tts(&msg) {
+        return Ok(());
+    }
     let item = TtsQueueItem::from_message(&msg);
     {
         let mut queue = state.tts_queue.lock().unwrap();
@@ -321,10 +430,13 @@ fn tts_speak_text(app: AppHandle, state: State<'_, AppState>, text: String) -> R
         .as_millis();
     let timestamp_ms = i64::try_from(epoch_millis).unwrap_or(i64::MAX);
     let msg = ChatMessage {
+        listener: None,
         id: format!("tts-text-{epoch_millis}"),
         platform: Platform::Youtube,
         channel: "system".to_string(),
         author: Author {
+            nickname: None,
+            avatar_url: None,
             id: String::new(),
             name: String::new(),
             display_color: None,
@@ -337,6 +449,7 @@ fn tts_speak_text(app: AppHandle, state: State<'_, AppState>, text: String) -> R
         timestamp_ms,
         raw: None,
         skip_tts: false,
+        injected_test: false,
     };
 
     match try_enqueue_tts_message(&app, &state, msg) {
@@ -401,13 +514,15 @@ async fn test_tts(state: State<'_, AppState>) -> Result<String, String> {
 
             match backend.speak("読み上げテストです".to_string()).await {
                 Ok(()) => {
-                    let launch_note =
-                        if matches!(launch_outcome, bouyomi::LaunchOutcome::Launched) {
-                            " (自動起動しました)"
-                        } else {
-                            ""
-                        };
-                    Ok(format!("棒読みちゃんへ送出しました ({host}:{port}){launch_note}"))
+                    let launch_note = if matches!(launch_outcome, bouyomi::LaunchOutcome::Launched)
+                    {
+                        " (自動起動しました)"
+                    } else {
+                        ""
+                    };
+                    Ok(format!(
+                        "棒読みちゃんへ送出しました ({host}:{port}){launch_note}"
+                    ))
                 }
                 Err(e) => {
                     if let Some(detail) = bouyomi::connect_error_detail(&e) {
@@ -420,12 +535,14 @@ async fn test_tts(state: State<'_, AppState>) -> Result<String, String> {
                 }
             }
         }
-        TtsBackendKind::Voicevox => {
-            Ok("現在のバックエンドは VOICEVOX です。棒読みちゃんを選択するとテストできます".to_string())
-        }
-        TtsBackendKind::WebSpeech => {
-            Ok("現在のバックエンドは Web Speech です。棒読みちゃんを選択するとテストできます".to_string())
-        }
+        TtsBackendKind::Voicevox => Ok(
+            "現在のバックエンドは VOICEVOX です。棒読みちゃんを選択するとテストできます"
+                .to_string(),
+        ),
+        TtsBackendKind::WebSpeech => Ok(
+            "現在のバックエンドは Web Speech です。棒読みちゃんを選択するとテストできます"
+                .to_string(),
+        ),
         TtsBackendKind::None => {
             Ok("現在、読み上げはOFFです。棒読みちゃんを選択するとテストできます".to_string())
         }
@@ -585,6 +702,15 @@ async fn disconnect_youtube_oauth(
     state.youtube_auth.disconnect(&client_id).await
 }
 
+/// コメントログ設定を反映する。失敗(ログ用ディレクトリを開けない等)は警告のみで、
+/// 設定保存・通知・チャンネル差分適用は止めない。ChatLog 側は設定を確定したまま
+/// writer を未オープンで残すため、次回の configure で open を再試行する。
+async fn configure_chatlog_nonfatal(chatlog: &chatlog::ChatLog, config: config::LogConfig) {
+    if let Err(err) = chatlog.configure(config).await {
+        tracing::warn!("chatlog configure failed: {err}");
+    }
+}
+
 /// 設定全体を更新して保存する。moderation/tts/obs などの実行時状態も反映する。
 ///
 /// チャンネル一覧の差分適用(追加/削除)も行う。
@@ -614,8 +740,7 @@ async fn update_config(
                     != new_config.credentials.x_auth_token.trim()
                 || current.credentials.x_csrf_token.trim()
                     != new_config.credentials.x_csrf_token.trim(),
-            current.credentials.twitch_oauth.trim()
-                != new_config.credentials.twitch_oauth.trim()
+            current.credentials.twitch_oauth.trim() != new_config.credentials.twitch_oauth.trim()
                 || current.credentials.twitch_client_id.trim()
                     != new_config.credentials.twitch_client_id.trim()
                 || current.credentials.twitch_client_secret.trim()
@@ -625,6 +750,7 @@ async fn update_config(
 
     // 保存。
     new_config.obs.normalize();
+    new_config.log.normalize();
     new_config
         .save(&state.config_dir)
         .map_err(|e| e.to_string())?;
@@ -638,6 +764,8 @@ async fn update_config(
 
     // OBS ポート反映。ポートが変わった場合は旧サーバを停止し、新ポートで再 bind する。
     restart_obs_server_if_needed(&state, new_config.obs.port)?;
+
+    configure_chatlog_nonfatal(&state.chatlog, new_config.log.clone()).await;
 
     // 差分計算用にチャンネル一覧を退避しておく。
     let desired_channels = new_config.channels.clone();
@@ -734,11 +862,7 @@ fn add_channel(
         let mut cfg = state.config.lock().unwrap();
         // 既存の同一キーがあれば重複追加しない。
         let key = AppState::channel_key(&channel);
-        if cfg
-            .channels
-            .iter()
-            .any(|c| AppState::channel_key(c) == key)
-        {
+        if cfg.channels.iter().any(|c| AppState::channel_key(c) == key) {
             return Err(format!("チャンネルは既に存在します: {key}"));
         }
         cfg.channels.push(channel.clone());
@@ -761,8 +885,7 @@ fn remove_channel(state: State<'_, AppState>, key: String) -> Result<(), String>
     // 設定から除去して保存。
     let next_config = {
         let mut cfg = state.config.lock().unwrap();
-        cfg.channels
-            .retain(|c| AppState::channel_key(c) != key);
+        cfg.channels.retain(|c| AppState::channel_key(c) != key);
         cfg.save(&state.config_dir).map_err(|e| e.to_string())?;
         cfg.clone()
     };
@@ -1008,7 +1131,8 @@ fn is_png_skin_file_name(name: &str) -> bool {
         return false;
     }
     let path = std::path::Path::new(name);
-    path.parent().is_none_or(|parent| parent.as_os_str().is_empty())
+    path.parent()
+        .is_none_or(|parent| parent.as_os_str().is_empty())
         && path
             .extension()
             .and_then(|ext| ext.to_str())
@@ -1136,14 +1260,29 @@ fn inject_test_comment(
     amount: Option<f64>,
     count: Option<u32>,
 ) -> Result<(), String> {
-    let platform = match platform.as_str() {
+    for msg in build_injected_test_messages(&platform, &name, &text, kind.as_deref(), amount, count)? {
+        let _ = state.source_tx.send(msg);
+    }
+    Ok(())
+}
+
+/// inject_test_comment が流すメッセージを組み立てる(テスト可能な純関数部分)。
+fn build_injected_test_messages(
+    platform: &str,
+    name: &str,
+    text: &str,
+    kind: Option<&str>,
+    amount: Option<f64>,
+    count: Option<u32>,
+) -> Result<Vec<ChatMessage>, String> {
+    let platform = match platform {
         "twitch" => Platform::Twitch,
         "youtube" => Platform::Youtube,
         "x" => Platform::X,
         "niconico" => Platform::Niconico,
         other => return Err(format!("不正な platform です: {other}")),
     };
-    let kind = match kind.as_deref().unwrap_or("normal") {
+    let kind = match kind.unwrap_or("normal") {
         "normal" => MessageKind::Normal,
         "superChat" => MessageKind::SuperChat,
         "membership" => MessageKind::Membership,
@@ -1170,13 +1309,17 @@ fn inject_test_comment(
         body
     };
 
+    let mut messages = Vec::with_capacity(count as usize);
     for i in 0..count {
         let value = amount.filter(|_| matches!(kind, MessageKind::SuperChat | MessageKind::Bits));
-        let msg = ChatMessage {
-            id: format!("test-{epoch_millis}-{i}"),
+        messages.push(ChatMessage {
+            listener: None,
+            id: format!("injected-test:{epoch_millis}-{i}"),
             platform,
             channel: "test".to_string(),
             author: Author {
+                nickname: None,
+                avatar_url: None,
                 id: format!("test{i}"),
                 name: author_name.to_string(),
                 display_color: None,
@@ -1193,11 +1336,10 @@ fn inject_test_comment(
             timestamp_ms: timestamp_ms.saturating_add(i64::from(i)),
             raw: None,
             skip_tts: false,
-        };
-        let _ = state.source_tx.send(msg);
+            injected_test: true,
+        });
     }
-
-    Ok(())
+    Ok(messages)
 }
 
 // ============ 内部ヘルパ ============
@@ -1319,14 +1461,7 @@ fn spawn_one_channel(_app: &AppHandle, state: &AppState, ch: &ChannelConfig) {
         return;
     }
     let key = AppState::channel_key(ch);
-    let (
-        overrides,
-        youtube_api_key,
-        x_overrides,
-        x_auth,
-        niconico_overrides,
-        twitch_viewer_auth,
-    ) = {
+    let (overrides, youtube_api_key, x_overrides, x_auth, niconico_overrides, twitch_viewer_auth) = {
         let config = state.config.lock().unwrap();
         // X の名前解決 cookie は auth_token / ct0 の両方が揃って初めて有効。
         let x_auth = {
@@ -1440,7 +1575,12 @@ fn spawn_pipeline(app: AppHandle, cancel: CancellationToken) {
                     };
 
                     // 判定はロックを短く保持して取り出す(MutexGuard を await 跨ぎで持たない)。
+                    state.listeners.observe(&mut msg);
                     let verdict = state.moderator.lock().unwrap().judge(&msg);
+                    let log_config = state.config.lock().unwrap().log.clone();
+                    if log_config.enabled && (!matches!(verdict, Verdict::Hide) || log_config.include_hidden) {
+                        state.chatlog.try_send(msg.clone(), matches!(verdict, Verdict::Hide));
+                    }
                     match verdict {
                         Verdict::Hide => continue,
                         Verdict::Highlight => {
@@ -1459,7 +1599,7 @@ fn spawn_pipeline(app: AppHandle, cancel: CancellationToken) {
                     // 読み上げは単一の長命ワーカーへ bounded channel で渡す。
                     // バースト時は try_send が Full を返すので drop し、UI/OBS 配信は止めない
                     // (背圧/有界・SPEC 設計原則2)。
-                    if !msg.skip_tts && !state.tts_paused.load(Ordering::Relaxed) {
+                    if listeners::allows_tts(&msg) && !state.tts_paused.load(Ordering::Relaxed) {
                         if let Err(mpsc::error::TrySendError::Full(_)) =
                             try_enqueue_tts_message(&app, &state, msg.clone())
                         {
@@ -1482,7 +1622,11 @@ fn spawn_pipeline(app: AppHandle, cancel: CancellationToken) {
 /// 設定は都度スナップショットを取り `update_config` で反映する(バックエンド再構築は
 /// 各 speak 内で行うが、毎メッセージのタスク spawn / 再プローブは行わない)。
 /// `speak_message` は内部で speak→Err 時に Web Speech フォールバックする(#15 と整合)。
-fn spawn_tts_worker(app: AppHandle, mut rx: mpsc::Receiver<ChatMessage>, cancel: CancellationToken) {
+fn spawn_tts_worker(
+    app: AppHandle,
+    mut rx: mpsc::Receiver<ChatMessage>,
+    cancel: CancellationToken,
+) {
     tauri::async_runtime::spawn(async move {
         let initial_cfg = {
             let state = app.state::<AppState>();
@@ -1561,7 +1705,7 @@ fn resolve_templates_dir(app: &AppHandle) -> PathBuf {
     // 開発時フォールバック候補(cwd は dev 時 src-tauri/ になりがち)。
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     for candidate in [
-        cwd.join("templates"),         // cwd=リポジトリルートの場合
+        cwd.join("templates"),            // cwd=リポジトリルートの場合
         cwd.join("..").join("templates"), // cwd=src-tauri/ の場合(dev)
     ] {
         if candidate.exists() {
@@ -1632,6 +1776,8 @@ pub fn run() {
             }
 
             let state = AppState {
+                listeners: Arc::new(listeners::ListenerStore::load(&config_dir)),
+                chatlog: chatlog::ChatLog::start(&config_dir, config.log.clone()),
                 config: Mutex::new(config.clone()),
                 config_tx,
                 timer_tx,
@@ -1658,7 +1804,25 @@ pub fn run() {
                 youtube_auth: YoutubeAuth::new()
                     .expect("YouTube投稿用HTTPクライアントの作成に失敗しました"),
             };
+            let listener_store = state.listeners.clone();
             app.manage(state);
+            let listener_cancel = app_cancel.clone();
+            tauri::async_runtime::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(5));
+                interval.tick().await;
+                loop {
+                    tokio::select! {
+                        _ = listener_cancel.cancelled() => break,
+                        _ = interval.tick() => {
+                            let store = listener_store.clone();
+                            match tauri::async_runtime::spawn_blocking(move || store.flush()).await {
+                                Ok(Ok(())) => {},
+                                result => tracing::error!("リスナー記録の保存失敗: {result:?}"),
+                            }
+                        }
+                    }
+                }
+            });
 
             if config.tts.backend == config::TtsBackendKind::Bouyomi {
                 let path = config.tts.options.bouyomi_path.trim().to_string();
@@ -1708,7 +1872,14 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            get_listener,
+            update_listener,
+            set_listener_voice,
+            list_listeners,
+            delete_listener,
             get_config,
+            get_comment_log_dir,
+            open_comment_log_dir,
             get_tts_queue_state,
             set_tts_paused,
             clear_tts_queue,
@@ -1743,6 +1914,113 @@ pub fn run() {
             check_for_update,
             open_url,
         ])
-        .run(tauri::generate_context!())
-        .expect("Tauri アプリの起動に失敗しました");
+        .build(tauri::generate_context!())
+        .expect("Tauri アプリの起動に失敗しました")
+        .run(|app, event| {
+            if matches!(event, tauri::RunEvent::Exit) {
+                let state = app.state::<AppState>();
+                state.app_cancel.cancel();
+                if let Err(e) = tauri::async_runtime::block_on(state.chatlog.shutdown()) {
+                    tracing::error!("終了時のコメントログ保存失敗: {e}");
+                }
+                if let Err(e) = state.listeners.shutdown() {
+                    tracing::error!("終了時のリスナー記録の保存失敗: {e}");
+                }
+            }
+        });
+}
+
+#[cfg(test)]
+mod followup_tests {
+    use super::*;
+
+    struct TestDir(PathBuf);
+    impl TestDir {
+        fn new(tag: &str) -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("fast-comment-{tag}-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn enabled_log() -> config::LogConfig {
+        config::LogConfig {
+            enabled: true,
+            ..config::LogConfig::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn chatlog_configure_failure_is_nonfatal_and_retried() {
+        let dir = TestDir::new("chatlog-nonfatal");
+        // logs をファイルにしてログ用ディレクトリ作成を失敗させる。
+        std::fs::write(dir.0.join("logs"), b"not a dir").unwrap();
+        let log = chatlog::ChatLog::start(
+            &dir.0,
+            config::LogConfig {
+                enabled: false,
+                ..config::LogConfig::default()
+            },
+        );
+        // 失敗しても戻り値は () で、呼び出し側(update_config)は続行する。
+        configure_chatlog_nonfatal(&log, enabled_log()).await;
+        // 実際に失敗経路を通っていること、かつワーカーは生存し再試行することを確認。
+        assert!(log.configure(enabled_log()).await.is_err());
+        std::fs::remove_file(dir.0.join("logs")).unwrap();
+        log.configure(enabled_log()).await.unwrap();
+        assert!(chatlog::log_dir(&dir.0).is_dir());
+        log.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn config_save_failure_is_still_an_error() {
+        let dir = TestDir::new("config-save-fail");
+        let file = dir.0.join("not-a-dir");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(AppConfig::default().save(&file).is_err());
+    }
+
+    #[tokio::test]
+    async fn injected_test_flag_survives_broadcast_and_clone_but_not_serde() {
+        let msgs = build_injected_test_messages("twitch", "", "", None, None, Some(2)).unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert!(msgs.iter().all(|m| m.injected_test && m.is_injected_test_comment()));
+
+        let (tx, mut rx) = broadcast::channel::<ChatMessage>(4);
+        tx.send(msgs[0].clone()).unwrap();
+        let received = rx.recv().await.unwrap();
+        assert!(received.injected_test);
+        assert!(received.clone().injected_test);
+
+        let json = serde_json::to_value(&received).unwrap();
+        assert!(json.get("injectedTest").is_none());
+        assert!(json.get("injected_test").is_none());
+        let back: ChatMessage = serde_json::from_value(json).unwrap();
+        assert!(!back.injected_test);
+    }
+
+    #[tokio::test]
+    async fn injected_test_message_is_not_recorded_as_listener() {
+        let dir = TestDir::new("injected-listener");
+        let store = listeners::ListenerStore::load(&dir.0);
+        let msgs = build_injected_test_messages("youtube", "a", "b", None, None, None).unwrap();
+        let (tx, mut rx) = broadcast::channel::<ChatMessage>(4);
+        tx.send(msgs[0].clone()).unwrap();
+        let mut msg = rx.recv().await.unwrap();
+        store.observe(&mut msg);
+        assert!(msg.listener.is_none());
+        assert!(store.list(None, 100).is_empty());
+    }
+
+    #[test]
+    fn build_injected_test_messages_rejects_bad_input() {
+        assert!(build_injected_test_messages("bogus", "", "", None, None, None).is_err());
+        assert!(build_injected_test_messages("x", "", "", Some("bogus"), None, None).is_err());
+    }
 }

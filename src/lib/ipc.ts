@@ -7,7 +7,7 @@
  * - Safe to import in a plain browser (Tauri absent): all calls are no-ops.
  */
 
-import type { ChatMessage, YoutubeReaction } from './types';
+import type { ChatMessage, ListenerRecord, ListenerUpdate, TtsVoiceOverride, YoutubeReaction } from './types';
 import { invoke as tauriInvoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { getCurrentWindow, primaryMonitor } from '@tauri-apps/api/window';
@@ -219,6 +219,23 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
 export interface TtsDictEntry {
   from: string;
   to: string;
+  regex?: boolean;
+}
+
+export interface TtsReadKinds {
+  normal?: boolean;
+  superChat?: boolean;
+  membership?: boolean;
+  bits?: boolean;
+  gift?: boolean;
+  system?: boolean;
+}
+
+/** Mirror of Rust `LogConfig` (config.rs). */
+export interface LogConfig {
+  enabled?: boolean;
+  retentionDays?: number;
+  includeHidden?: boolean;
 }
 
 export interface TtsOptions {
@@ -241,6 +258,10 @@ export interface TtsOptions {
   stripEmoji?: boolean;
   maxLength?: number;
   dictionary?: TtsDictEntry[];
+  nameFormat?: string;
+  excludeUsers?: string[];
+  readKinds?: TtsReadKinds;
+  skipCommands?: boolean;
 }
 
 export interface AppConfig {
@@ -271,6 +292,7 @@ export interface AppConfig {
     notifyVolume: number;
   };
   participation: ParticipationConfig;
+  log?: LogConfig;
   youtubeOverrides?: { apiKey?: string; clientVersion?: string; paths?: Record<string, string> };
   xOverrides?: { bearerToken?: string; endpoints?: Record<string, string> };
   // External API/chat credentials (Rust `CredentialsConfig`, serde camelCase).
@@ -441,6 +463,72 @@ export async function setConfig(config: AppConfig): Promise<void> {
 export async function setTtsPaused(paused: boolean): Promise<void> {
   await invoke<void>('set_tts_paused', { paused });
 }
+
+export async function getListener(platform: string, authorId: string): Promise<ListenerRecord | null> {
+  return invoke<ListenerRecord | null>('get_listener', { platform, authorId });
+}
+
+export async function updateListener(
+  platform: string,
+  authorId: string,
+  nickname: string | null,
+  label: string | null,
+  memo: string | null,
+  ttsMuted: boolean,
+): Promise<ListenerRecord | null> {
+  return invoke<ListenerRecord>('update_listener', { platform, authorId, nickname, label, memo, ttsMuted });
+}
+
+export async function listListeners(query: string | null, limit: number): Promise<ListenerRecord[]> {
+  return (await invoke<ListenerRecord[]>('list_listeners', { query, limit })) ?? [];
+}
+
+export async function setListenerVoice(
+  platform: string,
+  authorId: string,
+  voice: TtsVoiceOverride | null,
+): Promise<ListenerRecord | null> {
+  return invoke<ListenerRecord>('set_listener_voice', { platform, authorId, voice });
+}
+
+export async function getCommentLogDir(): Promise<string> {
+  return (await invoke<string>('get_comment_log_dir')) ?? '';
+}
+
+export async function openCommentLogDir(): Promise<void> {
+  await invoke<void>('open_comment_log_dir');
+}
+
+export async function deleteListener(platform: string, authorId: string): Promise<boolean> {
+  return (await invoke<boolean>('delete_listener', { platform, authorId })) ?? false;
+}
+
+/** Subscribe to 'listener-updated' (record upsert or `{deleted: true}`). Returns unlisten. */
+export async function startListenerUpdatedListener(handler: (u: ListenerUpdate) => void): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  return listen<ListenerUpdate>('listener-updated', (event) => handler(event.payload));
+}
+
+/** Append a value to the moderation NG list (ngUsers / ngWords) in the config. */
+export async function appendModerationValue(kind: 'ngUsers' | 'ngWords', value: string): Promise<void> {
+  const normalized = value.trim();
+  if (!normalized) return;
+
+  const config = await getConfig();
+  if (!config) return;
+
+  const current = config.moderation[kind] ?? [];
+  if (!current.includes(normalized)) {
+    config.moderation[kind] = [...current, normalized];
+    await setConfig(config);
+  }
+  // Let an open Settings form merge it into its unsaved edit state, otherwise its next save
+  // would overwrite the config with the stale list and drop this entry.
+  window.dispatchEvent(new CustomEvent<ModerationAppended>(MODERATION_APPENDED_EVENT, { detail: { kind, value: normalized } }));
+}
+
+export const MODERATION_APPENDED_EVENT = 'fc:moderation-appended';
+export type ModerationAppended = { kind: 'ngUsers' | 'ngWords'; value: string };
 
 export async function getTtsQueueState(): Promise<TtsQueueState | null> {
   return invoke<TtsQueueState>('get_tts_queue_state');

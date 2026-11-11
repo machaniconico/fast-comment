@@ -138,10 +138,13 @@ mod tests {
 
     fn message(id: &str, author_id: &str, author_name: &str, texts: &[&str]) -> ChatMessage {
         ChatMessage {
+            listener: None,
             id: id.to_string(),
             platform: Platform::Twitch,
             channel: "test-channel".to_string(),
             author: Author {
+                nickname: None,
+                avatar_url: None,
                 id: author_id.to_string(),
                 name: author_name.to_string(),
                 display_color: None,
@@ -154,6 +157,7 @@ mod tests {
             timestamp_ms: 0,
             raw: None,
             skip_tts: false,
+            injected_test: false,
         }
     }
 

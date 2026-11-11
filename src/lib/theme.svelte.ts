@@ -21,6 +21,7 @@ export interface AppearanceSnapshot {
   wrapComments: boolean;
   showViewerBadges: boolean;
   showCommentMilestones: boolean;
+  showAvatars: boolean;
 }
 
 const STORAGE_KEY = 'fc.appearance';
@@ -33,6 +34,7 @@ const DEFAULT_APPEARANCE: AppearanceSnapshot = {
   wrapComments: false,
   showViewerBadges: false,
   showCommentMilestones: false,
+  showAvatars: true,
 };
 
 function canUseLocalStorage(): boolean {
@@ -87,6 +89,9 @@ function parseAppearanceSnapshot(value: unknown): AppearanceSnapshot | null {
   const showCommentMilestonesValue = value.showCommentMilestones === undefined
     ? DEFAULT_APPEARANCE.showCommentMilestones
     : value.showCommentMilestones;
+  const showAvatarsValue = value.showAvatars === undefined
+    ? DEFAULT_APPEARANCE.showAvatars
+    : value.showAvatars;
 
   if (
     !isTheme(themeValue) ||
@@ -96,7 +101,8 @@ function parseAppearanceSnapshot(value: unknown): AppearanceSnapshot | null {
     !isViewerDisplay(viewerDisplayValue) ||
     typeof wrapCommentsValue !== 'boolean' ||
     typeof showViewerBadgesValue !== 'boolean' ||
-    typeof showCommentMilestonesValue !== 'boolean'
+    typeof showCommentMilestonesValue !== 'boolean' ||
+    typeof showAvatarsValue !== 'boolean'
   ) {
     return null;
   }
@@ -110,6 +116,7 @@ function parseAppearanceSnapshot(value: unknown): AppearanceSnapshot | null {
     wrapComments: wrapCommentsValue,
     showViewerBadges: showViewerBadgesValue,
     showCommentMilestones: showCommentMilestonesValue,
+    showAvatars: showAvatarsValue,
   };
 }
 
@@ -122,6 +129,7 @@ class ThemeStore {
   wrapComments: boolean = $state(DEFAULT_APPEARANCE.wrapComments);
   showViewerBadges: boolean = $state(DEFAULT_APPEARANCE.showViewerBadges);
   showCommentMilestones: boolean = $state(DEFAULT_APPEARANCE.showCommentMilestones);
+  showAvatars: boolean = $state(DEFAULT_APPEARANCE.showAvatars);
   systemTheme: ResolvedTheme = $state('dark');
 
   private mediaCleanup: (() => void) | null = null;
@@ -201,6 +209,11 @@ class ThemeStore {
     this.save();
   }
 
+  setShowAvatars(value: boolean): void {
+    this.showAvatars = value;
+    this.save();
+  }
+
   getSnapshot(): AppearanceSnapshot {
     return {
       theme: this.theme,
@@ -211,6 +224,7 @@ class ThemeStore {
       wrapComments: this.wrapComments,
       showViewerBadges: this.showViewerBadges,
       showCommentMilestones: this.showCommentMilestones,
+      showAvatars: this.showAvatars,
     };
   }
 
@@ -234,6 +248,7 @@ class ThemeStore {
     this.wrapComments = next.wrapComments;
     this.showViewerBadges = next.showViewerBadges;
     this.showCommentMilestones = next.showCommentMilestones;
+    this.showAvatars = next.showAvatars;
   }
 
   private save(): void {

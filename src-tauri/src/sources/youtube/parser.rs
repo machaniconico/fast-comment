@@ -607,6 +607,7 @@ fn build_message(
         .unwrap_or_else(now_ms);
 
     ChatMessage {
+        listener: None,
         id,
         platform: Platform::Youtube,
         channel: channel.to_string(),
@@ -617,6 +618,7 @@ fn build_message(
         timestamp_ms,
         raw: None,
         skip_tts: false,
+        injected_test: false,
     }
 }
 
@@ -677,12 +679,39 @@ fn parse_author(r: &Value) -> Author {
     let (roles, badges) = parse_author_badges(r.get("authorBadges"));
 
     Author {
+        nickname: None,
+        avatar_url: author_avatar_url(r),
         id,
         name,
         display_color: None, // YouTube はユーザー色を持たない(バッジ色は別途)。
         badges,
         roles,
     }
+}
+
+/// Missing/malformed thumbnails are ignored; choose the largest usable image.
+fn author_avatar_url(r: &Value) -> Option<String> {
+    let thumbnails = dig_keys(r, &["authorPhoto", "thumbnails"])?.as_array()?;
+    let (_, url) = thumbnails
+        .iter()
+        .filter_map(|thumbnail| {
+            let url = thumbnail.get("url")?.as_str()?.trim();
+            if url.is_empty() {
+                return None;
+            }
+            let width = thumbnail.get("width").and_then(Value::as_u64).unwrap_or(0);
+            let height = thumbnail
+                .get("height")
+                .and_then(Value::as_u64)
+                .unwrap_or(width);
+            Some((width.saturating_mul(height), url))
+        })
+        .max_by_key(|(size, _)| *size)?;
+    Some(if url.starts_with("//") {
+        format!("https:{url}")
+    } else {
+        url.to_string()
+    })
 }
 
 /// `authorBadges[]` から Roles と Badge を作る。
@@ -985,13 +1014,73 @@ fn now_ms() -> i64 {
 mod tests {
     use std::collections::HashMap;
 
-    use serde_json::json;
+    use serde_json::{json, Value};
 
     use super::{
         dig, extract_actions, extract_reaction_counts, extract_reactions_delta, parse_action,
         parse_runs, split_currency_value, Seg,
     };
     use crate::model::{Fragment, MessageKind, YoutubeReaction};
+
+    #[test]
+    fn author_photo_uses_largest_valid_thumbnail_and_normalizes_protocol() {
+        let action = |photo: Value| {
+            serde_json::json!({
+                "addChatItemAction": {"item": {"liveChatTextMessageRenderer": {
+                    "id": "photo-test", "authorPhoto": photo,
+                    "message": {"runs": [{"text": "hello"}]}
+                }}}
+            })
+        };
+        let message = parse_action(
+            &action(serde_json::json!({"thumbnails": [
+                {"url": "https://example.com/small.jpg", "width": 32, "height": 32},
+                {"url": "//example.com/large.jpg", "width": 128, "height": 128},
+                {"url": "https://example.com/medium.jpg", "width": 64, "height": 64},
+                {"width": 512, "height": 512}
+            ]})),
+            "video",
+        )
+        .unwrap();
+        assert_eq!(
+            message.author.avatar_url.as_deref(),
+            Some("https://example.com/large.jpg")
+        );
+        for photo in [
+            Value::Null,
+            serde_json::json!({}),
+            serde_json::json!({"thumbnails": []}),
+            serde_json::json!({"thumbnails": [{"url": ""}, {"url": 12}]}),
+            serde_json::json!({"thumbnails": "invalid"}),
+        ] {
+            assert!(parse_action(&action(photo), "video")
+                .unwrap()
+                .author
+                .avatar_url
+                .is_none());
+        }
+        let mut missing = action(Value::Null);
+        missing["addChatItemAction"]["item"]["liveChatTextMessageRenderer"]
+            .as_object_mut()
+            .unwrap()
+            .remove("authorPhoto");
+        assert!(parse_action(&missing, "video")
+            .unwrap()
+            .author
+            .avatar_url
+            .is_none());
+        let https = parse_action(
+            &action(serde_json::json!({"thumbnails": [
+                {"url": "https://example.com/photo.jpg"}
+            ]})),
+            "video",
+        )
+        .unwrap();
+        assert_eq!(
+            https.author.avatar_url.as_deref(),
+            Some("https://example.com/photo.jpg")
+        );
+    }
 
     #[test]
     fn dig_returns_value_or_none_for_missing_path() {

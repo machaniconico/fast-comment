@@ -36,7 +36,7 @@ tonic = { version = "0.12", features = ["tls", "tls-roots"] }
 prost = "0.13"
 # niconico NDGR メッセージサーバーの length-delimited Protobuf ストリーム読み
 bytes = "1"
-chrono = { version = "0.4", default-features = false, features = ["std"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 
 # OBS overlay server
 axum = { version = "0.7", features = ["ws"] }

@@ -3,6 +3,7 @@
  * No dependencies. Plain ES2020 JS.
  *
  * URL params:
+ *   ?avatar=1           show author avatar (default 0)
  *   ?template=default   (unused here, consumed by axum router)
  *   ?channel=<id>        optional filter: only show this channel
  *   ?max=8               max visible rows (default 8)
@@ -20,6 +21,7 @@
 
   // ---- Config from URL params ----
   const params = new URLSearchParams(location.search);
+  const SHOW_AVATAR = params.get('avatar') === '1';
   const CHANNEL_FILTER = params.get('channel') || null;
   const MAX_ROWS = positiveIntParam('max', 8);
   const TTL_MS   = positiveIntParam('ttl', 12000);
@@ -123,6 +125,7 @@
     });
 
     // Author name
+    appendAvatar(div, msg);
     const author = document.createElement('span');
     author.className = 'author';
     const color = msg.author && msg.author.displayColor;
@@ -202,6 +205,19 @@
     setTimeout(() => {
       if (el.parentNode) el.parentNode.removeChild(el);
     }, LEAVE_MS);
+  }
+
+  function appendAvatar(parent, msg) {
+    const url = msg.author && msg.author.avatarUrl;
+    if (!SHOW_AVATAR || typeof url !== 'string' || !/^https?:\/\//i.test(url)) return;
+    const img = document.createElement('img');
+    img.className = 'avatar';
+    img.alt = '';
+    img.loading = 'lazy';
+    img.referrerPolicy = 'no-referrer';
+    img.onerror = () => { img.style.display = 'none'; };
+    img.src = url;
+    parent.appendChild(img);
   }
 
   function positiveIntParam(name, fallback) {

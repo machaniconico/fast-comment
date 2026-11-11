@@ -199,7 +199,7 @@ impl TwitchSource {
                             // 1フレームに複数行、逆に1行が複数フレームに割れる場合もある。
                             for line in lines.push(&text) {
                                 let handled = self.handle_line(&line, tx);
-                                if handled.emitted_privmsg {
+                                if handled.emitted_privmsg || handled.emitted_usernotice {
                                     received_data = true;
                                 }
                                 if let Some(reply) = handled.reply {
@@ -253,15 +253,28 @@ impl TwitchSource {
             // Twitch は `PING :tmi.twitch.tv` を送るため trailing にトークンが入る。
             // trailing 優先、なければ params フォールバック。
             "PING" => {
-                let token = parsed.trailing.clone().or_else(|| {
-                    let j = parsed.params.join(" ");
-                    if j.is_empty() { None } else { Some(j) }
-                }).unwrap_or_default();
+                let token = parsed
+                    .trailing
+                    .clone()
+                    .or_else(|| {
+                        let j = parsed.params.join(" ");
+                        if j.is_empty() {
+                            None
+                        } else {
+                            Some(j)
+                        }
+                    })
+                    .unwrap_or_default();
                 result.reply = Some(format!("PONG :{}", token));
             }
             "PRIVMSG" => {
                 if let Some(msg) = self.privmsg_to_chat(&parsed) {
                     result.emitted_privmsg = tx.send(msg).is_ok();
+                }
+            }
+            "USERNOTICE" => {
+                if let Some(msg) = self.usernotice_to_chat(&parsed) {
+                    result.emitted_usernotice = tx.send(msg).is_ok();
                 }
             }
             // エッジ再起動の予告。接続を張り直すまでコメントは届かない。
@@ -275,6 +288,77 @@ impl TwitchSource {
         result
     }
 
+    fn usernotice_to_chat(&self, p: &IrcLine) -> Option<ChatMessage> {
+        let event = p.tags.get("msg-id").map(String::as_str).unwrap_or("");
+        // Community gifts arrive once as an aggregate and again for every recipient.
+        // Only the aggregate should affect totals, notifications and TTS.
+        if matches!(event, "subgift" | "anonsubgift")
+            && p.tags
+                .get("msg-param-community-gift-id")
+                .is_some_and(|id| !id.is_empty())
+        {
+            return None;
+        }
+        let system = p.tags.get("system-msg").cloned().unwrap_or_default();
+        let kind = match event {
+            "sub" | "resub" | "primepaidupgrade" | "giftpaidupgrade" => MessageKind::Membership,
+            "subgift" | "submysterygift" | "anonsubgift" | "anonsubmysterygift" => {
+                MessageKind::Gift
+            }
+            "raid" => MessageKind::System,
+            "announcement" => MessageKind::Normal,
+            _ if !system.is_empty() => MessageKind::System,
+            _ => return None,
+        };
+        // 共通の著者/バッジ/エモート処理。位置はユーザー本文に対するものなので
+        // system-msg はエモート分割後に先頭へ追加する。
+        let mut msg = self.privmsg_to_chat(p)?;
+        msg.kind = kind;
+        msg.amount = if kind == MessageKind::Gift {
+            let count = if matches!(event, "submysterygift" | "anonsubmysterygift") {
+                p.tags
+                    .get("msg-param-mass-gift-count")
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .unwrap_or(1)
+            } else {
+                1
+            };
+            Some(Amount {
+                value: count as f64,
+                currency: "SUBGIFT".into(),
+                raw_text: format!("{count} サブギフト"),
+            })
+        } else {
+            None
+        };
+        let mut system = system;
+        if event == "raid" {
+            if let Some(viewers) = p
+                .tags
+                .get("msg-param-viewerCount")
+                .filter(|v| !v.is_empty())
+            {
+                // system-msg が欠落/変更されても視聴者数を失わない。
+                if !system
+                    .split(|c: char| !c.is_alphanumeric() && c != '_')
+                    .any(|word| word == viewers)
+                {
+                    if !system.is_empty() {
+                        system.push(' ');
+                    }
+                    system.push_str(&format!("{viewers} viewers"));
+                }
+            }
+        }
+        if !system.is_empty() {
+            if !msg.fragments.is_empty() {
+                system.push(' ');
+            }
+            msg.fragments.insert(0, Fragment::text(system));
+        }
+        Some(msg)
+    }
+
     /// PRIVMSG を `ChatMessage` に正規化する。
     fn privmsg_to_chat(&self, p: &IrcLine) -> Option<ChatMessage> {
         // 本文: 最後のパラメータ(`:` 以降)。
@@ -282,9 +366,15 @@ impl TwitchSource {
 
         // 送信者ログイン名: prefix の `nick!user@host` の nick 部分。
         let login = p
-            .prefix
-            .as_deref()
-            .and_then(|pre| pre.split('!').next())
+            .tags
+            .get("login")
+            .filter(|s| !s.is_empty())
+            .map(String::as_str)
+            .or_else(|| {
+                (p.command == "PRIVMSG")
+                    .then(|| p.prefix.as_deref().and_then(|pre| pre.split('!').next()))
+                    .flatten()
+            })
             .unwrap_or("")
             .to_string();
 
@@ -301,16 +391,14 @@ impl TwitchSource {
             .cloned()
             .unwrap_or_else(|| login.clone());
 
-        let color = tags
-            .get("color")
-            .filter(|s| !s.is_empty())
-            .cloned();
+        let color = tags.get("color").filter(|s| !s.is_empty()).cloned();
 
         // バッジ → Roles / Badge ベクタ。
         let (roles, badges) = parse_badges(tags.get("badges").map(|s| s.as_str()).unwrap_or(""));
 
         // emotes タグから本文を Fragment 分割。
-        let fragments = split_fragments(&body, tags.get("emotes").map(|s| s.as_str()).unwrap_or(""));
+        let fragments =
+            split_fragments(&body, tags.get("emotes").map(|s| s.as_str()).unwrap_or(""));
 
         // bits タグがあれば Bits 扱い。
         let (kind, amount) = match tags.get("bits").and_then(|b| b.parse::<f64>().ok()) {
@@ -332,13 +420,13 @@ impl TwitchSource {
             .unwrap_or_else(now_ms);
 
         Some(ChatMessage {
-            id: tags
-                .get("id")
-                .cloned()
-                .unwrap_or_else(ChatMessage::new_id),
+            listener: None,
+            id: tags.get("id").cloned().unwrap_or_else(ChatMessage::new_id),
             platform: Platform::Twitch,
             channel: self.channel.clone(),
             author: Author {
+                nickname: None,
+                avatar_url: super::twitch_helix::avatar_for_user(&self.channel, &user_id),
                 id: user_id,
                 name: display_name,
                 display_color: color,
@@ -351,6 +439,7 @@ impl TwitchSource {
             timestamp_ms,
             raw: None,
             skip_tts: false,
+            injected_test: false,
         })
     }
 }
@@ -376,6 +465,7 @@ struct HandleLineResult {
     reply: Option<String>,
     /// PRIVMSG を ChatMessage に正規化し、broadcast 送信に成功したか。
     emitted_privmsg: bool,
+    emitted_usernotice: bool,
     /// サーバーから RECONNECT を受け、セッションを張り直すべきか。
     reconnect: bool,
 }
@@ -583,9 +673,7 @@ fn split_fragments(body: &str, emotes_tag: &str) -> Vec<Fragment> {
                 fragments.push(Fragment::text(text));
             }
         }
-        let url = format!(
-            "https://static-cdn.jtvnw.net/emoticons/v2/{id}/default/dark/2.0"
-        );
+        let url = format!("https://static-cdn.jtvnw.net/emoticons/v2/{id}/default/dark/2.0");
         fragments.push(Fragment::Emote { id, name, url });
         cursor = end + 1;
     }
@@ -781,10 +869,8 @@ mod tests {
             },
         ];
 
-        let fragments = split_fragments(
-            parsed.trailing.as_deref().unwrap(),
-            tag(&parsed, "emotes"),
-        );
+        let fragments =
+            split_fragments(parsed.trailing.as_deref().unwrap(), tag(&parsed, "emotes"));
         assert_eq!(fragments, expected);
 
         let msg = source()
@@ -817,8 +903,8 @@ mod tests {
     }
 
     #[test]
-    fn handle_line_emits_only_privmsg() {
-        // 通常PRIVMSGのみ送信済み扱いになり、CAP ACKや001 welcomeは無視される。
+    fn handle_line_emits_privmsg_and_usernotice_only() {
+        // USERNOTICE は専用フラグで送信済み扱いにし、無関係のコマンドは無視する。
         let (tx, mut rx) = broadcast::channel(8);
         let source = source();
 
@@ -830,8 +916,19 @@ mod tests {
         assert_eq!(emitted.kind, MessageKind::Normal);
         assert_eq!(emitted.plain_text(), "hello chat");
 
-        let cap_ack =
-            source.handle_line(":tmi.twitch.tv CAP * ACK :twitch.tv/tags twitch.tv/commands", &tx);
+        let notice = source.handle_line(
+            "@msg-id=sub;login=alice;system-msg=Alice\\ssubscribed! :tmi.twitch.tv USERNOTICE #fastcomment",
+            &tx,
+        );
+        assert!(notice.emitted_usernotice);
+        assert!(!notice.emitted_privmsg);
+        assert!(notice.reply.is_none());
+        assert_eq!(rx.try_recv().unwrap().kind, MessageKind::Membership);
+
+        let cap_ack = source.handle_line(
+            ":tmi.twitch.tv CAP * ACK :twitch.tv/tags twitch.tv/commands",
+            &tx,
+        );
         assert!(!cap_ack.emitted_privmsg);
         assert!(cap_ack.reply.is_none());
 
@@ -842,6 +939,191 @@ mod tests {
             rx.try_recv(),
             Err(broadcast::error::TryRecvError::Empty)
         ));
+    }
+
+    #[test]
+    fn usernotice_samples_preserve_kind_amount_body_and_author() {
+        // Real IRC tag layout and event-specific system messages (spaces are IRCv3 escaped).
+        let cases = [
+            ("sub", "", "", "", MessageKind::Membership, None,
+                "Alice subscribed at Tier 1.", "Alice subscribed at Tier 1."),
+            ("resub", ";msg-param-cumulative-months=12;msg-param-months=0;msg-param-sub-plan=1000", "25:0-4", " :Kappa hello",
+                MessageKind::Membership, None,
+                "Alice subscribed at Tier 1. They've subscribed for 12 months!",
+                "Alice subscribed at Tier 1. They've subscribed for 12 months! Kappa hello"),
+            ("primepaidupgrade", "", "", "", MessageKind::Membership, None,
+                "Alice converted from a Prime sub to a Tier 1 sub!", "Alice converted from a Prime sub to a Tier 1 sub!"),
+            ("giftpaidupgrade", "", "", "", MessageKind::Membership, None,
+                "Alice is continuing the Gift Sub they got from Bob!", "Alice is continuing the Gift Sub they got from Bob!"),
+            ("subgift", ";msg-param-recipient-display-name=Bob;msg-param-recipient-id=67890;msg-param-recipient-user-name=bob;msg-param-sub-plan=1000", "", "", MessageKind::Gift, Some(1),
+                "Alice gifted a Tier 1 sub to Bob!", "Alice gifted a Tier 1 sub to Bob!"),
+            ("submysterygift", ";msg-param-mass-gift-count=5;msg-param-sub-plan=1000", "", "", MessageKind::Gift, Some(5),
+                "Alice is gifting 5 Tier 1 Subs to fastcomment's community!", "Alice is gifting 5 Tier 1 Subs to fastcomment's community!"),
+            ("anonsubgift", ";msg-param-recipient-display-name=Bob;msg-param-recipient-id=67890", "", "", MessageKind::Gift, Some(1),
+                "An anonymous user gifted a Tier 1 sub to Bob!", "An anonymous user gifted a Tier 1 sub to Bob!"),
+            ("anonsubmysterygift", ";msg-param-mass-gift-count=3", "", "", MessageKind::Gift, Some(3),
+                "An anonymous user is gifting 3 Tier 1 Subs to fastcomment's community!", "An anonymous user is gifting 3 Tier 1 Subs to fastcomment's community!"),
+            ("raid", ";msg-param-displayName=Alice;msg-param-login=alice;msg-param-viewerCount=42", "", "", MessageKind::System, None,
+                "42 raiders from Alice have joined!", "42 raiders from Alice have joined!"),
+            ("announcement", ";msg-param-color=PRIMARY", "", " :hello chat", MessageKind::Normal, None,
+                "", "hello chat"),
+            ("future-event", "", "", "", MessageKind::System, None,
+                "Alice triggered a future event!", "Alice triggered a future event!"),
+        ];
+        let (tx, mut rx) = broadcast::channel(16);
+        for (event, extra, emotes, body, kind, count, system, text) in cases {
+            let anonymous = event.starts_with("anon");
+            let (login, name, id) = if anonymous {
+                ("ananonymousgifter", "AnAnonymousGifter", "274598607")
+            } else {
+                ("alice", "Alice", "12345")
+            };
+            let system = system.replace(' ', r"\s");
+            let line = format!(
+                "@badge-info=subscriber/12;badges=subscriber/12;color=#123456;display-name={name};emotes={emotes};id=notice-id;login={login};msg-id={event}{extra};room-id=111;system-msg={system};tmi-sent-ts=1700000000000;user-id={id} :tmi.twitch.tv USERNOTICE #fastcomment{body}"
+            );
+            let handled = source().handle_line(&line, &tx);
+            assert!(handled.emitted_usernotice, "{event}");
+            assert!(!handled.emitted_privmsg);
+            let msg = rx.try_recv().unwrap();
+            assert_eq!(msg.kind, kind, "{event}");
+            assert_eq!(msg.plain_text(), text, "{event}");
+            assert_eq!(msg.author.id, id);
+            assert_eq!(msg.author.name, name);
+            assert_eq!(msg.author.display_color.as_deref(), Some("#123456"));
+            assert!(msg.author.roles.subscriber);
+            assert_eq!(msg.author.badges[0].label, "subscriber/12");
+            assert_eq!(msg.timestamp_ms, 1700000000000);
+            assert_eq!(msg.amount.as_ref().map(|a| a.value as u32), count);
+            if let Some(count) = count {
+                let amount = msg.amount.unwrap();
+                assert_eq!(amount.currency, "SUBGIFT");
+                assert_eq!(amount.raw_text, format!("{count} サブギフト"));
+            }
+            if event == "resub" {
+                assert!(
+                    matches!(&msg.fragments[1], Fragment::Emote { id, name, .. } if id == "25" && name == "Kappa")
+                );
+            }
+        }
+        for line in [
+            "@msg-id=future-event :tmi.twitch.tv USERNOTICE #fastcomment :ignored",
+            ":tmi.twitch.tv NOTICE #fastcomment :ignored",
+            ":tmi.twitch.tv ROOMSTATE #fastcomment",
+            ":alice!alice@host JOIN #fastcomment",
+            ":alice!alice@host PART #fastcomment",
+            ":tmi.twitch.tv USERSTATE #fastcomment",
+        ] {
+            let handled = source().handle_line(line, &tx);
+            assert!(!handled.emitted_usernotice);
+            assert!(!handled.emitted_privmsg);
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn community_gift_recipients_are_not_emitted_or_counted_twice() {
+        let (tx, mut rx) = broadcast::channel(16);
+        for (aggregate, individual) in [
+            ("submysterygift", "subgift"),
+            ("anonsubmysterygift", "anonsubgift"),
+        ] {
+            source().handle_line(&format!(
+                "@msg-id={aggregate};msg-param-mass-gift-count=5;system-msg=Gifted\\s5\\ssubs! :tmi.twitch.tv USERNOTICE #fastcomment"
+            ), &tx);
+            assert_eq!(rx.try_recv().unwrap().amount.unwrap().value, 5.0);
+            for recipient in 0..5 {
+                let line = format!(
+                    "@msg-id={individual};msg-param-community-gift-id=community-123;msg-param-recipient-display-name=Recipient{recipient};system-msg=Gifted\\sa\\ssub! :tmi.twitch.tv USERNOTICE #fastcomment"
+                );
+                assert!(source()
+                    .usernotice_to_chat(&parse_irc_line(&line))
+                    .is_none());
+                let handled = source().handle_line(&line, &tx);
+                assert!(!handled.emitted_usernotice);
+                assert!(!handled.emitted_privmsg);
+                assert!(rx.try_recv().is_err());
+            }
+            // A missing/empty community ID still represents a standalone gift.
+            for extra in ["", ";msg-param-community-gift-id="] {
+                source().handle_line(&format!(
+                    "@msg-id={individual}{extra};system-msg=Gifted\\sa\\ssub! :tmi.twitch.tv USERNOTICE #fastcomment"
+                ), &tx);
+                let msg = rx.try_recv().unwrap();
+                assert_eq!(msg.kind, MessageKind::Gift);
+                assert_eq!(msg.amount.unwrap().value, 1.0);
+            }
+        }
+    }
+
+    #[test]
+    fn usernotice_author_does_not_fall_back_to_server_prefix() {
+        for tags in ["", ";login=;display-name="] {
+            let msg = source().usernotice_to_chat(&parse_irc_line(&format!(
+                "@msg-id=sub;user-id=42{tags};system-msg=Subscribed! :tmi.twitch.tv USERNOTICE #fastcomment"
+            ))).unwrap();
+            assert_eq!(msg.author.id, "42");
+            assert_eq!(msg.author.name, "");
+        }
+        let msg = source().usernotice_to_chat(&parse_irc_line(
+            "@msg-id=raid;login=raider;user-id=42;msg-param-viewerCount=12;system-msg=Raider\\sraids\\swith\\s12\\sviewers :tmi.twitch.tv USERNOTICE #fastcomment"
+        )).unwrap();
+        assert_eq!(msg.author.name, "raider");
+        assert_eq!(msg.author.id, "42");
+        let msg = source()
+            .privmsg_to_chat(&parse_irc_line(
+                ":alice!alice@host PRIVMSG #fastcomment :hello",
+            ))
+            .unwrap();
+        assert_eq!(msg.author.name, "alice");
+        assert_eq!(msg.author.id, "alice");
+    }
+
+    #[test]
+    fn raid_viewer_count_requires_a_whole_word() {
+        for (system, expected) in [
+            ("Raider12 is raiding!", "Raider12 is raiding! 12 viewers"),
+            (
+                "112 raiders have joined!",
+                "112 raiders have joined! 12 viewers",
+            ),
+            ("12_raider is raiding!", "12_raider is raiding! 12 viewers"),
+            (
+                "12 raiders from Alice have joined!",
+                "12 raiders from Alice have joined!",
+            ),
+            (
+                "Alice raids with (12) viewers!",
+                "Alice raids with (12) viewers!",
+            ),
+            ("", "12 viewers"),
+        ] {
+            let system = system.replace(' ', r"\s");
+            let msg = source().usernotice_to_chat(&parse_irc_line(&format!(
+                "@msg-id=raid;login=alice;msg-param-viewerCount=12;system-msg={system} :tmi.twitch.tv USERNOTICE #fastcomment"
+            ))).unwrap();
+            assert_eq!(msg.kind, MessageKind::System);
+            assert_eq!(msg.plain_text(), expected);
+        }
+    }
+
+    #[test]
+    fn avatar_hit_and_miss_do_not_delay_message_emission() {
+        let mut pending = super::super::twitch_helix::test_avatar_resolver("avatar-test");
+        let source = TwitchSource::new("avatar-test".into());
+        let (tx, mut rx) = broadcast::channel(4);
+        assert!(source.handle_line(NORMAL_PRIVMSG, &tx).emitted_privmsg);
+        assert!(rx.try_recv().unwrap().author.avatar_url.is_none());
+        assert_eq!(pending.try_recv().unwrap(), "22222");
+        source.handle_line(NORMAL_PRIVMSG, &tx);
+        assert!(rx.try_recv().unwrap().author.avatar_url.is_none());
+        assert!(pending.try_recv().is_err());
+        source.handle_line(TAGGED_BITS_PRIVMSG, &tx);
+        assert_eq!(
+            rx.try_recv().unwrap().author.avatar_url.as_deref(),
+            Some("https://example.com/avatar.png")
+        );
+        assert!(pending.try_recv().is_err());
     }
 
     #[test]
@@ -876,7 +1158,9 @@ mod tests {
         // 行の途中でフレームが切れても、CRLF が揃うまで持ち越して1行として返す。
         let mut lines = LineAssembler::default();
 
-        assert!(lines.push(":user!user@user.tmi.twitch.tv PRIVMSG #ch :hel").is_empty());
+        assert!(lines
+            .push(":user!user@user.tmi.twitch.tv PRIVMSG #ch :hel")
+            .is_empty());
         assert_eq!(
             lines.push("lo chat\r\n"),
             vec![":user!user@user.tmi.twitch.tv PRIVMSG #ch :hello chat".to_string()]

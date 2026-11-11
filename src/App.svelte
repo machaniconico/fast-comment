@@ -20,6 +20,7 @@
   import CommandPalette from './lib/components/CommandPalette.svelte';
   import CommentComposer from './lib/components/CommentComposer.svelte';
   import ShortcutHelp from './lib/components/ShortcutHelp.svelte';
+  import UserCard from './lib/UserCard.svelte';
   import Notifier from './lib/components/Notifier.svelte';
   import TtsQueuePanel from './lib/components/TtsQueuePanel.svelte';
   import { store, initStore, clearMessages } from './lib/stores.svelte';
@@ -724,6 +725,7 @@
 
   <CommandPalette />
   <ShortcutHelp />
+  <UserCard />
   <Notifier />
 </div>
 

@@ -57,6 +57,10 @@ pub struct Badge {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Author {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nickname: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar_url: Option<String>,
     pub id: String,
     pub name: String,
     /// 表示色(例 "#FF7F50")。プラットフォーム/ユーザー設定由来。
@@ -72,8 +76,14 @@ pub struct Author {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum Fragment {
-    Text { text: String },
-    Emote { id: String, name: String, url: String },
+    Text {
+        text: String,
+    },
+    Emote {
+        id: String,
+        name: String,
+        url: String,
+    },
 }
 
 impl Fragment {
@@ -118,10 +128,26 @@ pub struct YoutubeReaction {
     pub count: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListenerInfo {
+    pub comment_count: u64,
+    pub gift_count: u64,
+    pub first_seen_ms: u64,
+    pub prev_seen_ms: Option<u64>,
+    pub is_first_ever: bool,
+    pub label: Option<String>,
+    pub tts_muted: bool,
+    #[serde(default)]
+    pub tts_voice: Option<crate::listeners::TtsVoiceOverride>,
+}
+
 /// 正規化済みコメント。Source → Bus → UI/OBS を一貫して流れる単一型。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatMessage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listener: Option<ListenerInfo>,
     /// 内部一意ID(uuid v4)。重複排除/個別操作に使う。
     pub id: String,
     pub platform: Platform,
@@ -140,9 +166,17 @@ pub struct ChatMessage {
     /// 内部制御用: 表示はするが TTS には流さない。
     #[serde(skip)]
     pub skip_tts: bool,
+    /// 内部制御用: inject_test_comment が注入したテストコメント。シリアライズしない。
+    #[serde(skip)]
+    pub injected_test: bool,
 }
 
 impl ChatMessage {
+    /// inject_test_comment が立てる内部フラグ(id 接頭辞は見ない)。
+    pub fn is_injected_test_comment(&self) -> bool {
+        self.injected_test
+    }
+
     /// 本文をプレーンテキストに連結(TTS/検索用)。
     /// emote は name で埋めて境界なし連結する既存挙動を維持する。
     pub fn plain_text(&self) -> String {
@@ -173,6 +207,23 @@ impl ChatMessage {
 #[cfg(test)]
 mod tests {
     use super::YoutubeReaction;
+
+    #[test]
+    fn legacy_chat_message_without_listener_fields_deserializes() {
+        let msg: super::ChatMessage = serde_json::from_value(serde_json::json!({
+            "id": "old", "platform": "twitch", "channel": "channel",
+            "author": {"id": "user", "name": "Alice"},
+            "fragments": [], "kind": "normal", "timestampMs": 1
+        }))
+        .unwrap();
+        assert!(msg.author.nickname.is_none());
+        assert!(msg.author.avatar_url.is_none());
+        assert!(msg.listener.is_none());
+        let serialized = serde_json::to_value(&msg).unwrap();
+        assert!(serialized.get("listener").is_none());
+        assert!(serialized["author"].get("nickname").is_none());
+        assert!(serialized["author"].get("avatarUrl").is_none());
+    }
 
     #[test]
     fn youtube_reaction_serializes_for_camel_case_ipc() {

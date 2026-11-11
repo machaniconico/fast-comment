@@ -186,6 +186,10 @@ fn to_chat_message(item: LiveChatMessage, video_id: &str) -> Option<ChatMessage>
         badges.push(text_badge("member", "メンバー"));
     }
     let mut author = Author {
+        nickname: None,
+        avatar_url: author_details
+            .profile_image_url
+            .filter(|url| !url.trim().is_empty()),
         id: author_details
             .channel_id
             .or_else(|| snippet.author_channel_id.clone())
@@ -280,6 +284,7 @@ fn to_chat_message(item: LiveChatMessage, video_id: &str) -> Option<ChatMessage>
         .unwrap_or_else(ChatMessage::new_id);
 
     Some(ChatMessage {
+        listener: None,
         id,
         platform: Platform::Youtube,
         channel: video_id.to_string(),
@@ -294,6 +299,7 @@ fn to_chat_message(item: LiveChatMessage, video_id: &str) -> Option<ChatMessage>
             .unwrap_or_else(now_ms),
         raw: None,
         skip_tts: false,
+        injected_test: false,
     })
 }
 
@@ -504,6 +510,8 @@ struct LiveChatMessageAuthorDetails {
     channel_id: Option<String>,
     #[prost(string, optional, tag = "103")]
     display_name: Option<String>,
+    #[prost(string, optional, tag = "104")]
+    profile_image_url: Option<String>,
     #[prost(bool, optional, tag = "5")]
     is_chat_owner: Option<bool>,
     #[prost(bool, optional, tag = "6")]
@@ -656,6 +664,7 @@ mod tests {
                 ..Default::default()
             }),
             author_details: Some(LiveChatMessageAuthorDetails {
+                profile_image_url: Some("https://example.com/host.jpg".to_string()),
                 display_name: Some("配信者".to_string()),
                 is_chat_owner: Some(true),
                 ..Default::default()
@@ -663,6 +672,10 @@ mod tests {
         };
 
         let message = to_chat_message(item, "video-1").expect("chat message");
+        assert_eq!(
+            message.author.avatar_url.as_deref(),
+            Some("https://example.com/host.jpg")
+        );
         assert_eq!(message.id, "message-1");
         assert_eq!(message.plain_text(), "こんにちは");
         assert_eq!(message.kind, MessageKind::Normal);
@@ -818,10 +831,13 @@ mod tests {
 
     fn fixture_message(id: &str, text: &str, kind: MessageKind) -> ChatMessage {
         ChatMessage {
+            listener: None,
             id: id.to_string(),
             platform: Platform::Youtube,
             channel: "video-1".to_string(),
             author: Author {
+                nickname: None,
+                avatar_url: None,
                 id: "author-1".to_string(),
                 name: "Alice".to_string(),
                 display_color: None,
@@ -834,6 +850,7 @@ mod tests {
             timestamp_ms: 0,
             raw: None,
             skip_tts: false,
+            injected_test: false,
         }
     }
 }
