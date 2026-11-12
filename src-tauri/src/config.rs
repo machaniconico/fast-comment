@@ -641,6 +641,9 @@ pub struct UiConfig {
     /// 投げ銭を別タブで表示するか。既定 false。
     #[serde(default)]
     pub show_donation_panel: bool,
+    /// 初見コメントを別タブで表示するか。既定 false。
+    #[serde(default)]
+    pub show_first_comment_panel: bool,
     /// ハイライト一致コメント到着時に効果音で通知するか。既定 false。
     #[serde(default)]
     pub notify_sound: bool,
@@ -656,6 +659,7 @@ impl Default for UiConfig {
             youtube_member_name_green: true,
             twitch_native_style: true,
             show_donation_panel: false,
+            show_first_comment_panel: false,
             notify_sound: false,
             notify_volume: default_notify_volume(),
         }
@@ -1135,6 +1139,7 @@ mod tests {
                 youtube_member_name_green: false,
                 twitch_native_style: false,
                 show_donation_panel: true,
+                show_first_comment_panel: true,
                 notify_sound: true,
                 notify_volume: 0.8,
             },
@@ -1208,6 +1213,7 @@ mod tests {
         assert_eq!(json["welcome"]["count"].as_u64(), Some(16));
         assert_eq!(json["ui"]["maxBuffer"].as_u64(), Some(1234));
         assert_eq!(json["ui"]["showDonationPanel"].as_bool(), Some(true));
+        assert_eq!(json["ui"]["showFirstCommentPanel"].as_bool(), Some(true));
         assert_eq!(json["ui"]["notifySound"].as_bool(), Some(true));
         // f32→JSON→f64 はビット表現が変わるので近似比較する。
         assert!((json["ui"]["notifyVolume"].as_f64().expect("notifyVolume") - 0.8).abs() < 1e-6);
@@ -1418,6 +1424,7 @@ mod tests {
         assert!(cfg.ui.youtube_member_name_green);
         assert!(cfg.ui.twitch_native_style);
         assert!(!cfg.ui.show_donation_panel);
+        assert!(!cfg.ui.show_first_comment_panel);
         // 通知設定は旧 config(キー欠落)でも default に劣化する(後方互換)。
         assert!(!cfg.ui.notify_sound);
         assert_eq!(cfg.ui.notify_volume, default_notify_volume());
@@ -1502,6 +1509,7 @@ mod tests {
         assert!(cfg.ui.youtube_member_name_green);
         assert!(cfg.ui.twitch_native_style);
         assert!(!cfg.ui.show_donation_panel);
+        assert!(!cfg.ui.show_first_comment_panel);
         assert_eq!(cfg.participation, ParticipationConfig::default());
         assert_eq!(cfg.credentials, CredentialsConfig::default());
         assert_eq!(cfg.youtube_overrides, YoutubeOverrides::default());

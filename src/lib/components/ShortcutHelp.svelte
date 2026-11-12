@@ -5,6 +5,9 @@
 
   const shortcuts = [
     { keys: ['Ctrl/⌘', 'K'], label: 'コマンドパレット' },
+    { keys: ['Ctrl/⌘', 'F'], label: 'コメント検索欄にフォーカス' },
+    { keys: ['Ctrl/⌘', '+ / -'], label: '画面ズームの拡大/縮小(50〜200%)' },
+    { keys: ['Ctrl/⌘', '0'], label: '画面ズームを 100% に戻す' },
     { keys: ['?'], label: 'このヘルプ' },
     { keys: ['Esc'], label: 'パレット/メニュー/ヘルプを閉じる' },
     { keys: ['↑ ↓', 'Enter'], label: 'パレットの項目移動・実行' },

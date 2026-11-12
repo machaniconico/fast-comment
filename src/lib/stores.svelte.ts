@@ -11,6 +11,7 @@
  */
 
 import { isListenerDeleted, type ChatMessage, type ListenerUpdate, type Platform, type UiChatMessage } from './types';
+import { activeFilterCount, prependCapped, defaultDisplayFilter, isDefaultFilter, matchesDisplayFilter, normalizeDisplayFilter, type DisplayFilter } from './displayFilter';
 import { onChatBatch, startChatListener, startListenerUpdatedListener, startTtsSpeakListener, startTtsCancelListener, startTtsAudioListener, getConfig } from './ipc';
 
 const DEFAULT_MAX_BUFFER = 2000;
@@ -107,6 +108,22 @@ export function getDonationKind(msg: ChatMessage): DonationKind | null {
   return null;
 }
 
+const DISPLAY_FILTER_KEY = 'fc.displayFilter';
+/** Max entries shown in the first-comment (初見) panel. */
+const FIRST_COMMENT_PANEL_MAX = 50;
+
+/** Load the persisted display filter; any read/parse error or invalid value → default. */
+function loadDisplayFilter(): DisplayFilter {
+  if (typeof window === 'undefined') return defaultDisplayFilter();
+  try {
+    const raw = localStorage.getItem(DISPLAY_FILTER_KEY);
+    if (raw === null) return defaultDisplayFilter();
+    return normalizeDisplayFilter(JSON.parse(raw));
+  } catch {
+    return defaultDisplayFilter();
+  }
+}
+
 class CommentStore {
   // Private backing state — entries carry a precomputed search string.
   private _buf: BufEntry[] = $state([]);
@@ -136,11 +153,15 @@ class CommentStore {
   filterPlatform: Platform | 'all' = $state('all');
   searchQuery: string = $state('');
   searchMode: SearchMode = $state('text');
+  // Condition filter (visit / kind / role). Persisted; the search query is not.
+  displayFilter: DisplayFilter = $state(loadDisplayFilter());
   hiddenIds: Set<string> = $state(new Set());
   // Pinned comments: full ChatMessage objects (NOT ids) so a pinned comment
   // survives ring-buffer eviction and stays visible after it scrolls out.
   // Capped FIFO (oldest dropped) so the pinned strip never grows unbounded.
   private _pinned: UiChatMessage[] = $state([]);
+  // Session-scoped first-ever comments (newest first, capped); reset on clear.
+  private _firstComments: UiChatMessage[] = $state([]);
 
   // Derived: full unfiltered list
   readonly allMessages: UiChatMessage[] = $derived(this._msgs);
@@ -169,9 +190,11 @@ class CommentStore {
     const hidden = this.hiddenIds;
     const platform = this.filterPlatform;
     const q = this.searchQuery.trim();
+    const df = this.displayFilter;
+    const dfDefault = isDefaultFilter(df);
 
-    // Fast path: no platform filter and no search — only strip hidden.
-    if (platform === 'all' && q === '') {
+    // Fast path: no platform/condition filter and no search — only strip hidden.
+    if (platform === 'all' && q === '' && dfDefault) {
       // No hidden either: return the prebuilt msg-only array as-is (no re-scan).
       if (hidden.size === 0) return this._msgs;
       return this._buf.filter((e) => !hidden.has(e.msg.id)).map((e) => e.msg);
@@ -181,6 +204,7 @@ class CommentStore {
     for (const e of this._buf) {
       if (hidden.has(e.msg.id)) continue;
       if (platform !== 'all' && e.msg.platform !== platform) continue;
+      if (!dfDefault && !matchesDisplayFilter(e.msg, df)) continue;
       if (q !== '' && !this.matchesSearch(e.search)) continue;
       out.push(e.msg);
     }
@@ -209,6 +233,14 @@ class CommentStore {
     }
     return out;
   });
+
+  // Derived: number of active display-filter condition groups (toolbar badge).
+  readonly displayFilterCount: number = $derived(activeFilterCount(this.displayFilter));
+
+  // Derived: session-scoped first-ever comments, newest first (max 50). Kept
+  // outside the ring buffer so it survives eviction; not affected by the main
+  // comment tab's filters.
+  readonly firstCommentMessages: UiChatMessage[] = $derived(this._firstComments);
 
   // Derived: pinned comments (oldest first)
   readonly pinnedMessages: UiChatMessage[] = $derived(this._pinned);
@@ -348,6 +380,13 @@ class CommentStore {
     if (donChanged) this._donations = { byCurrency, memberships };
     if (highlightDelta) this._highlightSeq += highlightDelta;
 
+    this._firstComments = prependCapped(
+      this._firstComments,
+      incoming,
+      (e) => (e.msg.listener?.isFirstEver === true ? e.msg : null),
+      FIRST_COMMENT_PANEL_MAX,
+    );
+
     const combined = baseBuffer.concat(incoming);
     if (combined.length > this._maxBuffer) {
       this._buf = combined.slice(combined.length - this._maxBuffer);
@@ -404,6 +443,15 @@ class CommentStore {
     else this.pinMessage(msg);
   }
 
+  setDisplayFilter(f: DisplayFilter): void {
+    this.displayFilter = normalizeDisplayFilter(f);
+    try {
+      localStorage.setItem(DISPLAY_FILTER_KEY, JSON.stringify(this.displayFilter));
+    } catch {
+      // Storage quota or private-mode errors are non-fatal.
+    }
+  }
+
   setFilterPlatform(p: Platform | 'all'): void {
     this.filterPlatform = p;
   }
@@ -457,6 +505,7 @@ class CommentStore {
     // Explicit clear is a session reset, so the donation summary resets too.
     this._donations = emptyDonationSummary();
     this._pinned = [];
+    this._firstComments = [];
   }
 
   buildCsv(): string {

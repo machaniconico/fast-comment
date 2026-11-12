@@ -12,6 +12,7 @@
   import type { ContextMenuItem } from './ContextMenu.svelte';
   import CommentItem from './CommentItem.svelte';
   import { store } from '../stores.svelte';
+  import { isDefaultFilter, matchesDisplayFilter } from '../displayFilter';
   import { theme } from '../theme.svelte';
 
   interface Props {
@@ -41,10 +42,13 @@
     if (!platformFilter) return store.visibleMessages;
 
     const hidden = store.hiddenIds;
+    const df = store.displayFilter;
+    const dfDefault = isDefaultFilter(df);
     const out: ChatMessage[] = [];
     for (const msg of store.allMessages) {
       if (hidden.has(msg.id)) continue;
       if (msg.platform !== platformFilter) continue;
+      if (!dfDefault && !matchesDisplayFilter(msg, df)) continue;
       // Use the store's shared matcher so regex/text mode behaves identically
       // here as in the single-column visibleMessages path.
       if (!store.matchesSearch(messageSearchText(msg))) continue;
