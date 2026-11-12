@@ -673,6 +673,7 @@ impl NiconicoSource {
             likes: None,
             title,
             live: Some(live),
+            notice: None,
             reactions_delta: None,
             full_snapshot: false,
         };

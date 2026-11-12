@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config::{AppConfig, ChannelPlatform};
 use crate::model::{ChatMessage, Platform};
 use crate::sources::niconico::extract_live_id;
-use crate::sources::x::extract_broadcast_id;
+use crate::sources::x::x_channel_name;
 use crate::sources::youtube::{extract_video_id, is_channel_identifier};
 
 /// 接続中チャンネルに表示する補助タイトル。
@@ -51,6 +51,9 @@ pub struct ChannelStatus {
     pub viewers: Option<u32>,
     pub viewers_kind: ViewerCountKind,
     pub live: Option<bool>,
+    /// 待機中に出す状態メッセージ(cookie 未設定・認証失敗・アカウント不在など)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notice: Option<String>,
 }
 
 /// OBS Goals overlay へ送る最新統計。
@@ -128,6 +131,8 @@ pub struct YoutubeMetadataUpdate {
     pub likes: Option<u32>,
     pub title: Option<String>,
     pub live: Option<bool>,
+    /// 状態メッセージ。`live` または `notice` を持つ更新で置き換わる(None で消える)。
+    pub notice: Option<String>,
     pub reactions_delta: Option<u32>,
     /// `None` を「取得値なし」として反映する完全なメタデータスナップショットか。
     pub full_snapshot: bool,
@@ -142,6 +147,7 @@ struct MetadataState {
     likes: Option<u32>,
     title: Option<String>,
     live: Option<bool>,
+    notice: Option<String>,
 }
 
 impl Default for YoutubeMetadataUpdate {
@@ -154,6 +160,7 @@ impl Default for YoutubeMetadataUpdate {
             likes: None,
             title: None,
             live: None,
+            notice: None,
             reactions_delta: None,
             full_snapshot: false,
         }
@@ -351,6 +358,7 @@ fn build_snapshot(
             viewers: metadata.concurrent_viewers,
             viewers_kind: metadata.viewers_kind,
             live: metadata.live,
+            notice: metadata.notice.clone(),
         })
         .collect::<Vec<_>>();
     channel_status.sort_by(|a, b| {
@@ -407,6 +415,9 @@ fn merge_metadata_update(
     }
     if let Some(title) = update.title {
         entry.title = Some(title);
+    }
+    if update.live.is_some() || update.notice.is_some() {
+        entry.notice = update.notice;
     }
     if let Some(live) = update.live {
         entry.live = Some(live);
@@ -468,8 +479,8 @@ fn enabled_scope_keys(config: &AppConfig) -> HashSet<String> {
         .map(|ch| match ch.platform {
             ChannelPlatform::Twitch => format!("twitch:{}", ch.identifier),
             ChannelPlatform::Youtube => format!("youtube:{}", extract_video_id(&ch.identifier)),
-            // XSource は ChatMessage.channel に正規化済み broadcast ID を入れる。
-            ChannelPlatform::X => format!("x:{}", extract_broadcast_id(&ch.identifier)),
+            // XSource は ChatMessage.channel に正規化済み broadcast ID(アカウントモードは @handle 小文字)を入れる。
+            ChannelPlatform::X => format!("x:{}", x_channel_name(&ch.identifier)),
             // NiconicoSource も同様に正規化済み lv 番組 ID を入れる。
             ChannelPlatform::Niconico => {
                 format!("niconico:{}", extract_live_id(&ch.identifier))
@@ -504,7 +515,7 @@ fn enabled_metadata_keys(config: &AppConfig) -> HashSet<String> {
                 metadata_key(Platform::Youtube, &extract_video_id(&ch.identifier))
             }
             ChannelPlatform::X => {
-                metadata_key(Platform::X, &extract_broadcast_id(&ch.identifier))
+                metadata_key(Platform::X, &x_channel_name(&ch.identifier))
             }
             ChannelPlatform::Niconico => {
                 metadata_key(Platform::Niconico, &extract_live_id(&ch.identifier))
@@ -750,6 +761,7 @@ mod tests {
                 likes: Some(3),
                 title: Some("YouTube Live".to_string()),
                 live: Some(true),
+                notice: None,
             },
         );
         metadata.insert(
@@ -762,6 +774,7 @@ mod tests {
                 likes: None,
                 title: None,
                 live: Some(true),
+                notice: None,
             },
         );
 
@@ -863,6 +876,7 @@ mod tests {
                 likes: Some(45),
                 title: Some("Live title".to_string()),
                 live: Some(true),
+                notice: None,
                 reactions_delta: None,
                 full_snapshot: true,
             },
@@ -938,6 +952,7 @@ mod tests {
                 likes: Some(45),
                 title: Some("Live title".to_string()),
                 live: Some(true),
+                notice: None,
                 reactions_delta: None,
                 full_snapshot: true,
             },
@@ -978,5 +993,25 @@ mod tests {
             }],
             ..AppConfig::default()
         }
+    }
+
+    #[test]
+    fn notice_is_set_by_update_and_cleared_by_next_live_state() {
+        let mut metadata = HashMap::new();
+        let upd = |live, notice: Option<&str>| YoutubeMetadataUpdate {
+            platform: Platform::X,
+            channel: "@a".to_string(),
+            live,
+            notice: notice.map(str::to_string),
+            ..YoutubeMetadataUpdate::default()
+        };
+        merge_metadata_update(&mut metadata, upd(Some(false), Some("msg")));
+        let key = metadata_key(Platform::X, "@a");
+        assert_eq!(metadata[&key].notice.as_deref(), Some("msg"));
+        // live を持たない更新(視聴者数ポーリング等)では消えない。
+        merge_metadata_update(&mut metadata, upd(None, None));
+        assert_eq!(metadata[&key].notice.as_deref(), Some("msg"));
+        merge_metadata_update(&mut metadata, upd(Some(true), None));
+        assert_eq!(metadata[&key].notice, None);
     }
 }

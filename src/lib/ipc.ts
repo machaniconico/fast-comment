@@ -472,6 +472,7 @@ export interface ChannelStatus {
   viewers?: number | null;
   viewersKind?: 'concurrent' | 'cumulative' | null;
   live?: boolean | null;
+  notice?: string | null;
 }
 
 export interface StatsSnapshot {

@@ -101,6 +101,7 @@ pub fn spawn_metadata_poller(
                         likes: values.likes,
                         title: values.title,
                         live: None,
+                        notice: None,
                         reactions_delta: None,
                         full_snapshot: true,
                     };

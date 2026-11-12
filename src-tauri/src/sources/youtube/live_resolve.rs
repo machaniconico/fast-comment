@@ -245,6 +245,7 @@ async fn send_live_status(
         likes: None,
         title: None,
         live: Some(live),
+        notice: None,
         reactions_delta: None,
         full_snapshot: false,
     };
