@@ -17,7 +17,7 @@ Twitch / YouTube のライブコメントを1つの画面に集約し、OBS オ�
 - **投げ銭の別表示** — SuperChat / Bits / メンバーシップを通常コメントと分けて表示（アプリ内タブ / OBS `?only=gift`）。既定OFF
 - **参加型配信の管理** — キーワード(既定「参加」)での参加登録、先着/ランダム抽選、専用タブ。既定OFF
 - **運営コメント投稿** — Twitch / YouTube Liveへ配信者・運営アカウントとして投稿。YouTubeは公式Data API + PKCE認証を使い、更新トークンをOS資格情報ストアへ保管
-- **モデレーション(ローカル)** — NGワード/NGユーザー(正規表現)・ハイライトルール。ローカル非表示/グレー化に加え、YouTube は配信側のコメント削除・タイムアウト・BAN（P6 Phase 1、要Google接続）。Twitch は P6 Phase 2 予定
+- **モデレーション(ローカル)** — NGワード/NGユーザー(正規表現)・ハイライトルール。ローカル非表示/グレー化に加え、YouTube は配信側のコメント削除・タイムアウト・BAN（P6 Phase 1、要Google接続）。Twitch も同様に配信側のコメント削除・タイムアウト・BAN・BAN解除に対応（Device Code ログイン、要 Twitch クライアントID）
 - **コマンドパレット** — `Ctrl+K` でアクション実行・設定ジャンプ・コメント検索
 - **コメントピン留め / キーワード通知音** — 重要コメントの固定表示、一致コメント到着時の効果音通知
 - **起動時の更新チェック** — GitHub Releases の最新タグを semver 比較し、新版があれば通知バナーを表示
@@ -82,6 +82,8 @@ Twitch の同時接続数をヘッダーに表示するには、dev.twitch.tv �
 
 YouTubeへ運営コメントを投稿する場合は、Google CloudでYouTube Data API v3を有効にし、OAuthクライアントを種類「デスクトップアプリ」で作成します。設定画面にクライアントIDを貼り付けて「Googleに接続」を実行してください。クライアントシークレットは不要で、Googleの更新トークンは`config.json`ではなくOSの資格情報ストアへ保存されます。認証・配信探索・投稿はユーザー操作時だけ動作し、コメント受信ループへの常駐処理追加はありません。
 
+Twitchの配信側モデレーション（コメント削除・タイムアウト・BAN・BAN解除）を使う場合は、設定画面にTwitchクライアントIDを入力して保存し、「Twitch モデレーション」の「Twitch にログイン」を押します。表示されたコードをブラウザで入力して許可します（Device Code ログイン）。必要スコープは `moderator:manage:banned_users` と `moderator:manage:chat_messages` です。Twitch開発者コンソールで、既存アプリのDevice Code Grantが使える必要があります。更新トークンはOSの資格情報ストアへ保存されます。操作対象のチャンネルでモデレーター（または配信者）である必要があります。
+
 ## ロードマップ
 
 - [x] P0 足場（設定/モデル/Tauri・Svelte雛形/ビルド導線）
@@ -90,7 +92,7 @@ YouTubeへ運営コメントを投稿する場合は、Google CloudでYouTube Da
 - [x] P3 OBS（axum WS + テンプレート）
 - [x] P4 TTS（3バックエンド + ルーティング）
 - [x] P5 モデレーション + 設定UI仕上げ
-- [ ] P6 OAuth実モデレーション / テンプレ編集UI / niconico等の追加Source
+- [ ] P6 OAuth実モデレーション(YouTube / Twitch 実装済み) / テンプレ編集UI / niconico等の追加Source
 
 ## ライセンス
 

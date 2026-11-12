@@ -22,6 +22,7 @@ export interface ModerationError {
 
 export interface ModerationAuth {
   youtubeConnected: boolean;
+  twitchConnected?: boolean;
 }
 
 export interface ModerationTargetMessage {
@@ -44,6 +45,8 @@ export interface ModerationAvailability {
   delete: ActionAvailability;
   timeout: ActionAvailability;
   ban: ActionAvailability;
+  /** Twitch: always available when ban is. YouTube: mirrors ban (only the user card offers it). */
+  unban: ActionAvailability;
 }
 
 /** Timeout presets in seconds, shared by the user card. */
@@ -51,7 +54,8 @@ export const TIMEOUT_PRESETS: readonly number[] = [60, 600, 3600, 86400];
 /** Context-menu quick timeout (seconds). */
 export const QUICK_TIMEOUT_SECS = 600;
 
-export const TWITCH_PENDING_REASON = 'Twitch のモデレーションは次の更新で対応';
+export const TWITCH_DELETE_UNSUPPORTED_REASON = 'このコメントはメッセージIDが無いため削除できません';
+export const TWITCH_NOT_CONNECTED_REASON = '設定で Twitch モデレーションにログインしてください';
 export const DELETE_UNSUPPORTED_REASON =
   'この受信方式のコメントは削除できません(YouTube API キー設定時の受信分のみ)';
 
@@ -60,11 +64,12 @@ const HIDDEN: ModerationAvailability = {
   delete: { enabled: false },
   timeout: { enabled: false },
   ban: { enabled: false },
+  unban: { enabled: false },
 };
 
 function allDisabled(reason: string): ModerationAvailability {
   const a = { enabled: false, reason };
-  return { visible: true, delete: a, timeout: a, ban: a };
+  return { visible: true, delete: a, timeout: a, ban: a, unban: a };
 }
 
 export function moderationAvailability(
@@ -74,19 +79,25 @@ export function moderationAvailability(
   const platform = msg.platform.trim().toLowerCase();
   if (msg.kind === 'system') return HIDDEN;
   if (platform !== 'youtube' && platform !== 'twitch') return HIDDEN;
-  if (platform === 'twitch') return allDisabled(TWITCH_PENDING_REASON);
-  if (!auth.youtubeConnected) return allDisabled('設定で YouTube(Google アカウント)に接続してください');
+  const isTwitch = platform === 'twitch';
+  if (isTwitch ? auth.twitchConnected !== true : !auth.youtubeConnected) {
+    return allDisabled(isTwitch ? TWITCH_NOT_CONNECTED_REASON : '設定で YouTube(Google アカウント)に接続してください');
+  }
   if (!msg.author.id) return allDisabled('投稿者を特定できません');
   const roles = msg.author.roles;
   if (roles.broadcaster || roles.moderator) return allDisabled('配信者・モデレーターは対象外');
 
   const ok = { enabled: true };
-  const canDelete = msg.nativeId === true && msg.id.startsWith('LCC.');
+  // YouTube: only official-stream ids (`LCC.`). Twitch: the IRC `id` tag (nativeId).
+  const canDelete = msg.nativeId === true && (isTwitch ? msg.id !== '' : msg.id.startsWith('LCC.'));
   return {
     visible: true,
-    delete: canDelete ? ok : { enabled: false, reason: DELETE_UNSUPPORTED_REASON },
+    delete: canDelete
+      ? ok
+      : { enabled: false, reason: isTwitch ? TWITCH_DELETE_UNSUPPORTED_REASON : DELETE_UNSUPPORTED_REASON },
     timeout: ok,
     ban: ok,
+    unban: ok,
   };
 }
 

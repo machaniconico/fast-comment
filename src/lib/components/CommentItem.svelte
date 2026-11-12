@@ -253,6 +253,14 @@
         title: avail.ban.reason,
         action: () => moderation.requestBan(target, menuReturnFocus),
       },
+      ...(message.platform.trim().toLowerCase() === 'twitch'
+        ? [{
+            label: 'BAN解除',
+            disabled: !avail.unban.enabled,
+            title: avail.unban.reason,
+            action: () => moderation.unban(target),
+          }]
+        : []),
     ];
   }
 

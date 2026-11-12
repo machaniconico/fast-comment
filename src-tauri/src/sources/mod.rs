@@ -6,7 +6,9 @@
 
 pub mod niconico;
 pub mod twitch;
+pub mod twitch_auth;
 pub mod twitch_helix;
+pub mod twitch_moderation;
 pub mod twitch_send;
 pub mod x;
 pub mod x_live;

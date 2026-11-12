@@ -27,7 +27,8 @@ export type SettingsAnchor =
   | 'notify'
   | 'danmaku'
   | 'portability'
-  | 'youtubeOauth';
+  | 'youtubeOauth'
+  | 'twitchOauth';
 
 /** Maps a SettingsAnchor to the DOM id rendered on the matching <section>. */
 export const SETTINGS_ANCHOR_IDS: Record<SettingsAnchor, string> = {
@@ -41,6 +42,7 @@ export const SETTINGS_ANCHOR_IDS: Record<SettingsAnchor, string> = {
   danmaku: 'settings-danmaku',
   portability: 'settings-portability',
   youtubeOauth: 'settings-youtube-low-latency',
+  twitchOauth: 'settings-twitch-moderation',
 };
 
 /** localStorage key for persisting recent command ids. */

@@ -405,6 +405,20 @@ export interface YoutubeOauthStatus {
   channelTitle?: string | null;
 }
 
+/** Device Code Flow の案内。verificationUri をブラウザで開き、userCode を入力する。 */
+export interface TwitchDeviceLogin {
+  userCode: string;
+  verificationUri: string;
+  expiresInSecs: number;
+}
+
+export interface TwitchOauthStatus {
+  configured: boolean;
+  connected: boolean;
+  login: string | null;
+  scopesOk: boolean;
+}
+
 export interface GoalsConfig {
   enabled: boolean;
   showInApp: boolean;
@@ -762,6 +776,28 @@ export async function disconnectYoutubeOauth(): Promise<YoutubeOauthStatus> {
     connected: false,
     channelTitle: null,
   };
+}
+
+export async function getTwitchOauthStatus(): Promise<TwitchOauthStatus | null> {
+  return invoke<TwitchOauthStatus>('get_twitch_oauth_status');
+}
+
+/** Starts Device Code Flow and opens the verification page in the system browser. */
+export async function beginTwitchLogin(): Promise<TwitchDeviceLogin | null> {
+  return invoke<TwitchDeviceLogin>('begin_twitch_login');
+}
+
+/** Resolves when the device login completes, expires, or is cancelled. */
+export async function awaitTwitchLogin(): Promise<TwitchOauthStatus | null> {
+  return invoke<TwitchOauthStatus>('await_twitch_login');
+}
+
+export async function cancelTwitchLogin(): Promise<void> {
+  await invoke<void>('cancel_twitch_login');
+}
+
+export async function disconnectTwitchOauth(): Promise<TwitchOauthStatus | null> {
+  return invoke<TwitchOauthStatus>('disconnect_twitch_oauth');
 }
 
 /** Stream-side moderation. Rejects with `{code, message}` (see moderationActions.ts toModerationError). */

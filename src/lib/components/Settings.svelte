@@ -2,12 +2,13 @@
   import { onMount, onDestroy, untrack } from 'svelte';
   import type {
     AppConfig, EffectRule, EffectsConfig, GoalsConfig, InjectTestCommentOptions, TtsDictEntry, TtsOptions,
-    TimerConfig, WelcomeConfig, YoutubeOauthStatus, ModerationAppended
+    TimerConfig, WelcomeConfig, YoutubeOauthStatus, ModerationAppended, TwitchOauthStatus, TwitchDeviceLogin
   } from '../ipc';
   import {
     getConfig, setConfig, getObsUrl, getObsGoalsUrl, getObsTimerUrl, exportCommentsCsv, injectTestComment,
     setTtsPaused, clearTtsQueue, skipCurrentTts, testTts, probeTtsEngine, getYoutubeOauthStatus,
-    connectYoutubeOauth, disconnectYoutubeOauth, getGoalSkinInfo, openUrl,
+    connectYoutubeOauth, disconnectYoutubeOauth, getTwitchOauthStatus, beginTwitchLogin,
+    awaitTwitchLogin, cancelTwitchLogin, disconnectTwitchOauth, getGoalSkinInfo, openUrl,
     getCommentLogDir, openCommentLogDir, listListeners, deleteListener, MODERATION_APPENDED_EVENT
   } from '../ipc';
   import {
@@ -149,6 +150,16 @@
   let youtubeOauthBusy: boolean = $state(false);
   let youtubeOauthMsg: string = $state('');
   let youtubeOauthOk: boolean | null = $state(null);
+  let twitchOauthStatus: TwitchOauthStatus | null = $state(null);
+  let twitchLogin: TwitchDeviceLogin | null = $state(null);
+  let twitchBusy: boolean = $state(false);
+  let twitchMsg: string = $state('');
+  let twitchOk: boolean | null = $state(null);
+  let twitchCodeCopied: boolean = $state(false);
+  // この画面が開始したログインの番号と破棄フラグ。古い await の結果で状態を更新しない。
+  let twitchLoginAttempt = 0;
+  let twitchLoginPending = false;
+  let destroyed = false;
 
   // Scroll to settings section when the command palette sets a settingsAnchor.
   // Gate on `config`: the tts/obs/moderation sections live inside {#if config},
@@ -384,6 +395,8 @@
       youtubeOauthOk = false;
     }
 
+    await refreshTwitchOauth();
+
     const url = await getObsUrl();
     obsBaseUrl = url ?? 'http://127.0.0.1:11180/?template=default';
     obsGoalsBaseUrl = await getObsGoalsUrl();
@@ -398,6 +411,12 @@
   });
 
   onDestroy(() => {
+    destroyed = true;
+    if (twitchLoginPending) {
+      twitchLoginPending = false;
+      // 自分が開始したログイン待機を止め、Rust 側のポーリングを残さない。
+      cancelTwitchLogin().catch(() => {});
+    }
     if (saveMsgTimer !== null) clearTimeout(saveMsgTimer);
     if (copiedObsTimer !== null) clearTimeout(copiedObsTimer);
     if (copiedGiftObsTimer !== null) clearTimeout(copiedGiftObsTimer);
@@ -1190,6 +1209,8 @@
       } catch {
         // Saving succeeded; a credential-store status failure should not report save failure.
       }
+      // client_id の変更で Twitch 側も未接続になり得るので、こちらも取り直す。
+      await refreshTwitchOauth();
       setNotify(config.ui.notifySound, config.ui.notifyVolume);
       onConfigSaved?.(config);
       saveMsg = saveWarned ? `保存しました(警告: ${warnings.join(' / ')})` : '保存しました';
@@ -1255,6 +1276,94 @@
     } finally {
       youtubeOauthBusy = false;
     }
+  }
+
+  async function refreshTwitchOauth() {
+    try {
+      twitchOauthStatus = await getTwitchOauthStatus();
+      moderation.setTwitchConnected(twitchOauthStatus?.connected === true);
+    } catch (e) {
+      twitchMsg = e instanceof Error ? e.message : String(e);
+      twitchOk = false;
+    }
+  }
+
+  async function onTwitchLogin() {
+    if (twitchBusy || credTwitchClientId.trim() === '') return;
+    twitchBusy = true;
+    twitchMsg = '';
+    twitchOk = null;
+    twitchCodeCopied = false;
+    const attempt = ++twitchLoginAttempt;
+    const stale = () => destroyed || attempt !== twitchLoginAttempt;
+    twitchLoginPending = true;
+    try {
+      const login = await beginTwitchLogin();
+      if (stale()) return;
+      twitchLogin = login;
+      const status = await awaitTwitchLogin();
+      // 接続状態は共有なので、画面が閉じた後でも Rust の結果に揃える。
+      moderation.setTwitchConnected(status?.connected === true);
+      if (stale()) return;
+      twitchOauthStatus = status;
+      twitchMsg = status?.connected ? 'Twitch に接続しました' : '';
+      twitchOk = status?.connected ? true : null;
+    } catch (e) {
+      if (stale()) {
+        // 取消で保存済みの認証が巻き戻ることがあるので、共有状態だけ取り直す。
+        try {
+          moderation.setTwitchConnected((await getTwitchOauthStatus())?.connected === true);
+        } catch {
+          // The component is gone; nothing to report.
+        }
+        return;
+      }
+      twitchMsg = typeof e === 'string' ? e : e instanceof Error ? e.message : String(e);
+      twitchOk = false;
+      await refreshTwitchOauth();
+    } finally {
+      if (attempt === twitchLoginAttempt) twitchLoginPending = false;
+      if (!stale()) {
+        twitchLogin = null;
+        twitchBusy = false;
+      }
+    }
+  }
+
+  async function onCancelTwitchLogin() {
+    try {
+      await cancelTwitchLogin();
+    } catch {
+      // The pending await reports the final outcome.
+    }
+  }
+
+  async function onDisconnectTwitchOauth() {
+    if (twitchBusy) return;
+    twitchBusy = true;
+    twitchMsg = '';
+    twitchOk = null;
+    try {
+      twitchOauthStatus = await disconnectTwitchOauth();
+      moderation.setTwitchConnected(twitchOauthStatus?.connected === true);
+      twitchMsg = 'このPCの Twitch 接続情報を削除しました';
+      twitchOk = true;
+    } catch (e) {
+      twitchMsg = typeof e === 'string' ? e : e instanceof Error ? e.message : String(e);
+      twitchOk = false;
+      // keyring の削除に失敗してもアプリ内では切断済みなので、表示と共有状態を揃える。
+      await refreshTwitchOauth();
+    } finally {
+      twitchBusy = false;
+    }
+  }
+
+  function onCopyTwitchCode() {
+    if (!twitchLogin) return;
+    copyText(twitchLogin.userCode, () => {
+      twitchCodeCopied = true;
+      setTimeout(() => { twitchCodeCopied = false; }, 1500);
+    });
   }
 
   function copyText(text: string, markCopied: () => void) {
@@ -1734,6 +1843,70 @@
         つまずいたときは <code>docs/TWITCH_VIEWER_COUNT.md</code> に詳しい手順とトラブルシュートがあります。
       </p>
     </details>
+    <div class="youtube-oauth-card twitch-mod-card" id="settings-twitch-moderation">
+      <div class="oauth-card-head">
+        <span class="credential-subhead">Twitch モデレーション</span>
+        <span
+          class="oauth-status"
+          class:oauth-status--connected={twitchOauthStatus?.connected === true}
+          class:oauth-status--unknown={twitchOauthStatus === null}
+        >
+          <span class="oauth-status-dot" aria-hidden="true"></span>
+          {twitchOauthStatus?.connected
+            ? `${twitchOauthStatus.login ?? 'Twitch接続済み'} で操作`
+            : twitchOauthStatus === null ? '確認中' : '未接続'}
+        </span>
+      </div>
+      {#if twitchOauthStatus?.connected && !twitchOauthStatus.scopesOk}
+        <p class="oauth-result oauth-result--error" role="alert">権限が不足しています。再ログインしてください</p>
+      {/if}
+      {#if twitchLogin}
+        <div class="twitch-device-code">
+          <span class="twitch-device-code-label">ブラウザで次のコードを入力してください</span>
+          <div class="twitch-device-code-row">
+            <code class="twitch-device-code-value">{twitchLogin.userCode}</code>
+            <button type="button" class="copy-btn" onclick={onCopyTwitchCode}>{twitchCodeCopied ? 'コピーしました' : 'コピー'}</button>
+          </div>
+          <span class="hint">
+            {twitchLogin.verificationUri} を開いて入力し、許可します(ブラウザは自動で開きます。約{Math.max(1, Math.round(twitchLogin.expiresInSecs / 60))}分以内)。
+          </span>
+        </div>
+      {/if}
+      <div class="field-row oauth-actions">
+        {#if twitchBusy && twitchLogin}
+          <button type="button" class="copy-btn oauth-disconnect-btn" onclick={onCancelTwitchLogin}>取消</button>
+        {:else if twitchOauthStatus?.connected}
+          <button type="button" class="export-btn youtube-connect-btn" onclick={onTwitchLogin} disabled={twitchBusy || credTwitchClientId.trim() === ''}>再ログイン</button>
+          <button type="button" class="copy-btn oauth-disconnect-btn" onclick={onDisconnectTwitchOauth} disabled={twitchBusy}>切断</button>
+        {:else}
+          <button
+            type="button"
+            class="export-btn youtube-connect-btn"
+            onclick={onTwitchLogin}
+            disabled={twitchBusy || credTwitchClientId.trim() === ''}
+          >
+            {twitchBusy ? '準備中…' : 'Twitch にログイン'}
+          </button>
+        {/if}
+        {#if credTwitchClientId.trim() === ''}
+          <span class="oauth-result oauth-result--error">Twitch クライアントIDを入力してください</span>
+        {:else if twitchMsg}
+          <span
+            class="oauth-result"
+            class:oauth-result--ok={twitchOk === true}
+            class:oauth-result--error={twitchOk === false}
+            role="status"
+            aria-live="polite"
+          >{twitchMsg}</span>
+        {/if}
+      </div>
+      <p class="hint">
+        コメントの削除・タイムアウト・BANに使います。クライアントIDを保存してからログインしてください。
+        必要な権限は moderator:manage:banned_users と moderator:manage:chat_messages です。
+        Twitch 開発者コンソールで、既存アプリの Device Code Grant が使えることが前提です。
+        更新トークンは config.json ではなく OSの資格情報ストアへ保存します。
+      </p>
+    </div>
     <div class="field-row">
       <label for="cred-x-auth-token">X auth_token</label>
       <input
@@ -2894,6 +3067,20 @@
     font-size: 12px;
     font-weight: 700;
     letter-spacing: 0.04em;
+  }
+
+  .twitch-mod-card { margin-top: 12px; }
+  .twitch-device-code { display: flex; flex-direction: column; gap: 6px; margin: 8px 0; }
+  .twitch-device-code-label { font-size: 12px; color: #bdbdbd; }
+  .twitch-device-code-row { display: flex; align-items: center; gap: 10px; }
+  .twitch-device-code-value {
+    font-size: 26px;
+    font-weight: 700;
+    letter-spacing: 0.18em;
+    padding: 4px 12px;
+    background: #1e1e1e;
+    border-radius: 6px;
+    user-select: all;
   }
 
   .twitch-credential-head {
