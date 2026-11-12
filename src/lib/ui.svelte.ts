@@ -10,7 +10,9 @@
  * singleton so any component can import `ui` and read/write reactively.
  */
 
-export type Tab = 'comments' | 'donations' | 'participation' | 'settings';
+import { ZOOM_DEFAULT, clampZoom, normalizeZoom, stepZoom, type ZoomAction } from './displayFilter';
+
+export type Tab = 'comments' | 'donations' | 'firstComments' | 'participation' | 'settings';
 export type ViewMode = 'unified' | 'columns';
 export type ToolSettingsView = 'goals' | 'danmaku';
 
@@ -43,6 +45,8 @@ export const SETTINGS_ANCHOR_IDS: Record<SettingsAnchor, string> = {
 const RECENT_COMMANDS_KEY = 'fc.recentCommands';
 /** localStorage key for persisting the window always-on-top preference. */
 const ALWAYS_ON_TOP_KEY = 'fc.alwaysOnTop';
+/** localStorage key for persisting the UI zoom level. */
+const ZOOM_KEY = 'fc.uiZoom';
 /** Maximum number of recent command entries to retain. */
 const RECENT_COMMANDS_MAX = 5;
 
@@ -61,6 +65,18 @@ function loadRecentCommandIds(): string[] {
     return ids.slice(0, RECENT_COMMANDS_MAX);
   } catch {
     return [];
+  }
+}
+
+/** Load the UI zoom level from localStorage; invalid or missing → 1.0. */
+function loadZoom(): number {
+  if (typeof window === 'undefined') return ZOOM_DEFAULT;
+  try {
+    const raw = localStorage.getItem(ZOOM_KEY);
+    if (raw === null) return ZOOM_DEFAULT;
+    return normalizeZoom(JSON.parse(raw));
+  } catch {
+    return ZOOM_DEFAULT;
   }
 }
 
@@ -113,6 +129,10 @@ class UiStore {
   paletteOpen: boolean = $state(false);
   showShortcuts: boolean = $state(false);
   alwaysOnTop: boolean = $state(loadAlwaysOnTop());
+  zoom: number = $state(loadZoom());
+  // Transient "NN%" toast text shown after a zoom change ('' = hidden).
+  zoomToast: string = $state('');
+  private _zoomToastTimer: ReturnType<typeof setTimeout> | null = null;
   // One-shot scroll target. Set when navigating from the command palette;
   // Settings consumes it (scrolls, then clears) so reopening the tab later
   // does not re-scroll.
@@ -227,6 +247,38 @@ class UiStore {
     } catch {
       // Storage quota or private-mode errors are non-fatal.
     }
+  }
+
+  /** Apply the stored zoom to the webview (call once at startup). No-op outside Tauri. */
+  restoreZoom(): void {
+    if (this.zoom !== ZOOM_DEFAULT) void this.applyZoom(this.zoom);
+  }
+
+  private async applyZoom(level: number): Promise<void> {
+    try {
+      const { getCurrentWebview } = await import('@tauri-apps/api/webview');
+      await getCurrentWebview().setZoom(level);
+    } catch {
+      // Not running inside Tauri (plain vite dev) or permission missing: ignore.
+    }
+  }
+
+  /** Zoom in/out by one step, or reset to 100%; persists, applies and shows a 1s toast. */
+  changeZoom(action: ZoomAction): void {
+    const next = action === 'reset' ? ZOOM_DEFAULT : stepZoom(this.zoom, action === 'in' ? 1 : -1);
+    this.zoom = clampZoom(next);
+    void this.applyZoom(this.zoom);
+    try {
+      localStorage.setItem(ZOOM_KEY, JSON.stringify(this.zoom));
+    } catch {
+      // Storage quota or private-mode errors are non-fatal.
+    }
+    this.zoomToast = `${Math.round(this.zoom * 100)}%`;
+    if (this._zoomToastTimer !== null) clearTimeout(this._zoomToastTimer);
+    this._zoomToastTimer = setTimeout(() => {
+      this.zoomToast = '';
+      this._zoomToastTimer = null;
+    }, 1000);
   }
 
   /** Switch to the settings tab and request a scroll to the given section. */

@@ -2709,6 +2709,15 @@
       />
     </div>
     <div class="field-row">
+      <label for="show-first-comment-panel">初見コメントを別タブで表示</label>
+      <input
+        id="show-first-comment-panel"
+        type="checkbox"
+        bind:checked={config.ui.showFirstCommentPanel}
+        class="chk"
+      />
+    </div>
+    <div class="field-row">
       <label for="notify-sound">ハイライトを効果音で通知</label>
       <input
         id="notify-sound"

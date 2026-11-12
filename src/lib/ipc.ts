@@ -377,6 +377,7 @@ export interface AppConfig {
     youtubeMemberNameGreen: boolean;
     twitchNativeStyle: boolean;
     showDonationPanel: boolean;
+    showFirstCommentPanel: boolean;
     notifySound: boolean;
     notifyVolume: number;
   };

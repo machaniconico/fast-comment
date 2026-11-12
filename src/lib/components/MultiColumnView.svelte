@@ -2,6 +2,7 @@
   import type { Platform } from '../types';
   import CommentList from './CommentList.svelte';
   import { store } from '../stores.svelte';
+  import { isDefaultFilter, matchesDisplayFilter } from '../displayFilter';
 
   const columns: { platform: Platform; label: string; className: string }[] = [
     { platform: 'twitch', label: 'Twitch', className: 'twitch' },
@@ -10,7 +11,11 @@
   ];
 
   function platformCount(platform: Platform): number {
-    return store.allMessages.filter((msg) => msg.platform === platform && !store.hiddenIds.has(msg.id)).length;
+    const df = store.displayFilter;
+    const dfDefault = isDefaultFilter(df);
+    return store.allMessages.filter(
+      (msg) => msg.platform === platform && !store.hiddenIds.has(msg.id) && (dfDefault || matchesDisplayFilter(msg, df)),
+    ).length;
   }
 </script>
 

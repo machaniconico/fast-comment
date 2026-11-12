@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, onDestroy } from 'svelte';
+  import { onMount, onDestroy, tick } from 'svelte';
   import { TauriEvent } from '@tauri-apps/api/event';
   import type { Platform } from './lib/types';
   import CommentList from './lib/components/CommentList.svelte';
@@ -8,6 +8,7 @@
   import Timer from './lib/components/Timer.svelte';
   import MultiColumnView from './lib/components/MultiColumnView.svelte';
   import DonationPanel from './lib/components/DonationPanel.svelte';
+  import FirstCommentPanel from './lib/components/FirstCommentPanel.svelte';
   import Effects from './lib/components/Effects.svelte';
   import GoalsBar from './lib/components/GoalsBar.svelte';
   import Sparkline from './lib/components/Sparkline.svelte';
@@ -26,6 +27,15 @@
   import { store, initStore, clearMessages } from './lib/stores.svelte';
   import { ui } from './lib/ui.svelte';
   import { theme } from './lib/theme.svelte';
+  import {
+    FILTER_KINDS,
+    FILTER_ROLES,
+    defaultDisplayFilter,
+    zoomActionForKey,
+    type RoleKey,
+    type VisitFilter,
+  } from './lib/displayFilter';
+  import type { MessageKind } from './lib/types';
   import {
     checkForUpdate,
     openReleaseUrl,
@@ -51,6 +61,57 @@
   let ttsNoticeTimer: ReturnType<typeof setTimeout> | null = null;
   let toolsOpen = $state(false);
   let toolsMenuEl: HTMLDivElement | null = null;
+  let searchInputEl: HTMLInputElement | null = $state(null);
+  let filterMenuEl: HTMLDivElement | null = $state(null);
+  let filterOpen = $state(false);
+
+  const VISIT_LABEL: Record<VisitFilter, string> = { all: 'すべて', first: '初見のみ', returning: '再訪のみ' };
+  const KIND_LABEL: Record<MessageKind, string> = {
+    normal: '通常',
+    superChat: 'スーパーチャット',
+    membership: 'メンバーシップ',
+    bits: 'Bits',
+    gift: 'ギフト',
+    system: 'システム',
+  };
+  const ROLE_LABEL: Record<RoleKey, string> = {
+    broadcaster: '配信者',
+    moderator: 'モデレーター',
+    member: 'メンバー',
+    subscriber: 'サブスク',
+    vip: 'VIP',
+  };
+
+  function setVisitFilter(visit: VisitFilter) {
+    store.setDisplayFilter({ ...store.displayFilter, visit });
+  }
+
+  function toggleFilterKind(kind: MessageKind) {
+    const cur = store.displayFilter.kinds;
+    const kinds = cur.includes(kind) ? cur.filter((k) => k !== kind) : [...cur, kind];
+    store.setDisplayFilter({ ...store.displayFilter, kinds });
+  }
+
+  function toggleFilterRole(role: RoleKey) {
+    const cur = store.displayFilter.roles;
+    const roles = cur.includes(role) ? cur.filter((r) => r !== role) : [...cur, role];
+    store.setDisplayFilter({ ...store.displayFilter, roles });
+  }
+
+  function resetDisplayFilter() {
+    store.setDisplayFilter(defaultDisplayFilter());
+  }
+
+  async function focusSearch() {
+    filterOpen = false;
+    ui.closePalette();
+    ui.closeShortcuts();
+    closeToolsMenu();
+    if (ui.activeTab !== 'comments' || standaloneOpen) ui.setTab('comments');
+    await tick();
+    searchInputEl?.focus();
+    searchInputEl?.select();
+  }
   let danmakuOpen = $state(false);
   let goalsToggleSaving = $state(false);
   let goalsToggleError = $state('');
@@ -62,6 +123,10 @@
 
   function isDonationPanelEnabled(cfg: AppConfig | null): boolean {
     return cfg?.ui.showDonationPanel === true;
+  }
+
+  function isFirstCommentPanelEnabled(cfg: AppConfig | null): boolean {
+    return cfg?.ui.showFirstCommentPanel === true;
   }
 
   function isGoalsBarVisible(cfg: AppConfig | null): boolean {
@@ -103,8 +168,14 @@
     if (!showDonationPanel && ui.activeTab === 'donations') ui.setTab('comments');
   });
 
+  const showFirstCommentPanel = $derived(isFirstCommentPanelEnabled(config));
+  $effect(() => {
+    if (!showFirstCommentPanel && ui.activeTab === 'firstComments') ui.setTab('comments');
+  });
+
   onMount(async () => {
     theme.load();
+    ui.restoreZoom();
     void setAlwaysOnTop(ui.alwaysOnTop);
     window.addEventListener('click', onWindowClick);
     window.addEventListener('keydown', onWindowKey);
@@ -174,6 +245,10 @@
 
   function onWindowKey(e: KeyboardEvent) {
     if (e.key === 'Escape') {
+      if (filterOpen) {
+        filterOpen = false;
+        return;
+      }
       if (ui.showShortcuts) {
         ui.closeShortcuts();
         return;
@@ -187,6 +262,19 @@
       e.preventDefault();
       ui.togglePalette();
       return;
+    }
+    if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.isComposing && e.keyCode !== 229) {
+      if (e.key.toLowerCase() === 'f') {
+        e.preventDefault();
+        void focusSearch();
+        return;
+      }
+      const zoomAction = zoomActionForKey(e.key, e.code);
+      if (zoomAction) {
+        e.preventDefault();
+        ui.changeZoom(zoomAction);
+        return;
+      }
     }
     if (e.key === '?' && !isEditableKeyTarget(e.target)) {
       e.preventDefault();
@@ -207,8 +295,11 @@
   }
 
   function onWindowClick(e: MouseEvent) {
-    if (!toolsOpen) return;
     const target = e.target;
+    if (filterOpen && !(target instanceof Node && filterMenuEl?.contains(target))) {
+      filterOpen = false;
+    }
+    if (!toolsOpen) return;
     if (target instanceof Node && toolsMenuEl?.contains(target)) return;
     closeToolsMenu();
   }
@@ -492,6 +583,15 @@
             onclick={() => ui.setTab('donations')}
           >投げ銭</button>
         {/if}
+        {#if showFirstCommentPanel}
+          <button
+            role="tab"
+            class="tab-btn"
+            class:active={ui.activeTab === 'firstComments' && !standaloneOpen}
+            aria-selected={ui.activeTab === 'firstComments' && !standaloneOpen}
+            onclick={() => ui.setTab('firstComments')}
+          >初見</button>
+        {/if}
       </div>
       <div class="tools-menu" bind:this={toolsMenuEl}>
         <button
@@ -619,12 +719,64 @@
       <input
         type="search"
         class="search-input"
+        bind:this={searchInputEl}
         placeholder="検索..."
         value={store.searchQuery}
         oninput={onSearchInput}
         aria-label={store.searchMode === 'regex' ? 'コメント検索（正規表現）' : 'コメント検索'}
         aria-invalid={store.searchRegexInvalid}
       />
+      <div class="filter-menu" bind:this={filterMenuEl}>
+        <button
+          class="search-mode-btn filter-menu-btn"
+          class:active={store.displayFilterCount > 0}
+          aria-haspopup="dialog"
+          aria-expanded={filterOpen}
+          onclick={() => { filterOpen = !filterOpen; }}
+        >フィルタ{#if store.displayFilterCount > 0}<span class="filter-menu-badge">{store.displayFilterCount}</span>{/if}</button>
+        {#if filterOpen}
+          <div class="filter-popover" role="dialog" aria-label="表示フィルタ">
+            <fieldset>
+              <legend>来訪</legend>
+              {#each Object.keys(VISIT_LABEL) as v (v)}
+                <label>
+                  <input
+                    type="radio"
+                    name="visit-filter"
+                    checked={store.displayFilter.visit === v}
+                    onchange={() => setVisitFilter(v as VisitFilter)}
+                  />{VISIT_LABEL[v as VisitFilter]}
+                </label>
+              {/each}
+            </fieldset>
+            <fieldset>
+              <legend>種別(未選択=すべて)</legend>
+              {#each FILTER_KINDS as k (k)}
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={store.displayFilter.kinds.includes(k)}
+                    onchange={() => toggleFilterKind(k)}
+                  />{KIND_LABEL[k]}
+                </label>
+              {/each}
+            </fieldset>
+            <fieldset>
+              <legend>ロール(未選択=全員)</legend>
+              {#each FILTER_ROLES as r (r)}
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={store.displayFilter.roles.includes(r)}
+                    onchange={() => toggleFilterRole(r)}
+                  />{ROLE_LABEL[r]}
+                </label>
+              {/each}
+            </fieldset>
+            <button class="filter-reset-btn" onclick={resetDisplayFilter}>解除</button>
+          </div>
+        {/if}
+      </div>
       <div class="search-mode-group" role="group" aria-label="検索モード">
         <button
           class="search-mode-btn"
@@ -677,6 +829,8 @@
       {/if}
     {:else if ui.activeTab === 'donations' && showDonationPanel}
       <DonationPanel />
+    {:else if ui.activeTab === 'firstComments' && showFirstCommentPanel}
+      <FirstCommentPanel />
     {:else if ui.activeTab === 'participation'}
       <Participation />
     {:else}
@@ -725,6 +879,9 @@
 
   <CommandPalette />
   <ShortcutHelp />
+  {#if ui.zoomToast}
+    <div class="zoom-toast" role="status">{ui.zoomToast}</div>
+  {/if}
   <UserCard />
   <Notifier />
 </div>
@@ -1295,6 +1452,100 @@
 
   .app[data-theme='light'] .search-input[aria-invalid='true'] {
     border-color: rgba(220,38,38,0.52);
+  }
+
+  .filter-menu {
+    position: relative;
+    flex-shrink: 0;
+  }
+
+  .filter-menu-btn {
+    min-width: 0;
+    padding: 0 8px;
+    white-space: nowrap;
+  }
+
+  .filter-menu-badge {
+    margin-left: 4px;
+    padding: 0 5px;
+    border-radius: 8px;
+    background: #4a9eff;
+    color: #fff;
+    font-size: 10px;
+    font-weight: 700;
+  }
+
+  .filter-popover {
+    position: absolute;
+    top: calc(100% + 4px);
+    right: 0;
+    z-index: 50;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    min-width: 200px;
+    padding: 8px 10px;
+    background: #202020;
+    border: 1px solid rgba(255,255,255,0.15);
+    border-radius: 6px;
+    box-shadow: 0 6px 18px rgba(0,0,0,0.5);
+    font-size: 12px;
+    color: #ddd;
+  }
+
+  .filter-popover fieldset {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 12px;
+    margin: 0;
+    padding: 0;
+    border: none;
+  }
+
+  .filter-popover legend {
+    padding: 0;
+    margin-bottom: 2px;
+    color: #999;
+    font-size: 11px;
+    font-weight: 700;
+  }
+
+  .filter-popover label {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    cursor: pointer;
+  }
+
+  .filter-reset-btn {
+    align-self: flex-end;
+    padding: 2px 10px;
+    border: 1px solid rgba(255,255,255,0.2);
+    border-radius: 4px;
+    background: transparent;
+    color: #ddd;
+    font-size: 11px;
+    cursor: pointer;
+  }
+
+  .app[data-theme='light'] .filter-popover {
+    background: #fff;
+    color: #222;
+    border-color: rgba(0,0,0,0.18);
+  }
+
+  .zoom-toast {
+    position: fixed;
+    top: 12px;
+    right: 12px;
+    z-index: 200;
+    padding: 4px 12px;
+    border-radius: 6px;
+    background: rgba(0,0,0,0.78);
+    color: #fff;
+    font-size: 14px;
+    font-weight: 700;
+    pointer-events: none;
   }
 
   .search-mode-group {
