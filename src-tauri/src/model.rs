@@ -142,6 +142,10 @@ pub struct ListenerInfo {
     pub tts_voice: Option<crate::listeners::TtsVoiceOverride>,
 }
 
+fn is_false(v: &bool) -> bool {
+    !*v
+}
+
 /// 正規化済みコメント。Source → Bus → UI/OBS を一貫して流れる単一型。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -150,6 +154,9 @@ pub struct ChatMessage {
     pub listener: Option<ListenerInfo>,
     /// 内部一意ID(uuid v4)。重複排除/個別操作に使う。
     pub id: String,
+    /// `id` がプラットフォーム由来(モデレーション API に渡せる)の時だけ true。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub native_id: bool,
     pub platform: Platform,
     /// 配信チャンネル識別子(Twitchはチャンネル名、YouTubeはvideoId)。
     pub channel: String,
@@ -219,8 +226,10 @@ mod tests {
         assert!(msg.author.nickname.is_none());
         assert!(msg.author.avatar_url.is_none());
         assert!(msg.listener.is_none());
+        assert!(!msg.native_id);
         let serialized = serde_json::to_value(&msg).unwrap();
         assert!(serialized.get("listener").is_none());
+        assert!(serialized.get("nativeId").is_none());
         assert!(serialized["author"].get("nickname").is_none());
         assert!(serialized["author"].get("avatarUrl").is_none());
     }

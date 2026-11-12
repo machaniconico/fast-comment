@@ -159,12 +159,13 @@ trait TtsBackend { async fn speak(&self, text: String) -> Result<()>; fn availab
 - ルーティング: 設定で優先バックエンド選択。優先が `available()==false` なら Web Speech へフォールバック。
 - 読み上げ整形: 名前/本文の読み方、URL省略、絵文字除去、長文カット等(設定可)。
 
-## 7. モデレーション (`moderation.rs`) — MVPは認証不要範囲
+## 7. モデレーション (`moderation.rs`) — ローカル処理 + 配信側(P6 Phase 1)
 
 - **NGワード/NGユーザー**(正規表現可) → マッチは UI/OBS に流さない or グレー表示。
 - **ハイライトルール**(ユーザー/キーワード)→ flag 付与。
 - **ローカル非表示**(手動): UIで個別コメントを隠す。
-- ⚠️ 実BAN/タイムアウト(Twitch)・コメ削除(YouTube)は各OAuth必須 → **フェーズ2**。MVPではローカル処理のみ。
+- **配信側モデレーション(P6 Phase 1・YouTube)**: コメント右クリック / ユーザーカードから、コメント削除(`LCC.` 形式 ID = API キー設定時の公式 stream 受信分のみ)・タイムアウト(1分/10分/1時間/24時間)・永久 BAN(確認ダイアログ)・BAN 解除(同セッションで行った BAN のみ)。既存の Google OAuth(`youtube.force-ssl`)を使う。実行後は該当コメントを減光 +「削除済み」「タイムアウト」「BAN済み」ラベルで残す(UI のみ)。X / niconico は対象外。
+- ⚠️ Twitch の実BAN/削除は別 OAuth が必要 → Phase 2。プラットフォーム側操作の反映(Phase 3)も未実装。
 
 ## 8. UI (`src/`)
 

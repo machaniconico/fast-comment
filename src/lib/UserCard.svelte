@@ -3,6 +3,8 @@
   import { appendModerationValue, deleteListener, getListener, setListenerVoice, updateListener } from './ipc';
   import { store } from './stores.svelte';
   import { ui } from './ui.svelte';
+  import { moderation } from './moderation.svelte';
+  import { moderationAvailability, TIMEOUT_PRESETS, formatTimeoutLabel } from './moderationActions';
   import { isListenerDeleted, safeAvatarUrl, type ListenerRecord, type ListenerUpdate } from './types';
 
   type LoadState = 'loading' | 'loaded' | 'error';
@@ -38,6 +40,30 @@
   let avatar = $derived(
     target?.avatarUrl && target.avatarUrl !== failedAvatar ? (safeAvatarUrl(target.avatarUrl) ?? '') : ''
   );
+
+  // Moderation row. Roles come from the newest buffered comment of this user (unknown => allowed).
+  const NO_CHANNEL_REASON = 'コメントから開いた時のみ';
+  let modTarget = $derived(
+    target?.channel
+      ? { platform: target.platform, channel: target.channel, authorId: target.authorId, name: (record as ListenerRecord | null)?.nickname || (record as ListenerRecord | null)?.name || target.name }
+      : null,
+  );
+  let modAvail = $derived.by(() => {
+    if (!target) return null;
+    const latest = comments[0];
+    return moderationAvailability(
+      {
+        platform: target.platform,
+        kind: 'normal',
+        id: '',
+        author: { id: target.authorId, roles: latest?.author.roles ?? { broadcaster: false, moderator: false } },
+      },
+      moderation.auth,
+    );
+  });
+  let modBusy = $derived(modTarget ? moderation.isBusy(moderation.userKey(modTarget)) : false);
+  let modReason = $derived(!modTarget ? NO_CHANNEL_REASON : modAvail?.ban.reason);
+  let modEnabled = $derived(!!modTarget && modAvail?.ban.enabled === true && !modBusy);
 
   function profileOf(rec: ListenerRecord | null) {
     return { nickname: rec?.nickname ?? '', label: rec?.label ?? '', memo: rec?.memo ?? '', ttsMuted: rec?.ttsMuted ?? false };
@@ -404,6 +430,35 @@
           {/if}
           {#if status}<span class="uc-status">{status}</span>{/if}
         </div>
+
+        {#if modAvail?.visible}
+          <h3>モデレーション(配信側)</h3>
+          <div class="uc-actions" title={modReason}>
+            {#each TIMEOUT_PRESETS as secs (secs)}
+              <button
+                type="button"
+                class="uc-btn"
+                disabled={!modEnabled}
+                title={modReason}
+                onclick={() => modTarget && moderation.timeout(modTarget, secs)}
+              >{formatTimeoutLabel(secs)}</button>
+            {/each}
+            <button
+              type="button"
+              class="uc-btn danger"
+              disabled={!modEnabled}
+              title={modReason}
+              onclick={(e) => modTarget && moderation.requestBan(modTarget, e.currentTarget)}
+            >BAN</button>
+            <button
+              type="button"
+              class="uc-btn"
+              disabled={!modEnabled}
+              title={modReason}
+              onclick={() => modTarget && moderation.unban(modTarget)}
+            >BAN解除</button>
+          </div>
+        {/if}
 
         <dl class="uc-stats">
           <dt>累計コメント</dt><dd>{record?.commentCount ?? 0}</dd>

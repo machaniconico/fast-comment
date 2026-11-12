@@ -764,6 +764,34 @@ export async function disconnectYoutubeOauth(): Promise<YoutubeOauthStatus> {
   };
 }
 
+/** Stream-side moderation. Rejects with `{code, message}` (see moderationActions.ts toModerationError). */
+export async function moderateDeleteMessage(
+  platform: string,
+  channel: string,
+  messageId: string,
+  authorId: string,
+): Promise<void> {
+  await invoke<void>('moderate_delete_message', { platform, channel, messageId, authorId });
+}
+
+export async function moderateBanUser(
+  platform: string,
+  channel: string,
+  authorId: string,
+  durationSecs: number | null,
+  reason: string | null,
+): Promise<void> {
+  await invoke<void>('moderate_ban_user', { platform, channel, authorId, durationSecs, reason });
+}
+
+export async function moderateUnbanUser(
+  platform: string,
+  channel: string,
+  authorId: string,
+): Promise<void> {
+  await invoke<void>('moderate_unban_user', { platform, channel, authorId });
+}
+
 export async function checkForUpdate(): Promise<UpdateStatus | null> {
   return invoke<UpdateStatus>('check_for_update');
 }

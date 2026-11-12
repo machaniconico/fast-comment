@@ -26,7 +26,8 @@ export type SettingsAnchor =
   | 'moderation'
   | 'notify'
   | 'danmaku'
-  | 'portability';
+  | 'portability'
+  | 'youtubeOauth';
 
 /** Maps a SettingsAnchor to the DOM id rendered on the matching <section>. */
 export const SETTINGS_ANCHOR_IDS: Record<SettingsAnchor, string> = {
@@ -39,6 +40,7 @@ export const SETTINGS_ANCHOR_IDS: Record<SettingsAnchor, string> = {
   notify: 'settings-notify',
   danmaku: 'settings-danmaku',
   portability: 'settings-portability',
+  youtubeOauth: 'settings-youtube-low-latency',
 };
 
 /** localStorage key for persisting recent command ids. */
@@ -102,6 +104,17 @@ export interface UserCardTarget {
   authorId: string;
   name: string;
   avatarUrl?: string;
+  /** Stream channel (Twitch channel / YouTube videoId). Set only when opened from a comment. */
+  channel?: string;
+}
+
+/** Generic toast (moderation results etc.). */
+export type ToastKind = 'info' | 'success' | 'error';
+export interface Toast {
+  id: number;
+  text: string;
+  kind: ToastKind;
+  action?: { label: string; run: () => void };
 }
 
 class UiStore {
@@ -133,6 +146,27 @@ class UiStore {
   // Transient "NN%" toast text shown after a zoom change ('' = hidden).
   zoomToast: string = $state('');
   private _zoomToastTimer: ReturnType<typeof setTimeout> | null = null;
+  // Generic toast (null = hidden). Separate from zoomToast, which keeps its own 1s style.
+  toast: Toast | null = $state(null);
+  private _toastTimer: ReturnType<typeof setTimeout> | null = null;
+  private _toastSeq = 0;
+
+  /** Show a toast; a newer one replaces the current. Errors stay longer. */
+  showToast(text: string, kind: ToastKind = 'info', action?: Toast['action']): void {
+    this._toastSeq += 1;
+    this.toast = { id: this._toastSeq, text, kind, action };
+    if (this._toastTimer !== null) clearTimeout(this._toastTimer);
+    this._toastTimer = setTimeout(() => {
+      this.toast = null;
+      this._toastTimer = null;
+    }, kind === 'error' ? 7000 : 3000);
+  }
+
+  dismissToast(): void {
+    if (this._toastTimer !== null) clearTimeout(this._toastTimer);
+    this._toastTimer = null;
+    this.toast = null;
+  }
   // One-shot scroll target. Set when navigating from the command palette;
   // Settings consumes it (scrolls, then clears) so reopening the tab later
   // does not re-scroll.

@@ -600,6 +600,7 @@ mod tests {
     fn msg(platform: Platform, channel: &str, id: &str, name: &str) -> ChatMessage {
         ChatMessage {
             listener: None,
+            native_id: false,
             id: ChatMessage::new_id(),
             platform,
             channel: channel.to_string(),

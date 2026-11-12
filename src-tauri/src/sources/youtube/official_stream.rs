@@ -271,9 +271,9 @@ fn to_chat_message(item: LiveChatMessage, video_id: &str) -> Option<ChatMessage>
             _ => "[YouTube event]".to_string(),
         });
 
-    let id = item
-        .id
-        .filter(|id| !id.trim().is_empty())
+    let native_id_value = item.id.filter(|id| !id.trim().is_empty());
+    let native_id = native_id_value.is_some();
+    let id = native_id_value
         .or_else(|| {
             if kind == MessageKind::Gift {
                 gift_fallback_id(video_id, &author, &snippet)
@@ -285,6 +285,7 @@ fn to_chat_message(item: LiveChatMessage, video_id: &str) -> Option<ChatMessage>
 
     Some(ChatMessage {
         listener: None,
+        native_id,
         id,
         platform: Platform::Youtube,
         channel: video_id.to_string(),
@@ -832,6 +833,7 @@ mod tests {
     fn fixture_message(id: &str, text: &str, kind: MessageKind) -> ChatMessage {
         ChatMessage {
             listener: None,
+            native_id: false,
             id: id.to_string(),
             platform: Platform::Youtube,
             channel: "video-1".to_string(),

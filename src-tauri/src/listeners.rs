@@ -402,6 +402,7 @@ mod tests {
     fn message() -> ChatMessage {
         ChatMessage {
             listener: None,
+            native_id: false,
             id: "message".into(),
             platform: Platform::Twitch,
             channel: "channel".into(),

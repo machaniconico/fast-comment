@@ -23,6 +23,8 @@
   import ShortcutHelp from './lib/components/ShortcutHelp.svelte';
   import UserCard from './lib/UserCard.svelte';
   import Notifier from './lib/components/Notifier.svelte';
+  import ConfirmDialog from './lib/components/ConfirmDialog.svelte';
+  import { moderation } from './lib/moderation.svelte';
   import TtsQueuePanel from './lib/components/TtsQueuePanel.svelte';
   import { store, initStore, clearMessages } from './lib/stores.svelte';
   import { ui } from './lib/ui.svelte';
@@ -181,6 +183,7 @@
     window.addEventListener('keydown', onWindowKey);
     void loadUpdateStatus();
     void loadConfig();
+    void moderation.refreshAuth();
     {
       const fn = await initStore();
       if (destroyed) fn();
@@ -244,6 +247,9 @@
   }
 
   function onWindowKey(e: KeyboardEvent) {
+    // The BAN confirmation is modal: app shortcuts (Ctrl+F etc.) must not move
+    // focus behind it. The dialog handles its own Esc/Tab.
+    if (moderation.confirm) return;
     if (e.key === 'Escape') {
       if (filterOpen) {
         filterOpen = false;
@@ -883,6 +889,16 @@
     <div class="zoom-toast" role="status">{ui.zoomToast}</div>
   {/if}
   <UserCard />
+  <ConfirmDialog />
+  {#if ui.toast}
+    <div class="app-toast {ui.toast.kind}" role={ui.toast.kind === 'error' ? 'alert' : 'status'}>
+      <span>{ui.toast.text}</span>
+      {#if ui.toast.action}
+        {@const act = ui.toast.action}
+        <button type="button" class="app-toast-action" onclick={() => { act.run(); ui.dismissToast(); }}>{act.label}</button>
+      {/if}
+    </div>
+  {/if}
   <Notifier />
 </div>
 
@@ -1532,6 +1548,36 @@
     background: #fff;
     color: #222;
     border-color: rgba(0,0,0,0.18);
+  }
+
+  .app-toast {
+    position: fixed;
+    top: 44px;
+    right: 12px;
+    z-index: 1005;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    max-width: min(420px, calc(100vw - 24px));
+    padding: 6px 12px;
+    border-radius: 6px;
+    border-left: 3px solid #90a4ae;
+    background: rgba(0,0,0,0.85);
+    color: #fff;
+    font-size: 13px;
+  }
+  .app-toast.success { border-left-color: #66bb6a; }
+  .app-toast.error { border-left-color: #ef5350; }
+  .app-toast-action {
+    flex-shrink: 0;
+    padding: 2px 8px;
+    border: 1px solid rgba(255,255,255,0.35);
+    border-radius: 4px;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    font-size: 12px;
+    cursor: pointer;
   }
 
   .zoom-toast {
