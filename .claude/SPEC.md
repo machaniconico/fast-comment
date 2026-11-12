@@ -165,7 +165,8 @@ trait TtsBackend { async fn speak(&self, text: String) -> Result<()>; fn availab
 - **ハイライトルール**(ユーザー/キーワード)→ flag 付与。
 - **ローカル非表示**(手動): UIで個別コメントを隠す。
 - **配信側モデレーション(P6 Phase 1・YouTube)**: コメント右クリック / ユーザーカードから、コメント削除(`LCC.` 形式 ID = API キー設定時の公式 stream 受信分のみ)・タイムアウト(1分/10分/1時間/24時間)・永久 BAN(確認ダイアログ)・BAN 解除(同セッションで行った BAN のみ)。既存の Google OAuth(`youtube.force-ssl`)を使う。実行後は該当コメントを減光 +「削除済み」「タイムアウト」「BAN済み」ラベルで残す(UI のみ)。X / niconico は対象外。
-- ⚠️ Twitch の実BAN/削除は別 OAuth が必要 → Phase 2。プラットフォーム側操作の反映(Phase 3)も未実装。
+- **配信側モデレーション(P6 Phase 2・Twitch)**: 同じメニュー / ユーザーカードで、コメント削除(IRC `id` タグ = `nativeId` が true のメッセージのみ)・タイムアウト・永久 BAN・BAN 解除(**Twitch では常に表示**)。Twitch Helix を使い、認証は Device Code Flow(設定 >「Twitch モデレーション」の [Twitch にログイン] でコード表示、ブラウザは Rust 側で開く)。必要スコープは `moderator:manage:banned_users` `moderator:manage:chat_messages`。前提: Twitch 開発者コンソールの既存アプリで Device Code Grant が使えること(`credentials.twitchClientId` 必須)。スコープ不足時は設定に「再ログイン」警告。エラーは Rust の `ModerationError` をそのままトースト表示。
+- ⚠️ プラットフォーム側操作の反映(Phase 3)は未実装。
 
 ## 8. UI (`src/`)
 

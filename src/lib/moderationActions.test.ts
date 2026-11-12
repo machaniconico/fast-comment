@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   moderationAvailability, formatTimeoutLabel, toModerationError, TIMEOUT_PRESETS, QUICK_TIMEOUT_SECS,
-  DELETE_UNSUPPORTED_REASON, TWITCH_PENDING_REASON, focusReturnCandidates,
+  DELETE_UNSUPPORTED_REASON, TWITCH_NOT_CONNECTED_REASON, TWITCH_DELETE_UNSUPPORTED_REASON, focusReturnCandidates,
 } from './moderationActions.ts';
 import type { ModerationTargetMessage } from './moderationActions.ts';
 
@@ -59,11 +59,40 @@ test('delete requires nativeId and LCC. prefix', () => {
   assert.equal(inner.ban.enabled, true);
 });
 
-test('twitch is disabled for now', () => {
-  const a = moderationAvailability(m({ platform: 'twitch', id: 'uuid' }), on);
-  assert.equal(a.visible, true);
-  assert.equal(a.delete.enabled || a.timeout.enabled || a.ban.enabled, false);
-  assert.equal(a.ban.reason, TWITCH_PENDING_REASON);
+const tw = { youtubeConnected: false, twitchConnected: true };
+function t(over: Parameters<typeof m>[0] = {}) {
+  return m({ platform: 'twitch', id: 'uuid-1', nativeId: true, ...over });
+}
+
+test('twitch not connected: everything disabled with login hint (youtube login does not help)', () => {
+  for (const auth of [off, on, { youtubeConnected: true, twitchConnected: false }]) {
+    const a = moderationAvailability(t(), auth);
+    assert.equal(a.visible, true);
+    assert.equal(a.delete.enabled || a.timeout.enabled || a.ban.enabled || a.unban.enabled, false);
+    assert.equal(a.ban.reason, TWITCH_NOT_CONNECTED_REASON);
+  }
+});
+
+test('twitch connected: timeout / ban / unban enabled, delete needs nativeId', () => {
+  const a = moderationAvailability(t(), tw);
+  assert.equal(a.delete.enabled, true);
+  assert.equal(a.timeout.enabled, true);
+  assert.equal(a.ban.enabled, true);
+  assert.equal(a.unban.enabled, true);
+  const noNative = moderationAvailability(t({ nativeId: false }), tw);
+  assert.equal(noNative.delete.enabled, false);
+  assert.equal(noNative.delete.reason, TWITCH_DELETE_UNSUPPORTED_REASON);
+  assert.equal(noNative.unban.enabled, true);
+  assert.equal(moderationAvailability(t({ nativeId: undefined }), tw).delete.enabled, false);
+  assert.equal(moderationAvailability(t({ id: '' }), tw).delete.enabled, false);
+});
+
+test('twitch: broadcaster / moderator / unknown author are disabled; youtube unaffected by twitch login', () => {
+  assert.equal(moderationAvailability(t({ roles: { moderator: true } }), tw).unban.enabled, false);
+  assert.equal(moderationAvailability(t({ roles: { broadcaster: true } }), tw).ban.enabled, false);
+  assert.equal(moderationAvailability(t({ author: { id: '', roles: { broadcaster: false, moderator: false } } }), tw).ban.enabled, false);
+  assert.equal(moderationAvailability(m(), tw).timeout.enabled, false);
+  assert.equal(moderationAvailability(m(), { youtubeConnected: true, twitchConnected: false }).timeout.enabled, true);
 });
 
 test('presets and labels', () => {

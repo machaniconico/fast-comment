@@ -18,6 +18,7 @@ pub mod listeners;
 pub mod model;
 pub mod moderation;
 mod moderation_error;
+mod secret_store;
 pub mod sources;
 pub mod stats;
 pub mod tts;
@@ -43,6 +44,7 @@ use crate::model::{
 };
 use crate::moderation::{Moderator, Verdict};
 use crate::moderation_error::{ModerationError, ModerationErrorCode};
+use crate::sources::twitch_auth::{TwitchAuth, TwitchDeviceLogin, TwitchOauthStatus};
 use crate::sources::youtube_send::{YoutubeAuth, YoutubeOauthStatus};
 use crate::sources::SourceManager;
 use crate::stats::{spawn_stats_aggregator, StatsSnapshot, TimerSnapshot, YoutubeMetadataUpdate};
@@ -94,6 +96,8 @@ pub struct AppState {
     participants: Mutex<Vec<Participant>>,
     /// YouTube投稿用OAuth状態。バックグラウンド処理は持たず、操作時だけ通信する。
     youtube_auth: YoutubeAuth,
+    /// Twitchモデレーション用OAuth状態。access tokenはメモリのみ。
+    twitch_auth: TwitchAuth,
 }
 
 #[tauri::command]
@@ -661,6 +665,68 @@ async fn disconnect_youtube_oauth(
     state.youtube_auth.disconnect(&client_id).await
 }
 
+/// Twitch モデレーションの接続状態を取得する。
+#[tauri::command]
+async fn get_twitch_oauth_status(
+    state: State<'_, AppState>,
+) -> Result<TwitchOauthStatus, String> {
+    let client_id = state
+        .config
+        .lock()
+        .unwrap()
+        .credentials
+        .twitch_client_id
+        .clone();
+    state.twitch_auth.status(&client_id).await
+}
+
+/// Twitch の Device Code Flow を開始し、システムブラウザで認証ページを開く。
+#[tauri::command]
+async fn begin_twitch_login(state: State<'_, AppState>) -> Result<TwitchDeviceLogin, String> {
+    let client_id = state
+        .config
+        .lock()
+        .unwrap()
+        .credentials
+        .twitch_client_id
+        .trim()
+        .to_string();
+    let login = state.twitch_auth.begin_login(&client_id).await?;
+    // ブラウザを開けなくても、UI に出したコードと URL で手動認証できるので続行する。
+    if let Err(error) = crate::update::open_url(login.verification_uri.clone()) {
+        tracing::warn!("Twitchの認証ページを開けませんでした: {error}");
+    }
+    Ok(login)
+}
+
+/// 開始済みの Twitch ログインを完了・期限切れ・取消まで待つ。
+#[tauri::command]
+async fn await_twitch_login(state: State<'_, AppState>) -> Result<TwitchOauthStatus, String> {
+    state.twitch_auth.await_login().await
+}
+
+/// 進行中の Twitch ログインを取り消す。
+#[tauri::command]
+async fn cancel_twitch_login(state: State<'_, AppState>) -> Result<(), String> {
+    state.twitch_auth.cancel_login().await;
+    Ok(())
+}
+
+/// このPCに保存した Twitch モデレーション用認証を削除する。
+#[tauri::command]
+async fn disconnect_twitch_oauth(
+    state: State<'_, AppState>,
+) -> Result<TwitchOauthStatus, String> {
+    let client_id = state
+        .config
+        .lock()
+        .unwrap()
+        .credentials
+        .twitch_client_id
+        .clone();
+    state.twitch_auth.disconnect(&client_id).await
+}
+
 /// 配信側のコメントを削除する(YouTube は `LCC.` 形式の受信分のみ)。
 #[tauri::command]
 async fn moderate_delete_message(
@@ -695,10 +761,27 @@ async fn moderate_delete_message(
             state.moderator.lock().unwrap().hide_id(message_id);
             Ok(())
         }
-        "twitch" => Err(ModerationError::new(
-            ModerationErrorCode::Unavailable,
-            "Twitch のモデレーションは次の更新で対応",
-        )),
+        "twitch" => {
+            let (client_id, client_secret) = {
+                let cfg = state.config.lock().unwrap();
+                (
+                    cfg.credentials.twitch_client_id.trim().to_string(),
+                    cfg.credentials.twitch_client_secret.trim().to_string(),
+                )
+            };
+            if client_id.is_empty() {
+                return Err(ModerationError::new(
+                    ModerationErrorCode::NotLoggedIn,
+                    "設定でTwitchのクライアントIDを入力し、Twitchにログインしてください",
+                ));
+            }
+            state
+                .twitch_auth
+                .delete_message(&client_id, &client_secret, &channel, &message_id)
+                .await?;
+            state.moderator.lock().unwrap().hide_id(message_id);
+            Ok(())
+        }
         _ => Err(ModerationError::new(
             ModerationErrorCode::Unavailable,
             "このプラットフォームのモデレーションには対応していません",
@@ -717,7 +800,6 @@ async fn moderate_ban_user(
     reason: Option<String>,
 ) -> Result<(), ModerationError> {
     // YouTube の liveChatBans には reason 項目が無いため、この値は使わない。
-    let _ = reason;
     match platform.trim().to_lowercase().as_str() {
         "youtube" => {
             let client_id = state
@@ -740,10 +822,32 @@ async fn moderate_ban_user(
                 .ban_user(&client_id, &video_id, author_id.trim(), duration_secs)
                 .await
         }
-        "twitch" => Err(ModerationError::new(
-            ModerationErrorCode::Unavailable,
-            "Twitch のモデレーションは次の更新で対応",
-        )),
+        "twitch" => {
+            let (client_id, client_secret) = {
+                let cfg = state.config.lock().unwrap();
+                (
+                    cfg.credentials.twitch_client_id.trim().to_string(),
+                    cfg.credentials.twitch_client_secret.trim().to_string(),
+                )
+            };
+            if client_id.is_empty() {
+                return Err(ModerationError::new(
+                    ModerationErrorCode::NotLoggedIn,
+                    "設定でTwitchのクライアントIDを入力し、Twitchにログインしてください",
+                ));
+            }
+            state
+                .twitch_auth
+                .ban_user(
+                    &client_id,
+                    &client_secret,
+                    &channel,
+                    author_id.trim(),
+                    duration_secs,
+                    reason.as_deref(),
+                )
+                .await
+        }
         _ => Err(ModerationError::new(
             ModerationErrorCode::Unavailable,
             "このプラットフォームのモデレーションには対応していません",
@@ -781,10 +885,25 @@ async fn moderate_unban_user(
                 .unban_user(&client_id, &video_id, author_id.trim())
                 .await
         }
-        "twitch" => Err(ModerationError::new(
-            ModerationErrorCode::Unavailable,
-            "Twitch のモデレーションは次の更新で対応",
-        )),
+        "twitch" => {
+            let (client_id, client_secret) = {
+                let cfg = state.config.lock().unwrap();
+                (
+                    cfg.credentials.twitch_client_id.trim().to_string(),
+                    cfg.credentials.twitch_client_secret.trim().to_string(),
+                )
+            };
+            if client_id.is_empty() {
+                return Err(ModerationError::new(
+                    ModerationErrorCode::NotLoggedIn,
+                    "設定でTwitchのクライアントIDを入力し、Twitchにログインしてください",
+                ));
+            }
+            state
+                .twitch_auth
+                .unban_user(&client_id, &client_secret, &channel, author_id.trim())
+                .await
+        }
         _ => Err(ModerationError::new(
             ModerationErrorCode::Unavailable,
             "このプラットフォームのモデレーションには対応していません",
@@ -1838,6 +1957,8 @@ pub fn run() {
                 participants: Mutex::new(Vec::new()),
                 youtube_auth: YoutubeAuth::new()
                     .expect("YouTube投稿用HTTPクライアントの作成に失敗しました"),
+                twitch_auth: TwitchAuth::new()
+                    .expect("Twitch認証用HTTPクライアントの作成に失敗しました"),
             };
             let listener_store = state.listeners.clone();
             app.manage(state);
@@ -1928,6 +2049,11 @@ pub fn run() {
             get_youtube_oauth_status,
             connect_youtube_oauth,
             disconnect_youtube_oauth,
+            get_twitch_oauth_status,
+            begin_twitch_login,
+            await_twitch_login,
+            cancel_twitch_login,
+            disconnect_twitch_oauth,
             moderate_delete_message,
             moderate_ban_user,
             moderate_unban_user,

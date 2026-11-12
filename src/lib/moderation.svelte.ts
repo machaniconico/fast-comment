@@ -2,7 +2,7 @@
  * Stream-side moderation runner: login state, in-flight guard, confirm request,
  * toasts and local "removed" marking. Pure decision logic lives in moderationActions.ts.
  */
-import { getYoutubeOauthStatus, moderateBanUser, moderateDeleteMessage, moderateUnbanUser } from './ipc';
+import { getTwitchOauthStatus, getYoutubeOauthStatus, moderateBanUser, moderateDeleteMessage, moderateUnbanUser } from './ipc';
 import { formatTimeoutLabel, toModerationError, type ModerationAuth } from './moderationActions';
 import { store } from './stores.svelte';
 import { ui } from './ui.svelte';
@@ -19,6 +19,10 @@ export interface BanRequest extends ModerationTarget {
   returnFocus: HTMLElement | null;
 }
 
+function isTwitch(t: ModerationTarget): boolean {
+  return t.platform.trim().toLowerCase() === 'twitch';
+}
+
 class ModerationState {
   auth: ModerationAuth = $state({ youtubeConnected: false });
   /** Permanent-BAN confirmation request (null = dialog closed). */
@@ -29,14 +33,24 @@ class ModerationState {
   async refreshAuth(): Promise<void> {
     try {
       const s = await getYoutubeOauthStatus();
-      this.auth = { youtubeConnected: s?.connected === true };
+      this.setYoutubeConnected(s?.connected === true);
     } catch {
-      this.auth = { youtubeConnected: false };
+      this.setYoutubeConnected(false);
+    }
+    try {
+      const t = await getTwitchOauthStatus();
+      this.setTwitchConnected(t?.connected === true);
+    } catch {
+      this.setTwitchConnected(false);
     }
   }
 
   setYoutubeConnected(connected: boolean): void {
-    this.auth = { youtubeConnected: connected };
+    this.auth = { ...this.auth, youtubeConnected: connected };
+  }
+
+  setTwitchConnected(connected: boolean): void {
+    this.auth = { ...this.auth, twitchConnected: connected };
   }
 
   userKey(t: ModerationTarget): string {
@@ -51,7 +65,7 @@ class ModerationState {
     return this.busy[key] === true;
   }
 
-  private async run(key: string, job: () => Promise<void>, success: string, onOk: () => void): Promise<void> {
+  private async run(key: string, job: () => Promise<void>, success: string, onOk: () => void, twitch = false): Promise<void> {
     if (this.busy[key]) return; // double-click guard (each call burns API quota)
     this.busy = { ...this.busy, [key]: true };
     try {
@@ -62,10 +76,13 @@ class ModerationState {
       const err = toModerationError(e);
       const action =
         err.code === 'notLoggedIn' || err.code === 'scopeMissing'
-          ? { label: '設定を開く', run: () => ui.gotoSetting('youtubeOauth') }
+          ? { label: '設定を開く', run: () => ui.gotoSetting(twitch ? 'twitchOauth' : 'youtubeOauth') }
           : undefined;
       ui.showToast(err.message, 'error', action);
-      if (err.code === 'notLoggedIn') this.setYoutubeConnected(false);
+      if (err.code === 'notLoggedIn') {
+        if (twitch) this.setTwitchConnected(false);
+        else this.setYoutubeConnected(false);
+      }
     } finally {
       const { [key]: _done, ...rest } = this.busy;
       this.busy = rest;
@@ -78,6 +95,7 @@ class ModerationState {
       () => moderateDeleteMessage(t.platform, t.channel, messageId, t.authorId),
       'コメントを削除しました',
       () => store.markRemoved(t.platform, t.authorId, 'deleted', messageId),
+      isTwitch(t),
     );
   }
 
@@ -87,6 +105,7 @@ class ModerationState {
       () => moderateBanUser(t.platform, t.channel, t.authorId, secs, null),
       `タイムアウトしました(${formatTimeoutLabel(secs)})`,
       () => store.markRemoved(t.platform, t.authorId, 'timeout'),
+      isTwitch(t),
     );
   }
 
@@ -96,6 +115,7 @@ class ModerationState {
       () => moderateBanUser(t.platform, t.channel, t.authorId, null, null),
       'BAN しました',
       () => store.markRemoved(t.platform, t.authorId, 'banned'),
+      isTwitch(t),
     );
   }
 
@@ -105,6 +125,7 @@ class ModerationState {
       () => moderateUnbanUser(t.platform, t.channel, t.authorId),
       'BAN を解除しました',
       () => {},
+      isTwitch(t),
     );
   }
 
