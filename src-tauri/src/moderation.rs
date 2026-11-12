@@ -139,6 +139,7 @@ mod tests {
     fn message(id: &str, author_id: &str, author_name: &str, texts: &[&str]) -> ChatMessage {
         ChatMessage {
             listener: None,
+            native_id: false,
             id: id.to_string(),
             platform: Platform::Twitch,
             channel: "test-channel".to_string(),

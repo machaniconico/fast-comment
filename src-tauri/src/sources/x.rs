@@ -987,6 +987,7 @@ impl XSource {
 
         Some(ChatMessage {
             listener: None,
+            native_id: false,
             id,
             platform: Platform::X,
             channel: self.channel.clone(),

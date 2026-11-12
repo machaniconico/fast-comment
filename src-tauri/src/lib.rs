@@ -17,6 +17,7 @@ pub mod config;
 pub mod listeners;
 pub mod model;
 pub mod moderation;
+mod moderation_error;
 pub mod sources;
 pub mod stats;
 pub mod tts;
@@ -41,6 +42,7 @@ use crate::model::{
     YoutubeReaction,
 };
 use crate::moderation::{Moderator, Verdict};
+use crate::moderation_error::{ModerationError, ModerationErrorCode};
 use crate::sources::youtube_send::{YoutubeAuth, YoutubeOauthStatus};
 use crate::sources::SourceManager;
 use crate::stats::{spawn_stats_aggregator, StatsSnapshot, TimerSnapshot, YoutubeMetadataUpdate};
@@ -371,6 +373,7 @@ fn tts_speak_text(app: AppHandle, state: State<'_, AppState>, text: String) -> R
     let timestamp_ms = i64::try_from(epoch_millis).unwrap_or(i64::MAX);
     let msg = ChatMessage {
         listener: None,
+        native_id: false,
         id: format!("tts-text-{epoch_millis}"),
         platform: Platform::Youtube,
         channel: "system".to_string(),
@@ -656,6 +659,137 @@ async fn disconnect_youtube_oauth(
         .youtube_oauth_client_id
         .clone();
     state.youtube_auth.disconnect(&client_id).await
+}
+
+/// 配信側のコメントを削除する(YouTube は `LCC.` 形式の受信分のみ)。
+#[tauri::command]
+async fn moderate_delete_message(
+    state: State<'_, AppState>,
+    platform: String,
+    channel: String,
+    message_id: String,
+    author_id: String,
+) -> Result<(), ModerationError> {
+    let _ = author_id;
+    match platform.trim().to_lowercase().as_str() {
+        "youtube" => {
+            let client_id = state
+                .config
+                .lock()
+                .unwrap()
+                .credentials
+                .youtube_oauth_client_id
+                .trim()
+                .to_string();
+            if client_id.is_empty() {
+                return Err(ModerationError::new(
+                    ModerationErrorCode::NotLoggedIn,
+                    "設定でYouTube OAuthクライアントIDを入力し、Googleに接続してください",
+                ));
+            }
+            let video_id = crate::sources::youtube::extract_video_id(&channel);
+            state
+                .youtube_auth
+                .delete_message(&client_id, &video_id, &message_id)
+                .await?;
+            state.moderator.lock().unwrap().hide_id(message_id);
+            Ok(())
+        }
+        "twitch" => Err(ModerationError::new(
+            ModerationErrorCode::Unavailable,
+            "Twitch のモデレーションは次の更新で対応",
+        )),
+        _ => Err(ModerationError::new(
+            ModerationErrorCode::Unavailable,
+            "このプラットフォームのモデレーションには対応していません",
+        )),
+    }
+}
+
+/// ユーザーを BAN する。`duration_secs: None` は永久 BAN。
+#[tauri::command]
+async fn moderate_ban_user(
+    state: State<'_, AppState>,
+    platform: String,
+    channel: String,
+    author_id: String,
+    duration_secs: Option<u32>,
+    reason: Option<String>,
+) -> Result<(), ModerationError> {
+    // YouTube の liveChatBans には reason 項目が無いため、この値は使わない。
+    let _ = reason;
+    match platform.trim().to_lowercase().as_str() {
+        "youtube" => {
+            let client_id = state
+                .config
+                .lock()
+                .unwrap()
+                .credentials
+                .youtube_oauth_client_id
+                .trim()
+                .to_string();
+            if client_id.is_empty() {
+                return Err(ModerationError::new(
+                    ModerationErrorCode::NotLoggedIn,
+                    "設定でYouTube OAuthクライアントIDを入力し、Googleに接続してください",
+                ));
+            }
+            let video_id = crate::sources::youtube::extract_video_id(&channel);
+            state
+                .youtube_auth
+                .ban_user(&client_id, &video_id, author_id.trim(), duration_secs)
+                .await
+        }
+        "twitch" => Err(ModerationError::new(
+            ModerationErrorCode::Unavailable,
+            "Twitch のモデレーションは次の更新で対応",
+        )),
+        _ => Err(ModerationError::new(
+            ModerationErrorCode::Unavailable,
+            "このプラットフォームのモデレーションには対応していません",
+        )),
+    }
+}
+
+/// このセッションで BAN したユーザーの BAN を解除する。
+#[tauri::command]
+async fn moderate_unban_user(
+    state: State<'_, AppState>,
+    platform: String,
+    channel: String,
+    author_id: String,
+) -> Result<(), ModerationError> {
+    match platform.trim().to_lowercase().as_str() {
+        "youtube" => {
+            let client_id = state
+                .config
+                .lock()
+                .unwrap()
+                .credentials
+                .youtube_oauth_client_id
+                .trim()
+                .to_string();
+            if client_id.is_empty() {
+                return Err(ModerationError::new(
+                    ModerationErrorCode::NotLoggedIn,
+                    "設定でYouTube OAuthクライアントIDを入力し、Googleに接続してください",
+                ));
+            }
+            let video_id = crate::sources::youtube::extract_video_id(&channel);
+            state
+                .youtube_auth
+                .unban_user(&client_id, &video_id, author_id.trim())
+                .await
+        }
+        "twitch" => Err(ModerationError::new(
+            ModerationErrorCode::Unavailable,
+            "Twitch のモデレーションは次の更新で対応",
+        )),
+        _ => Err(ModerationError::new(
+            ModerationErrorCode::Unavailable,
+            "このプラットフォームのモデレーションには対応していません",
+        )),
+    }
 }
 
 /// コメントログ設定を反映する。失敗(ログ用ディレクトリを開けない等)は警告のみで、
@@ -1287,6 +1421,7 @@ fn build_injected_test_messages(
         let value = amount.filter(|_| matches!(kind, MessageKind::SuperChat | MessageKind::Bits));
         messages.push(ChatMessage {
             listener: None,
+            native_id: false,
             id: format!("injected-test:{epoch_millis}-{i}"),
             platform,
             channel: "test".to_string(),
@@ -1793,6 +1928,9 @@ pub fn run() {
             get_youtube_oauth_status,
             connect_youtube_oauth,
             disconnect_youtube_oauth,
+            moderate_delete_message,
+            moderate_ban_user,
+            moderate_unban_user,
             update_config,
             add_channel,
             remove_channel,

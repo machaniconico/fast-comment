@@ -3,6 +3,8 @@
   import { store, togglePin } from '../stores.svelte';
   import { appendModerationValue, copyTextToClipboard, getListener, hideMessage as ipcHideMessage, ttsSpeakText, updateListener } from '../ipc';
   import { ui } from '../ui.svelte';
+  import { moderation } from '../moderation.svelte';
+  import { moderationAvailability, QUICK_TIMEOUT_SECS, formatTimeoutLabel } from '../moderationActions';
   import { PLATFORM_COLORS } from '../platform';
   import { theme, type AppearanceTimeDisplay } from '../theme.svelte';
   import type { ContextMenuItem } from './ContextMenu.svelte';
@@ -175,6 +177,7 @@
       authorId: message.author.id,
       name: message.author.name,
       avatarUrl: message.author.avatarUrl,
+      channel: message.channel,
     }, notice);
   }
 
@@ -220,6 +223,39 @@
     }
   }
 
+  function buildModerationItems(): ContextMenuItem[] {
+    const avail = moderationAvailability(message, moderation.auth);
+    if (!avail.visible) return [];
+    const target = {
+      platform: message.platform,
+      channel: message.channel,
+      authorId: message.author.id,
+      name: message.author.nickname || message.author.name,
+    };
+    return [
+      {
+        label: 'コメントを削除(配信側)',
+        danger: true,
+        disabled: !avail.delete.enabled,
+        title: avail.delete.reason,
+        action: () => moderation.deleteMessage(target, message.id),
+      },
+      {
+        label: `タイムアウト ${formatTimeoutLabel(QUICK_TIMEOUT_SECS)}`,
+        disabled: !avail.timeout.enabled,
+        title: avail.timeout.reason,
+        action: () => moderation.timeout(target, QUICK_TIMEOUT_SECS),
+      },
+      {
+        label: 'BAN…',
+        danger: true,
+        disabled: !avail.ban.enabled,
+        title: avail.ban.reason,
+        action: () => moderation.requestBan(target, menuReturnFocus),
+      },
+    ];
+  }
+
   function buildMenuItems(): ContextMenuItem[] {
     const pinnedLabel = pinned ? 'ピン留め解除' : 'ピン留め';
     const ngWord = getNgWordCandidate();
@@ -256,16 +292,28 @@
             },
           ]
         : []),
+      ...buildModerationItems(),
     ];
   }
 
-  function openContextMenu(x: number, y: number) {
+  const REMOVED_LABELS = { deleted: '削除済み', timeout: 'タイムアウト', banned: 'BAN済み' } as const;
+
+  let rootEl: HTMLDivElement | undefined = $state();
+  // Where focus goes back after a dialog opened from this item's menu (the menu closes first).
+  let menuReturnFocus: HTMLElement | null = null;
+
+  function openContextMenu(x: number, y: number, returnFocus: HTMLElement | null) {
+    menuReturnFocus = returnFocus;
     onOpenContextMenu({ x, y, items: buildMenuItems() });
   }
 
   function onContextMenu(event: MouseEvent) {
     event.preventDefault();
-    openContextMenu(event.clientX, event.clientY);
+    openContextMenu(
+      event.clientX,
+      event.clientY,
+      rootEl?.querySelector<HTMLElement>('.menu-btn') ?? null,
+    );
   }
 
   // 標準の単語選択は消さない(選択語をNGワードに追加する導線で使う)。
@@ -280,7 +328,7 @@
   function onMoreClick(event: MouseEvent) {
     const target = event.currentTarget as HTMLElement;
     const rect = target.getBoundingClientRect();
-    openContextMenu(rect.right, rect.bottom);
+    openContextMenu(rect.right, rect.bottom, target);
   }
 
   function formatTime(ms: number, mode: AppearanceTimeDisplay): string {
@@ -322,12 +370,14 @@
 </script>
 
 <div
+  bind:this={rootEl}
   class="comment-item"
   class:wrap={wrap}
   class:highlighted={isHighlighted}
   class:highlight-badge={hasHighlightBadge}
   class:gift={isGift}
   class:copied
+  class:removed={!!message.removed}
   class:twitch-native={message.platform === 'twitch'}
   style:background={kindBg}
   style:color={kindFg}
@@ -405,6 +455,10 @@
 
   {#if isGift}
     <span class="gift-label" title="YouTubeギフト" aria-label="YouTubeギフト">GIFT</span>
+  {/if}
+
+  {#if message.removed}
+    <span class="removed-label">{REMOVED_LABELS[message.removed]}</span>
   {/if}
 
   <!-- Fragments -->
@@ -589,6 +643,21 @@
   .comment-item.gift .author-name {
     color: #e1c4ff;
     font-weight: 700;
+  }
+
+  .comment-item.removed {
+    opacity: 0.5;
+  }
+
+  .removed-label {
+    flex-shrink: 0;
+    padding: 1px 5px;
+    border: 1px solid rgba(255, 180, 169, 0.7);
+    border-radius: 3px;
+    color: #ffb4a9;
+    font-size: 10px;
+    font-weight: 700;
+    line-height: 13px;
   }
 
   .gift-label {

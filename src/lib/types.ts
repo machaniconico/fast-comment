@@ -106,6 +106,8 @@ export function isListenerDeleted(u: ListenerUpdate): u is ListenerDeleted {
 export interface ChatMessage {
   listener?: ListenerInfo;
   id: string;
+  /** true when `id` is the platform's own message id (usable for moderation APIs). */
+  nativeId?: boolean;
   platform: Platform;
   channel: string;
   author: Author;
@@ -127,7 +129,11 @@ export interface YoutubeReaction {
  * Frontend-only projection of ChatMessage.
  * Keep ChatMessage itself a strict mirror of the Rust model.
  */
+/** Local mark after a successful stream-side moderation action (UI only). */
+export type RemovedState = 'deleted' | 'timeout' | 'banned';
+
 export type UiChatMessage = ChatMessage & {
+  removed?: RemovedState;
   /** Session sequence number for this viewer, derived in the UI store. */
   viewerSeq?: number;
 };

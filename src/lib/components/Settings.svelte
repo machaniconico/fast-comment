@@ -17,6 +17,7 @@
   import type { TtsEngineSpeaker, VoicevoxEngineKind } from '../ipc';
   import { isListenerDeleted, safeAvatarUrl, type ListenerRecord, type ListenerUpdate } from '../types';
   import { ui, SETTINGS_ANCHOR_IDS } from '../ui.svelte';
+  import { moderation } from '../moderation.svelte';
   import {
     theme,
     type AppearanceDensity,
@@ -377,6 +378,7 @@
     refreshLogDir();
     try {
       youtubeOauthStatus = await getYoutubeOauthStatus();
+      moderation.setYoutubeConnected(youtubeOauthStatus?.connected === true);
     } catch (e) {
       youtubeOauthMsg = e instanceof Error ? e.message : String(e);
       youtubeOauthOk = false;
@@ -1184,6 +1186,7 @@
       saveWarned = warnings.length > 0;
       try {
         youtubeOauthStatus = await getYoutubeOauthStatus();
+        moderation.setYoutubeConnected(youtubeOauthStatus?.connected === true);
       } catch {
         // Saving succeeded; a credential-store status failure should not report save failure.
       }
@@ -1213,6 +1216,7 @@
     youtubeOauthOk = null;
     try {
       youtubeOauthStatus = await connectYoutubeOauth(clientId);
+      moderation.setYoutubeConnected(youtubeOauthStatus?.connected === true);
       if (config) {
         config.credentials = {
           ...(config.credentials ?? {}),
@@ -1226,6 +1230,7 @@
       youtubeOauthOk = false;
       try {
         youtubeOauthStatus = await getYoutubeOauthStatus();
+        moderation.setYoutubeConnected(youtubeOauthStatus?.connected === true);
       } catch {
         // The original OAuth error is more useful than a follow-up status error.
       }
@@ -1241,6 +1246,7 @@
     youtubeOauthOk = null;
     try {
       youtubeOauthStatus = await disconnectYoutubeOauth();
+      moderation.setYoutubeConnected(youtubeOauthStatus?.connected === true);
       youtubeOauthMsg = 'このPCのGoogle接続情報を削除しました';
       youtubeOauthOk = true;
     } catch (e) {

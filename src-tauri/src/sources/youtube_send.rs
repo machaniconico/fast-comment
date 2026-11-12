@@ -17,6 +17,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 
+use crate::moderation_error::ModerationError;
+
 const GOOGLE_AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const YOUTUBE_SCOPE: &str = "https://www.googleapis.com/auth/youtube.force-ssl";
@@ -59,7 +61,7 @@ struct CachedLiveChat {
 
 /// OAuth・投稿専用の軽量状態。バックグラウンドタスクは持たない。
 pub struct YoutubeAuth {
-    http: reqwest::Client,
+    pub(super) http: reqwest::Client,
     login_lock: Mutex<()>,
     keyring_lock: Mutex<()>,
     access_token: Mutex<Option<CachedAccessToken>>,
@@ -159,6 +161,9 @@ impl YoutubeAuth {
             channel_title: Some(channel_title.clone()),
         })
         .await?;
+        // 同じクライアントIDで別アカウントへ再接続した場合も、旧アカウントの
+        // liveChatId / banId を使わないよう認証世代を進めてキャッシュを捨てる。
+        self.clear_caches().await;
         self.cache_access_token(client_id, token.access_token().secret(), token.expires_in())
             .await;
 
@@ -183,6 +188,7 @@ impl YoutubeAuth {
     pub async fn clear_caches(&self) {
         *self.access_token.lock().await = None;
         *self.live_chat.lock().await = None;
+        super::youtube_moderation::clear_moderation_caches().await;
     }
 
     pub async fn send_message(
@@ -207,23 +213,25 @@ impl YoutubeAuth {
         }
 
         // 期限切れ/無効化されたaccess tokenだけ1回更新して再試行する。
-        for attempt in 0..2 {
-            let access_token = self.access_token(client_id).await?;
-            match self.send_once(target, text, &access_token).await {
-                Ok(()) => return Ok(()),
-                Err(SendError::Unauthorized) if attempt == 0 => {
-                    *self.access_token.lock().await = None;
-                }
-                Err(SendError::Message(message)) => return Err(message),
-                Err(SendError::Unauthorized) => {
-                    return Err(
-                        "YouTube認証の有効期限が切れています。設定からGoogleへ再接続してください"
-                            .to_string(),
-                    )
-                }
-            }
+        let this = self;
+        let result = self
+            .with_token_retry(client_id, move |access_token: String| {
+                let this = this;
+                async move { this.send_once(target, text, &access_token).await }
+            })
+            .await;
+        match result {
+            Ok(()) => Ok(()),
+            Err(SendError::Unauthorized) => Err(
+                "YouTube認証の有効期限が切れています。設定からGoogleへ再接続してください"
+                    .to_string(),
+            ),
+            Err(SendError::NotLoggedIn(message))
+            | Err(SendError::Message(message))
+            | Err(SendError::Network(message)) => Err(message),
+            Err(SendError::Api { status, body }) => Err(map_google_api_error(status, &body)),
+            Err(SendError::Moderation(error)) => Err(error.message),
         }
-        unreachable!("YouTube投稿の再試行は最大2回")
     }
 
     async fn send_once(
@@ -313,7 +321,38 @@ impl YoutubeAuth {
         Ok(live_chat_id)
     }
 
-    async fn access_token(&self, client_id: &str) -> Result<String, String> {
+    /// access token を取得し、API 呼び出しが 401 を返したらキャッシュを捨てて
+    /// もう一度だけ同じ操作を実行する共通ヘルパ。
+    ///
+    /// 2 回目も 401 の場合は `SendError::Unauthorized` を返すので、呼び出し側が
+    /// 用途に応じた文言へ変換する。`action` は呼ばれるたびに新しい access token を
+    /// 受け取るため、内部でトークンを保持しないこと。
+    pub(super) async fn with_token_retry<F, Fut, T>(
+        &self,
+        client_id: &str,
+        mut action: F,
+    ) -> Result<T, SendError>
+    where
+        F: FnMut(String) -> Fut,
+        Fut: std::future::Future<Output = Result<T, SendError>>,
+    {
+        for attempt in 0..2 {
+            let access_token = match self.access_token(client_id).await {
+                Ok(token) => token,
+                Err(message) => return Err(SendError::NotLoggedIn(message)),
+            };
+            match action(access_token).await {
+                Ok(value) => return Ok(value),
+                Err(SendError::Unauthorized) if attempt == 0 => {
+                    *self.access_token.lock().await = None;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(SendError::Unauthorized)
+    }
+
+    pub(super) async fn access_token(&self, client_id: &str) -> Result<String, String> {
         // refreshを同時実行しないため、更新完了まで同じmutexを保持する。
         let mut cache = self.access_token.lock().await;
         if let Some(cached) = cache.as_ref() {
@@ -446,9 +485,19 @@ impl YoutubeAuth {
     }
 }
 
-enum SendError {
+pub(super) enum SendError {
+    /// 401。共通ヘルパが 1 回だけ再試行し、最終的にこれを返す。
     Unauthorized,
+    /// リフレッシュトークンが無い・更新できない等、未接続扱いの失敗。
+    NotLoggedIn(String),
+    /// 投稿向けの整形済みメッセージ。
     Message(String),
+    /// モデレーション側でステータスと本文から code を判定するための生の API 応答。
+    Api { status: StatusCode, body: String },
+    /// 通信・解析の失敗。
+    Network(String),
+    /// モデレーション固有のエラーをそのまま伝播する。
+    Moderation(ModerationError),
 }
 
 fn safe_token_deadline(expires_in: Option<Duration>) -> Instant {
@@ -531,7 +580,7 @@ fn map_google_api_error(status: StatusCode, body: &str) -> String {
     }
 }
 
-fn google_api_reason(body: &str) -> Option<String> {
+pub(super) fn google_api_reason(body: &str) -> Option<String> {
     serde_json::from_str::<Value>(body)
         .ok()?
         .pointer("/error/errors/0/reason")?

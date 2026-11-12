@@ -10,7 +10,7 @@
  * - Wired to ipc.ts via onChatBatch + startChatListener (+ startTtsSpeakListener/startTtsCancelListener).
  */
 
-import { isListenerDeleted, type ChatMessage, type ListenerUpdate, type Platform, type UiChatMessage } from './types';
+import { isListenerDeleted, type ChatMessage, type ListenerUpdate, type Platform, type RemovedState, type UiChatMessage } from './types';
 import { activeFilterCount, prependCapped, defaultDisplayFilter, isDefaultFilter, matchesDisplayFilter, normalizeDisplayFilter, type DisplayFilter } from './displayFilter';
 import { onChatBatch, startChatListener, startListenerUpdatedListener, startTtsSpeakListener, startTtsCancelListener, startTtsAudioListener, getConfig } from './ipc';
 
@@ -305,6 +305,30 @@ class CommentStore {
       this._msgs = next.map((e) => e.msg);
     }
     if (this._pinned.some((m) => patch(m) !== m)) this._pinned = this._pinned.map(patch);
+  }
+
+  /**
+   * Mark buffered comments as removed after a successful stream-side moderation action
+   * (UI only; touched only on user action). With `messageId` only that message is marked,
+   * otherwise every message of `platform + authorId`. Matching pinned comments are unpinned.
+   */
+  markRemoved(platform: string, authorId: string, removed: RemovedState, messageId?: string): void {
+    const hit = (m: UiChatMessage) =>
+      m.platform === platform && (messageId !== undefined ? m.id === messageId : m.author.id === authorId);
+    const mark = (m: UiChatMessage): UiChatMessage => (hit(m) && m.removed !== removed ? { ...m, removed } : m);
+    let changed = false;
+    const next = this._buf.map((entry) => {
+      const msg = mark(entry.msg);
+      if (msg === entry.msg) return entry;
+      changed = true;
+      return { msg, search: entry.search };
+    });
+    if (changed) {
+      this._buf = next;
+      this._msgs = next.map((e) => e.msg);
+    }
+    if (this._firstComments.some((m) => mark(m) !== m)) this._firstComments = this._firstComments.map(mark);
+    if (this._pinned.some(hit)) this._pinned = this._pinned.filter((m) => !hit(m));
   }
 
   /** Push a batch into the ring buffer, evicting oldest on overflow. */

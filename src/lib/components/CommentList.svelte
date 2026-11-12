@@ -217,6 +217,7 @@
   class="comment-list-container"
   bind:this={containerEl}
   onscroll={onScroll}
+  tabindex="-1"
   role="list"
   aria-label={platformFilter ? `${platformFilter} コメント一覧` : 'コメント一覧'}
 >

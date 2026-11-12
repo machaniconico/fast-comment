@@ -583,12 +583,14 @@ fn build_message(
     kind: MessageKind,
     amount: Option<Amount>,
 ) -> ChatMessage {
-    let id = r
+    let native_id_value = r
         .get("id")
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(str::to_string)
+        .map(str::to_string);
+    let native_id = native_id_value.is_some();
+    let id = native_id_value
         .or_else(|| {
             if kind == MessageKind::Gift {
                 gift_fallback_id(r, channel, &author)
@@ -608,6 +610,7 @@ fn build_message(
 
     ChatMessage {
         listener: None,
+        native_id,
         id,
         platform: Platform::Youtube,
         channel: channel.to_string(),

@@ -634,6 +634,7 @@ mod tests {
     fn message(author_name: &str, body: &str) -> ChatMessage {
         ChatMessage {
             listener: None,
+            native_id: false,
             id: "msg-1".to_string(),
             platform: Platform::Youtube,
             channel: "channel".to_string(),

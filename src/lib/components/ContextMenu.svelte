@@ -3,6 +3,9 @@
     label: string;
     action: () => void | Promise<void>;
     danger?: boolean;
+    /** Rendered dimmed and not clickable; `title` explains why. */
+    disabled?: boolean;
+    title?: string;
   }
 </script>
 
@@ -55,7 +58,7 @@
 
   function choose(index: number) {
     const item = items[index];
-    if (!item) return;
+    if (!item || item.disabled) return;
     onClose();
     void item.action();
   }
@@ -110,6 +113,9 @@
       class="menu-item"
       class:danger={item.danger}
       class:active={index === activeIndex}
+      class:disabled={item.disabled}
+      aria-disabled={item.disabled ? 'true' : undefined}
+      title={item.title}
       role="menuitem"
       tabindex="-1"
       onmouseenter={() => { activeIndex = index; }}
@@ -156,6 +162,16 @@
   .menu-item.active,
   .menu-item:hover {
     background: rgba(255, 255, 255, 0.1);
+  }
+
+  .menu-item.disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+  }
+
+  .menu-item.disabled.active,
+  .menu-item.disabled:hover {
+    background: transparent;
   }
 
   .menu-item.danger {

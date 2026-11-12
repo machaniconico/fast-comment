@@ -421,6 +421,7 @@ impl TwitchSource {
 
         Some(ChatMessage {
             listener: None,
+            native_id: tags.contains_key("id"),
             id: tags.get("id").cloned().unwrap_or_else(ChatMessage::new_id),
             platform: Platform::Twitch,
             channel: self.channel.clone(),

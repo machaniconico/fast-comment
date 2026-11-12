@@ -868,6 +868,7 @@ fn chunked_to_chat(
 
             Some(ChatMessage {
                 listener: None,
+                native_id: false,
                 id,
                 platform: Platform::Niconico,
                 channel: live_id.to_string(),
@@ -913,6 +914,7 @@ fn chunked_to_chat(
 
             Some(ChatMessage {
                 listener: None,
+                native_id: false,
                 id,
                 platform: Platform::Niconico,
                 channel: live_id.to_string(),
