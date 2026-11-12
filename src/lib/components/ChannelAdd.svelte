@@ -30,7 +30,8 @@
     return !!a
       && (a.title ?? null) === (b.title ?? null)
       && (a.viewers ?? null) === (b.viewers ?? null)
-      && (a.live ?? null) === (b.live ?? null);
+      && (a.live ?? null) === (b.live ?? null)
+      && (a.notice ?? null) === (b.notice ?? null);
   }
 
   function updateChannelStatus(statuses: ChannelStatus[] | undefined) {
@@ -64,6 +65,9 @@
   }
 
   function chipTooltip(ch: ChannelConfig, status: ChannelStatus | undefined, display: string): string {
+    if (status?.notice) {
+      return `${ch.identifier}\n${status.notice}`;
+    }
     if (status?.live === true) {
       return display === ch.identifier ? ch.identifier : `${display}\n${ch.identifier}`;
     }
@@ -78,6 +82,9 @@
       return `https://www.twitch.tv/${encodeURIComponent(ch.identifier)}`;
     }
     if (ch.platform === 'x') {
+      if (ch.identifier.startsWith('@')) {
+        return `https://x.com/${encodeURIComponent(ch.identifier.slice(1))}`;
+      }
       return `https://x.com/i/broadcasts/${encodeURIComponent(ch.identifier)}`;
     }
     if (ch.platform === 'niconico') {
@@ -219,6 +226,16 @@
   const TWITCH_HOSTS = new Set(['twitch.tv', 'm.twitch.tv']);
   const YOUTUBE_HOSTS = new Set(['youtube.com', 'm.youtube.com', 'music.youtube.com', 'youtu.be']);
   const X_HOSTS = new Set(['x.com', 'twitter.com']);
+  // アカウントモード(自動検知)の handle。x_live.rs の parse_x_target と同じ規則。
+  const X_HANDLE_RE = /^[A-Za-z0-9_]{1,15}$/;
+  // URL の第1パスとして除外する語。`live` / `help` 等の実在 handle も URL 形では弾くが、@live の直接入力は通る。
+  // Rust 側 sources/x_live.rs の is_reserved_path と同期すること。
+  const X_RESERVED_PATHS = new Set([
+    'i', 'home', 'search', 'explore', 'settings', 'messages', 'notifications', 'compose',
+    'login', 'logout', 'signup', 'tos', 'privacy', 'intent', 'share', 'hashtag', 'account',
+    'jobs', 'about', 'download', 'help', 'communities', 'premium', 'verified', 'bookmark',
+    'followers', 'following', 'lists', 'moments', 'topics', 'live', 'broadcasts'
+  ]);
   const NICONICO_HOSTS = new Set(['live.nicovideo.jp', 'nico.ms', 'live2.nicovideo.jp']);
   const NICONICO_LIVE_ID_RE = /^lv\d+$/;
   const YOUTUBE_PATH_ID_PREFIXES = new Set(['live', 'embed', 'shorts', 'v']);
@@ -346,6 +363,13 @@
     return match ? match[0] : null;
   }
 
+  // X のアカウント指定(x.com/{handle}[/live])から handle を抽出する。予約パスは除外。
+  function extractXHandle(url: URL): string | null {
+    const first = url.pathname.split('/').filter(Boolean)[0];
+    if (!first || X_RESERVED_PATHS.has(first.toLowerCase()) || !X_HANDLE_RE.test(first)) return null;
+    return first;
+  }
+
   // ニコ生URL(live.nicovideo.jp/watch/lvN, nico.ms/lvN)から lv 番組IDを抽出する。
   // Rust 側 sources/niconico.rs の extract_live_id と同等の抽出。
   function extractNiconicoLiveId(url: URL): string | null {
@@ -362,6 +386,10 @@
     if (!url) {
       if (NICONICO_LIVE_ID_RE.test(raw)) {
         return { kind: 'detected', platform: 'niconico', identifier: raw };
+      }
+      // 手動で X を選んでいる時の @handle はアカウントモード(自動検知)。YouTube の @handle 判別は変えない。
+      if (newPlatform === 'x' && raw.startsWith('@') && X_HANDLE_RE.test(raw.slice(1))) {
+        return { kind: 'detected', platform: 'x', identifier: raw.toLowerCase() };
       }
       const youtubeChannelIdentifier =
         validYoutubeHandle(raw) ?? validYoutubeChannelId(raw);
@@ -415,10 +443,14 @@
       if (id) {
         return { kind: 'detected', platform: 'x', identifier: id };
       }
+      const handle = extractXHandle(url);
+      if (handle) {
+        return { kind: 'detected', platform: 'x', identifier: `@${handle.toLowerCase()}` };
+      }
       return {
         kind: 'known-url',
         platform: 'x',
-        message: 'Xのbroadcast IDが見つかりません。配信URL(.../i/broadcasts/xxxx)かbroadcast IDを手動入力してください。'
+        message: 'Xのbroadcast IDが見つかりません。配信URL(.../i/broadcasts/xxxx)かbroadcast ID、または @アカウント名 を手動入力してください。'
       };
     }
 
@@ -474,6 +506,13 @@
             : detection.youtubeKind === 'channel'
               ? 'YouTubeチャンネル'
               : 'YouTube動画';
+      if (detection.platform === 'x' && detection.identifier.startsWith('@')) {
+        return {
+          tone: 'ok',
+          message: 'X アカウントとして自動判別（配信開始を自動検知。認証情報の X ログイン cookie が必要）:',
+          identifier: detection.identifier
+        };
+      }
       return { tone: 'ok', message: `${label} として自動判別:`, identifier: detection.identifier };
     }
     if (detection.kind === 'known-url' || detection.kind === 'unsupported-url') {
@@ -567,7 +606,8 @@
         {@const display = statusTitle(status) ?? titles.get(key) ?? ch.identifier}
         {@const isLive = status?.live === true}
         {@const isIdle = status?.live === false}
-        {@const bodyText = isIdle ? ch.identifier : display}
+        {@const notice = status?.notice ?? null}
+        {@const bodyText = notice ? `⚠ ${ch.identifier}` : isIdle ? ch.identifier : display}
         <span
           class="chip"
           class:twitch={ch.platform === 'twitch'}
@@ -590,7 +630,7 @@
         <span
           class="chip x placeholder"
           role="listitem"
-          title="X (Twitter) は配信ごとに URL を追加します。クリックで入力欄へ。"
+          title="X (Twitter) は配信 URL を追加します。プラットフォームで X を選び @アカウント名 を入れると、ログイン cookie 設定時に配信開始を自動検知します。クリックで入力欄へ。"
         >
           <span class="chip-dot" aria-hidden="true"></span>
           <button type="button" class="chip-add" onclick={focusXAdd}>X 未接続</button>

@@ -176,6 +176,7 @@ pub fn spawn_twitch_viewer_poller(
                             likes: None,
                             title: None,
                             live: values.live,
+                            notice: None,
                             reactions_delta: None,
                             full_snapshot: true,
                         };

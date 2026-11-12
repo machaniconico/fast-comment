@@ -39,6 +39,7 @@ use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
+use super::x_live::{self, DetectOutcome, LiveDetector, XTarget};
 use super::{Backoff, Source};
 use crate::config::XOverrides;
 use crate::model::{Author, ChatMessage, Fragment, MessageKind, Platform, Roles};
@@ -278,10 +279,61 @@ impl XSessionError {
     }
 }
 
-/// X ライブ配信1件のチャットを購読する Source。
+/// 識別子から `ChatMessage.channel` / 状態表示キーになる名前を作る。
+/// 配信 ID モードは正規化済み broadcast ID、アカウントモードは `@handle`(小文字)。
+pub fn x_channel_name(identifier: &str) -> String {
+    match x_live::parse_x_target(identifier) {
+        XTarget::Broadcast(id) => id,
+        XTarget::Account(handle) => format!("@{}", handle.to_ascii_lowercase()),
+    }
+}
+
+/// アカウントモードで cookie が無い時の状態表示。
+const NEED_COOKIE_MSG: &str = "X の自動検知にはログイン cookie(認証情報)が必要です";
+/// アカウントモードで cookie が拒否された時の状態表示。
+const AUTH_FAILED_MSG: &str = "X のログイン cookie が無効です(認証情報を更新してください)";
+
+/// ポーリング用のジッター(0〜`MAX_JITTER_MS`)。暗号用途ではないので時刻ゆらぎで足りる。
+fn poll_jitter() -> Duration {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    Duration::from_millis(u64::from(nanos) % (x_live::MAX_JITTER_MS + 1))
+}
+
+fn now_epoch_s() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// アカウントモード1周分の検知(uid 未解決なら先に解決してキャッシュ)。
+/// 第2要素は Live だがレート残量 0 の時の reset(`LiveDetector::probe` 参照)。
+async fn detect_step(
+    detector: &LiveDetector,
+    handle: &str,
+    uid: &mut Option<String>,
+) -> (DetectOutcome, Option<u64>) {
+    if uid.is_none() {
+        match detector.resolve_user_id(handle).await {
+            Ok(id) => *uid = Some(id),
+            Err(e) => return (e.into(), None),
+        }
+    }
+    match uid.as_deref() {
+        Some(u) => detector.probe(u).await,
+        None => (DetectOutcome::NotLive, None),
+    }
+}
+
+/// X ライブ配信のチャットを購読する Source。配信 ID モードは1配信、
+/// アカウントモードは `@handle` の配信開始を検知して順次接続する。
 pub struct XSource {
-    /// 正規化済み broadcast ID。
-    broadcast_id: String,
+    target: XTarget,
+    /// `ChatMessage.channel` / 状態表示のキー([`x_channel_name`])。
+    channel: String,
     overrides: XOverrides,
     /// ユーザー名解決用のログイン cookie。None なら匿名表示で動く。
     auth: Option<XAuth>,
@@ -297,7 +349,8 @@ impl XSource {
         metadata_tx: Option<mpsc::Sender<YoutubeMetadataUpdate>>,
     ) -> Self {
         XSource {
-            broadcast_id: extract_broadcast_id(&identifier),
+            target: x_live::parse_x_target(&identifier),
+            channel: x_channel_name(&identifier),
             overrides,
             auth,
             metadata_tx,
@@ -328,7 +381,7 @@ impl XSource {
 
 impl Source for XSource {
     fn name(&self) -> String {
-        format!("x:{}", self.broadcast_id)
+        format!("x:{}", self.channel)
     }
 
     fn run(
@@ -337,50 +390,21 @@ impl Source for XSource {
         cancel: CancellationToken,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + '_>> {
         Box::pin(async move {
-            let mut backoff = Backoff::new();
             // dedup は再接続を跨いで保持する。live-chat は接続のたびに直近
             // チャットを全量バックフィルするため、セッションローカルにすると
             // 再接続のたびに同じコメントが UI へ再流入する(実害: 一覧クリア後に
-            // 消したはずのコメントが復活する)。
+            // 消したはずのコメントが復活する)。アカウントモードでは配信をまたぐ。
             let mut seen = ChatDedup::new(DEDUP_CAPACITY);
             // guest_token も跨いで使い回す(数時間有効。毎回 activate しない)。
             let mut guest_token: Option<String> = None;
-            loop {
-                if cancel.is_cancelled() {
-                    return Ok(());
+            match &self.target {
+                XTarget::Broadcast(id) => {
+                    self.run_broadcast(id, &tx, &cancel, &mut seen, &mut guest_token)
+                        .await
                 }
-
-                match self
-                    .connect_and_listen(&tx, &cancel, &mut seen, &mut guest_token)
-                    .await
-                {
-                    Ok(stable) => {
-                        if cancel.is_cancelled() {
-                            return Ok(());
-                        }
-                        self.send_live_state(false, None, None).await;
-                        if stable {
-                            backoff.reset();
-                        }
-                    }
-                    Err(e) => {
-                        self.send_live_state(false, None, None).await;
-                        if e.stable {
-                            backoff.reset();
-                        }
-                        tracing::warn!("x:{} 接続エラー: {:#}", self.broadcast_id, e.error);
-                    }
-                }
-
-                let delay = backoff.next_delay();
-                tracing::info!(
-                    "x:{} {}ms 後に再接続",
-                    self.broadcast_id,
-                    delay.as_millis()
-                );
-                tokio::select! {
-                    _ = cancel.cancelled() => return Ok(()),
-                    _ = tokio::time::sleep(delay) => {}
+                XTarget::Account(handle) => {
+                    self.run_account(handle, &tx, &cancel, &mut seen, &mut guest_token)
+                        .await
                 }
             }
         })
@@ -388,11 +412,178 @@ impl Source for XSource {
 }
 
 impl XSource {
+    /// 配信 ID モード: 1配信に張り続け、切れたら指数バックオフで再接続する。
+    async fn run_broadcast(
+        &self,
+        broadcast_id: &str,
+        tx: &broadcast::Sender<ChatMessage>,
+        cancel: &CancellationToken,
+        seen: &mut ChatDedup,
+        guest_token: &mut Option<String>,
+    ) -> anyhow::Result<()> {
+        let mut backoff = Backoff::new();
+        loop {
+            if cancel.is_cancelled() {
+                return Ok(());
+            }
+
+            match self
+                .connect_and_listen(broadcast_id, None, tx, cancel, seen, guest_token)
+                .await
+            {
+                Ok(stable) => {
+                    if cancel.is_cancelled() {
+                        return Ok(());
+                    }
+                    self.send_live_state(false, None, None).await;
+                    if stable {
+                        backoff.reset();
+                    }
+                }
+                Err(e) => {
+                    self.send_live_state(false, None, None).await;
+                    if e.stable {
+                        backoff.reset();
+                    }
+                    tracing::warn!("x:{} 接続エラー: {:#}", self.channel, e.error);
+                }
+            }
+
+            let delay = backoff.next_delay();
+            tracing::info!("x:{} {}ms 後に再接続", self.channel, delay.as_millis());
+            tokio::select! {
+                _ = cancel.cancelled() => return Ok(()),
+                _ = tokio::time::sleep(delay) => {}
+            }
+        }
+    }
+
+    /// アカウントモード: 配信開始を検知 → 接続 → 終了で検知へ戻る。
+    /// cookie が無ければ接続せず、状態表示だけ出して cancel まで待つ。
+    async fn run_account(
+        &self,
+        handle: &str,
+        tx: &broadcast::Sender<ChatMessage>,
+        cancel: &CancellationToken,
+        seen: &mut ChatDedup,
+        guest_token: &mut Option<String>,
+    ) -> anyhow::Result<()> {
+        let detector = match self.auth.clone() {
+            Some(auth) => LiveDetector::with_default_client(self.overrides.clone(), auth)
+                .map_err(|e| tracing::warn!("x:{} 検知クライアント作成失敗: {:#}", self.channel, e))
+                .ok(),
+            None => None,
+        };
+        let Some(detector) = detector else {
+            tracing::warn!("x:{} {}", self.channel, NEED_COOKIE_MSG);
+            self.send_notice(NEED_COOKIE_MSG).await;
+            cancel.cancelled().await;
+            return Ok(());
+        };
+
+        let base = x_live::poll_interval(self.overrides.live_poll_secs);
+        let mut uid: Option<String> = None;
+        let mut attempt: u32 = 0;
+        let mut unknown_streak: u32 = 0;
+        // チップが「待機中」表示になっているか(同じ状態を毎周送らないため)。
+        let mut idle_shown = false;
+        loop {
+            if cancel.is_cancelled() {
+                return Ok(());
+            }
+            if !idle_shown {
+                self.send_live_state(false, None, None).await;
+                idle_shown = true;
+            }
+
+            let (outcome, deferred_until) = tokio::select! {
+                _ = cancel.cancelled() => return Ok(()),
+                o = detect_step(&detector, handle, &mut uid) => o,
+            };
+            let mut condition = outcome.wait_condition();
+            let mut retry_now = false;
+            match outcome {
+                DetectOutcome::Live(id) => {
+                    attempt = 0;
+                    unknown_streak = 0;
+                    tracing::info!("x:{} 配信を検知 id={}", self.channel, id);
+                    let owner = uid.clone();
+                    match self
+                        .connect_and_listen(&id, owner.as_deref(), tx, cancel, seen, guest_token)
+                        .await
+                    {
+                        Ok(stable) => {
+                            if cancel.is_cancelled() {
+                                return Ok(());
+                            }
+                            // 安定接続だった配信の終了/切断は待たずに再検知する。
+                            retry_now = stable;
+                        }
+                        Err(e) => {
+                            tracing::warn!("x:{} 接続エラー: {:#}", self.channel, e.error);
+                            retry_now = e.stable;
+                        }
+                    }
+                    self.send_live_state(false, None, None).await;
+                    idle_shown = true;
+                }
+                DetectOutcome::NotLive => {
+                    attempt = 0;
+                    unknown_streak = 0;
+                }
+                DetectOutcome::Unknown(e) => {
+                    unknown_streak = unknown_streak.saturating_add(1);
+                    (condition, attempt) = x_live::escalate_unknown(unknown_streak);
+                    tracing::warn!(
+                        "x:{} 自動検知の応答を解釈できず({}回連続): {:#}",
+                        self.channel,
+                        unknown_streak,
+                        e
+                    );
+                }
+                DetectOutcome::NotFound => {
+                    // 凍結解除・改名に追従できるよう、ゆっくり再解決する(通知は表示したまま)。
+                    attempt = 0;
+                    let msg = format!("X アカウント @{handle} が見つかりません");
+                    tracing::warn!("x:{} {}", self.channel, msg);
+                    self.send_notice(&msg).await;
+                    idle_shown = false;
+                }
+                DetectOutcome::RateLimited { until } => {
+                    attempt = attempt.saturating_add(1);
+                    tracing::warn!("x:{} 自動検知がレート制限中 (reset={:?})", self.channel, until);
+                }
+                DetectOutcome::AuthFailed => {
+                    attempt = 0;
+                    tracing::warn!("x:{} {}", self.channel, AUTH_FAILED_MSG);
+                    self.send_notice(AUTH_FAILED_MSG).await;
+                    idle_shown = false;
+                }
+            }
+            // Live だがレート残量 0 だった場合は、接続後・次の probe の前にだけ待つ。
+            if let Some(until) = deferred_until.filter(|u| *u > now_epoch_s()) {
+                retry_now = false;
+                condition = x_live::WaitCondition::RateLimited { until: Some(until) };
+            }
+            if retry_now {
+                continue;
+            }
+
+            let delay = x_live::next_wait(condition, base, now_epoch_s(), attempt, poll_jitter());
+            tokio::select! {
+                _ = cancel.cancelled() => return Ok(()),
+                _ = tokio::time::sleep(delay) => {}
+            }
+        }
+    }
+
     /// 1接続分のセッション。show.json → live-chat ストリーム接続 → 受信ループ。
     ///
     /// 戻り値は Twitch と同じ「安定セッション」判定(チャット実受信 or 30秒以上)。
     async fn connect_and_listen(
         &self,
+        broadcast_id: &str,
+        expected_owner: Option<&str>,
         tx: &broadcast::Sender<ChatMessage>,
         cancel: &CancellationToken,
         seen: &mut ChatDedup,
@@ -409,7 +600,7 @@ impl XSource {
         // HTTP フローは配信未開始/終了でも失敗するため、失敗は不安定扱いで
         // バックオフを伸ばし続ける(=配信開始待ちのポーリングを兼ねる)。
         // チャンネル削除/設定変更の cancel は bootstrap 中も効かせる。
-        let fetcher = self.show_fetch();
+        let fetcher = self.show_fetch(broadcast_id);
         let mut show = tokio::select! {
             _ = cancel.cancelled() => return Ok(true),
             r = fetcher.fetch(&client, guest) => r.map_err(|e| XSessionError::new(e, false))?,
@@ -422,10 +613,19 @@ impl XSource {
                 false,
             ));
         }
+        // アカウントモードは検知した ID の所有者と状態を接続前に再確認する。
+        if let Some(uid) = expected_owner {
+            if !x_live::is_running_owned(&show.state, show.broadcaster_id.as_deref(), uid) {
+                return Err(XSessionError::new(
+                    anyhow::anyhow!("検知した配信が RUNNING でない、または所有者が一致しない"),
+                    false,
+                ));
+            }
+        }
         if show.state != "RUNNING" {
             tracing::warn!(
                 "x:{} 想定外の配信状態 state={}",
-                self.broadcast_id,
+                broadcast_id,
                 show.state
             );
         }
@@ -436,7 +636,7 @@ impl XSource {
             _ = cancel.cancelled() => return Ok(true),
             r = client
                 .get(&live_chat_url)
-                .query(&[("broadcastId", self.broadcast_id.as_str())])
+                .query(&[("broadcastId", broadcast_id)])
                 .send() => r.map_err(|e| XSessionError::new(e, false))?,
         };
         let status = resp.status();
@@ -450,7 +650,7 @@ impl XSource {
         }
         tracing::info!(
             "x:{} live-chat 接続 status={} content-type={:?}",
-            self.broadcast_id,
+            broadcast_id,
             status,
             resp.headers().get("content-type"),
         );
@@ -470,16 +670,16 @@ impl XSource {
             )
         });
         if resolver.is_some() {
-            tracing::info!("x:{} ユーザー名解決 有効(cookie 設定あり)", self.broadcast_id);
+            tracing::info!("x:{} ユーザー名解決 有効(cookie 設定あり)", broadcast_id);
         }
         tokio::spawn(name_resolver_task(
             chat_rx,
             tx.clone(),
             resolver,
-            self.broadcast_id.clone(),
+            broadcast_id.to_string(),
         ));
 
-        let mut stats = SessionStats::new(&self.broadcast_id);
+        let mut stats = SessionStats::new(broadcast_id);
         // NDJSON はチャンク境界が行境界と一致しない(実測: 行が分割されて届く)
         // ため、バイト列を貯めて改行単位で切り出す。
         let mut line_buf: Vec<u8> = Vec::new();
@@ -545,7 +745,7 @@ impl XSource {
                             if matches!(next.state.as_str(), "ENDED" | "TIMED_OUT") {
                                 tracing::info!(
                                     "x:{} 配信終了を検出 (state={})",
-                                    self.broadcast_id,
+                                    broadcast_id,
                                     next.state
                                 );
                                 self.flush_backfill(&mut backfill_buf, &chat_tx, &mut stats);
@@ -556,7 +756,7 @@ impl XSource {
                         }
                         Some(Err(e)) => {
                             stats.show_errors += 1;
-                            tracing::debug!("x:{} show 再取得失敗: {:#}", self.broadcast_id, e);
+                            tracing::debug!("x:{} show 再取得失敗: {:#}", broadcast_id, e);
                         }
                         None => {
                             // poller タスク消滅。recv() が即 None を返し続けて
@@ -633,7 +833,7 @@ impl XSource {
                                 );
                             }
                             self.flush_backfill(&mut backfill_buf, &chat_tx, &mut stats);
-                            tracing::info!("x:{} live-chat ストリーム終了", self.broadcast_id);
+                            tracing::info!("x:{} live-chat ストリーム終了", broadcast_id);
                             return Ok(stats.is_stable());
                         }
                     }
@@ -663,7 +863,7 @@ impl XSource {
                 if stats.parse_errors <= 5 {
                     tracing::info!(
                         "x:{} NDJSON パース失敗: {}",
-                        self.broadcast_id,
+                        self.channel,
                         truncate_chars(line, 200)
                     );
                 }
@@ -683,7 +883,7 @@ impl XSource {
             if stats.parse_errors <= 5 {
                 tracing::info!(
                     "x:{} チャット行の正規化失敗: {}",
-                    self.broadcast_id,
+                    self.channel,
                     truncate_chars(line, 200)
                 );
             }
@@ -739,7 +939,7 @@ impl XSource {
     ) {
         stats.chats += 1;
         if stats.chats == 1 {
-            tracing::info!("x:{} 初チャット受信", self.broadcast_id);
+            tracing::info!("x:{} 初チャット受信", self.channel);
         }
         // 名前解決タスクが GraphQL 待ちで詰まった時だけ満杯になり得る。
         // ブロックすると受信ループごと止まるため、捨てて数える。
@@ -748,7 +948,7 @@ impl XSource {
             if stats.queue_full == 1 {
                 tracing::warn!(
                     "x:{} 名前解決キュー満杯 — チャットを破棄",
-                    self.broadcast_id
+                    self.channel
                 );
             }
         }
@@ -789,7 +989,7 @@ impl XSource {
             listener: None,
             id,
             platform: Platform::X,
-            channel: self.broadcast_id.clone(),
+            channel: self.channel.clone(),
             author: Author {
                 nickname: None,
                 avatar_url: profile_avatar_url(v).or_else(|| {
@@ -820,9 +1020,9 @@ impl XSource {
 
     /// show.json 取得に必要な値のスナップショットを作る(ポーリングタスクへ
     /// move するため、&self に縛られない所有型で切り出す)。
-    fn show_fetch(&self) -> ShowFetch {
+    fn show_fetch(&self, broadcast_id: &str) -> ShowFetch {
         ShowFetch {
-            broadcast_id: self.broadcast_id.clone(),
+            broadcast_id: broadcast_id.to_string(),
             bearer: self.bearer(),
             activate_url: self.endpoint_url("guestActivateUrl", GUEST_ACTIVATE_URL),
             show_url: self.endpoint_url("broadcastShowUrl", BROADCAST_SHOW_URL),
@@ -836,12 +1036,34 @@ impl XSource {
         let Some(tx) = &self.metadata_tx else { return };
         let update = YoutubeMetadataUpdate {
             platform: Platform::X,
-            channel: self.broadcast_id.clone(),
+            channel: self.channel.clone(),
             concurrent_viewers: viewers,
             viewers_kind: ViewerCountKind::Concurrent,
             likes: None,
             title,
             live: Some(live),
+            notice: None,
+            reactions_delta: None,
+            full_snapshot: false,
+        };
+        let _ = tx.send(update).await;
+    }
+}
+
+impl XSource {
+    /// 待機中(live=false)のまま、チップに状態メッセージ(`notice`)を載せる。
+    /// 次の `send_live_state` で消える。チャット/ログには流れない。
+    async fn send_notice(&self, message: &str) {
+        let Some(tx) = &self.metadata_tx else { return };
+        let update = YoutubeMetadataUpdate {
+            platform: Platform::X,
+            channel: self.channel.clone(),
+            concurrent_viewers: None,
+            viewers_kind: ViewerCountKind::Concurrent,
+            likes: None,
+            title: None,
+            live: Some(false),
+            notice: Some(message.to_string()),
             reactions_delta: None,
             full_snapshot: false,
         };
@@ -1299,6 +1521,22 @@ mod tests {
             json!({"profileImageUrl": "javascript:bad"}),
         ] {
             assert!(profile_avatar_url(&value).is_none());
+        }
+    }
+
+    #[test]
+    fn channel_name_is_broadcast_id_or_lowercase_handle() {
+        assert_eq!(x_channel_name("https://x.com/i/broadcasts/1yoJMWvbtbtxQ"), "1yoJMWvbtbtxQ");
+        assert_eq!(x_channel_name("1yoJMWvbtbtxQ"), "1yoJMWvbtbtxQ");
+        assert_eq!(x_channel_name("@FooBar"), "@foobar");
+        assert_eq!(x_channel_name("https://x.com/FooBar/"), "@foobar");
+        assert_eq!(x_channel_name("twitter.com/FooBar/live"), "@foobar");
+    }
+
+    #[test]
+    fn poll_jitter_stays_within_bound() {
+        for _ in 0..50 {
+            assert!(poll_jitter() <= Duration::from_millis(x_live::MAX_JITTER_MS));
         }
     }
 

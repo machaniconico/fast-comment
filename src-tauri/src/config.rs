@@ -715,11 +715,17 @@ pub struct XOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bearer_token: Option<String>,
     /// API エンドポイント URL の上書き(キー→URL)。空なら既定。
-    /// キー: guestActivateUrl / broadcastShowUrl / liveChatUrl / userQueryUrl
-    /// (sources/x.rs が実際に読むキー。liveChatUrl が本文ストリーム、userQueryUrl
-    /// が cookie 併用時のユーザー名解決。最も壊れやすい liveChatUrl はここで差替可)。
+    /// キー: guestActivateUrl / broadcastShowUrl / liveChatUrl / userQueryUrl /
+    /// userByScreenNameUrl / avatarContentUrl
+    /// (sources/x.rs・x_live.rs が実際に読むキー。liveChatUrl が本文ストリーム、
+    /// userQueryUrl が cookie 併用時のユーザー名解決、userByScreenNameUrl が
+    /// アカウントモードの handle→user id(GraphQL、queryId 込み URL)、
+    /// avatarContentUrl が配信中判定。最も壊れやすい liveChatUrl はここで差替可)。
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub endpoints: std::collections::HashMap<String, String>,
+    /// アカウントモードのライブ検知ポーリング間隔(秒)。既定 30、下限 15。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_poll_secs: Option<u64>,
 }
 
 /// ニコニコ生放送の仕様変更を再ビルド無しで吸収するための上書き設定。
@@ -1166,6 +1172,7 @@ mod tests {
             x_overrides: XOverrides {
                 bearer_token: Some("test-bearer".to_string()),
                 endpoints: HashMap::new(),
+                live_poll_secs: Some(45),
             },
             niconico_overrides: NiconicoOverrides::default(),
         };
@@ -1332,6 +1339,7 @@ mod tests {
             json["xOverrides"]["bearerToken"].as_str(),
             Some("test-bearer")
         );
+        assert_eq!(json["xOverrides"]["livePollSecs"].as_u64(), Some(45));
 
         let decoded: AppConfig = serde_json::from_str(&text).expect("deserialize AppConfig");
         assert_eq!(decoded, cfg);
