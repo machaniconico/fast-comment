@@ -762,7 +762,15 @@ async fn moderate_delete_message(
                 .youtube_auth
                 .delete_message(&client_id, &video_id, &message_id)
                 .await?;
-            state.moderator.lock().unwrap().hide_id(message_id);
+            state.moderator.lock().unwrap().hide_id(message_id.as_str());
+            send_app_moderation(
+                &state,
+                ModerationEvent::MessageDeleted {
+                    platform: Platform::Youtube,
+                    channel,
+                    message_id,
+                },
+            );
             Ok(())
         }
         "twitch" => {
@@ -783,7 +791,15 @@ async fn moderate_delete_message(
                 .twitch_auth
                 .delete_message(&client_id, &client_secret, &channel, &message_id)
                 .await?;
-            state.moderator.lock().unwrap().hide_id(message_id);
+            state.moderator.lock().unwrap().hide_id(message_id.as_str());
+            send_app_moderation(
+                &state,
+                ModerationEvent::MessageDeleted {
+                    platform: Platform::Twitch,
+                    channel,
+                    message_id,
+                },
+            );
             Ok(())
         }
         _ => Err(ModerationError::new(
@@ -804,7 +820,7 @@ async fn moderate_ban_user(
     reason: Option<String>,
 ) -> Result<(), ModerationError> {
     // YouTube の liveChatBans には reason 項目が無いため、この値は使わない。
-    match platform.trim().to_lowercase().as_str() {
+    let (target_platform, result) = match platform.trim().to_lowercase().as_str() {
         "youtube" => {
             let client_id = state
                 .config
@@ -821,10 +837,11 @@ async fn moderate_ban_user(
                 ));
             }
             let video_id = crate::sources::youtube::extract_video_id(&channel);
-            state
+            let result = state
                 .youtube_auth
                 .ban_user(&client_id, &video_id, author_id.trim(), duration_secs)
-                .await
+                .await;
+            (Platform::Youtube, result)
         }
         "twitch" => {
             let (client_id, client_secret) = {
@@ -840,7 +857,7 @@ async fn moderate_ban_user(
                     "設定でTwitchのクライアントIDを入力し、Twitchにログインしてください",
                 ));
             }
-            state
+            let result = state
                 .twitch_auth
                 .ban_user(
                     &client_id,
@@ -850,13 +867,64 @@ async fn moderate_ban_user(
                     duration_secs,
                     reason.as_deref(),
                 )
-                .await
+                .await;
+            (Platform::Twitch, result)
         }
-        _ => Err(ModerationError::new(
-            ModerationErrorCode::Unavailable,
-            "このプラットフォームのモデレーションには対応していません",
-        )),
+        _ => {
+            return Err(ModerationError::new(
+                ModerationErrorCode::Unavailable,
+                "このプラットフォームのモデレーションには対応していません",
+            ))
+        }
+    };
+    if result.is_ok() {
+        // 配信側エコーを待たず OBS・TTS へ反映する(エコーと二重でも冪等)。
+        // アプリの時計とコメントのサーバー時刻は別物なので境界は付けない。
+        send_app_moderation(
+            &state,
+            ModerationEvent::UserCleared {
+                platform: target_platform,
+                channel,
+                author_id: author_id.trim().to_string(),
+                duration_secs: duration_secs.map(u64::from),
+                certain: true,
+                before_ms: None,
+            },
+        );
     }
+    result
+}
+
+/// アプリ発の削除・BAN をプラットフォーム発と同じ経路(moderation forwarder)へ流す。
+/// UI・TTS・OBS へ 1 フレーム単位で届く。満杯でも操作自体は成功扱い(try_send)。
+fn send_app_moderation(state: &AppState, event: ModerationEvent) {
+    if let Err(e) = state.mod_tx.try_send(event) {
+        tracing::debug!("アプリ発モデレーションイベントをdrop: {e}");
+    }
+}
+
+/// UI から来たプラットフォーム文字列を `Platform` へ。未知なら None。
+fn parse_platform(value: &str) -> Option<Platform> {
+    serde_json::from_value(serde_json::Value::String(value.trim().to_lowercase())).ok()
+}
+
+/// ローカル非表示を OBS opt-in クライアントへ伝える `MessageDeleted`。
+/// UI には送らない(UI 側の非表示は独自管理で、「削除済み」ラベルを付けないため)。
+fn local_hide_event(
+    id: &str,
+    platform: Option<&str>,
+    channel: Option<&str>,
+) -> Option<ModerationEvent> {
+    let id = id.trim();
+    let channel = channel?.trim();
+    if id.is_empty() || channel.is_empty() {
+        return None;
+    }
+    Some(ModerationEvent::MessageDeleted {
+        platform: parse_platform(platform?)?,
+        channel: channel.to_string(),
+        message_id: id.to_string(),
+    })
 }
 
 /// このセッションで BAN したユーザーの BAN を解除する。
@@ -1125,7 +1193,18 @@ fn remove_channel(state: State<'_, AppState>, key: String) -> Result<(), String>
 
 /// 個別コメントをローカル非表示にする(以後の同一 ID 送出を抑止)。
 #[tauri::command]
-fn hide_message(state: State<'_, AppState>, id: String) -> Result<(), String> {
+///
+/// `platform` / `channel` があれば OBS(`/ws?modEvents=1`)の表示からも除く。
+/// 解除(unhide)は OBS へは戻さない(除去済みの DOM は復元しない)。
+fn hide_message(
+    state: State<'_, AppState>,
+    id: String,
+    platform: Option<String>,
+    channel: Option<String>,
+) -> Result<(), String> {
+    if let Some(event) = local_hide_event(&id, platform.as_deref(), channel.as_deref()) {
+        state.bus.publish_moderation(event);
+    }
     state.moderator.lock().unwrap().hide_id(id);
     Ok(())
 }
@@ -1797,6 +1876,10 @@ fn apply_platform_moderation(app: &AppHandle, events: &[ModerationEvent]) {
         }
     }
     state.tts.remove_moderated(app, events);
+    // OBS opt-in クライアントへ(配信側・アプリ発の削除・BAN を同じ経路で)。
+    for event in events {
+        state.bus.publish_moderation(event.clone());
+    }
 }
 
 /// moderation + TTS パイプラインを起動する。
@@ -2132,6 +2215,24 @@ pub fn run() {
 #[cfg(test)]
 mod followup_tests {
     use super::*;
+
+    #[test]
+    fn local_hide_event_requires_known_platform_channel_and_id() {
+        assert_eq!(
+            local_hide_event("m1", Some(" Twitch "), Some("ch")),
+            Some(ModerationEvent::MessageDeleted {
+                platform: Platform::Twitch,
+                channel: "ch".into(),
+                message_id: "m1".into(),
+            })
+        );
+        assert!(local_hide_event("m1", Some("youtube"), Some("vid")).is_some());
+        // 旧 UI(platform/channel なし)・空 ID・未知プラットフォームは OBS へ送らない。
+        assert_eq!(local_hide_event("m1", None, None), None);
+        assert_eq!(local_hide_event("", Some("twitch"), Some("ch")), None);
+        assert_eq!(local_hide_event("m1", Some("twitch"), Some(" ")), None);
+        assert_eq!(local_hide_event("m1", Some("mystery"), Some("ch")), None);
+    }
 
     struct TestDir(PathBuf);
     impl TestDir {

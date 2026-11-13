@@ -82,7 +82,7 @@
 
   function onHide() {
     store.hideMessage(message.id);
-    ipcHideMessage(message.id);
+    ipcHideMessage(message.id, message.platform, message.channel);
   }
 
   function getMessageText(): string {
@@ -276,7 +276,7 @@
         danger: true,
         action: () => {
           store.hideMessage(message.id);
-          void ipcHideMessage(message.id);
+          void ipcHideMessage(message.id, message.platform, message.channel);
           void appendModerationValue('ngUsers', message.author.name);
         },
       },
@@ -286,7 +286,7 @@
         action: () => {
           if (!ngWord) return;
           store.hideMessage(message.id);
-          void ipcHideMessage(message.id);
+          void ipcHideMessage(message.id, message.platform, message.channel);
           void appendModerationValue('ngWords', ngWord);
         },
       },

@@ -120,6 +120,7 @@
         existing.el && existing.el.isConnected
       ) {
         existing.count += 1;
+        if (existing.el.__fcMsgs) existing.el.__fcMsgs.push(msg);
         existing.at = now;
         existing.el.textContent =
           existing.base + (existing.count >= 2 ? ' ×' + existing.count : '');
@@ -154,6 +155,7 @@
     el.style.fontSize = FONT_SIZE + 'px';
     el.style.setProperty('--dur', DURATION_SEC + 's');
     el.textContent = text;
+    el.__fcMsgs = [msg];
 
     // アニメ終了で自分を撤去。fly(座標) と fade(opacity) の2アニメで2回発火するので、
     // 座標側(danmaku-fly)の時だけ撤去し二重/早期撤去を防ぐ。
@@ -227,6 +229,7 @@
       el.classList.add('member');
     }
     el.textContent = text;
+    el.__fcMsgs = [msg];
 
     // 最新を上に。PIN_MAX 超過は末尾(最古)から間引く。
     pinLayer.prepend(el);
@@ -268,6 +271,11 @@
       } catch (_e) {
         return;
       }
+      const modEvents = fcModFrameEvents(batch);
+      if (modEvents) {
+        applyModeration(modEvents);
+        return;
+      }
       if (!Array.isArray(batch)) batch = [batch];
       batch.forEach(handleMessage);
     });
@@ -285,8 +293,91 @@
     });
   }
 
+  // ---- fc-moderation:begin ----
+  // 配信側・アプリ発の削除 / タイムアウト / BAN / ローカル非表示(`/ws?modEvents=1` の
+  // {"moderation":[…]} フレーム)。視聴者に見える面なので該当コメントは DOM から完全に除く。
+  // 同梱テンプレ共通のコピー(各テンプレは単体の静的サイトなので共有ファイルにしない)。
+  // templates/obsModeration.test.mjs が全コピーの一致と挙動を検証する。
+  const FC_MOD_MAX = 512;
+  const FC_MOD_TTL_MS = 10000;
+
+  // {"moderation":[…]} フレームならイベント配列、それ以外(chat 配列など)は null。
+  function fcModFrameEvents(frame) {
+    if (!frame || typeof frame !== 'object' || Array.isArray(frame)) return null;
+    if (!Array.isArray(frame.moderation)) return null;
+    return frame.moderation.filter(function (e) { return !!e && typeof e === 'object'; });
+  }
+
+  // userCleared / chatCleared は beforeMs(サーバー時刻)以前のコメントだけ。null は境界なし。
+  // userCleared は certain の有無に関わらず除く。
+  function fcModMatches(ev, msg) {
+    if (!ev || !msg || ev.platform !== msg.platform || ev.channel !== msg.channel) return false;
+    const within = ev.beforeMs == null ||
+      (typeof msg.timestampMs === 'number' && msg.timestampMs <= ev.beforeMs);
+    if (ev.type === 'messageDeleted') return !!ev.messageId && ev.messageId === msg.id;
+    if (ev.type === 'userCleared') {
+      return !!ev.authorId && !!msg.author && ev.authorId === msg.author.id && within;
+    }
+    if (ev.type === 'chatCleared') return within;
+    return false;
+  }
+
+  function fcModAnyMatch(events, msg) {
+    for (let i = 0; i < events.length; i++) {
+      if (fcModMatches(events[i], msg)) return true;
+    }
+    return false;
+  }
+
+  // イベントがコメントより先に届いた時のための直近記録(最大 512 件、記録から 10 秒、単調時計)。
+  function fcModCreateLog(now) {
+    const clock = now || function () { return performance.now(); };
+    let entries = [];
+    return {
+      add: function (events) {
+        const t = clock();
+        events.forEach(function (event) { entries.push({ event: event, at: t }); });
+        if (entries.length > FC_MOD_MAX) entries = entries.slice(entries.length - FC_MOD_MAX);
+      },
+      matches: function (msg) {
+        if (entries.length === 0) return false;
+        const t = clock();
+        entries = entries.filter(function (e) {
+          const age = t - e.at;
+          return age >= 0 && age <= FC_MOD_TTL_MS;
+        });
+        return entries.some(function (e) { return fcModMatches(e.event, msg); });
+      },
+      size: function () { return entries.length; },
+    };
+  }
+
+  // 要素に紐づけたコメント(複数可)のどれかが対象なら要素ごと除く。除いた要素を返す。
+  function fcModRemoveFrom(container, events) {
+    const removed = [];
+    if (!container) return removed;
+    Array.prototype.slice.call(container.children).forEach(function (el) {
+      const msgs = el.__fcMsgs || [];
+      if (msgs.some(function (m) { return fcModAnyMatch(events, m); })) {
+        if (el.parentNode) el.parentNode.removeChild(el);
+        removed.push(el);
+      }
+    });
+    return removed;
+  }
+
+  const fcModLog = fcModCreateLog();
+  // ---- fc-moderation:end ----
+
+  function applyModeration(events) {
+    fcModLog.add(events);
+    fcModRemoveFrom(root, events).forEach(removeRecentByTextEl);
+    fcModRemoveFrom(pinLayer, events);
+  }
+
   // ---- Message handler ----
   function handleMessage(msg) {
+    if (fcModLog.matches(msg)) return;
     if (!msg) return;
     if (CHANNEL_FILTER && msg.channel !== CHANNEL_FILTER) return;
     if (ONLY_GIFT && !isGiftMessage(msg)) return;
@@ -326,6 +417,8 @@
 
   function buildWsUrl(base) {
     const url = new URL(base, location.href);
+    // 削除・BAN の {"moderation":[…]} フレームを受け取る(opt-in。未対応の改造テンプレには届かない)。
+    url.searchParams.set('modEvents', '1');
     if (CHANNEL_FILTER) {
       url.searchParams.set('channel', CHANNEL_FILTER);
     }

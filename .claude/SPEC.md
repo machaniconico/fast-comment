@@ -149,7 +149,7 @@ trait Source {
 - **UI向け**: Tauri の `app_handle.emit("chat", batch)`。**個別送出せず ~16ms(1フレーム) でまとめて配列送出**(IPC往復削減)。
 - **OBS向け**: axum WebSocket `/ws`。接続クライアントへ同じ batch を push。`GET /?template=<name>` は `templates/<name>/index.html` を返す（未指定は `default`、`../` 等は拒否）。静的アセットは `/<name>/...` で配信。ポートは設定(既定 11180)で、変更時は新ポートの bind 成功後にサーバを再起動して再 bind する。
 - バックプレッシャ: 各クライアントごとに bounded queue、溢れたら古いものから捨てる。
-- **モデレーションイベント**(P6 Phase 3): Source → `mpsc`(容量 1024、送信は `try_send` で chat 受信をブロックしない)→ `spawn_moderation_ui_forwarder` が 16ms バッチで `emit("chat-moderation", Vec<ModerationEvent>)`。同じ forwarder で `MessageDeleted` を Moderator の hidden_ids(上限 8192 の FIFO)へ入れ、未読み上げの該当コメントを TTS キューから除く。OBS `/ws` へは未送出(3b で `?modEvents=1` opt-in 予定)。
+- **モデレーションイベント**(P6 Phase 3): Source → `mpsc`(容量 1024、送信は `try_send` で chat 受信をブロックしない)→ `spawn_moderation_ui_forwarder` が 16ms バッチで `emit("chat-moderation", Vec<ModerationEvent>)`。同じ forwarder で `MessageDeleted` を Moderator の hidden_ids(上限 8192 の FIFO)へ入れ、未読み上げの該当コメントを TTS キューから除く。同じ forwarder から OBS(`/ws?modEvents=1`)へも流す(§9)。
 
 ## 6. TTS 層 (`tts/`) — 3バックエンドをアダプタ化
 
@@ -240,6 +240,11 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
 
 - 共通クエリパラメータ: `ws`(接続先), `channel`(フィルタ), `only=gift`(投げ銭のみ) 等。テンプレ間で `max` の意味が異なる点に注意 — 通常overlayでは「表示行数の上限」、`danmaku` では「同時アニメDOM数の上限(MAX_ACTIVE)」。`danmaku` 専用: `dur`(横断秒数)/`size`(文字px)/`opacity`/`name`(名前前置)/`outline`(縁取り)/`area`(`full`/`top`/`bottom` 表示縦帯)/`coalesce`(連投まとめ ×N、`0`で無効)/`pin`(投げ銭を上部固定強調、`0`で無効)。弾幕URL生成(`Settings.svelte` の `withDanmaku()`)は弾幕に無関係なパラメータ(`max`/`ttl`/`font`/`bg`/`pos`/`icon`)を allowlist で除外する。
 - システム種別(`kind==='system'` 接続通知等)は配信画面に流さない(全テンプレで除外)。
+- **削除・BAN の反映(P6 3b)**: `/ws?modEvents=1`(`1` / `true` のみ opt-in。`0`・値なし・未指定は opt-out で購読もしない)のクライアントにだけ、同じソケットで chat 配列の後に `{"moderation":[ModerationEvent…]}` を 16ms tick 単位で送る(channel フィルタも適用)。opt-out の改造テンプレには一切届かない。
+  - 送るイベント: 配信側(§7 Phase 3)、アプリ発の `moderate_delete_message` / `moderate_ban_user` 成功時(moderation forwarder 経由で UI・TTS と同じ経路。BAN は `certain`=true・`beforeMs`=null)、ローカル非表示 `hide_message`(`platform`/`channel` 付きの時のみ messageDeleted を OBS へだけ。UI へは送らない)。解除(unhide / unban)は OBS へ戻さない。
+  - 同梱テンプレ `default` / `simple` / `bubble` / `ticker` / `donation` / `danmaku` が対応し、該当コメントを DOM から完全に除く(減光しない)。messageDeleted は ID、userCleared は author + `beforeMs`(`certain` に関係なく除く)、chatCleared は `beforeMs` 以前。`donation` の合計、`danmaku` の集約弾幕(×N)は要素ごと除く・合計は戻さない。
+  - `ranking` / `goals` / `timer` は集計表示で本文を出さないため対象外(接続 URL も opt-in しない)。
+  - 後着対策: 各テンプレが直近イベント(最大 512 件、記録から 10 秒、`performance.now()`)を覚え、後から届いたコメントを表示しない。テンプレは単体の静的サイトなので共有ファイルにせず、同一ブロック(`fc-moderation:begin`〜`end`)を各 `app.js` に複製し、`templates/obsModeration.test.mjs` が一致と挙動を検証する。
 
 ## 10. 設定永続化 (`config.rs`)
 
