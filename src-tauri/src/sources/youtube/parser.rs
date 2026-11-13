@@ -14,7 +14,8 @@ use std::sync::OnceLock;
 use serde_json::Value;
 
 use crate::model::{
-    Amount, Author, Badge, ChatMessage, Fragment, MessageKind, Platform, Roles, YoutubeReaction,
+    Amount, Author, Badge, ChatMessage, Fragment, MessageKind, ModerationEvent, Platform, Roles,
+    YoutubeReaction,
 };
 
 /// パーサのバージョン。レスポンス構造の解釈が変わったら上げる。
@@ -42,6 +43,17 @@ const KEY_REACTION_MUTATIONS_PATH: &str = "reactionMutationsPath";
 /// mutation 配下の reactionBuckets 配列までの探索パス(`>` 区切りのキー列)。
 /// 既定 `payload>emojiFountainDataEntity>reactionBuckets`。
 const KEY_REACTION_BUCKET_PATH: &str = "reactionBucketPath";
+/// 1 コメント削除アクション名(改行区切り)。値の `targetItemId` を読む。
+const KEY_MODERATION_DELETE_ACTION_KEYS: &str = "moderationDeleteActionKeys";
+/// 著者単位の削除(タイムアウト/BAN)アクション名(改行区切り)。値の `externalChannelId` を読む。
+const KEY_MODERATION_AUTHOR_ACTION_KEYS: &str = "moderationAuthorActionKeys";
+
+const DEFAULT_MODERATION_DELETE_ACTION_KEYS: &[&str] =
+    &["markChatItemAsDeletedAction", "removeChatItemAction"];
+const DEFAULT_MODERATION_AUTHOR_ACTION_KEYS: &[&str] = &[
+    "markChatItemsByAuthorAsDeletedAction",
+    "removeChatItemByAuthorAction",
+];
 
 const DEFAULT_ACTIONS_PATH: &[&str] = &["continuationContents", "liveChatContinuation", "actions"];
 const DEFAULT_CONTINUATIONS_PATH: &[&str] = &[
@@ -329,6 +341,63 @@ fn saturating_u32(value: u64) -> u32 {
 /// 解析失敗時のログ対象を絞り込むのに使う。
 pub fn is_chat_item_action(action: &Value) -> bool {
     action.get("addChatItemAction").is_some()
+}
+
+/// 配信側の削除・BAN アクションを `ModerationEvent` に正規化する。対応外・欠落なら `None`。
+///
+/// - 削除系(既定 `markChatItemAsDeletedAction` / `removeChatItemAction`)の `targetItemId`
+///   → MessageDeleted。ID は InnerTube 形式(`ChatMessage.id` と同じ)。
+/// - 著者系(既定 `markChatItemsByAuthorAsDeletedAction` / `removeChatItemByAuthorAction`)の
+///   `externalChannelId` → UserCleared。InnerTube はタイムアウトと BAN を区別しないため
+///   `duration_secs` は None・`certain` は false(既存のタイムアウト表示を BAN で上書きしない)。
+///   アクションに時刻が無いため `before_ms` も None(タイムアウト中の著者は投稿できない)。
+/// - `replaceChatItemAction` 等は対象外。アクション名は `paths` で差し替え可能。
+pub fn parse_moderation_action(
+    action: &Value,
+    video_id: &str,
+    paths: &HashMap<String, String>,
+) -> Option<ModerationEvent> {
+    let non_empty_str = |v: &Value, key: &str| {
+        v.get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    for key in split_lines(
+        paths,
+        KEY_MODERATION_DELETE_ACTION_KEYS,
+        DEFAULT_MODERATION_DELETE_ACTION_KEYS,
+    ) {
+        if let Some(body) = action.get(key) {
+            return non_empty_str(body, "targetItemId").map(|message_id| {
+                ModerationEvent::MessageDeleted {
+                    platform: Platform::Youtube,
+                    channel: video_id.to_string(),
+                    message_id,
+                }
+            });
+        }
+    }
+    for key in split_lines(
+        paths,
+        KEY_MODERATION_AUTHOR_ACTION_KEYS,
+        DEFAULT_MODERATION_AUTHOR_ACTION_KEYS,
+    ) {
+        if let Some(body) = action.get(key) {
+            return non_empty_str(body, "externalChannelId").map(|author_id| {
+                ModerationEvent::UserCleared {
+                    platform: Platform::Youtube,
+                    channel: video_id.to_string(),
+                    author_id,
+                    duration_secs: None,
+                    certain: false,
+                    before_ms: None,
+                }
+            });
+        }
+    }
+    None
 }
 
 /// 1アクションを `ChatMessage` に正規化する。対応外なら `None`。
@@ -1021,9 +1090,101 @@ mod tests {
 
     use super::{
         dig, extract_actions, extract_reaction_counts, extract_reactions_delta, parse_action,
-        parse_runs, split_currency_value, Seg,
+        parse_moderation_action, parse_runs, split_currency_value, Seg,
     };
-    use crate::model::{Fragment, MessageKind, YoutubeReaction};
+    use crate::model::{Fragment, MessageKind, ModerationEvent, Platform, YoutubeReaction};
+
+    #[test]
+    fn parse_moderation_action_handles_four_default_actions() {
+        let paths = HashMap::new();
+        for key in ["markChatItemAsDeletedAction", "removeChatItemAction"] {
+            let action = json!({ key: {
+                "deletedStateMessage": {"runs": [{"text": "[message deleted]"}]},
+                "targetItemId": "ChwKGkNKX3h4eHh4"
+            }});
+            assert_eq!(
+                parse_moderation_action(&action, "vid1", &paths),
+                Some(ModerationEvent::MessageDeleted {
+                    platform: Platform::Youtube,
+                    channel: "vid1".into(),
+                    message_id: "ChwKGkNKX3h4eHh4".into(),
+                }),
+                "{key}"
+            );
+        }
+        for key in [
+            "markChatItemsByAuthorAsDeletedAction",
+            "removeChatItemByAuthorAction",
+        ] {
+            let action = json!({ key: { "externalChannelId": "UCabc" } });
+            assert_eq!(
+                parse_moderation_action(&action, "vid1", &paths),
+                Some(ModerationEvent::UserCleared {
+                    platform: Platform::Youtube,
+                    channel: "vid1".into(),
+                    author_id: "UCabc".into(),
+                    duration_secs: None,
+                    certain: false,
+                    before_ms: None,
+                }),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_moderation_action_missing_or_unknown_is_none() {
+        let paths = HashMap::new();
+        for action in [
+            json!({"markChatItemAsDeletedAction": {}}),
+            json!({"removeChatItemAction": {"targetItemId": ""}}),
+            json!({"removeChatItemAction": {"targetItemId": 123}}),
+            json!({"removeChatItemAction": null}),
+            json!({"markChatItemsByAuthorAsDeletedAction": {"externalChannelId": "  "}}),
+            json!({"removeChatItemByAuthorAction": "oops"}),
+            json!({"replaceChatItemAction": {"targetItemId": "x", "replacementItem": {}}}),
+            json!({"someFutureAction": {"targetItemId": "x"}}),
+            json!({"addChatItemAction": {"item": {}}}),
+            json!([]),
+            Value::Null,
+        ] {
+            assert_eq!(
+                parse_moderation_action(&action, "vid1", &paths),
+                None,
+                "{action}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_moderation_action_respects_override_keys() {
+        let mut paths = HashMap::new();
+        paths.insert(
+            "moderationDeleteActionKeys".to_string(),
+            "newDeleteAction\n".to_string(),
+        );
+        paths.insert(
+            "moderationAuthorActionKeys".to_string(),
+            " newAuthorAction \nother".to_string(),
+        );
+        let del = json!({"newDeleteAction": {"targetItemId": "m1"}});
+        assert!(matches!(
+            parse_moderation_action(&del, "v", &paths),
+            Some(ModerationEvent::MessageDeleted { message_id, .. }) if message_id == "m1"
+        ));
+        let author = json!({"newAuthorAction": {"externalChannelId": "UC9"}});
+        assert!(matches!(
+            parse_moderation_action(&author, "v", &paths),
+            Some(ModerationEvent::UserCleared { author_id, .. }) if author_id == "UC9"
+        ));
+        // 差し替えたら既定名は使われない。
+        let old = json!({"removeChatItemAction": {"targetItemId": "m1"}});
+        assert_eq!(parse_moderation_action(&old, "v", &paths), None);
+        // 空文字の override は既定値へフォールバック。
+        let mut empty = HashMap::new();
+        empty.insert("moderationDeleteActionKeys".to_string(), String::new());
+        assert!(parse_moderation_action(&old, "v", &empty).is_some());
+    }
 
     #[test]
     fn author_photo_uses_largest_valid_thumbnail_and_normalizes_protocol() {

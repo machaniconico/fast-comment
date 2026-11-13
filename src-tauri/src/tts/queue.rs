@@ -16,6 +16,8 @@ pub struct TtsJob {
 pub enum PushResult {
     Queued { dropped_oldest: usize },
     RejectedPaused,
+    /// 直近の配信側削除・BAN の対象(後着分)なので読み上げない。
+    RejectedModerated,
 }
 
 pub struct Popped {
@@ -82,6 +84,14 @@ impl TtsQueueCore {
         self.play_until = None;
     }
 
+    /// 未読み上げのジョブのうち `pred` に合うものを除き、除いた件数を返す。
+    /// 合成中・再生中の 1 件(既に pop 済み)には触れない。
+    pub fn remove_where(&mut self, mut pred: impl FnMut(&ChatMessage) -> bool) -> usize {
+        let before = self.jobs.len();
+        self.jobs.retain(|job| !pred(&job.msg));
+        before - self.jobs.len()
+    }
+
     pub fn set_paused(&mut self, paused: bool) {
         if paused {
             self.clear();
@@ -142,6 +152,19 @@ mod tests {
             msg,
             enqueued_at,
         }
+    }
+
+    #[test]
+    fn remove_where_drops_only_matching_pending_jobs() {
+        let now = Instant::now();
+        let mut core = TtsQueueCore::default();
+        for id in ["a", "b", "c"] {
+            core.push(job(id, now), 8);
+        }
+        assert_eq!(core.remove_where(|m| m.id == "b"), 1);
+        assert_eq!(core.remove_where(|m| m.id == "missing"), 0);
+        let ids: Vec<_> = core.snapshot().items.into_iter().map(|i| i.id).collect();
+        assert_eq!(ids, ["a", "c"]);
     }
 
     #[test]

@@ -125,6 +125,18 @@ export interface YoutubeReaction {
   count: number;
 }
 
+/** Platform-side moderation (mirror of Rust `ModerationEvent`, emitted as `chat-moderation`). */
+export type ModerationEvent =
+  | { type: 'messageDeleted'; platform: Platform; channel: string; messageId: string }
+  | {
+      type: 'userCleared'; platform: Platform; channel: string; authorId: string; durationSecs: number | null;
+      /** false: timeout vs ban unknown (InnerTube) — never overwrites an existing ban/timeout mark. */
+      certain: boolean;
+      /** Server-time boundary (ms): only comments with timestampMs <= beforeMs. null = no boundary. */
+      beforeMs: number | null;
+    }
+  | { type: 'chatCleared'; platform: Platform; channel: string; beforeMs: number | null };
+
 /**
  * Frontend-only projection of ChatMessage.
  * Keep ChatMessage itself a strict mirror of the Rust model.

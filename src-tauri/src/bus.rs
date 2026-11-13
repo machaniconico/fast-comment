@@ -31,7 +31,7 @@ use tokio_util::sync::CancellationToken;
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 
-use crate::model::{ChatMessage, YoutubeReaction};
+use crate::model::{ChatMessage, ModerationEvent, YoutubeReaction};
 use crate::stats::{StatsSnapshot, TimerSnapshot};
 
 /// broadcast チャネルの容量。UI/OBS の購読者が遅れても最新が優先される。
@@ -40,6 +40,8 @@ const BROADCAST_CAPACITY: usize = 4096;
 const UI_BATCH_INTERVAL_MS: u64 = 16;
 /// 1回のリアクションIPCに載せる種類数上限。表示用だけをdropし、統計には影響させない。
 const MAX_REACTION_ITEMS_PER_UI_BATCH: usize = 256;
+/// 1回のモデレーションIPCに載せるイベント数上限(異常流量時の保険)。
+const MAX_MODERATION_EVENTS_PER_UI_BATCH: usize = 1024;
 /// WS クライアントごとの送信キュー上限(溢れたら古いものから drop)。
 const WS_CLIENT_QUEUE: usize = 256;
 
@@ -80,6 +82,52 @@ pub fn spawn_reaction_ui_forwarder(
         }
 
         tracing::info!("YouTube reaction forwarder 終了");
+    });
+}
+
+/// プラットフォーム側の削除・BAN 通知を UI へ1フレーム単位でまとめて送る。
+///
+/// `on_batch` は emit の直前に1フレーム分のイベントで1回呼ばれる(Moderator の
+/// hidden_ids 反映・TTS キュー除外など)。chat とは別イベント `chat-moderation` で送り、
+/// UI 側の rAF flush で chat バッチの後に適用する。
+pub fn spawn_moderation_ui_forwarder<F>(
+    mut rx: mpsc::Receiver<ModerationEvent>,
+    app: AppHandle,
+    cancel: CancellationToken,
+    on_batch: F,
+) where
+    F: Fn(&[ModerationEvent]) + Send + 'static,
+{
+    tauri::async_runtime::spawn(async move {
+        let mut ticker = interval(Duration::from_millis(UI_BATCH_INTERVAL_MS));
+        let mut batch = Vec::<ModerationEvent>::with_capacity(16);
+
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = ticker.tick() => {
+                    if !batch.is_empty() {
+                        on_batch(&batch);
+                        if let Err(e) = app.emit("chat-moderation", &batch) {
+                            tracing::warn!("モデレーションイベントのUI emitに失敗: {e}");
+                        }
+                        batch.clear();
+                    }
+                }
+                incoming = rx.recv() => {
+                    match incoming {
+                        Some(event) => {
+                            if batch.len() < MAX_MODERATION_EVENTS_PER_UI_BATCH {
+                                batch.push(event);
+                            }
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+
+        tracing::info!("moderation forwarder 終了");
     });
 }
 

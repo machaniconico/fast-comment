@@ -9,7 +9,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "check": "svelte-check --tsconfig ./tsconfig.json",
-    "test": "svelte-check --tsconfig ./tsconfig.json && vite build && node --test src/lib/displayFilter.test.ts src/lib/moderationActions.test.ts templates/goals/app.test.mjs templates/danmaku/app.test.mjs templates/ttsAudio.test.mjs templates/ttsSettings.test.mjs",
+    "test": "svelte-check --tsconfig ./tsconfig.json && vite build && node --test src/lib/displayFilter.test.ts src/lib/moderationActions.test.ts src/lib/moderationEvents.test.ts templates/goals/app.test.mjs templates/danmaku/app.test.mjs templates/ttsAudio.test.mjs templates/ttsSettings.test.mjs",
     "tauri": "tauri"
   },
   "devDependencies": {

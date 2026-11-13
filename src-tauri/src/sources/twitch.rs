@@ -11,12 +11,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_util::sync::CancellationToken;
 
 use super::{Backoff, Source};
-use crate::model::{Amount, Author, Badge, ChatMessage, Fragment, MessageKind, Platform, Roles};
+use crate::model::{
+    Amount, Author, Badge, ChatMessage, Fragment, MessageKind, ModerationEvent, Platform, Roles,
+};
 
 const TWITCH_WS_URL: &str = "wss://irc-ws.chat.twitch.tv:443";
 /// こちらから投げる PING の間隔。サーバー PING は約5分間隔でしか来ないため、
@@ -52,13 +54,89 @@ impl TwitchSessionError {
 pub struct TwitchSource {
     /// `#` を含まないチャンネル名(小文字化して使う)。
     channel: String,
+    /// CLEARMSG / CLEARCHAT を流す side channel。None なら無視する。
+    mod_tx: Option<mpsc::Sender<ModerationEvent>>,
 }
 
 impl TwitchSource {
     pub fn new(channel: String) -> Self {
         // 入力に `#` が付いていても許容する。
         let channel = channel.trim().trim_start_matches('#').to_lowercase();
-        TwitchSource { channel }
+        TwitchSource {
+            channel,
+            mod_tx: None,
+        }
+    }
+
+    /// プラットフォーム側モデレーション通知の送信端を付ける。
+    pub fn with_moderation_tx(mut self, mod_tx: Option<mpsc::Sender<ModerationEvent>>) -> Self {
+        self.mod_tx = mod_tx;
+        self
+    }
+
+    /// side channel へ送る。満杯・切断でも chat 受信ループは止めない(try_send)。
+    fn send_moderation(&self, event: ModerationEvent) {
+        if let Some(mod_tx) = &self.mod_tx {
+            if let Err(e) = mod_tx.try_send(event) {
+                tracing::debug!("twitch:{} モデレーションイベントをdrop: {e}", self.channel);
+            }
+        }
+    }
+
+    /// `CLEARMSG`(1 コメント削除)→ MessageDeleted。`target-msg-id` が空なら None。
+    fn parse_clearmsg(&self, p: &IrcLine) -> Option<ModerationEvent> {
+        let message_id = p
+            .tags
+            .get("target-msg-id")
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())?;
+        Some(ModerationEvent::MessageDeleted {
+            platform: Platform::Twitch,
+            channel: self.channel.clone(),
+            message_id: message_id.to_string(),
+        })
+    }
+
+    /// `CLEARCHAT` → UserCleared(`target-user-id` あり)/ ChatCleared(対象なし)。
+    ///
+    /// - `ban-duration` あり → タイムアウト(秒)。非数値は Some(0)=期間不明のタイムアウト扱い。
+    /// - `ban-duration` なし → 永久 BAN(None)。
+    /// - `target-user-id` が無いのに trailing(login)がある形は ID 照合できないため None。
+    ///   ここで ChatCleared にすると全コメントを誤って消してしまう。
+    /// - `tmi-sent-ts` を適用境界 `before_ms` にする(PRIVMSG の `timestamp_ms` と同じサーバー時刻)。
+    ///   同じフレームに後着した新コメントへ印が付かない。欠落・非数値なら境界なし。
+    fn parse_clearchat(&self, p: &IrcLine) -> Option<ModerationEvent> {
+        let before_ms = p
+            .tags
+            .get("tmi-sent-ts")
+            .and_then(|t| t.trim().parse::<i64>().ok());
+        let target_user_id = p
+            .tags
+            .get("target-user-id")
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty());
+        match target_user_id {
+            Some(author_id) => {
+                let duration_secs = p
+                    .tags
+                    .get("ban-duration")
+                    .map(|d| d.trim().parse::<u64>().unwrap_or(0));
+                Some(ModerationEvent::UserCleared {
+                    platform: Platform::Twitch,
+                    channel: self.channel.clone(),
+                    author_id: author_id.to_string(),
+                    duration_secs,
+                    certain: true,
+                    before_ms,
+                })
+            }
+            None if p.trailing.as_deref().is_some_and(|t| !t.trim().is_empty()) => None,
+            None => Some(ModerationEvent::ChatCleared {
+                platform: Platform::Twitch,
+                channel: self.channel.clone(),
+                before_ms,
+            }),
+        }
     }
 }
 
@@ -275,6 +353,18 @@ impl TwitchSource {
             "USERNOTICE" => {
                 if let Some(msg) = self.usernotice_to_chat(&parsed) {
                     result.emitted_usernotice = tx.send(msg).is_ok();
+                }
+            }
+            // 配信側でのコメント削除(モデレーター操作)。
+            "CLEARMSG" => {
+                if let Some(event) = self.parse_clearmsg(&parsed) {
+                    self.send_moderation(event);
+                }
+            }
+            // タイムアウト・BAN・チャット全消去。
+            "CLEARCHAT" => {
+                if let Some(event) = self.parse_clearchat(&parsed) {
+                    self.send_moderation(event);
                 }
             }
             // エッジ再起動の予告。接続を張り直すまでコメントは届かない。
@@ -901,6 +991,142 @@ mod tests {
 
         assert_eq!(handled.reply.as_deref(), Some("PONG :tmi.twitch.tv"));
         assert!(!handled.emitted_privmsg);
+    }
+
+    #[test]
+    fn parse_clearmsg_extracts_target_msg_id() {
+        let src = source();
+        let line = parse_irc_line(
+            "@login=ronni;room-id=;target-msg-id=abc-123-def;tmi-sent-ts=1642720582342 :tmi.twitch.tv CLEARMSG #fastcomment :HeyGuys",
+        );
+        assert_eq!(
+            src.parse_clearmsg(&line),
+            Some(ModerationEvent::MessageDeleted {
+                platform: Platform::Twitch,
+                channel: "fastcomment".into(),
+                message_id: "abc-123-def".into(),
+            })
+        );
+        // 空 / 欠落の target-msg-id は無視する(全消去と取り違えない)。
+        let empty =
+            parse_irc_line("@login=ronni;target-msg-id= :tmi.twitch.tv CLEARMSG #fastcomment :x");
+        assert_eq!(src.parse_clearmsg(&empty), None);
+        let missing = parse_irc_line("@login=ronni :tmi.twitch.tv CLEARMSG #fastcomment :x");
+        assert_eq!(src.parse_clearmsg(&missing), None);
+    }
+
+    #[test]
+    fn parse_clearchat_timeout_ban_and_clear() {
+        let src = source();
+        // タイムアウト: ban-duration 秒。
+        let timeout = parse_irc_line(
+            "@ban-duration=350;room-id=12345678;target-user-id=87654321;tmi-sent-ts=1642715756806 :tmi.twitch.tv CLEARCHAT #fastcomment :ronni",
+        );
+        assert_eq!(
+            src.parse_clearchat(&timeout),
+            Some(ModerationEvent::UserCleared {
+                platform: Platform::Twitch,
+                channel: "fastcomment".into(),
+                author_id: "87654321".into(),
+                duration_secs: Some(350),
+                certain: true,
+                before_ms: Some(1642715756806),
+            })
+        );
+        // 永久 BAN: ban-duration 無し。author_id は login ではなく user-id。
+        let ban = parse_irc_line(
+            "@room-id=12345678;target-user-id=87654321;tmi-sent-ts=1642715756806 :tmi.twitch.tv CLEARCHAT #fastcomment :ronni",
+        );
+        assert_eq!(
+            src.parse_clearchat(&ban),
+            Some(ModerationEvent::UserCleared {
+                platform: Platform::Twitch,
+                channel: "fastcomment".into(),
+                author_id: "87654321".into(),
+                duration_secs: None,
+                certain: true,
+                before_ms: Some(1642715756806),
+            })
+        );
+        // 全消去: 対象ユーザー無し。
+        let clear = parse_irc_line(
+            "@room-id=12345678;tmi-sent-ts=1642715695392 :tmi.twitch.tv CLEARCHAT #fastcomment",
+        );
+        assert_eq!(
+            src.parse_clearchat(&clear),
+            Some(ModerationEvent::ChatCleared {
+                platform: Platform::Twitch,
+                channel: "fastcomment".into(),
+                before_ms: Some(1642715695392),
+            })
+        );
+        // tmi-sent-ts 欠落・非数値は境界なし。
+        for tags in ["", "@tmi-sent-ts=abc "] {
+            let line = parse_irc_line(&format!("{tags}:tmi.twitch.tv CLEARCHAT #fastcomment"));
+            assert!(matches!(
+                src.parse_clearchat(&line),
+                Some(ModerationEvent::ChatCleared {
+                    before_ms: None,
+                    ..
+                })
+            ));
+        }
+        // 境界: ban-duration 0 / 非数値はタイムアウト(期間不明)扱い。永久 BAN と取り違えない。
+        for d in ["0", "abc", ""] {
+            let line = parse_irc_line(&format!(
+                "@ban-duration={d};target-user-id=42 :tmi.twitch.tv CLEARCHAT #fastcomment :ronni"
+            ));
+            assert!(matches!(
+                src.parse_clearchat(&line),
+                Some(ModerationEvent::UserCleared {
+                    duration_secs: Some(0),
+                    ..
+                })
+            ));
+        }
+        // target-user-id が無いのに login がある形は全消去にしない。
+        let login_only = parse_irc_line(":tmi.twitch.tv CLEARCHAT #fastcomment :ronni");
+        assert_eq!(src.parse_clearchat(&login_only), None);
+    }
+
+    #[test]
+    fn clearchat_boundary_excludes_comments_sent_after_clear() {
+        // 旧コメント(ts=…000)→ CLEARCHAT(ts=…001)→ 新コメント(ts=…002)が同じフレームに入っても
+        // 新コメントは対象外(TTS 除外・UI 印の両方が matches / before_ms を使う)。
+        let old = chat_from(TAGGED_BITS_PRIVMSG);
+        let new = chat_from(NORMAL_PRIVMSG);
+        let clear = source()
+            .parse_clearchat(&parse_irc_line(
+                "@room-id=111111;tmi-sent-ts=1700000000001 :tmi.twitch.tv CLEARCHAT #fastcomment",
+            ))
+            .unwrap();
+        assert!(clear.matches(&old));
+        assert!(!clear.matches(&new));
+    }
+
+    #[test]
+    fn handle_line_sends_moderation_without_blocking_and_keeps_pong() {
+        let (tx, _rx) = broadcast::channel(8);
+        let (mod_tx, mut mod_rx) = tokio::sync::mpsc::channel(1);
+        let src = source().with_moderation_tx(Some(mod_tx));
+        let clear = ":tmi.twitch.tv CLEARCHAT #fastcomment";
+        let r = src.handle_line(clear, &tx);
+        assert!(r.reply.is_none() && !r.emitted_privmsg);
+        // 満杯でも handle_line はブロック/パニックしない。
+        src.handle_line(clear, &tx);
+        assert!(matches!(
+            mod_rx.try_recv(),
+            Ok(ModerationEvent::ChatCleared { .. })
+        ));
+        assert!(mod_rx.try_recv().is_err());
+        // 受信側が閉じても止まらず、PING には PONG を返し続ける。
+        drop(mod_rx);
+        src.handle_line(
+            "@target-msg-id=x :tmi.twitch.tv CLEARMSG #fastcomment :y",
+            &tx,
+        );
+        let ping = src.handle_line("PING :tmi.twitch.tv", &tx);
+        assert_eq!(ping.reply.as_deref(), Some("PONG :tmi.twitch.tv"));
     }
 
     #[test]

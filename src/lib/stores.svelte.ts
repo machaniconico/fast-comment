@@ -10,9 +10,10 @@
  * - Wired to ipc.ts via onChatBatch + startChatListener (+ startTtsSpeakListener/startTtsCancelListener).
  */
 
-import { isListenerDeleted, type ChatMessage, type ListenerUpdate, type Platform, type RemovedState, type UiChatMessage } from './types';
+import { isListenerDeleted, type ChatMessage, type ListenerUpdate, type ModerationEvent, type Platform, type RemovedState, type UiChatMessage } from './types';
 import { activeFilterCount, prependCapped, defaultDisplayFilter, isDefaultFilter, matchesDisplayFilter, normalizeDisplayFilter, type DisplayFilter } from './displayFilter';
-import { onChatBatch, startChatListener, startListenerUpdatedListener, startTtsSpeakListener, startTtsCancelListener, startTtsAudioListener, getConfig } from './ipc';
+import { carryModeration, moderationMatcher, RecentModerationLog } from './moderationEvents';
+import { onChatBatch, onModerationBatch, startModerationListener, startChatListener, startListenerUpdatedListener, startTtsSpeakListener, startTtsCancelListener, startTtsAudioListener, getConfig } from './ipc';
 
 const DEFAULT_MAX_BUFFER = 2000;
 /** Max pinned comments kept in the pinned strip (oldest dropped on overflow). */
@@ -162,6 +163,8 @@ class CommentStore {
   private _pinned: UiChatMessage[] = $state([]);
   // Session-scoped first-ever comments (newest first, capped); reset on clear.
   private _firstComments: UiChatMessage[] = $state([]);
+  // Recent platform moderation events, re-applied to comments that arrive in a later flush.
+  private _recentModeration = new RecentModerationLog();
 
   // Derived: full unfiltered list
   readonly allMessages: UiChatMessage[] = $derived(this._msgs);
@@ -331,6 +334,29 @@ class CommentStore {
     if (this._pinned.some(hit)) this._pinned = this._pinned.filter((m) => !hit(m));
   }
 
+  /**
+   * Reflect platform-side deletes / timeouts / bans (`chat-moderation`). Same marks and pin
+   * handling as `markRemoved`; one pass over each list per flush. Idempotent.
+   */
+  applyModerationEvents(events: ModerationEvent[]): void {
+    const matcher = moderationMatcher(events);
+    if (!matcher) return;
+    this._recentModeration.add(events, performance.now());
+    let changed = false;
+    const next = this._buf.map((entry) => {
+      const msg = matcher.mark(entry.msg);
+      if (msg === entry.msg) return entry;
+      changed = true;
+      return { msg, search: entry.search };
+    });
+    if (changed) {
+      this._buf = next;
+      this._msgs = next.map((e) => e.msg);
+    }
+    if (this._firstComments.some((m) => matcher.mark(m) !== m)) this._firstComments = this._firstComments.map((m) => matcher.mark(m));
+    if (this._pinned.some(matcher.hits)) this._pinned = this._pinned.filter((m) => !matcher.hits(m));
+  }
+
   /** Push a batch into the ring buffer, evicting oldest on overflow. */
   pushBatch(messages: ChatMessage[]): void {
     // Accumulate the session donation tally (clone-on-write so the reactive
@@ -343,6 +369,8 @@ class CommentStore {
     const incoming: BufEntry[] = [];
     let baseBuffer = this._buf;
     let copiedForGiftUpdate = false;
+    // Moderation that reached the UI before its target comment (separate IPC batches).
+    const lateModeration = this._recentModeration.matcher(performance.now());
 
     for (const msg of messages) {
       if (msg.kind === 'gift') {
@@ -353,9 +381,9 @@ class CommentStore {
             copiedForGiftUpdate = true;
           }
           const previous = baseBuffer[existingIndex]?.msg;
-          const uiMsg: UiChatMessage = this.withListenerOverride(previous?.viewerSeq === undefined
+          const uiMsg: UiChatMessage = carryModeration(this.withListenerOverride(previous?.viewerSeq === undefined
             ? msg
-            : { ...msg, viewerSeq: previous.viewerSeq });
+            : { ...msg, viewerSeq: previous.viewerSeq }), previous, lateModeration);
           baseBuffer[existingIndex] = { msg: uiMsg, search: buildSearch(msg) };
           continue;
         }
@@ -363,9 +391,9 @@ class CommentStore {
         const pendingIndex = incoming.findIndex((entry) => entry.msg.id === msg.id);
         if (pendingIndex >= 0) {
           const previous = incoming[pendingIndex]?.msg;
-          const uiMsg: UiChatMessage = this.withListenerOverride(previous?.viewerSeq === undefined
+          const uiMsg: UiChatMessage = carryModeration(this.withListenerOverride(previous?.viewerSeq === undefined
             ? msg
-            : { ...msg, viewerSeq: previous.viewerSeq });
+            : { ...msg, viewerSeq: previous.viewerSeq }), previous, lateModeration);
           incoming[pendingIndex] = { msg: uiMsg, search: buildSearch(msg) };
           continue;
         }
@@ -378,6 +406,7 @@ class CommentStore {
         this._viewerCounts.set(key, seq);
         uiMsg = { ...uiMsg, viewerSeq: seq };
       }
+      if (lateModeration) uiMsg = lateModeration.mark(uiMsg);
       incoming.push({ msg: uiMsg, search: buildSearch(msg) });
 
       // Highlight detection is independent of kind (a SuperChat can also be a
@@ -560,6 +589,7 @@ class CommentStore {
     // allSettled: if one listener fails to register, release the ones that did.
     const results = await Promise.allSettled([
       startChatListener(),
+      startModerationListener(),
       startTtsSpeakListener(),
       startTtsCancelListener(),
       startTtsAudioListener(),
@@ -586,6 +616,7 @@ export const store = new CommentStore();
 
 // Wire the rAF batch handler once at module load time.
 onChatBatch((batch) => store.pushBatch(batch));
+onModerationBatch((events) => store.applyModerationEvents(events));
 
 // Convenience re-exports so call sites stay terse
 export function hideMessage(id: string): void { store.hideMessage(id); }

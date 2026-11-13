@@ -142,6 +142,82 @@ pub struct ListenerInfo {
     pub tts_voice: Option<crate::listeners::TtsVoiceOverride>,
 }
 
+/// 配信プラットフォーム側で行われた削除・BAN の通知(P6 Phase 3)。
+///
+/// Source が受信して side channel へ流し、UI へは 1 フレーム単位のバッチで送る。
+/// `channel` は `ChatMessage.channel` と同じ識別子(Twitch はチャンネル名、YouTube は videoId)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum ModerationEvent {
+    /// 1 コメントの削除。`message_id` は `ChatMessage.id` と同じ形式。
+    MessageDeleted {
+        platform: Platform,
+        channel: String,
+        message_id: String,
+    },
+    /// ユーザーのタイムアウト(`duration_secs` = Some)または永久 BAN(None)。
+    UserCleared {
+        platform: Platform,
+        channel: String,
+        author_id: String,
+        duration_secs: Option<u64>,
+        /// `duration_secs` が確定情報か。false(InnerTube の著者削除など種別不明)なら
+        /// UI は既存のタイムアウト / BAN 表示を上書きしない。
+        certain: bool,
+        /// 適用範囲の境界(サーバー時刻 ms)。`timestamp_ms <= before_ms` のコメントだけが対象。
+        /// None なら境界なし(全コメント)。
+        before_ms: Option<i64>,
+    },
+    /// チャット全消去(Twitch `/clear`)。`before_ms` は UserCleared と同じ意味。
+    ChatCleared {
+        platform: Platform,
+        channel: String,
+        before_ms: Option<i64>,
+    },
+}
+
+impl ModerationEvent {
+    /// このイベントが `msg` を対象にするか。TTS キューからの除外判定に使う。
+    pub fn matches(&self, msg: &ChatMessage) -> bool {
+        match self {
+            ModerationEvent::MessageDeleted {
+                platform,
+                channel,
+                message_id,
+            } => msg.platform == *platform && msg.channel == *channel && msg.id == *message_id,
+            ModerationEvent::UserCleared {
+                platform,
+                channel,
+                author_id,
+                before_ms,
+                ..
+            } => {
+                msg.platform == *platform
+                    && msg.channel == *channel
+                    && msg.author.id == *author_id
+                    && within(*before_ms, msg)
+            }
+            ModerationEvent::ChatCleared {
+                platform,
+                channel,
+                before_ms,
+            } => msg.platform == *platform && msg.channel == *channel && within(*before_ms, msg),
+        }
+    }
+}
+
+/// 境界以前(同時刻を含む)のコメントか。境界なしなら常に true。
+fn within(before_ms: Option<i64>, msg: &ChatMessage) -> bool {
+    match before_ms {
+        Some(b) => msg.timestamp_ms <= b,
+        None => true,
+    }
+}
+
 fn is_false(v: &bool) -> bool {
     !*v
 }
@@ -232,6 +308,73 @@ mod tests {
         assert!(serialized.get("nativeId").is_none());
         assert!(serialized["author"].get("nickname").is_none());
         assert!(serialized["author"].get("avatarUrl").is_none());
+    }
+
+    #[test]
+    fn moderation_event_serializes_with_type_tag_and_camel_case_fields() {
+        use super::{ModerationEvent, Platform};
+        let deleted = serde_json::to_value(ModerationEvent::MessageDeleted {
+            platform: Platform::Twitch,
+            channel: "ch".into(),
+            message_id: "m1".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            deleted,
+            serde_json::json!({"type": "messageDeleted", "platform": "twitch", "channel": "ch", "messageId": "m1"})
+        );
+        let cleared = serde_json::to_value(ModerationEvent::UserCleared {
+            platform: Platform::Youtube,
+            channel: "vid".into(),
+            author_id: "UC1".into(),
+            duration_secs: None,
+            certain: false,
+            before_ms: None,
+        })
+        .unwrap();
+        assert_eq!(cleared["type"], "userCleared");
+        assert_eq!(cleared["authorId"], "UC1");
+        assert!(cleared["durationSecs"].is_null());
+        assert_eq!(cleared["certain"], false);
+        assert!(cleared["beforeMs"].is_null());
+        let chat = serde_json::to_value(ModerationEvent::ChatCleared {
+            platform: Platform::Twitch,
+            channel: "ch".into(),
+            before_ms: Some(5),
+        })
+        .unwrap();
+        assert_eq!(chat["type"], "chatCleared");
+        assert_eq!(chat["beforeMs"], 5);
+    }
+
+    #[test]
+    fn moderation_event_matches_only_up_to_before_ms() {
+        // 「旧コメント → CLEARCHAT → 新コメント」で新コメント(境界より後)は対象外。
+        use super::{ModerationEvent, Platform};
+        let mut msg: super::ChatMessage = serde_json::from_value(serde_json::json!({
+            "id": "m", "platform": "twitch", "channel": "ch",
+            "author": {"id": "u", "name": "U"},
+            "fragments": [], "kind": "normal", "timestampMs": 100
+        }))
+        .unwrap();
+        let clear = |before_ms| ModerationEvent::ChatCleared {
+            platform: Platform::Twitch,
+            channel: "ch".into(),
+            before_ms,
+        };
+        assert!(clear(Some(100)).matches(&msg));
+        assert!(clear(None).matches(&msg));
+        assert!(!clear(Some(99)).matches(&msg));
+        msg.timestamp_ms = 101;
+        let user = ModerationEvent::UserCleared {
+            platform: Platform::Twitch,
+            channel: "ch".into(),
+            author_id: "u".into(),
+            duration_secs: Some(60),
+            certain: true,
+            before_ms: Some(100),
+        };
+        assert!(!user.matches(&msg));
     }
 
     #[test]
