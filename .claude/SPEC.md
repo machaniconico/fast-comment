@@ -106,6 +106,8 @@ trait Source {
     | `continuationDataKeys` | continuation データキー候補(改行区切り) | `invalidationContinuationData` 他5種 |
     | `reactionMutationsPath` | リアクション mutation 配列パス(`>`区切り) | `frameworkUpdates>entityBatchUpdate>mutations` |
     | `reactionBucketPath` | mutation 内の bucket 配列パス(`>`区切り) | `payload>emojiFountainDataEntity>reactionBuckets` |
+    | `moderationDeleteActionKeys` | 1 コメント削除アクション名(改行区切り、値の `targetItemId`) | `markChatItemAsDeletedAction` / `removeChatItemAction` |
+    | `moderationAuthorActionKeys` | 著者単位削除アクション名(改行区切り、値の `externalChannelId`) | `markChatItemsByAuthorAsDeletedAction` / `removeChatItemByAuthorAction` |
 - **parser.rs**: 寛容パース(アダプタの核)
   - `serde_json::Value` をパス探索で辿る。固い struct deserialize はしない。
   - ヘルパ `dig(value, &["a","b",0,"c"])` で Option を返す。途中欠落でも None で安全に劣化。
@@ -147,6 +149,7 @@ trait Source {
 - **UI向け**: Tauri の `app_handle.emit("chat", batch)`。**個別送出せず ~16ms(1フレーム) でまとめて配列送出**(IPC往復削減)。
 - **OBS向け**: axum WebSocket `/ws`。接続クライアントへ同じ batch を push。`GET /?template=<name>` は `templates/<name>/index.html` を返す（未指定は `default`、`../` 等は拒否）。静的アセットは `/<name>/...` で配信。ポートは設定(既定 11180)で、変更時は新ポートの bind 成功後にサーバを再起動して再 bind する。
 - バックプレッシャ: 各クライアントごとに bounded queue、溢れたら古いものから捨てる。
+- **モデレーションイベント**(P6 Phase 3): Source → `mpsc`(容量 1024、送信は `try_send` で chat 受信をブロックしない)→ `spawn_moderation_ui_forwarder` が 16ms バッチで `emit("chat-moderation", Vec<ModerationEvent>)`。同じ forwarder で `MessageDeleted` を Moderator の hidden_ids(上限 8192 の FIFO)へ入れ、未読み上げの該当コメントを TTS キューから除く。OBS `/ws` へは未送出(3b で `?modEvents=1` opt-in 予定)。
 
 ## 6. TTS 層 (`tts/`) — 3バックエンドをアダプタ化
 
@@ -166,7 +169,13 @@ trait TtsBackend { async fn speak(&self, text: String) -> Result<()>; fn availab
 - **ローカル非表示**(手動): UIで個別コメントを隠す。
 - **配信側モデレーション(P6 Phase 1・YouTube)**: コメント右クリック / ユーザーカードから、コメント削除(`LCC.` 形式 ID = API キー設定時の公式 stream 受信分のみ)・タイムアウト(1分/10分/1時間/24時間)・永久 BAN(確認ダイアログ)・BAN 解除(同セッションで行った BAN のみ)。既存の Google OAuth(`youtube.force-ssl`)を使う。実行後は該当コメントを減光 +「削除済み」「タイムアウト」「BAN済み」ラベルで残す(UI のみ)。X / niconico は対象外。
 - **配信側モデレーション(P6 Phase 2・Twitch)**: 同じメニュー / ユーザーカードで、コメント削除(IRC `id` タグ = `nativeId` が true のメッセージのみ)・タイムアウト・永久 BAN・BAN 解除(**Twitch では常に表示**)。Twitch Helix を使い、認証は Device Code Flow(設定 >「Twitch モデレーション」の [Twitch にログイン] でコード表示、ブラウザは Rust 側で開く)。必要スコープは `moderator:manage:banned_users` `moderator:manage:chat_messages`。前提: Twitch 開発者コンソールの既存アプリで Device Code Grant が使えること(`credentials.twitchClientId` 必須)。スコープ不足時は設定に「再ログイン」警告。エラーは Rust の `ModerationError` をそのままトースト表示。
-- ⚠️ プラットフォーム側操作の反映(Phase 3)は未実装。
+- **配信側操作の反映(P6 Phase 3)**: 公式 UI・他モデレーターの操作を `ModerationEvent`(`messageDeleted` / `userCleared{durationSecs}` / `chatCleared`、serde tag=`type`)としてアプリへ反映。
+  - 共通フィールド: userCleared の `certain`(false = タイムアウト/BAN の別が不明。UI は既存のタイムアウト・BAN 印を上書きせず、印が無ければ「BAN済み」)、userCleared / chatCleared の `beforeMs`(サーバー時刻の適用境界。`timestampMs <= beforeMs` のコメントだけが対象、null = 境界なし。TTS 除外も同じ判定)。
+  - Twitch(匿名 IRC のまま): `CLEARMSG` の `target-msg-id` → messageDeleted。`CLEARCHAT` + `target-user-id` → userCleared(`ban-duration` 秒、無ければ永久 BAN=null、非数値/0 は 0 秒=期間不明のタイムアウト、`certain`=true)。対象タグ無しかつ trailing も無し → chatCleared。`target-user-id` 欠落で login だけの形は無視。`beforeMs` は `tmi-sent-ts`(PRIVMSG の `timestampMs` と同じサーバー時刻)。
+  - YouTube InnerTube: `parser::parse_moderation_action`。削除系の `targetItemId` → messageDeleted、著者系の `externalChannelId` → userCleared(null、`certain`=false、`beforeMs`=null。InnerTube はタイムアウトと BAN を区別せず時刻も無い)。`replaceChatItemAction` は対象外。アクション名は §4.2 の override キーで差し替え可。
+  - YouTube 公式 streamList: `USER_BANNED_EVENT`(type 10、`user_banned_details`=22、`banned_user_details.channel_id`=101、`ban_type` PERMANENT=1/TEMPORARY=2、`ban_duration_seconds`=4。Google 公開 `stream_list.proto` 準拠)→ userCleared(`beforeMs` = `publishedAt`、banType 不明時は `certain`=false)。公開 proto に削除イベントが無いため、公式経路の削除反映は未対応。
+  - 公式 `LCC.` ID と InnerTube ID の突き合わせ(経路またぎ)は M0 未実施のため行わない(取りこぼし許容)。
+  - UI: `ipc.ts` の rAF flush で chat バッチ適用**後に** moderation バッチを適用(`moderationEvents.ts` の純関数、1 flush で各リスト 1 回走査)。messageDeleted / chatCleared → 「削除済み」、userCleared → 「タイムアウト」/「BAN済み」(Phase 1 と同じ減光 + ラベル)。初見パネル・投げ銭パネル(バッファ由来)にも反映、ピンは外す。バッファに無い ID はその場では無視するが、直近のイベント(最大 512 件、記録から 10 秒で失効)を覚えておき、後続 flush で届いたコメントにも適用する(chat と moderation は別 IPC バッチのため、イベントが先着しうる)。冪等(アプリ発操作のエコーで壊れない)、「削除済み」は既存の BAN/タイムアウト印を上書きしない。
 
 ## 8. UI (`src/`)
 
@@ -261,4 +270,5 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
 - YouTube InnerTube は非公式 → 仕様変更リスク。寛容パース+overrides+ログで吸収。
 - X chatapi も非公式(Periscope 由来) → 同リスク。寛容パース+`xOverrides` で吸収。
 - 実モデレーションはOAuth必須(P6)。
+- YouTube 公式 streamList 経由で受けたコメントの配信側削除はアプリに反映されない(公開 `stream_list.proto` に削除イベントの定義が無い。BAN / タイムアウトは反映される)。
 - Tauri build にはアイコン(`src-tauri/icons/`)が必要。

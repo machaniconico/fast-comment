@@ -1,5 +1,6 @@
 //! 読み上げワーカー。単一キュー、epoch ゲートと WAV 長による一件先読み。
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
@@ -9,13 +10,47 @@ use super::queue::{PushResult, TtsJob, TtsQueueCore};
 use super::{
     SpeakContext, SpeechOutput, TtsDispatcher, TtsQueueItem, TtsQueueStatePayload, TtsSink,
 };
-use crate::{config::TtsConfig, model::ChatMessage};
+use crate::{
+    config::TtsConfig,
+    model::{ChatMessage, ModerationEvent},
+};
+
+/// 直近の配信側モデレーションを覚えておく件数上限。
+const RECENT_MODERATION_MAX: usize = 512;
+/// 覚えたイベントが後着コメントに効く時間(単調時計)。
+const RECENT_MODERATION_TTL: Duration = Duration::from_secs(10);
+
+/// 処理済みの配信側モデレーション(有界・短命)。イベントより後に TTS へ投入された
+/// 対象コメント(`before_ms` 以前の ChatCleared / UserCleared、ID 指定の MessageDeleted)を弾く。
+#[derive(Default)]
+struct RecentModeration {
+    entries: VecDeque<(Instant, ModerationEvent)>,
+}
+
+impl RecentModeration {
+    fn record(&mut self, events: &[ModerationEvent], now: Instant) {
+        for event in events {
+            self.entries.push_back((now, event.clone()));
+        }
+        while self.entries.len() > RECENT_MODERATION_MAX {
+            self.entries.pop_front();
+        }
+    }
+
+    /// 失効判定はエントリごと。生きているイベントのどれかが `msg` を対象にすれば true。
+    fn blocks(&mut self, msg: &ChatMessage, now: Instant) -> bool {
+        self.entries
+            .retain(|(at, _)| now.saturating_duration_since(*at) <= RECENT_MODERATION_TTL);
+        self.entries.iter().any(|(_, e)| e.matches(msg))
+    }
+}
 
 #[derive(Default)]
 pub struct TtsShared {
     pub core: Mutex<TtsQueueCore>,
     pub wake: Notify,
     last_drop_notice: Mutex<Option<Instant>>,
+    recent_moderation: Mutex<RecentModeration>,
 }
 
 impl TtsShared {
@@ -36,6 +71,14 @@ impl TtsShared {
     }
 
     pub fn enqueue(&self, sink: &dyn TtsSink, msg: ChatMessage, max_pending: usize) -> PushResult {
+        if self
+            .recent_moderation
+            .lock()
+            .unwrap()
+            .blocks(&msg, Instant::now())
+        {
+            return PushResult::RejectedModerated;
+        }
         let job = TtsJob {
             item: TtsQueueItem::from_message(&msg),
             msg,
@@ -84,6 +127,23 @@ impl TtsShared {
             sink.queue_state(core.snapshot());
         }
         self.wake.notify_one();
+    }
+
+    /// プラットフォーム側で削除・BAN されたコメントを未読み上げキューから除き、
+    /// 後着分も弾けるよう直近イベントとして記録する。
+    pub fn remove_moderated(&self, sink: &dyn TtsSink, events: &[ModerationEvent]) {
+        if events.is_empty() {
+            return;
+        }
+        self.recent_moderation
+            .lock()
+            .unwrap()
+            .record(events, Instant::now());
+        let mut core = self.core.lock().unwrap();
+        let removed = core.remove_where(|msg| events.iter().any(|e| e.matches(msg)));
+        if removed > 0 {
+            sink.queue_state(core.snapshot());
+        }
     }
 
     pub fn snapshot(&self) -> TtsQueueStatePayload {
@@ -227,6 +287,73 @@ mod tests {
             self.notices.lock().unwrap().push(message);
         }
         fn queue_state(&self, _: TtsQueueStatePayload) {}
+    }
+    fn msg_at(id: &str, ts: i64) -> ChatMessage {
+        let mut m = msg(id);
+        m.timestamp_ms = ts;
+        m
+    }
+    #[test]
+    fn moderated_late_arrivals_are_rejected_by_boundary_and_id() {
+        use crate::model::Platform;
+        let shared = TtsShared::default();
+        let sink = Sink::default();
+        shared.remove_moderated(
+            &sink,
+            &[
+                ModerationEvent::ChatCleared {
+                    platform: Platform::Twitch,
+                    channel: "channel".into(),
+                    before_ms: Some(100),
+                },
+                ModerationEvent::MessageDeleted {
+                    platform: Platform::Twitch,
+                    channel: "channel".into(),
+                    message_id: "deleted".into(),
+                },
+            ],
+        );
+        // 境界以前のコメントが後から入ってきても読み上げない。
+        assert_eq!(
+            shared.enqueue(&sink, msg_at("old", 100), 64),
+            PushResult::RejectedModerated
+        );
+        // MessageDeleted の後着分も弾く(ID 指定なので時刻は問わない)。
+        assert_eq!(
+            shared.enqueue(&sink, msg_at("deleted", 500), 64),
+            PushResult::RejectedModerated
+        );
+        // 境界より新しいコメントは通常どおり。
+        assert_eq!(
+            shared.enqueue(&sink, msg_at("new", 101), 64),
+            PushResult::Queued { dropped_oldest: 0 }
+        );
+    }
+    #[test]
+    fn recent_moderation_expires_per_entry_and_is_bounded() {
+        use crate::model::Platform;
+        let del = |id: &str| ModerationEvent::MessageDeleted {
+            platform: Platform::Twitch,
+            channel: "channel".into(),
+            message_id: id.into(),
+        };
+        let t0 = Instant::now();
+        let mut recent = RecentModeration::default();
+        recent.record(&[del("old")], t0);
+        recent.record(&[del("fresh")], t0 + Duration::from_secs(5));
+        let later = t0 + RECENT_MODERATION_TTL + Duration::from_millis(1);
+        assert!(!recent.blocks(&msg("old"), later));
+        assert!(recent.blocks(&msg("fresh"), later));
+        assert_eq!(recent.entries.len(), 1);
+        // 上限超過は古い順に捨てる。
+        let many: Vec<_> = (0..=RECENT_MODERATION_MAX)
+            .map(|i| del(&format!("m{i}")))
+            .collect();
+        recent.record(&many, later);
+        assert_eq!(recent.entries.len(), RECENT_MODERATION_MAX);
+        assert!(!recent.blocks(&msg("fresh"), later));
+        assert!(!recent.blocks(&msg("m0"), later));
+        assert!(recent.blocks(&msg(&format!("m{RECENT_MODERATION_MAX}")), later));
     }
     fn msg(id: &str) -> ChatMessage {
         serde_json::from_value(json!({

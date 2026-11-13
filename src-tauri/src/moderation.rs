@@ -7,12 +7,16 @@
 //! ⚠️ 実 BAN/タイムアウト(Twitch)・コメ削除(YouTube)は OAuth 必須=フェーズ2。
 //!    ここでは送信前のローカル判定のみを行う。
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 
 use regex::Regex;
 
 use crate::config::ModerationConfig;
 use crate::model::ChatMessage;
+
+/// 非表示 ID を保持する上限。長時間配信でプラットフォーム側の削除通知が積もっても
+/// メモリが無制限に増えないよう、古いものから捨てる(FIFO)。
+const MAX_HIDDEN_IDS: usize = 8192;
 
 /// 1メッセージに対する判定結果。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,8 +34,10 @@ pub struct Moderator {
     ng_words: Vec<Regex>,
     ng_users: Vec<Regex>,
     highlights: Vec<Regex>,
-    /// 手動でローカル非表示にしたメッセージ ID。
+    /// 手動でローカル非表示にした / プラットフォーム側で削除されたメッセージ ID。
     hidden_ids: HashSet<String>,
+    /// `hidden_ids` の挿入順。上限超過時に最古を捨てる。
+    hidden_order: VecDeque<String>,
 }
 
 impl Moderator {
@@ -44,6 +50,7 @@ impl Moderator {
             ng_users: compile_all(&config.ng_users, "ngUsers"),
             highlights: compile_all(&config.highlights, "highlights"),
             hidden_ids: HashSet::new(),
+            hidden_order: VecDeque::new(),
         }
     }
 
@@ -55,13 +62,26 @@ impl Moderator {
     }
 
     /// 個別コメントを手動でローカル非表示にする。
+    /// 上限 `MAX_HIDDEN_IDS` を超えたら最古の ID から捨てる。
     pub fn hide_id(&mut self, id: impl Into<String>) {
-        self.hidden_ids.insert(id.into());
+        let id = id.into();
+        if id.is_empty() || !self.hidden_ids.insert(id.clone()) {
+            return;
+        }
+        self.hidden_order.push_back(id);
+        while self.hidden_order.len() > MAX_HIDDEN_IDS {
+            if let Some(oldest) = self.hidden_order.pop_front() {
+                self.hidden_ids.remove(&oldest);
+            }
+        }
     }
 
     /// 手動非表示を解除する。
     pub fn unhide_id(&mut self, id: &str) {
-        self.hidden_ids.remove(id);
+        if self.hidden_ids.remove(id) {
+            // 再度 hide された時に古い順序エントリで早期に追い出されないよう順序からも消す。
+            self.hidden_order.retain(|x| x != id);
+        }
     }
 
     /// メッセージを判定する。
@@ -218,6 +238,41 @@ mod tests {
         assert_eq!(moderator.judge(&msg), Verdict::Hide);
         moderator.unhide_id("hidden-message");
         assert_eq!(moderator.judge(&msg), Verdict::Show);
+    }
+
+    #[test]
+    fn hidden_ids_are_capped_fifo() {
+        // 上限を超えると最古の ID から捨てられ、新しい ID は保持される。
+        let mut moderator = Moderator::new(&ModerationConfig::default());
+        for i in 0..=super::MAX_HIDDEN_IDS {
+            moderator.hide_id(format!("id-{i}"));
+        }
+        assert_eq!(moderator.hidden_ids.len(), super::MAX_HIDDEN_IDS);
+        assert_eq!(moderator.hidden_order.len(), super::MAX_HIDDEN_IDS);
+        assert_eq!(
+            moderator.judge(&message("id-0", "u", "v", &["x"])),
+            Verdict::Show
+        );
+        assert_eq!(
+            moderator.judge(&message("id-1", "u", "v", &["x"])),
+            Verdict::Hide
+        );
+        let last = format!("id-{}", super::MAX_HIDDEN_IDS);
+        assert_eq!(
+            moderator.judge(&message(&last, "u", "v", &["x"])),
+            Verdict::Hide
+        );
+        // 重複 hide と空 ID は件数を増やさない。
+        moderator.hide_id(last.clone());
+        moderator.hide_id("");
+        assert_eq!(moderator.hidden_order.len(), super::MAX_HIDDEN_IDS);
+        // unhide は順序からも消える。
+        moderator.unhide_id(&last);
+        assert_eq!(moderator.hidden_order.len(), super::MAX_HIDDEN_IDS - 1);
+        assert_eq!(
+            moderator.judge(&message(&last, "u", "v", &["x"])),
+            Verdict::Show
+        );
     }
 
     #[test]

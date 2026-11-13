@@ -36,11 +36,13 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
-use crate::bus::{is_valid_template_name, spawn_reaction_ui_forwarder, Bus};
+use crate::bus::{
+    is_valid_template_name, spawn_moderation_ui_forwarder, spawn_reaction_ui_forwarder, Bus,
+};
 use crate::config::{AppConfig, ChannelConfig, ChannelPlatform, TtsBackendKind, VoicevoxEngineKind};
 use crate::model::{
-    Amount, Author, Badge, ChatMessage, Fragment, MessageKind, Participant, Platform, Roles,
-    YoutubeReaction,
+    Amount, Author, Badge, ChatMessage, Fragment, MessageKind, ModerationEvent, Participant,
+    Platform, Roles, YoutubeReaction,
 };
 use crate::moderation::{Moderator, Verdict};
 use crate::moderation_error::{ModerationError, ModerationErrorCode};
@@ -92,6 +94,8 @@ pub struct AppState {
     metadata_tx: mpsc::Sender<YoutubeMetadataUpdate>,
     /// YouTubeリアクション Source → 1フレームIPC forwarder の bounded 送信端。
     reaction_tx: mpsc::Sender<Vec<YoutubeReaction>>,
+    /// プラットフォーム側の削除・BAN 通知 Source → moderation forwarder の bounded 送信端。
+    mod_tx: mpsc::Sender<ModerationEvent>,
     /// 参加型配信の参加者一覧。
     participants: Mutex<Vec<Participant>>,
     /// YouTube投稿用OAuth状態。バックグラウンド処理は持たず、操作時だけ通信する。
@@ -1728,6 +1732,7 @@ fn spawn_one_channel(_app: &AppHandle, state: &AppState, ch: &ChannelConfig) {
             state.source_tx.clone(),
             state.metadata_tx.clone(),
             state.reaction_tx.clone(),
+            state.mod_tx.clone(),
             token.clone(),
         );
         token
@@ -1741,6 +1746,7 @@ fn spawn_one_channel(_app: &AppHandle, state: &AppState, ch: &ChannelConfig) {
             niconico_overrides,
             Some(state.metadata_tx.clone()),
             Some(state.reaction_tx.clone()),
+            Some(state.mod_tx.clone()),
         );
         manager.spawn_channel(ch)
     };
@@ -1774,6 +1780,23 @@ fn spawn_one_channel(_app: &AppHandle, state: &AppState, ch: &ChannelConfig) {
     if let Some(old) = map.insert(key, token) {
         old.cancel();
     }
+}
+
+/// プラットフォーム側の削除・BAN を Rust 側の状態へ反映する(1 フレーム分まとめて)。
+///
+/// - MessageDeleted: hidden_ids に入れ、後着(イベントが chat より先に届いた)分を抑止する。
+/// - 全種: 未読み上げの該当コメントを TTS キューから除く(`TtsQueueItem.id` = `ChatMessage.id`)。
+fn apply_platform_moderation(app: &AppHandle, events: &[ModerationEvent]) {
+    let state = app.state::<AppState>();
+    {
+        let mut moderator = state.moderator.lock().unwrap();
+        for event in events {
+            if let ModerationEvent::MessageDeleted { message_id, .. } = event {
+                moderator.hide_id(message_id.as_str());
+            }
+        }
+    }
+    state.tts.remove_moderated(app, events);
 }
 
 /// moderation + TTS パイプラインを起動する。
@@ -1914,6 +1937,7 @@ pub fn run() {
             let (config_tx, config_rx) = watch::channel::<AppConfig>(config.clone());
             let (metadata_tx, metadata_rx) = mpsc::channel::<YoutubeMetadataUpdate>(64);
             let (reaction_tx, reaction_rx) = mpsc::channel::<Vec<YoutubeReaction>>(64);
+            let (mod_tx, mod_rx) = mpsc::channel::<ModerationEvent>(1024);
 
             // 下流 Bus(パイプライン → UI/OBS)。
             let bus = Bus::new(obs_port, stats_tx.clone(), timer_tx.clone());
@@ -1954,6 +1978,7 @@ pub fn run() {
                 tts,
                 metadata_tx,
                 reaction_tx,
+                mod_tx,
                 participants: Mutex::new(Vec::new()),
                 youtube_auth: YoutubeAuth::new()
                     .expect("YouTube投稿用HTTPクライアントの作成に失敗しました"),
@@ -1997,6 +2022,15 @@ pub fn run() {
             // Bus の UI forwarder と OBS サーバを起動。
             bus.spawn_ui_forwarder(handle.clone(), app_cancel.clone());
             spawn_reaction_ui_forwarder(reaction_rx, handle.clone(), app_cancel.clone());
+            {
+                let app_for_mod = handle.clone();
+                spawn_moderation_ui_forwarder(
+                    mod_rx,
+                    handle.clone(),
+                    app_cancel.clone(),
+                    move |events| apply_platform_moderation(&app_for_mod, events),
+                );
+            }
             if let Err(e) = bus.spawn_obs_server(templates_dir, goals_skin_dir, obs_cancel) {
                 tracing::error!("{e}");
             }

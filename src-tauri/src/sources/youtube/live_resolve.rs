@@ -12,7 +12,7 @@ use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{ChannelConfig, ChannelPlatform, YoutubeOverrides};
-use crate::model::{ChatMessage, Platform, YoutubeReaction};
+use crate::model::{ChatMessage, ModerationEvent, Platform, YoutubeReaction};
 use crate::sources::SourceManager;
 use crate::stats::{ViewerCountKind, YoutubeMetadataUpdate};
 
@@ -102,6 +102,7 @@ pub fn spawn_live_resolve_poller(
     source_tx: broadcast::Sender<ChatMessage>,
     metadata_tx: mpsc::Sender<YoutubeMetadataUpdate>,
     reaction_tx: mpsc::Sender<Vec<YoutubeReaction>>,
+    mod_tx: mpsc::Sender<ModerationEvent>,
     cancel: CancellationToken,
 ) {
     tauri::async_runtime::spawn(async move {
@@ -128,6 +129,7 @@ pub fn spawn_live_resolve_poller(
             crate::config::NiconicoOverrides::default(),
             Some(metadata_tx.clone()),
             Some(reaction_tx),
+            Some(mod_tx),
         );
         let mut active_video_id: Option<String> = None;
         let mut active_cancel: Option<CancellationToken> = None;

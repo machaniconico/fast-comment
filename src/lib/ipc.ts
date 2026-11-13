@@ -7,7 +7,7 @@
  * - Safe to import in a plain browser (Tauri absent): all calls are no-ops.
  */
 
-import type { ChatMessage, ListenerRecord, ListenerUpdate, TtsVoiceOverride, YoutubeReaction } from './types';
+import type { ChatMessage, ListenerRecord, ListenerUpdate, ModerationEvent, TtsVoiceOverride, YoutubeReaction } from './types';
 import { invoke as tauriInvoke } from '@tauri-apps/api/core';
 import { emit, listen } from '@tauri-apps/api/event';
 import { getCurrentWindow, primaryMonitor } from '@tauri-apps/api/window';
@@ -21,8 +21,12 @@ const isTauri = (): boolean =>
 // ---- rAF batch queue ----
 type BatchHandler = (messages: ChatMessage[]) => void;
 
+type ModerationHandler = (events: ModerationEvent[]) => void;
+
 let _batchHandler: BatchHandler | null = null;
 let _pending: ChatMessage[] = [];
+let _modHandler: ModerationHandler | null = null;
+let _pendingMod: ModerationEvent[] = [];
 let _rafId: number | null = null;
 let _timerId: ReturnType<typeof setTimeout> | null = null;
 
@@ -33,10 +37,18 @@ function clearScheduled() {
 
 function flush() {
   clearScheduled();
-  if (_pending.length === 0 || !_batchHandler) return;
-  const batch = _pending;
-  _pending = [];
-  _batchHandler(batch);
+  // Order matters: chat first, then moderation, so a delete/ban that arrives in the same
+  // frame as its target comment still marks it.
+  if (_pending.length > 0 && _batchHandler) {
+    const batch = _pending;
+    _pending = [];
+    _batchHandler(batch);
+  }
+  if (_pendingMod.length > 0 && _modHandler) {
+    const events = _pendingMod;
+    _pendingMod = [];
+    _modHandler(events);
+  }
 }
 
 function scheduleFlusher() {
@@ -52,6 +64,11 @@ function scheduleFlusher() {
  */
 export function onChatBatch(handler: BatchHandler): void {
   _batchHandler = handler;
+}
+
+/** Register the handler that receives flushed platform moderation events (after chat). */
+export function onModerationBatch(handler: ModerationHandler): void {
+  _modHandler = handler;
 }
 
 export function offChatBatch(): void {
@@ -74,6 +91,18 @@ export async function startChatListener(): Promise<() => void> {
     scheduleFlusher();
   });
   return unlisten;
+}
+
+/**
+ * Start listening to 'chat-moderation' (platform-side deletes / timeouts / bans, batched per
+ * frame by Rust). Applied in the same rAF flush as chat. Returns an unlisten function.
+ */
+export async function startModerationListener(): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  return listen<ModerationEvent[]>('chat-moderation', (event) => {
+    _pendingMod.push(...event.payload);
+    scheduleFlusher();
+  });
 }
 
 /**

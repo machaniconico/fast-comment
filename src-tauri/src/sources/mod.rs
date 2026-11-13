@@ -22,7 +22,7 @@ use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{ChannelConfig, ChannelPlatform};
-use crate::model::{ChatMessage, YoutubeReaction};
+use crate::model::{ChatMessage, ModerationEvent, YoutubeReaction};
 use crate::stats::YoutubeMetadataUpdate;
 
 /// 接続元の共通インタフェース。
@@ -100,6 +100,8 @@ pub struct SourceManager {
     tx: broadcast::Sender<ChatMessage>,
     metadata_tx: Option<mpsc::Sender<YoutubeMetadataUpdate>>,
     reaction_tx: Option<mpsc::Sender<Vec<YoutubeReaction>>>,
+    /// プラットフォーム側の削除・BAN 通知の side channel(Twitch / YouTube のみ使う)。
+    mod_tx: Option<mpsc::Sender<ModerationEvent>>,
     /// YouTube overrides 等を渡すための設定スナップショット。
     youtube_overrides: crate::config::YoutubeOverrides,
     /// 公式YouTube Data API streamList用。空ならInnerTubeのみ。
@@ -123,11 +125,13 @@ impl SourceManager {
         niconico_overrides: crate::config::NiconicoOverrides,
         metadata_tx: Option<mpsc::Sender<YoutubeMetadataUpdate>>,
         reaction_tx: Option<mpsc::Sender<Vec<YoutubeReaction>>>,
+        mod_tx: Option<mpsc::Sender<ModerationEvent>>,
     ) -> Self {
         SourceManager {
             tx,
             metadata_tx,
             reaction_tx,
+            mod_tx,
             youtube_overrides,
             youtube_api_key,
             x_overrides,
@@ -152,10 +156,11 @@ impl SourceManager {
         let youtube_api_key = self.youtube_api_key.clone();
         let metadata_tx = self.metadata_tx.clone();
         let reaction_tx = self.reaction_tx.clone();
+        let mod_tx = self.mod_tx.clone();
 
         match ch.platform {
             ChannelPlatform::Twitch => {
-                let src = twitch::TwitchSource::new(identifier);
+                let src = twitch::TwitchSource::new(identifier).with_moderation_tx(mod_tx);
                 tauri::async_runtime::spawn(async move {
                     run_with_logging(&src, tx, child).await;
                 });
@@ -167,6 +172,7 @@ impl SourceManager {
                     youtube_api_key,
                     metadata_tx,
                     reaction_tx,
+                    mod_tx,
                 );
                 tauri::async_runtime::spawn(async move {
                     run_with_logging(&src, tx, child).await;

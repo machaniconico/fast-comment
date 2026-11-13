@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use super::{Backoff, Source};
 use crate::config::YoutubeOverrides;
-use crate::model::{ChatMessage, Platform, YoutubeReaction};
+use crate::model::{ChatMessage, ModerationEvent, Platform, YoutubeReaction};
 use crate::stats::YoutubeMetadataUpdate;
 
 use innertube::InnerTubeClient;
@@ -105,6 +105,8 @@ pub struct YoutubeSource {
     official_api_key: String,
     metadata_tx: Option<mpsc::Sender<YoutubeMetadataUpdate>>,
     reaction_tx: Option<mpsc::Sender<Vec<YoutubeReaction>>>,
+    /// 配信側の削除・BAN 通知の side channel。
+    mod_tx: Option<mpsc::Sender<ModerationEvent>>,
 }
 
 impl YoutubeSource {
@@ -114,6 +116,7 @@ impl YoutubeSource {
         official_api_key: String,
         metadata_tx: Option<mpsc::Sender<YoutubeMetadataUpdate>>,
         reaction_tx: Option<mpsc::Sender<Vec<YoutubeReaction>>>,
+        mod_tx: Option<mpsc::Sender<ModerationEvent>>,
     ) -> Self {
         YoutubeSource {
             video_input,
@@ -121,6 +124,7 @@ impl YoutubeSource {
             official_api_key,
             metadata_tx,
             reaction_tx,
+            mod_tx,
         }
     }
 
@@ -156,6 +160,7 @@ impl Source for YoutubeSource {
                         &tx,
                         &cancel,
                         &mut seen,
+                        self.mod_tx.as_ref(),
                     );
                     let reaction_sidecar = self.run_reaction_sidecar(&video_id, &cancel);
                     tokio::pin!(official);
@@ -172,6 +177,7 @@ impl Source for YoutubeSource {
                             &tx,
                             &cancel,
                             &mut seen,
+                            self.mod_tx.as_ref(),
                         )
                         .await,
                     )
@@ -295,6 +301,11 @@ impl YoutubeSource {
                         }
                         MessageDisposition::Duplicate => {}
                     }
+                } else if let Some(event) =
+                    parser::parse_moderation_action(action, video_id, &self.overrides.paths)
+                {
+                    // 初回ポールは過去分の再送なので、既にバッファに無い ID は UI 側で無視される。
+                    send_moderation_event(self.mod_tx.as_ref(), event, video_id);
                 } else if parser::is_chat_item_action(action) {
                     // 解析できなかった addChatItemAction はログへ1行追記。
                     parser::log_unparsed(action);
@@ -439,6 +450,19 @@ impl YoutubeSource {
                     tracing::debug!("youtube:{video_id} リアクション演出をdrop: {e}");
                 }
             }
+        }
+    }
+}
+
+/// side channel へ送る。満杯・切断でも受信ループは止めない(try_send)。
+pub(super) fn send_moderation_event(
+    mod_tx: Option<&mpsc::Sender<ModerationEvent>>,
+    event: ModerationEvent,
+    video_id: &str,
+) {
+    if let Some(mod_tx) = mod_tx {
+        if let Err(e) = mod_tx.try_send(event) {
+            tracing::debug!("youtube:{video_id} モデレーションイベントをdrop: {e}");
         }
     }
 }

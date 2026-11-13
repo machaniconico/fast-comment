@@ -8,13 +8,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::Context as _;
 use prost::Message;
 use serde::Deserialize;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 use tonic::codec::ProstCodec;
 use tonic::metadata::MetadataValue;
 use tonic::transport::Endpoint;
 
-use crate::model::{Amount, Author, Badge, ChatMessage, Fragment, MessageKind, Platform, Roles};
+use crate::model::{
+    Amount, Author, Badge, ChatMessage, Fragment, MessageKind, ModerationEvent, Platform, Roles,
+};
 
 use super::{MessageDisposition, RecentMessageIds};
 
@@ -30,6 +32,12 @@ const TYPE_MEMBER_MILESTONE: i32 = 17;
 const TYPE_MEMBERSHIP_GIFTING: i32 = 18;
 const TYPE_GIFT_MEMBERSHIP_RECEIVED: i32 = 19;
 const TYPE_GIFT: i32 = 21;
+// 以下 2 つと LiveChatUserBannedMessageDetails の番号は Google 公開の stream_list.proto
+// (https://developers.google.com/youtube/v3/live/streaming-live-chat 掲載、2026-11-13 確認)由来。
+// 同 proto には MESSAGE_DELETED_EVENT / messageDeletedDetails が載っていないため削除通知は扱わない。
+const TYPE_USER_BANNED: i32 = 10;
+const BAN_TYPE_PERMANENT: i32 = 1;
+const BAN_TYPE_TEMPORARY: i32 = 2;
 
 pub(super) async fn stream_live_chat(
     video_id: &str,
@@ -37,6 +45,7 @@ pub(super) async fn stream_live_chat(
     tx: &broadcast::Sender<ChatMessage>,
     cancel: &CancellationToken,
     seen: &mut RecentMessageIds,
+    mod_tx: Option<&mpsc::Sender<ModerationEvent>>,
 ) -> anyhow::Result<()> {
     let live_chat_id = tokio::select! {
         _ = cancel.cancelled() => return Ok(()),
@@ -94,6 +103,10 @@ pub(super) async fn stream_live_chat(
             }
 
             for item in response.items {
+                if let Some(event) = to_moderation_event(&item, video_id) {
+                    super::send_moderation_event(mod_tx, event, video_id);
+                    continue;
+                }
                 if let Some(mut message) = to_chat_message(item, video_id) {
                     message.skip_tts = first_response;
                     match seen.accept(&message) {
@@ -152,6 +165,38 @@ async fn resolve_live_chat_id(video_id: &str, api_key: &str) -> anyhow::Result<S
         .find_map(|item| item.live_streaming_details?.active_live_chat_id)
         .filter(|id| !id.trim().is_empty())
         .ok_or_else(|| anyhow::anyhow!("配信中のliveChatIdが見つかりません"))
+}
+
+/// USER_BANNED_EVENT → UserCleared。`banType` が temporary なら秒数、permanent なら None。
+/// banType 欠落・未知値は `banDurationSeconds` の有無で判定し、`certain` = false にする。
+/// `publishedAt`(コメントの `timestamp_ms` と同じサーバー時刻)を適用境界にする。対象外・欠落は None。
+fn to_moderation_event(item: &LiveChatMessage, video_id: &str) -> Option<ModerationEvent> {
+    let snippet = item.snippet.as_ref()?;
+    if snippet.r#type != Some(TYPE_USER_BANNED) {
+        return None;
+    }
+    let details = snippet.user_banned_details.as_ref()?;
+    let author_id = details
+        .banned_user_details
+        .as_ref()?
+        .channel_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?
+        .to_string();
+    let (duration_secs, certain) = match details.ban_type {
+        Some(BAN_TYPE_PERMANENT) => (None, true),
+        Some(BAN_TYPE_TEMPORARY) => (Some(details.ban_duration_seconds.unwrap_or(0)), true),
+        _ => (details.ban_duration_seconds, false),
+    };
+    Some(ModerationEvent::UserCleared {
+        platform: Platform::Youtube,
+        channel: video_id.to_string(),
+        author_id,
+        duration_secs,
+        certain,
+        before_ms: snippet.published_at.as_deref().and_then(parse_timestamp_ms),
+    })
 }
 
 fn to_chat_message(item: LiveChatMessage, video_id: &str) -> Option<ChatMessage> {
@@ -533,6 +578,8 @@ struct LiveChatMessageSnippet {
     display_message: Option<String>,
     #[prost(message, optional, tag = "19")]
     text_message_details: Option<LiveChatTextMessageDetails>,
+    #[prost(message, optional, tag = "22")]
+    user_banned_details: Option<LiveChatUserBannedMessageDetails>,
     #[prost(message, optional, tag = "27")]
     super_chat_details: Option<LiveChatSuperChatDetails>,
     #[prost(message, optional, tag = "28")]
@@ -557,6 +604,24 @@ enum LiveChatMessageType {
     MembershipGifting = TYPE_MEMBERSHIP_GIFTING,
     GiftMembershipReceived = TYPE_GIFT_MEMBERSHIP_RECEIVED,
     Gift = TYPE_GIFT,
+    UserBanned = TYPE_USER_BANNED,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct LiveChatUserBannedMessageDetails {
+    #[prost(message, optional, tag = "1")]
+    banned_user_details: Option<ChannelProfileDetails>,
+    /// BanTypeWrapper.BanType(PERMANENT=1 / TEMPORARY=2)。未知値でも落ちないよう i32 で受ける。
+    #[prost(int32, optional, tag = "2")]
+    ban_type: Option<i32>,
+    #[prost(uint64, optional, tag = "4")]
+    ban_duration_seconds: Option<u64>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct ChannelProfileDetails {
+    #[prost(string, optional, tag = "101")]
+    channel_id: Option<String>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -651,6 +716,114 @@ mod tests {
         jewels_amount: Option<i32>,
         #[prost(int32, optional, tag = "8")]
         combo_count: Option<i32>,
+    }
+
+    /// 公式 stream_list.proto の番号で手組みした wire bytes(構造体の注釈と独立に番号を検証する)。
+    fn banned_wire(ban_type: Option<u64>, duration: Option<u64>, channel_id: &str) -> Vec<u8> {
+        fn varint(mut v: u64, out: &mut Vec<u8>) {
+            loop {
+                let b = (v & 0x7f) as u8;
+                v >>= 7;
+                if v == 0 {
+                    out.push(b);
+                    break;
+                }
+                out.push(b | 0x80);
+            }
+        }
+        fn field_bytes(num: u64, payload: &[u8], out: &mut Vec<u8>) {
+            varint((num << 3) | 2, out);
+            varint(payload.len() as u64, out);
+            out.extend_from_slice(payload);
+        }
+        fn field_varint(num: u64, v: u64, out: &mut Vec<u8>) {
+            varint(num << 3, out);
+            varint(v, out);
+        }
+        let mut profile = Vec::new();
+        field_bytes(101, channel_id.as_bytes(), &mut profile); // ChannelProfileDetails.channel_id
+        let mut details = Vec::new();
+        field_bytes(1, &profile, &mut details); // banned_user_details
+        if let Some(t) = ban_type {
+            field_varint(2, t, &mut details); // ban_type
+        }
+        if let Some(d) = duration {
+            field_varint(4, d, &mut details); // ban_duration_seconds
+        }
+        let mut snippet = Vec::new();
+        field_varint(1, 10, &mut snippet); // type = USER_BANNED_EVENT
+        field_bytes(4, b"2026-07-21T01:02:03.456Z", &mut snippet); // published_at
+        field_bytes(22, &details, &mut snippet); // user_banned_details
+        let mut message = Vec::new();
+        field_bytes(101, b"LCC.ban-1", &mut message); // id
+        field_bytes(2, &snippet, &mut message); // snippet
+        message
+    }
+
+    #[test]
+    fn to_moderation_event_decodes_official_user_banned_wire() {
+        let temporary =
+            LiveChatMessage::decode(&banned_wire(Some(2), Some(300), "UCtarget")[..]).unwrap();
+        assert_eq!(
+            to_moderation_event(&temporary, "video-1"),
+            Some(ModerationEvent::UserCleared {
+                platform: Platform::Youtube,
+                channel: "video-1".into(),
+                author_id: "UCtarget".into(),
+                duration_secs: Some(300),
+                certain: true,
+                before_ms: Some(1_784_595_723_456),
+            })
+        );
+        // ban イベントはコメントとしては流さない。
+        assert!(to_chat_message(temporary, "video-1").is_none());
+
+        let permanent =
+            LiveChatMessage::decode(&banned_wire(Some(1), None, "UCtarget")[..]).unwrap();
+        assert!(matches!(
+            to_moderation_event(&permanent, "v"),
+            Some(ModerationEvent::UserCleared {
+                duration_secs: None,
+                certain: true,
+                ..
+            })
+        ));
+        // 未知の banType は duration の有無で判定。
+        let unknown = LiveChatMessage::decode(&banned_wire(Some(9), Some(60), "UCx")[..]).unwrap();
+        assert!(matches!(
+            to_moderation_event(&unknown, "v"),
+            Some(ModerationEvent::UserCleared {
+                duration_secs: Some(60),
+                certain: false,
+                ..
+            })
+        ));
+        // 空 channelId は None。
+        let empty = LiveChatMessage::decode(&banned_wire(Some(1), None, "")[..]).unwrap();
+        assert_eq!(to_moderation_event(&empty, "v"), None);
+    }
+
+    #[test]
+    fn to_moderation_event_ignores_other_types() {
+        let item = LiveChatMessage {
+            id: Some("m".into()),
+            snippet: Some(LiveChatMessageSnippet {
+                r#type: Some(TYPE_TEXT),
+                display_message: Some("hi".into()),
+                ..Default::default()
+            }),
+            author_details: None,
+        };
+        assert_eq!(to_moderation_event(&item, "v"), None);
+        let no_details = LiveChatMessage {
+            id: None,
+            snippet: Some(LiveChatMessageSnippet {
+                r#type: Some(TYPE_USER_BANNED),
+                ..Default::default()
+            }),
+            author_details: None,
+        };
+        assert_eq!(to_moderation_event(&no_details, "v"), None);
     }
 
     #[test]
