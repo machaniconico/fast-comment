@@ -44,6 +44,10 @@ const MAX_REACTION_ITEMS_PER_UI_BATCH: usize = 256;
 const MAX_MODERATION_EVENTS_PER_UI_BATCH: usize = 1024;
 /// WS クライアントごとの送信キュー上限(溢れたら古いものから drop)。
 const WS_CLIENT_QUEUE: usize = 256;
+/// OBS 向けモデレーションイベントの broadcast 容量。
+const MODERATION_BROADCAST_CAPACITY: usize = 1024;
+/// opt-in WS クライアントごとのモデレーションイベント待ち上限(溢れたら古いものから drop)。
+const WS_CLIENT_MODERATION_QUEUE: usize = 1024;
 
 /// YouTube リアクションをUIへ1フレーム単位でまとめて送る。
 ///
@@ -135,6 +139,8 @@ pub fn spawn_moderation_ui_forwarder<F>(
 #[derive(Clone)]
 pub struct Bus {
     tx: broadcast::Sender<ChatMessage>,
+    /// OBS `/ws?modEvents=1` へ流す削除・BAN・ローカル非表示(配信側・アプリ発の両方)。
+    mod_tx: broadcast::Sender<ModerationEvent>,
     stats_tx: watch::Sender<StatsSnapshot>,
     timer_tx: watch::Sender<TimerSnapshot>,
     obs_port: u16,
@@ -148,8 +154,10 @@ impl Bus {
         timer_tx: watch::Sender<TimerSnapshot>,
     ) -> Self {
         let (tx, _rx) = broadcast::channel(BROADCAST_CAPACITY);
+        let (mod_tx, _mod_rx) = broadcast::channel(MODERATION_BROADCAST_CAPACITY);
         Bus {
             tx,
+            mod_tx,
             stats_tx,
             timer_tx,
             obs_port,
@@ -165,6 +173,11 @@ impl Bus {
     /// 購読者が居なくてもエラーにしない。
     pub fn publish(&self, msg: ChatMessage) {
         let _ = self.tx.send(msg);
+    }
+
+    /// OBS の opt-in クライアントへモデレーションイベントを流す。購読者が居なくてもエラーにしない。
+    pub fn publish_moderation(&self, event: ModerationEvent) {
+        let _ = self.mod_tx.send(event);
     }
 
     /// UI 向けバッチ送出ループを起動する。
@@ -248,6 +261,7 @@ impl Bus {
 
         let state = ObsState {
             tx: Arc::new(tx),
+            mod_tx: Arc::new(self.mod_tx.clone()),
             stats_tx: Arc::new(self.stats_tx.clone()),
             timer_tx: Arc::new(self.timer_tx.clone()),
             templates_dir: Arc::new(templates_dir.clone()),
@@ -304,6 +318,7 @@ impl Bus {
 #[derive(Clone)]
 struct ObsState {
     tx: Arc<broadcast::Sender<ChatMessage>>,
+    mod_tx: Arc<broadcast::Sender<ModerationEvent>>,
     stats_tx: Arc<watch::Sender<StatsSnapshot>>,
     timer_tx: Arc<watch::Sender<TimerSnapshot>>,
     templates_dir: Arc<PathBuf>,
@@ -313,6 +328,46 @@ struct ObsState {
 #[derive(Debug, Deserialize)]
 struct WsQuery {
     channel: Option<String>,
+    /// `modEvents=1`(または `true`)のクライアントにだけ `{"moderation":[…]}` フレームを送る。
+    /// 未指定・`0`・値なしは opt-out(改造テンプレに未知フレームを送らない)。
+    #[serde(rename = "modEvents")]
+    mod_events: Option<String>,
+}
+
+/// `modEvents` クエリ値が opt-in か。
+fn mod_events_opted_in(value: Option<&str>) -> bool {
+    matches!(value.map(str::trim), Some("1") | Some("true"))
+}
+
+/// opt-in のときだけモデレーションイベントを購読する(opt-out は購読自体しない)。
+fn moderation_receiver(
+    mod_tx: &broadcast::Sender<ModerationEvent>,
+    query: &WsQuery,
+) -> Option<broadcast::Receiver<ModerationEvent>> {
+    mod_events_opted_in(query.mod_events.as_deref()).then(|| mod_tx.subscribe())
+}
+
+/// 1 tick 分のモデレーションイベントを `{"moderation":[…]}` へ。空なら送らない。
+fn moderation_frame(events: &[ModerationEvent]) -> Option<String> {
+    if events.is_empty() {
+        return None;
+    }
+    match serde_json::to_string(&serde_json::json!({ "moderation": events })) {
+        Ok(json) => Some(json),
+        Err(e) => {
+            tracing::warn!("WS 向けモデレーション JSON 化失敗: {e}");
+            None
+        }
+    }
+}
+
+/// `channel` フィルタ付きクライアントには、そのチャンネルのイベントだけを渡す。
+fn moderation_event_channel(event: &ModerationEvent) -> &str {
+    match event {
+        ModerationEvent::MessageDeleted { channel, .. }
+        | ModerationEvent::UserCleared { channel, .. }
+        | ModerationEvent::ChatCleared { channel, .. } => channel,
+    }
 }
 
 /// `/` のクエリ。`template` 未指定時は default を使う。
@@ -388,7 +443,8 @@ async fn ws_handler(
     Query(query): Query<WsQuery>,
 ) -> impl IntoResponse {
     let rx = state.tx.subscribe();
-    ws.on_upgrade(move |socket| handle_ws_client(socket, rx, query.channel))
+    let mod_rx = moderation_receiver(&state.mod_tx, &query);
+    ws.on_upgrade(move |socket| handle_ws_client(socket, rx, mod_rx, query.channel))
 }
 
 /// `/stats` のアップグレードハンドラ。
@@ -415,14 +471,20 @@ async fn timer_ws_handler(
 /// 受信(rx.recv)と送信(tick での flush)を分離し、遅いクライアントの socket.send が
 /// 受信をブロックしないようにする。受信は per-client の bounded queue を埋め続け、
 /// 満杯なら古いものから drop(最新優先)。`channel` 指定時は一致しないメッセージを捨てる。
+///
+/// `mod_rx` は `?modEvents=1` の opt-in クライアントだけ Some。同じ tick で chat 配列の
+/// **後に** `{"moderation":[…]}` を送り、chat との順序を同じソケット上で保つ。
 async fn handle_ws_client(
     mut socket: WebSocket,
     mut rx: broadcast::Receiver<ChatMessage>,
+    mut mod_rx: Option<broadcast::Receiver<ModerationEvent>>,
     channel: Option<String>,
 ) {
     let mut ticker = interval(Duration::from_millis(UI_BATCH_INTERVAL_MS));
     // クライアント個別の bounded queue。溢れたら古いものから drop(最新優先)。
     let mut queue: std::collections::VecDeque<ChatMessage> = std::collections::VecDeque::new();
+    let mut mod_queue: std::collections::VecDeque<ModerationEvent> =
+        std::collections::VecDeque::new();
 
     loop {
         tokio::select! {
@@ -447,19 +509,46 @@ async fn handle_ws_client(
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
+            // opt-in クライアントだけ: モデレーションイベントをキューへ。
+            recv = async { mod_rx.as_mut().unwrap().recv().await }, if mod_rx.is_some() => {
+                match recv {
+                    Ok(event) => {
+                        if let Some(ref ch) = channel {
+                            if moderation_event_channel(&event) != ch {
+                                continue;
+                            }
+                        }
+                        if mod_queue.len() >= WS_CLIENT_MODERATION_QUEUE {
+                            mod_queue.pop_front();
+                        }
+                        mod_queue.push_back(event);
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::debug!("WS moderation forwarder が {n} 件 lag");
+                    }
+                    // 送信端が消えても chat 配信は続ける。
+                    Err(broadcast::error::RecvError::Closed) => mod_rx = None,
+                }
+            }
             // ~16ms ごとに溜まった分を1つの JSON 配列としてまとめて送る。
             _ = ticker.tick() => {
-                if queue.is_empty() {
-                    continue; // 空 tick では送らない
-                }
-                let batch: Vec<ChatMessage> = queue.drain(..).collect();
-                match serde_json::to_string(&batch) {
-                    Ok(json) => {
-                        if socket.send(WsMessage::Text(json.into())).await.is_err() {
-                            return; // 切断
+                if !queue.is_empty() {
+                    let batch: Vec<ChatMessage> = queue.drain(..).collect();
+                    match serde_json::to_string(&batch) {
+                        Ok(json) => {
+                            if socket.send(WsMessage::Text(json.into())).await.is_err() {
+                                return; // 切断
+                            }
                         }
+                        Err(e) => tracing::warn!("WS 向け JSON 化失敗: {e}"),
                     }
-                    Err(e) => tracing::warn!("WS 向け JSON 化失敗: {e}"),
+                }
+                // chat の後にモデレーション(1 tick 1 フレーム)。
+                let events: Vec<ModerationEvent> = mod_queue.drain(..).collect();
+                if let Some(json) = moderation_frame(&events) {
+                    if socket.send(WsMessage::Text(json.into())).await.is_err() {
+                        return;
+                    }
                 }
             }
             // クライアントからのメッセージ(主に close / ping)を待つ。
@@ -652,6 +741,71 @@ mod tests {
     fn invalid_template_name_space() {
         // 空白を含む名前は拒否される
         assert!(!is_valid_template_name("a b"));
+    }
+
+    // --- OBS moderation opt-in ---
+
+    fn query(mod_events: Option<&str>) -> WsQuery {
+        WsQuery {
+            channel: None,
+            mod_events: mod_events.map(str::to_string),
+        }
+    }
+
+    fn deleted(id: &str) -> ModerationEvent {
+        ModerationEvent::MessageDeleted {
+            platform: crate::model::Platform::Twitch,
+            channel: "ch".into(),
+            message_id: id.into(),
+        }
+    }
+
+    #[test]
+    fn mod_events_opt_in_parsing() {
+        assert!(mod_events_opted_in(Some("1")));
+        assert!(mod_events_opted_in(Some("true")));
+        assert!(mod_events_opted_in(Some(" 1 ")));
+        let rejected = [None, Some(""), Some("0"), Some("false"), Some("yes")];
+        for v in rejected.into_iter().chain([Some("11")]) {
+            assert!(!mod_events_opted_in(v), "{v:?}");
+        }
+    }
+
+    #[test]
+    fn ws_query_deserializes_mod_events_from_query_string() {
+        let parse = |qs: &str| {
+            let uri: axum::http::Uri = format!("/ws?{qs}").parse().unwrap();
+            Query::<WsQuery>::try_from_uri(&uri).unwrap().0
+        };
+        let opted = |qs: &str| mod_events_opted_in(parse(qs).mod_events.as_deref());
+        assert!(opted("modEvents=1&channel=a"));
+        assert!(!opted("modEvents=0"));
+        assert!(!opted("modEvents"));
+        assert!(!opted("channel=a"));
+    }
+
+    #[test]
+    fn only_opted_in_clients_receive_moderation_events() {
+        let (mod_tx, _keep) = broadcast::channel(8);
+        let mut opted_in =
+            moderation_receiver(&mod_tx, &query(Some("1"))).expect("opt-in subscribes");
+        assert!(moderation_receiver(&mod_tx, &query(None)).is_none());
+        assert!(moderation_receiver(&mod_tx, &query(Some("0"))).is_none());
+        // opt-out は購読していないので受信者数は opt-in の 1 + _keep の 1 だけ。
+        assert_eq!(mod_tx.receiver_count(), 2);
+        mod_tx.send(deleted("m1")).unwrap();
+        assert_eq!(opted_in.try_recv().unwrap(), deleted("m1"));
+    }
+
+    #[test]
+    fn moderation_frame_wraps_batch_and_skips_empty() {
+        assert_eq!(moderation_frame(&[]), None);
+        let json = moderation_frame(&[deleted("a"), deleted("b")]).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["moderation"].as_array().unwrap().len(), 2);
+        assert_eq!(v["moderation"][0]["type"], "messageDeleted");
+        assert_eq!(v["moderation"][1]["messageId"], "b");
+        assert_eq!(moderation_event_channel(&deleted("a")), "ch");
     }
 
     // --- inject_template_base ---

@@ -708,8 +708,9 @@ export async function removeChannel(key: string): Promise<void> {
   await invoke<void>('remove_channel', { key });
 }
 
-export async function hideMessage(id: string): Promise<void> {
-  await invoke<void>('hide_message', { id });
+/** Local hide. `platform` / `channel` let Rust also remove it from opted-in OBS overlays. */
+export async function hideMessage(id: string, platform?: string, channel?: string): Promise<void> {
+  await invoke<void>('hide_message', { id, platform, channel });
 }
 
 export async function getObsUrl(): Promise<string | null> {
