@@ -22,6 +22,7 @@ mod moderation_error;
 mod secret_store;
 pub mod sources;
 pub mod stats;
+mod templates;
 pub mod tts;
 mod update;
 
@@ -41,9 +42,8 @@ use crate::autopost::{
     AutopostStatus, KeyringTokenStore, UserCommand as AutopostCommand, XEndpoints, XPostAuth,
     XPostError, XPostErrorCode, XPostStatus,
 };
-use crate::bus::{
-    is_valid_template_name, spawn_moderation_ui_forwarder, spawn_reaction_ui_forwarder, Bus,
-};
+use crate::bus::{spawn_moderation_ui_forwarder, spawn_reaction_ui_forwarder, Bus};
+use crate::templates::{TemplateInfo, TemplateRef, TemplateStore};
 use crate::config::{AppConfig, ChannelConfig, ChannelPlatform, TtsBackendKind, VoicevoxEngineKind};
 use crate::model::{
     Amount, Author, Badge, ChatMessage, Fragment, LiveEvent, LiveStream, MessageKind, ModerationEvent, Participant,
@@ -62,8 +62,6 @@ use crate::tts::{
 };
 use crate::update::{check_for_update, open_url};
 
-const EDITABLE_TEMPLATE_FILES: &[&str] = &["style.css", "index.html", "app.js"];
-const MAX_TEMPLATE_FILE_BYTES: usize = 1024 * 1024;
 
 /// アプリ全体で共有する実行時状態。
 pub struct AppState {
@@ -81,8 +79,8 @@ pub struct AppState {
     source_tx: broadcast::Sender<ChatMessage>,
     /// UI/OBS へ流す下流 Bus。
     bus: Bus,
-    /// OBS テンプレートの配信元ディレクトリ。
-    templates_dir: PathBuf,
+    /// OBS テンプレート(内蔵 + カスタム)の保存先。
+    templates: TemplateStore,
     /// ユーザー作成のGoals PNG背景を置く書き込み可能なディレクトリ。
     goals_skin_dir: PathBuf,
     /// アプリ全体の停止トークン。
@@ -1482,11 +1480,15 @@ fn get_obs_url(
     template: Option<String>,
     channel: Option<String>,
 ) -> Result<String, String> {
-    let template = template.unwrap_or_else(|| "default".to_string());
-    if !is_valid_template_name(&template) {
-        return Err("テンプレート名は半角英数字、'-'、'_' のみ使用できます".to_string());
-    }
     let port = state.obs_server.lock().unwrap().port;
+    obs_url(port, template.as_deref(), channel.as_deref())
+}
+
+/// OBS ブラウザソース用 URL を組み立てる。`template` は ID(`default` / `custom:foo`)。
+fn obs_url(port: u16, template: Option<&str>, channel: Option<&str>) -> Result<String, String> {
+    let template = TemplateRef::parse(template.unwrap_or("default"))
+        .map_err(|_| "テンプレート名は半角英数字、'-'、'_' のみ使用できます".to_string())?
+        .id();
     let mut url =
         format!("http://127.0.0.1:{port}/?template={template}&ws=ws://127.0.0.1:{port}/ws");
     if let Some(ch) = channel {
@@ -1588,49 +1590,23 @@ fn timer_now_ms() -> u64 {
         .min(u128::from(u64::MAX)) as u64
 }
 
-/// OBS テンプレートディレクトリ一覧を返す。
+/// OBS テンプレート一覧(内蔵 → カスタムの順)を返す。
 #[tauri::command]
-fn list_templates(state: State<'_, AppState>) -> Result<Vec<String>, String> {
-    let mut names = Vec::new();
-    let entries = fs::read_dir(&state.templates_dir).map_err(|e| {
-        format!(
-            "テンプレートディレクトリ読み込み失敗 {}: {e}",
-            state.templates_dir.display()
-        )
-    })?;
-
-    for entry in entries {
-        let entry = entry.map_err(|e| format!("テンプレート一覧取得失敗: {e}"))?;
-        let file_type = entry
-            .file_type()
-            .map_err(|e| format!("テンプレート種別取得失敗: {e}"))?;
-        if !file_type.is_dir() {
-            continue;
-        }
-        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
-            continue;
-        };
-        if is_valid_template_name(&name) {
-            names.push(name);
-        }
-    }
-    names.sort();
-    Ok(names)
+fn list_templates(state: State<'_, AppState>) -> Result<Vec<TemplateInfo>, String> {
+    state.templates.list()
 }
 
-/// OBS テンプレート内の編集可能ファイルを読み込む。
+/// OBS テンプレート内の編集可能ファイルを読み込む。`name` はテンプレート ID。
 #[tauri::command]
 fn read_template_file(
     state: State<'_, AppState>,
     name: String,
     file: String,
 ) -> Result<String, String> {
-    let path = template_file_path(&state, &name, &file)?;
-    fs::read_to_string(&path)
-        .map_err(|e| format!("テンプレートファイル読み込み失敗 {}: {e}", path.display()))
+    state.templates.read(&TemplateRef::parse(&name)?, &file)
 }
 
-/// OBS テンプレート内の編集可能ファイルを書き込む。
+/// OBS テンプレート内の編集可能ファイルを書き込む。内蔵は読み取り専用で Err。
 #[tauri::command]
 fn write_template_file(
     state: State<'_, AppState>,
@@ -1638,13 +1614,27 @@ fn write_template_file(
     file: String,
     contents: String,
 ) -> Result<(), String> {
-    if contents.len() > MAX_TEMPLATE_FILE_BYTES {
-        return Err("テンプレートファイルは1MiB以下にしてください".to_string());
-    }
+    state
+        .templates
+        .write(&TemplateRef::parse(&name)?, &file, &contents)
+}
 
-    let path = template_file_path(&state, &name, &file)?;
-    fs::write(&path, contents.as_bytes())
-        .map_err(|e| format!("テンプレートファイル書き込み失敗 {}: {e}", path.display()))
+/// テンプレート `source`(ID)をカスタム `name` として複製する。
+#[tauri::command]
+fn duplicate_template(
+    state: State<'_, AppState>,
+    source: String,
+    name: String,
+) -> Result<TemplateInfo, String> {
+    state
+        .templates
+        .duplicate(&TemplateRef::parse(&source)?, &name)
+}
+
+/// カスタムテンプレート(ID)を削除する。内蔵は Err。
+#[tauri::command]
+fn delete_template(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    state.templates.delete(&TemplateRef::parse(&id)?)
 }
 
 #[derive(Serialize)]
@@ -1708,6 +1698,19 @@ fn is_png_skin_file_name(name: &str) -> bool {
 }
 
 #[cfg(test)]
+mod obs_url_tests {
+    use super::obs_url;
+
+    #[test]
+    fn obs_url_accepts_custom_id() {
+        let url = obs_url(11180, Some("custom:foo"), None).unwrap();
+        assert!(url.contains("?template=custom:foo"), "{url}");
+        assert!(obs_url(11180, Some("custom:../x"), None).is_err());
+        assert!(obs_url(11180, None, None).unwrap().contains("?template=default&"));
+    }
+}
+
+#[cfg(test)]
 mod goal_skin_tests {
     use super::is_png_skin_file_name;
 
@@ -1720,26 +1723,6 @@ mod goal_skin_tests {
         assert!(!is_png_skin_file_name("skin.jpg"));
         assert!(!is_png_skin_file_name(""));
     }
-}
-
-fn validate_template_file_name(file: &str) -> Result<&str, String> {
-    EDITABLE_TEMPLATE_FILES
-        .iter()
-        .copied()
-        .find(|allowed| *allowed == file)
-        .ok_or_else(|| "編集できるファイルは style.css / index.html / app.js のみです".to_string())
-}
-
-fn template_file_path(state: &AppState, name: &str, file: &str) -> Result<PathBuf, String> {
-    if !is_valid_template_name(name) {
-        return Err("テンプレート名は半角英数字、'-'、'_' のみ使用できます".to_string());
-    }
-    let file = validate_template_file_name(file)?;
-    let dir = state.templates_dir.join(name);
-    if !dir.is_dir() {
-        return Err(format!("テンプレートディレクトリが見つかりません: {name}"));
-    }
-    Ok(dir.join(file))
 }
 
 /// 参加者一覧を取得する。
@@ -1977,7 +1960,8 @@ fn restart_obs_server_if_needed(state: &AppState, new_port: u16) -> Result<(), S
 
     let cancel = state.app_cancel.child_token();
     let _obs_task = state.bus.spawn_obs_server_on_port(
-        state.templates_dir.clone(),
+        state.templates.builtin_root().to_path_buf(),
+        state.templates.custom_root().to_path_buf(),
         state.goals_skin_dir.clone(),
         new_port,
         cancel.clone(),
@@ -2319,7 +2303,18 @@ pub fn run() {
             // アプリ全体の停止トークン(将来 on_window_event 等から cancel 可能)。
             let app_cancel = CancellationToken::new();
             let obs_cancel = app_cancel.child_token();
-            let templates_dir = resolve_templates_dir(&handle);
+            let templates =
+                TemplateStore::new(resolve_templates_dir(&handle), config_dir.join("templates"));
+            // カスタムの保存先。失敗しても内蔵の配信は続ける。
+            if let Err(e) = fs::create_dir_all(templates.custom_root()) {
+                tracing::warn!(
+                    "カスタムテンプレートフォルダの作成に失敗 {}: {e}",
+                    templates.custom_root().display()
+                );
+            }
+            if let Err(e) = templates.cleanup_stale_staging() {
+                tracing::warn!("テンプレート staging の掃除に失敗: {e}");
+            }
             let goals_skin_dir = config_dir.join("skin");
             if let Err(e) = fs::create_dir_all(&goals_skin_dir) {
                 tracing::warn!(
@@ -2337,7 +2332,7 @@ pub fn run() {
                 config_dir,
                 source_tx: source_tx.clone(),
                 bus: bus.clone(),
-                templates_dir: templates_dir.clone(),
+                templates: templates.clone(),
                 goals_skin_dir: goals_skin_dir.clone(),
                 app_cancel: app_cancel.clone(),
                 obs_server: Mutex::new(ObsServerControl {
@@ -2419,7 +2414,12 @@ pub fn run() {
                     move |events| apply_platform_moderation(&app_for_mod, events),
                 );
             }
-            if let Err(e) = bus.spawn_obs_server(templates_dir, goals_skin_dir, obs_cancel) {
+            if let Err(e) = bus.spawn_obs_server(
+                templates.builtin_root().to_path_buf(),
+                templates.custom_root().to_path_buf(),
+                goals_skin_dir,
+                obs_cancel,
+            ) {
                 tracing::error!("{e}");
             }
 
@@ -2491,6 +2491,8 @@ pub fn run() {
             list_templates,
             read_template_file,
             write_template_file,
+            duplicate_template,
+            delete_template,
             get_goal_skin_info,
             get_participants,
             pick_next_participant,

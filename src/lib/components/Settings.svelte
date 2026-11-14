@@ -15,7 +15,8 @@
     urlForEngineChange, buildVoicevoxParams, buildAutoSpeed, buildQueueLimits, kindTemplate, allTemplate,
     speakerLabel, PARAM_RANGES, type VoicevoxParamKey
   } from '../ttsSettings';
-  import type { TtsEngineSpeaker, VoicevoxEngineKind } from '../ipc';
+  import type { TemplateInfo, TtsEngineSpeaker, VoicevoxEngineKind } from '../ipc';
+  import { applyDeleted } from '../templateCatalog';
   import { isListenerDeleted, safeAvatarUrl, type ListenerRecord, type ListenerUpdate } from '../types';
   import { ui, SETTINGS_ANCHOR_IDS } from '../ui.svelte';
   import { moderation } from '../moderation.svelte';
@@ -121,6 +122,15 @@
 
   // Template selection is persisted in config (config.obs.template); SPEC §10
   // mandates config as the single persistence source (no localStorage).
+  // 候補は TemplateEditor が list_templates で取った ID(複製・削除の直後にも届く)。
+  let templateIds: string[] = $state([]);
+
+  function onTemplatesChange(list: TemplateInfo[], removedId?: string) {
+    templateIds = list.map((t) => t.id);
+    if (config && removedId !== undefined) {
+      config.obs.template = applyDeleted(list, removedId, config.obs.template).current;
+    }
+  }
 
   let saving: boolean = $state(false);
   let saveMsg: string = $state('');
@@ -2385,8 +2395,9 @@
         placeholder="default"
       />
       <datalist id="obs-template-list">
-        <option value="default"></option>
-        <option value="simple"></option>
+        {#each templateIds as id (id)}
+          <option value={id}></option>
+        {/each}
       </datalist>
     </div>
     <div class="field-row">
@@ -2466,7 +2477,7 @@
     </div>
     <div id="settings-obs-template-editor" class="template-editor-wrap">
       <h3>OBSテンプレート編集</h3>
-      <TemplateEditor obsPort={config.obs.port} currentTemplate={config.obs.template} />
+      <TemplateEditor obsPort={config.obs.port} currentTemplate={config.obs.template} {onTemplatesChange} />
     </div>
   </section>
 

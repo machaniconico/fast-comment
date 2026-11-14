@@ -9,7 +9,7 @@
 //! - クライアント(WS)ごとに bounded queue を持ち、溢れたら古いものから捨てる。
 
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -33,6 +33,7 @@ use tower_http::services::ServeDir;
 
 use crate::model::{ChatMessage, ModerationEvent, YoutubeReaction};
 use crate::stats::{StatsSnapshot, TimerSnapshot};
+use crate::templates::{TemplateRef, TemplateStore};
 
 /// broadcast チャネルの容量。UI/OBS の購読者が遅れても最新が優先される。
 const BROADCAST_CAPACITY: usize = 4096;
@@ -221,19 +222,28 @@ impl Bus {
     ///
     /// - `GET /ws` : WebSocket。UI と同じ ~16ms バッチ(JSON 配列)で push。
     ///   クエリ `?channel=...` 指定時はそのチャンネルのみに絞り込む。
-    /// - `GET /?template=<name>`: `templates_dir/<name>/index.html` を返す。
+    /// - `GET /?template=<id>`: 内蔵 `<name>` は `templates_dir/<name>/index.html`、
+    ///   カスタム `custom:<name>` は `custom_templates_dir/<name>/index.html` を返す。
     ///   `template` 未指定時は `default`。`../` 等のトラバーサルは拒否する。
-    /// - `GET /<name>/...`: テンプレの静的アセットを配信(ServeDir)。
+    /// - `GET /<name>/...`: 内蔵テンプレの静的アセットを配信(ServeDir)。
+    /// - `GET /custom/<name>/...`: カスタムテンプレの静的アセットを配信(ServeDir)。
     /// - `GET /skin/<file>.png`: ユーザー作成のGoals背景スキンを配信。
     ///
     /// `cancel` 発火でサーバを graceful shutdown する。
     pub fn spawn_obs_server(
         &self,
         templates_dir: PathBuf,
+        custom_templates_dir: PathBuf,
         goals_skin_dir: PathBuf,
         cancel: CancellationToken,
     ) -> Result<tauri::async_runtime::JoinHandle<()>, String> {
-        self.spawn_obs_server_on_port(templates_dir, goals_skin_dir, self.obs_port, cancel)
+        self.spawn_obs_server_on_port(
+            templates_dir,
+            custom_templates_dir,
+            goals_skin_dir,
+            self.obs_port,
+            cancel,
+        )
     }
 
     /// 指定ポートで OBS overlay サーバ(axum)を起動する。
@@ -242,11 +252,11 @@ impl Bus {
     pub fn spawn_obs_server_on_port(
         &self,
         templates_dir: PathBuf,
+        custom_templates_dir: PathBuf,
         goals_skin_dir: PathBuf,
         port: u16,
         cancel: CancellationToken,
     ) -> Result<tauri::async_runtime::JoinHandle<()>, String> {
-        let tx = self.tx.clone();
         let addr = SocketAddr::from(([127, 0, 0, 1], port));
         let std_listener = StdTcpListener::bind(addr).map_err(|e| {
             let msg = format!("OBS サーバの bind に失敗 {addr}: {e}");
@@ -259,13 +269,10 @@ impl Bus {
             msg
         })?;
 
-        let state = ObsState {
-            tx: Arc::new(tx),
-            mod_tx: Arc::new(self.mod_tx.clone()),
-            stats_tx: Arc::new(self.stats_tx.clone()),
-            timer_tx: Arc::new(self.timer_tx.clone()),
-            templates_dir: Arc::new(templates_dir.clone()),
-        };
+        let state = self.obs_state(TemplateStore::new(
+            templates_dir.clone(),
+            custom_templates_dir.clone(),
+        ));
 
         let handle = tauri::async_runtime::spawn(async move {
             let listener = match tokio::net::TcpListener::from_std(std_listener) {
@@ -276,24 +283,12 @@ impl Bus {
                 }
             };
 
-            // テンプレ静的配信。ディレクトリ直アクセス時は index.html を返す。
-            let serve_dir =
-                ServeDir::new(&templates_dir).append_index_html_on_directories(true);
-            let skin_dir = ServeDir::new(&goals_skin_dir);
-
-            let app = Router::new()
-                .route("/ws", get(ws_handler))
-                .route("/stats", get(stats_ws_handler))
-                .route("/timer", get(timer_ws_handler))
-                .route("/", get(template_index_handler))
-                .nest_service("/skin", skin_dir)
-                .fallback_service(serve_dir)
-                .layer(CorsLayer::permissive())
-                .with_state(state);
+            let app = obs_router(state, &goals_skin_dir);
 
             tracing::info!(
-                "OBS overlay サーバ起動: http://{addr}/  (templates: {}, skins: {})",
+                "OBS overlay サーバ起動: http://{addr}/  (templates: {}, custom: {}, skins: {})",
                 templates_dir.display(),
+                custom_templates_dir.display(),
                 goals_skin_dir.display()
             );
 
@@ -312,6 +307,42 @@ impl Bus {
 
         Ok(handle)
     }
+
+    fn obs_state(&self, templates: TemplateStore) -> ObsState {
+        ObsState {
+            tx: Arc::new(self.tx.clone()),
+            mod_tx: Arc::new(self.mod_tx.clone()),
+            stats_tx: Arc::new(self.stats_tx.clone()),
+            timer_tx: Arc::new(self.timer_tx.clone()),
+            templates: Arc::new(templates),
+        }
+    }
+}
+
+/// OBS overlay サーバのルータを組み立てる。
+fn obs_router(state: ObsState, goals_skin_dir: &Path) -> Router {
+    // テンプレ静的配信。ディレクトリ直アクセス時は index.html を返す。
+    let serve_dir =
+        ServeDir::new(state.templates.builtin_root()).append_index_html_on_directories(true);
+    let skin_dir = ServeDir::new(goals_skin_dir);
+    // 2 つのルートが重なる時はカスタムを配信しない(TemplateStore と同じ判定)。
+    let custom_dir = state.templates.custom_enabled().then(|| {
+        ServeDir::new(state.templates.custom_root()).append_index_html_on_directories(true)
+    });
+
+    let app = match custom_dir {
+        Some(custom_dir) => Router::new().nest_service("/custom", custom_dir),
+        None => Router::new(),
+    };
+    app
+        .route("/ws", get(ws_handler))
+        .route("/stats", get(stats_ws_handler))
+        .route("/timer", get(timer_ws_handler))
+        .route("/", get(template_index_handler))
+        .nest_service("/skin", skin_dir)
+        .fallback_service(serve_dir)
+        .layer(CorsLayer::permissive())
+        .with_state(state)
 }
 
 /// axum ハンドラ間で共有する状態。
@@ -321,7 +352,7 @@ struct ObsState {
     mod_tx: Arc<broadcast::Sender<ModerationEvent>>,
     stats_tx: Arc<watch::Sender<StatsSnapshot>>,
     timer_tx: Arc<watch::Sender<TimerSnapshot>>,
-    templates_dir: Arc<PathBuf>,
+    templates: Arc<TemplateStore>,
 }
 
 /// `/ws` のクエリ。`channel` 指定時は当該チャンネルのみに絞り込む(任意)。
@@ -387,23 +418,37 @@ pub fn is_valid_template_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
 }
 
-/// `GET /?template=<name>` を `templates/<name>/index.html` に解決する。
+/// `GET /?template=<id>` を内蔵 `<name>` / カスタム `custom:<name>` の index.html に解決する。
 async fn template_index_handler(
     State(state): State<ObsState>,
     Query(query): Query<TemplateQuery>,
 ) -> impl IntoResponse {
     let template = query.template.as_deref().unwrap_or("default");
-    if !is_valid_template_name(template) {
+    let Ok(template_ref) = TemplateRef::parse(template) else {
         return (
             StatusCode::BAD_REQUEST,
             "invalid template name: use only ASCII letters, digits, '-' or '_'",
         )
             .into_response();
-    }
+    };
 
-    let index_path = state.templates_dir.join(template).join("index.html");
+    let dir = match &template_ref {
+        // 内蔵は従来どおり単純連結(名前は parse で検証済み)。
+        TemplateRef::Builtin(name) => state.templates.builtin_root().join(name),
+        TemplateRef::Custom(_) => match state.templates.resolve(&template_ref) {
+            Ok(dir) => dir,
+            Err(_) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    format!("template not found: {template}"),
+                )
+                    .into_response()
+            }
+        },
+    };
+    let index_path = dir.join("index.html");
     match tokio::fs::read_to_string(&index_path).await {
-        Ok(html) => Html(inject_template_base(html, template)).into_response(),
+        Ok(html) => Html(inject_base_href(html, &template_ref.url_base())).into_response(),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => (
             StatusCode::NOT_FOUND,
             format!("template not found: {template}"),
@@ -424,12 +469,18 @@ async fn template_index_handler(
 }
 
 /// ルート URL から返した index.html 内の相対 CSS/JS を `/<template>/...` へ向ける。
-fn inject_template_base(mut html: String, template: &str) -> String {
+#[cfg(test)]
+fn inject_template_base(html: String, template: &str) -> String {
+    inject_base_href(html, &format!("/{template}/"))
+}
+
+/// index.html の `<head>` 直後に `<base href="{href}">` を入れる(既にあれば何もしない)。
+fn inject_base_href(mut html: String, href: &str) -> String {
     if html.contains("<base ") || html.contains("<base>") {
         return html;
     }
 
-    let base = format!(r#"<base href="/{template}/">"#);
+    let base = format!(r#"<base href="{href}">"#);
     if let Some(pos) = html.find("<head>") {
         html.insert_str(pos + "<head>".len(), &base);
     }
@@ -851,5 +902,133 @@ mod tests {
         let expected = html.clone();
         let result = inject_template_base(html, "default");
         assert_eq!(result, expected);
+    }
+
+    // --- OBS HTTP(内蔵とカスタムの 2 ルート配信) ---
+
+    fn temp_root() -> PathBuf {
+        let root = std::env::temp_dir().join(format!("fc-obs-http-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn put_template(root: &Path, name: &str) {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("index.html"),
+            format!("<html><head><title>{name}</title></head></html>"),
+        )
+        .unwrap();
+        std::fs::write(dir.join("style.css"), "body{}").unwrap();
+    }
+
+    /// 内蔵 default を置いた builtin と、未作成の custom を持つ一時ルート。
+    fn obs_roots() -> (PathBuf, PathBuf, PathBuf) {
+        let root = temp_root();
+        let builtin = root.join("builtin");
+        put_template(&builtin, "default");
+        (root.clone(), builtin, root.join("config").join("templates"))
+    }
+
+    async fn serve(builtin: &Path, custom: &Path) -> String {
+        let (stats_tx, _) = watch::channel(StatsSnapshot::default());
+        let (timer_tx, _) = watch::channel(TimerSnapshot::default());
+        let bus = Bus::new(0, stats_tx, timer_tx);
+        let state = bus.obs_state(TemplateStore::new(builtin.into(), custom.into()));
+        let app = obs_router(state, &builtin.join("no-skin"));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    async fn get_text(url: String) -> (u16, String) {
+        let response = reqwest::get(url).await.unwrap();
+        let status = response.status().as_u16();
+        (status, response.text().await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn obs_http_builtin_unchanged() {
+        let (root, builtin, custom) = obs_roots();
+        let base = serve(&builtin, &custom).await;
+
+        let (status, body) = get_text(format!("{base}/?template=default")).await;
+        assert_eq!(status, 200);
+        assert!(body.contains(r#"<base href="/default/">"#), "{body}");
+        assert_eq!(get_text(format!("{base}/default/style.css")).await.0, 200);
+        let (status, body) = get_text(format!("{base}/")).await;
+        assert_eq!(status, 200);
+        assert!(body.contains(r#"<base href="/default/">"#), "{body}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn obs_http_serves_custom_namespace() {
+        let (root, builtin, custom) = obs_roots();
+        let base = serve(&builtin, &custom).await;
+        // サーバ起動後に置いたファイルも配信される。
+        put_template(&custom, "foo");
+
+        for query in ["custom:foo", "custom%3Afoo"] {
+            let (status, body) = get_text(format!("{base}/?template={query}")).await;
+            assert_eq!(status, 200, "{query}");
+            assert!(body.contains(r#"<base href="/custom/foo/">"#), "{body}");
+        }
+        assert_eq!(get_text(format!("{base}/custom/foo/style.css")).await.0, 200);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn obs_http_custom_does_not_leak_into_builtin_paths() {
+        let (root, builtin, custom) = obs_roots();
+        put_template(&custom, "foo");
+        let base = serve(&builtin, &custom).await;
+
+        assert_eq!(get_text(format!("{base}/?template=foo")).await.0, 404);
+        assert_eq!(get_text(format!("{base}/foo/style.css")).await.0, 404);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn obs_http_rejects_bad_ids() {
+        let (root, builtin, custom) = obs_roots();
+        put_template(&custom, "foo");
+        let base = serve(&builtin, &custom).await;
+
+        for query in ["custom:../x", "custom:", "other:foo"] {
+            let (status, _) = get_text(format!("{base}/?template={query}")).await;
+            assert_eq!(status, 400, "{query}");
+        }
+        let (status, body) = get_text(format!("{base}/?template=custom:nope")).await;
+        assert_eq!(status, 404);
+        assert_eq!(body, "template not found: custom:nope");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn obs_http_custom_root_missing_is_ok() {
+        let (root, builtin, custom) = obs_roots();
+        assert!(!custom.exists());
+        let base = serve(&builtin, &custom).await;
+
+        assert_eq!(get_text(format!("{base}/?template=default")).await.0, 200);
+        assert_eq!(get_text(format!("{base}/default/style.css")).await.0, 200);
+        assert_eq!(get_text(format!("{base}/?template=custom:foo")).await.0, 404);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn builtin_names_do_not_collide_with_routes() {
+        let templates = Path::new(env!("CARGO_MANIFEST_DIR")).join("../templates");
+        assert!(templates.join("default").is_dir(), "{}", templates.display());
+        // timer は既存の内蔵テンプレ。`/timer` は完全一致ルートなので、`/timer/...` のアセットは
+        // fallback の ServeDir に届く(既存の OBS URL を壊さないため名前は変えない)。
+        for reserved in ["custom", "skin", "ws", "stats"] {
+            assert!(!templates.join(reserved).exists(), "templates/{reserved} が配信ルートと衝突する");
+        }
     }
 }

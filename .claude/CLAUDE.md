@@ -11,6 +11,7 @@
 - **Twitch の PING には必ず PONG を返す**（返さないと切断される）。
 - **IPC は1フレーム単位でバッチ送出**。1コメント1emitにしない（往復過多）。
 - **X への投稿は `autopost/` の公式 API だけ**。`xAuthToken` cookie を投稿に使わない。投稿は台帳へ `posting` を先に書いてから 1 回だけ(自動再送を足さない。5xx・タイムアウトは `uncertain`)。refresh token は single-use なので、使う前に新しい方を保存する。
+- **OBS テンプレの内蔵は読み取り専用**。書き換えず、カスタムは `custom:<name>` 名前空間でユーザーデータ側(`app_config_dir/templates`)に置く。テンプレ ID をパスに直接連結しない(`TemplateRef::parse` 経由)。配信ルートに symlink を作らない。仕様は SPEC §9.1。
 - 実モデレーション(BAN/削除)は OAuth 必須で **P6**。MVP はローカル非表示/NGのみ。
 
 詳細仕様は `.claude/SPEC.md`。これが単一情報源。

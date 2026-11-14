@@ -1,6 +1,20 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte';
-  import { listTemplates, readTemplateFile, writeTemplateFile } from '../ipc';
+  import {
+    deleteTemplate,
+    duplicateTemplate,
+    listTemplates,
+    readTemplateFile,
+    writeTemplateFile,
+    type TemplateInfo
+  } from '../ipc';
+  import {
+    applyDeleted,
+    applyDuplicated,
+    groupTemplates,
+    suggestCopyName,
+    templateKindLabel
+  } from '../templateCatalog';
 
   const FILES = ['style.css', 'index.html', 'app.js'] as const;
   type TemplateFile = (typeof FILES)[number];
@@ -18,11 +32,16 @@
   interface Props {
     obsPort: number;
     currentTemplate?: string;
+    /** 一覧の取得・複製・削除の後に呼ぶ。removedId は削除した ID。 */
+    onTemplatesChange?: (list: TemplateInfo[], removedId?: string) => void;
   }
 
-  let { obsPort, currentTemplate = 'default' }: Props = $props();
+  let { obsPort, currentTemplate = 'default', onTemplatesChange }: Props = $props();
 
-  let templates: string[] = $state([]);
+  let templateList: TemplateInfo[] = $state([]);
+  let copyName: string = $state('');
+  let copyOpen: boolean = $state(false);
+  let busy: boolean = $state(false);
   let selectedTemplate: string = $state('default');
   let selectedFile: TemplateFile = $state('style.css');
   let contents: string = $state('');
@@ -42,10 +61,12 @@
 
   const dirty = $derived(contents !== originalContents);
 
-  const templateOptions = $derived.by(() => {
-    if (!selectedTemplate || templates.includes(selectedTemplate)) return templates;
-    return [selectedTemplate, ...templates];
-  });
+  const templates = $derived(templateList.map((t) => t.id));
+  const grouped = $derived(groupTemplates(templateList));
+  const selectedInfo = $derived(templateList.find((t) => t.id === selectedTemplate));
+  // 一覧に無い ID(読み込み前など)は編集不可として扱う。
+  const editable = $derived(selectedInfo?.editable ?? false);
+  const unknownSelected = $derived(!!selectedTemplate && !templates.includes(selectedTemplate));
 
   const previewUrl = $derived.by(() => {
     const port = Number.isFinite(obsPort) && obsPort > 0 ? obsPort : 11180;
@@ -86,8 +107,8 @@
   async function refreshTemplates() {
     errorMsg = '';
     try {
-      const names = await listTemplates();
-      templates = names;
+      templateList = await listTemplates();
+      onTemplatesChange?.(templateList);
       if (templates.length > 0 && !templates.includes(selectedTemplate)) {
         selectedTemplate = templates.includes(currentTemplate) ? currentTemplate : templates[0];
       }
@@ -123,6 +144,7 @@
 
   async function onTemplateChange(event: Event) {
     selectedTemplate = (event.currentTarget as HTMLSelectElement).value;
+    copyOpen = false;
     previewNonce = Date.now();
     await loadSelectedFile();
   }
@@ -149,6 +171,95 @@
       errorMsg = `保存に失敗しました: ${errorText(e)}`;
     } finally {
       saving = false;
+    }
+  }
+
+  function openCopy() {
+    errorMsg = '';
+    copyName = suggestCopyName(
+      selectedInfo?.name ?? selectedTemplate,
+      grouped.custom.map((t) => t.name)
+    );
+    copyOpen = true;
+  }
+
+  async function onDuplicate() {
+    if (dirty && !window.confirm('未保存の変更があります。破棄して複製しますか?')) return;
+    errorMsg = '';
+    saveMsg = '';
+    busy = true;
+    try {
+      let created: TemplateInfo;
+      try {
+        created = await duplicateTemplate(selectedTemplate, copyName.trim());
+      } catch (e) {
+        errorMsg = `複製に失敗しました: ${errorText(e)}`;
+        return;
+      }
+      // 再取得の成否に関わらず、作成した 1 件を先に反映して選択・編集可能にする。
+      templateList = applyDuplicated(templateList, created);
+      onTemplatesChange?.(templateList);
+      copyOpen = false;
+      selectedTemplate = created.id;
+      previewNonce = Date.now();
+      await loadSelectedFile();
+      const refetchError = await refetchList((list) => applyDuplicated(list, created));
+      if (refetchError) {
+        errorMsg = errorMsg ? `${errorMsg} / ${refetchError}` : refetchError;
+      } else if (!errorMsg) {
+        saveMsg = `${created.id} を作成しました`;
+        scheduleSaveMessageClear();
+      }
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function onDelete() {
+    if (!editable) return;
+    const id = selectedTemplate;
+    const ok = window.confirm(
+      `カスタムテンプレート ${id} を削除しますか?\n` +
+        'この URL を使っている OBS ソースは表示されなくなります。この操作は元に戻せません。'
+    );
+    if (!ok) return;
+    errorMsg = '';
+    saveMsg = '';
+    busy = true;
+    try {
+      try {
+        await deleteTemplate(id);
+      } catch (e) {
+        errorMsg = `削除に失敗しました: ${errorText(e)}`;
+        return;
+      }
+      // 削除が成功した時点で一覧・選択・config.obs.template を直してから再取得する。
+      const applied = applyDeleted(templateList, id, selectedTemplate);
+      templateList = applied.list;
+      onTemplatesChange?.(templateList, id);
+      selectedTemplate = applied.current;
+      previewNonce = Date.now();
+      await loadSelectedFile();
+      const refetchError = await refetchList((list) => applyDeleted(list, id, selectedTemplate).list);
+      if (refetchError) {
+        errorMsg = errorMsg ? `${errorMsg} / ${refetchError}` : refetchError;
+      } else if (!errorMsg) {
+        saveMsg = `${id} を削除しました`;
+        scheduleSaveMessageClear();
+      }
+    } finally {
+      busy = false;
+    }
+  }
+
+  /** 一覧を取り直し、fix で直前の操作を重ねて反映する。失敗時はエラー文を返す(状態は変えない)。 */
+  async function refetchList(fix: (list: TemplateInfo[]) => TemplateInfo[]): Promise<string> {
+    try {
+      templateList = fix(await listTemplates());
+      onTemplatesChange?.(templateList);
+      return '';
+    } catch (e) {
+      return `テンプレート一覧の再取得に失敗しました: ${errorText(e)}`;
     }
   }
 
@@ -210,13 +321,78 @@
         class="template-select"
         bind:value={selectedTemplate}
         onchange={onTemplateChange}
-        disabled={loading || saving || templateOptions.length === 0}
+        disabled={loading || saving || busy || (templates.length === 0 && !unknownSelected)}
       >
-        {#each templateOptions as name}
-          <option value={name}>{name}</option>
-        {/each}
+        {#if unknownSelected}
+          <option value={selectedTemplate}>{selectedTemplate}</option>
+        {/if}
+        {#if grouped.builtin.length > 0}
+          <optgroup label={templateKindLabel('builtin')}>
+            {#each grouped.builtin as t (t.id)}
+              <option value={t.id}>{t.name}</option>
+            {/each}
+          </optgroup>
+        {/if}
+        {#if grouped.custom.length > 0}
+          <optgroup label={templateKindLabel('custom')}>
+            {#each grouped.custom as t (t.id)}
+              <option value={t.id}>{t.name}</option>
+            {/each}
+          </optgroup>
+        {/if}
       </select>
     </div>
+
+    <div class="template-actions">
+      {#if selectedInfo}
+        <span class="kind-badge" class:custom={selectedInfo.kind === 'custom'}>
+          {templateKindLabel(selectedInfo.kind)}
+        </span>
+      {/if}
+      <button
+        type="button"
+        class="preview-action-btn"
+        onclick={openCopy}
+        disabled={loading || saving || busy || !selectedInfo}
+      >
+        {editable ? '複製' : '複製して編集'}
+      </button>
+      <button
+        type="button"
+        class="preview-action-btn danger"
+        onclick={onDelete}
+        disabled={loading || saving || busy || !editable}
+        aria-label="カスタムテンプレートを削除"
+      >
+        削除
+      </button>
+    </div>
+
+    {#if copyOpen}
+      <div class="field-row">
+        <label for="template-editor-copy-name">複製先の名前</label>
+        <input
+          id="template-editor-copy-name"
+          type="text"
+          class="template-select"
+          bind:value={copyName}
+          spellcheck="false"
+          disabled={busy}
+          placeholder="英小文字・数字・_・-"
+        />
+        <button
+          type="button"
+          class="save-template-btn"
+          onclick={onDuplicate}
+          disabled={busy || copyName.trim() === ''}
+        >
+          {busy ? '複製中...' : '作成'}
+        </button>
+        <button type="button" class="preview-action-btn" onclick={() => (copyOpen = false)} disabled={busy}>
+          キャンセル
+        </button>
+      </div>
+    {/if}
 
     <div class="field-row">
       <label for="template-editor-file">ファイル</label>
@@ -225,7 +401,7 @@
         class="template-select"
         bind:value={selectedFile}
         onchange={onFileChange}
-        disabled={loading || saving || !selectedTemplate}
+        disabled={loading || saving || busy || !selectedTemplate}
       >
         {#each FILES as file}
           <option value={file}>{file}</option>
@@ -237,7 +413,8 @@
       class="template-textarea"
       bind:value={contents}
       spellcheck="false"
-      disabled={loading || saving || !selectedTemplate}
+      readonly={!editable}
+      disabled={loading || saving || busy || !selectedTemplate}
       aria-label="OBSテンプレートファイル内容"
     ></textarea>
 
@@ -246,10 +423,13 @@
         type="button"
         class="save-template-btn"
         onclick={onSave}
-        disabled={loading || saving || !selectedTemplate || !dirty}
+        disabled={loading || saving || busy || !selectedTemplate || !editable || !dirty}
       >
         {saving ? '保存中...' : '保存'}
       </button>
+      {#if selectedInfo && !editable}
+        <span class="status">内蔵テンプレートは読み取り専用です。「複製して編集」で編集できます</span>
+      {/if}
       {#if loading}<span class="status">読み込み中...</span>{/if}
       {#if saveMsg}<span class="status ok">{saveMsg}</span>{/if}
       {#if dirty}<span class="status dirty">未保存</span>{/if}
@@ -416,6 +596,36 @@
     font-weight: 600;
     background: #1976d2;
     color: #fff;
+  }
+
+  .template-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 6px;
+    flex-wrap: wrap;
+  }
+
+  .kind-badge {
+    font-size: 11px;
+    padding: 2px 8px;
+    border-radius: 10px;
+    background: rgba(255,255,255,0.1);
+    color: #ccc;
+  }
+
+  .kind-badge.custom {
+    background: rgba(25,118,210,0.25);
+    color: #90caf9;
+  }
+
+  .preview-action-btn.danger {
+    background: rgba(239,83,80,0.22);
+    color: #ef9a9a;
+  }
+
+  .template-textarea[readonly] {
+    color: #a8a8a8;
   }
 
   .save-template-btn:disabled {
