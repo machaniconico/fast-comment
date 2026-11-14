@@ -288,6 +288,7 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
 - **P5+ 拡張UI(実装済み, §8.1)**: 弾幕オーバーレイ(デスクトップ窓 + danmaku テンプレ)、コメント投稿(Twitch/YouTube)、参加型/抽選、投げ銭パネル、ダッシュボード、タイマー/ゴール/エフェクト、マルチカラム、設定ポータビリティ、テンプレ編集UI、最前面ピン、追加OBSテンプレ8種
 - **P5++ X対応(実装済み, §4.3)**: X (Twitter) ライブ配信のチャット受信(ゲストトークン + chatnow WebSocket、読み取り専用・投稿非対応)
 - **P5+++ niconico対応(実装済み, §4.4)**: ニコニコ生放送のコメント受信(watch WS + NDGR Protobuf、読み取り専用・投稿非対応)
+- **X 自動告知 Intent モード(実装済み, §13)**: 配信開始で X の投稿画面を開く(印・バナー・テンプレート・台帳)。API モード(完全自動)は後続
 - **P6(後)**: OAuth実モデレーション(実BAN/削除)、さらなる追加Source、テンプレ編集のライブプレビュー強化
 
 ## 12. 既知の制約・注意
@@ -297,4 +298,24 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
 - X chatapi も非公式(Periscope 由来) → 同リスク。寛容パース+`xOverrides` で吸収。
 - 実モデレーションはOAuth必須(P6)。
 - YouTube 公式 streamList 経由で受けたコメントの配信側削除はアプリに反映されない(公開 `stream_list.proto` に削除イベントの定義が無い。BAN / タイムアウトは反映される)。
+- X 自動告知(Intent)は投稿の成否が分からない(状態は `opened` まで)。同一文面の繰り返しは X の規約に触れうる。Twitch の配信検知は Helix 認証(Client ID)が前提。YouTube は videoId 直接指定の行だと対象外。
 - Tauri build にはアイコン(`src-tauri/icons/`)が必要。
+
+## 13. X 自動告知 — Intent モード (`autopost/`)
+
+配信開始を検知して、X の投稿画面(Web Intent)を開く機能。**既定オフ**。投稿ボタンは本人が押すので、X の API・OAuth・開発者アプリ・クレジットは要らず無料。API で完全自動にするモード(`xPost.mode="api"`)は別 PR で追加する(本節の対象外)。
+
+- **きっかけ**: 「自分の配信」の印(`channels[].ownStream`)が付いた YouTube のチャンネル指定行(`@ハンドル` / `UC…`)・Twitch 行・ニコ生行の `LiveEvent::Started`(§3.1)。YouTube の videoId 直接指定行と X 行は対象外。印と `xPost.enabled` の両方が要る。
+- **駆動**: `spawn_autopost` が `LiveEvent`・UI 操作・設定変更を受け、純粋な状態機械 `Coordinator` に渡す。I/O(台帳保存・ブラウザ起動)は返された `Action` を順に実行する側で行い、台帳保存が先、`OpenIntent` が後。保存に失敗したら開かない。
+- **判定順**(上から): 無効・印なし → 無視(台帳に書かない) / 台帳に同じ `platform:streamId` → 無視 / 同じ配信が猶予中 → 無視 / 鮮度(開始時刻が `staleMinutes` を超過 → `skipped(stale)`。`staleMinutes=0` はこの実行中に未配信(`Ended`)を観測した配信だけ通す、開始時刻不明で未配信を観測していない → `skipped(unknownStart)`) / 直近の告知から `cooldownMinutes` 以内 → `skipped(cooldown)`(Twitch の回線断で配信 ID が変わっても再告知しない) / 過去 24 時間の告知が `dailyLimit` 以上 → `skipped(dailyLimit)`。通れば `delaySecs` 後に発火する告知を作る。猶予中は同時配信を 1 件にまとめる(`combine=true`。`false` なら配信ごと)。猶予中に `Ended` が来た配信は告知から外し、台帳には書かない。
+- **開き方**(`xPost.intentOpen`): `button`(既定)はバナーの「告知を投稿」(`approve_x_autopost`)で開く。`auto` は猶予後に自動で開く。承認・取消はバナーに出ている告知の `id`(`AutopostStatus.id`)を付けて送り、先頭の告知と一致しない時は無視する(二度押しが次の告知に当たらない)。どちらも猶予中・承認待ちはバナーの取消(`cancel_x_autopost`)で止められ、取消は `cancelled` として台帳に残り同じ配信を再告知しない。承認待ちには期限があり、過ぎると `skipped(expired)`。
+- **開く URL**: `https://x.com/intent/post?text=<描画済み文面を URL エンコード>` を既定ブラウザで開く(既存の `open_url`)。投稿されたかは分からないので台帳の状態は `opened`。
+- **台帳**(at-most-once): `<config_dir>/x-autopost-ledger.json`、`{ version, entries:[{ key, platform, streamId, channel, state, atMs, text?, reason? }] }`、新しい順に 200 件。一時ファイル → fsync → rename で保存。壊れていたら `.corrupt-<時刻>` に退避し、その起動中は自動告知を止めて通知する(状態 `failed` / reason `ledgerFailed`)。`posting` のまま残っていたものは起動時に `uncertain` 扱いで、自動では再実行しない。
+- **文面テンプレート**(`xPost.template`、既定 `【配信開始】{title}\n{url}\n{date} {time}`): 変数 `{title}`(先頭配信のタイトル。YouTube > Twitch > ニコ生)、`{url}`(含む全配信の URL を 1 行ずつ)、`{platform}`(` / ` 連結)、`{date}`(`YYYY/MM/DD`)、`{time}`(`HH:MM`)。空行は詰め、未知の `{…}` は残して警告。`{url}` の無いテンプレートは `MissingUrl` で拒否。タイトルは制御文字・改行を空白に、`@` を `＠` に、`$`+英字を `＄` に置換(ハッシュタグは残す)。直近の台帳の文面と完全一致したら末尾に ` {time}` を足し、それでも一致すれば `Duplicate` で開かない。
+- **280 字**: 重み付きで数える(U+0000–U+10FF などは 1、日本語・絵文字は 2、`http(s)://` の語は 23)。絵文字の合成列は符号位置ごとに数える安全側の近似。超過時に縮めるのは `{title}` だけ(末尾 `…`)。固定部分と URL だけで超えるなら `TooLong` で開かない。数えるのは Rust のみで、UI は `preview_x_post` の結果(`{ text, weightedLen, warnings }`)を表示するだけ。
+- **UI**:
+  - 登録チャンネル一覧(`ChannelAdd.svelte`)の各行に「告知」トグル。対象外の行は無効化して理由を title に出す。押すと `set_channel_own_stream` が印だけを保存する(Source は再起動しない)。Twitch 行で Client ID が未設定の時は警告色にして、配信検知が動かず告知されない旨を出す。
+  - 告知バナー(`XAutopostBanner.svelte`、メイン画面ヘッダー直下): 猶予中は残り秒と取消、承認待ちは「告知を投稿」と取消(失効までの秒数つき)、`opened` は投稿画面を開いた旨、`failed` / `uncertain` は理由と再試行(`retry_x_autopost`。`canRetry` が true の時だけ出す。ブラウザを開けなかった時は `failed(openFailed)` で台帳も `failed`、テンプレート起因の失敗は再試行で描画し直す)、`skipped` は理由を数秒表示。状態は起動時に `get_x_autopost_status`、以後イベント `x-autopost-status`(状態が変わった時だけ emit)。
+  - 設定「X への配信開始告知」(`XPostSettings.svelte`): 有効化、`intentOpen`、`combine`、テンプレート編集と変数の挿入、プレビューと文字数(n/280)、猶予秒・取りこぼし許容分・クールダウン分・1 日の上限。保存は設定画面の保存ボタン。
+- **状態**(`x-autopost-status` の `state`): `idle` / `pending`(猶予中) / `awaitingApproval` / `posting` / `opened` / `posted` / `failed` / `uncertain` / `cancelled` / `skipped`。`skipped` / `failed` / `cancelled` は `reason`(`stale` / `unknownStart` / `cooldown` / `dailyLimit` / `notConnected` / `expired` / `ledgerFailed` / `Duplicate` / `TooLong` など)を伴う。
+- **注意**: 毎回同じ文面は X の規約に触れうるので、テンプレートにタイトルか日時を入れる。「実質同一」の判断は X 側にあり、この機能は技術的な完全一致を避けるだけ。X の `xAuthToken` cookie は告知に使わない。

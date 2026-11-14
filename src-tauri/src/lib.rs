@@ -11,6 +11,7 @@
 //!
 //! Tauri コマンドで設定取得/更新・チャンネル追加削除・コメント非表示・OBS URL 取得を公開。
 
+pub mod autopost;
 pub mod bus;
 pub mod chatlog;
 pub mod config;
@@ -36,12 +37,13 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
+use crate::autopost::{AutopostStatus, UserCommand as AutopostCommand};
 use crate::bus::{
     is_valid_template_name, spawn_moderation_ui_forwarder, spawn_reaction_ui_forwarder, Bus,
 };
 use crate::config::{AppConfig, ChannelConfig, ChannelPlatform, TtsBackendKind, VoicevoxEngineKind};
 use crate::model::{
-    Amount, Author, Badge, ChatMessage, Fragment, LiveEvent, MessageKind, ModerationEvent, Participant,
+    Amount, Author, Badge, ChatMessage, Fragment, LiveEvent, LiveStream, MessageKind, ModerationEvent, Participant,
     Platform, Roles, YoutubeReaction,
 };
 use crate::moderation::{Moderator, Verdict};
@@ -98,6 +100,10 @@ pub struct AppState {
     mod_tx: mpsc::Sender<ModerationEvent>,
     /// 配信開始/終了イベント Source → X 自動告知の bounded 送信端(満杯なら Source 側で破棄する)。
     live_tx: mpsc::Sender<LiveEvent>,
+    /// UI 操作(取消・承認・再試行)→ X 自動告知の駆動タスク。
+    autopost_user_tx: mpsc::Sender<AutopostCommand>,
+    /// X 自動告知の現在状態(駆動タスクが変化時だけ更新する)。
+    autopost_status: watch::Receiver<AutopostStatus>,
     /// 参加型配信の参加者一覧。
     participants: Mutex<Vec<Participant>>,
     /// YouTube投稿用OAuth状態。バックグラウンド処理は持たず、操作時だけ通信する。
@@ -1018,6 +1024,7 @@ async fn update_config(
     state: State<'_, AppState>,
     mut new_config: AppConfig,
 ) -> Result<UpdateConfigOutcome, String> {
+    validate_x_post_template(&new_config.x_post.template)?;
     let (
         youtube_source_config_changed,
         youtube_oauth_client_changed,
@@ -1191,6 +1198,113 @@ fn remove_channel(state: State<'_, AppState>, key: String) -> Result<(), String>
     };
     let _ = state.config_tx.send(next_config);
     Ok(())
+}
+
+/// 行の「自分の配信」印だけを保存する。Source は再起動しない(印は自動告知の判定にだけ使う)。
+#[tauri::command]
+fn set_channel_own_stream(state: State<'_, AppState>, key: String, own: bool) -> Result<(), String> {
+    let next_config = {
+        let mut cfg = state.config.lock().unwrap();
+        set_own_stream_in(&mut cfg, &key, own)?;
+        cfg.save(&state.config_dir).map_err(|e| e.to_string())?;
+        cfg.clone()
+    };
+    let _ = state.config_tx.send(next_config);
+    Ok(())
+}
+
+fn set_own_stream_in(cfg: &mut AppConfig, key: &str, own: bool) -> Result<(), String> {
+    let row = cfg
+        .channels
+        .iter_mut()
+        .find(|c| AppState::channel_key(c) == key)
+        .ok_or_else(|| format!("チャンネルが見つかりません: {key}"))?;
+    row.own_stream = own;
+    Ok(())
+}
+
+fn idle_autopost_status() -> AutopostStatus {
+    AutopostStatus::new("idle")
+}
+
+/// 起動時の X 自動告知の状態。以後はイベント `x-autopost-status`。
+#[tauri::command]
+fn get_x_autopost_status(state: State<'_, AppState>) -> AutopostStatus {
+    state.autopost_status.borrow().clone()
+}
+
+fn send_autopost_command(state: &AppState, command: AutopostCommand) -> Result<(), String> {
+    state
+        .autopost_user_tx
+        .try_send(command)
+        .map_err(|e| format!("自動告知へ操作を送れませんでした: {e}"))
+}
+
+/// 猶予中・承認待ちの告知を取り消す。`id` はバナーに出ていた告知(`AutopostStatus::id`)。
+#[tauri::command]
+fn cancel_x_autopost(state: State<'_, AppState>, id: u64) -> Result<(), String> {
+    send_autopost_command(&state, AutopostCommand::Cancel(id))
+}
+
+/// 承認待ちの告知を今すぐ開く(`intentOpen = "button"` のバナー操作)。`id` は同上。
+#[tauri::command]
+fn approve_x_autopost(state: State<'_, AppState>, id: u64) -> Result<(), String> {
+    send_autopost_command(&state, AutopostCommand::Approve(id))
+}
+
+/// 失敗した告知を再試行する。
+#[tauri::command]
+fn retry_x_autopost(state: State<'_, AppState>) -> Result<(), String> {
+    send_autopost_command(&state, AutopostCommand::Retry)
+}
+
+/// 保存前のテンプレート検査(§7.1: `{url}` の無いテンプレートは保存時に拒否)。
+fn validate_x_post_template(template: &str) -> Result<(), String> {
+    match preview_x_post(template.to_string()) {
+        Err(e) if e.code == autopost::XPostErrorCode::MissingUrl => Err(
+            "X 告知のテンプレートに {url} がありません。{url} を入れてから保存してください".into(),
+        ),
+        _ => Ok(()),
+    }
+}
+
+/// 見本データでテンプレートを描画する。文字数は Rust 側で数える(UI は数えない)。
+#[tauri::command]
+fn preview_x_post(template: String) -> Result<autopost::Rendered, autopost::XPostError> {
+    let now = chrono::Local::now();
+    let sample = LiveStream {
+        platform: Platform::Youtube,
+        channel_identifier: "@example".into(),
+        stream_id: "preview".into(),
+        title: Some("配信タイトルの見本".into()),
+        url: "https://www.youtube.com/watch?v=xxxxxxxxxxx".into(),
+        started_at_ms: Some(now.timestamp_millis().max(0) as u64),
+    };
+    autopost::render(&template, &[sample], now)
+}
+
+/// 自動告知の状態変化を UI へ 1 回ずつ emit する(watch は変化時だけ更新される)。
+fn spawn_autopost_status_emitter(
+    mut status_rx: watch::Receiver<AutopostStatus>,
+    app: AppHandle,
+    cancel: CancellationToken,
+) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                changed = status_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    let status = status_rx.borrow_and_update().clone();
+                    if let Err(e) = app.emit("x-autopost-status", &status) {
+                        tracing::warn!("x-autopost-status emit 失敗: {e}");
+                    }
+                }
+            }
+        }
+    });
 }
 
 /// 個別コメントをローカル非表示にする(以後の同一 ID 送出を抑止)。
@@ -2027,7 +2141,12 @@ pub fn run() {
             let (metadata_tx, metadata_rx) = mpsc::channel::<YoutubeMetadataUpdate>(64);
             let (reaction_tx, reaction_rx) = mpsc::channel::<Vec<YoutubeReaction>>(64);
             let (mod_tx, mod_rx) = mpsc::channel::<ModerationEvent>(1024);
-            let (live_tx, mut live_rx) = mpsc::channel::<LiveEvent>(64);
+            let (live_tx, live_rx) = mpsc::channel::<LiveEvent>(64);
+            let (autopost_user_tx, autopost_user_rx) = mpsc::channel::<AutopostCommand>(16);
+            let (autopost_status_tx, autopost_status) =
+                watch::channel::<AutopostStatus>(idle_autopost_status());
+            let autopost_config_rx = config_tx.subscribe();
+            let ledger_path = config_dir.join(autopost::LEDGER_FILE);
 
             // 下流 Bus(パイプライン → UI/OBS)。
             let bus = Bus::new(obs_port, stats_tx.clone(), timer_tx.clone());
@@ -2070,6 +2189,8 @@ pub fn run() {
                 reaction_tx,
                 mod_tx,
                 live_tx,
+                autopost_user_tx,
+                autopost_status: autopost_status.clone(),
                 participants: Mutex::new(Vec::new()),
                 youtube_auth: YoutubeAuth::new()
                     .expect("YouTube投稿用HTTPクライアントの作成に失敗しました"),
@@ -2079,19 +2200,17 @@ pub fn run() {
             };
             let listener_store = state.listeners.clone();
             app.manage(state);
-            // 配信開始/終了イベントの受信側。投稿処理は後続 PR。ここではデバッグログに出すだけ。
-            let live_cancel = app_cancel.clone();
-            tauri::async_runtime::spawn(async move {
-                loop {
-                    tokio::select! {
-                        _ = live_cancel.cancelled() => break,
-                        event = live_rx.recv() => match event {
-                            Some(event) => tracing::debug!("LiveEvent: {event:?}"),
-                            None => break,
-                        },
-                    }
-                }
-            });
+            // 配信開始/終了イベント → X 自動告知。状態は変化時だけ UI へ emit する。
+            autopost::spawn_autopost(
+                live_rx,
+                autopost_config_rx,
+                autopost_user_rx,
+                ledger_path,
+                autopost_status_tx,
+                |url: &str| open_url(url.to_string()),
+                app_cancel.clone(),
+            );
+            spawn_autopost_status_emitter(autopost_status, handle.clone(), app_cancel.clone());
             let listener_cancel = app_cancel.clone();
             tauri::async_runtime::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(5));
@@ -2217,6 +2336,12 @@ pub fn run() {
             inject_test_comment,
             check_for_update,
             open_url,
+            get_x_autopost_status,
+            cancel_x_autopost,
+            approve_x_autopost,
+            retry_x_autopost,
+            preview_x_post,
+            set_channel_own_stream,
         ])
         .build(tauri::generate_context!())
         .expect("Tauri アプリの起動に失敗しました")
@@ -2237,6 +2362,48 @@ pub fn run() {
 #[cfg(test)]
 mod followup_tests {
     use super::*;
+
+    #[test]
+    fn set_own_stream_changes_only_the_flag_of_the_matching_row() {
+        let mut cfg = AppConfig::default();
+        cfg.channels = vec![
+            ChannelConfig {
+                platform: ChannelPlatform::Twitch,
+                identifier: "mine".into(),
+                enabled: true,
+                own_stream: false,
+            },
+            ChannelConfig {
+                platform: ChannelPlatform::Youtube,
+                identifier: "@other".into(),
+                enabled: true,
+                own_stream: false,
+            },
+        ];
+        let before = cfg.channels.clone();
+        set_own_stream_in(&mut cfg, "twitch:mine", true).unwrap();
+        assert!(cfg.channels[0].own_stream);
+        assert_eq!(cfg.channels[1], before[1]);
+        // 再起動判定に使う識別キーと有効フラグは変わらない(Source を張り直さない)。
+        assert_eq!(AppState::channel_key(&cfg.channels[0]), "twitch:mine");
+        assert_eq!(cfg.channels[0].enabled, before[0].enabled);
+        assert!(set_own_stream_in(&mut cfg, "twitch:missing", true).is_err());
+    }
+
+    #[test]
+    fn template_without_url_is_rejected_before_save() {
+        assert!(validate_x_post_template("配信開始").is_err());
+        assert!(validate_x_post_template("{title}\n{url}").is_ok());
+        assert!(validate_x_post_template(&AppConfig::default().x_post.template).is_ok());
+    }
+
+    #[test]
+    fn preview_x_post_renders_sample_with_rust_side_length() {
+        let rendered = preview_x_post("{title}\n{url}".into()).unwrap();
+        assert!(rendered.text.contains("配信タイトルの見本"));
+        assert!(rendered.text.contains("https://www.youtube.com/watch?v="));
+        assert!(rendered.weighted_len > 0);
+    }
 
     #[test]
     fn local_hide_event_requires_known_platform_channel_and_id() {

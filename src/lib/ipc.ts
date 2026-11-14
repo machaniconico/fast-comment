@@ -967,3 +967,82 @@ export async function openUrl(url: string): Promise<void> {
   if (!url) return;
   await invoke<void>('open_url', { url });
 }
+
+// ── X 自動告知(Intent モード) ─────────────────────────────────────────
+
+/** 自動告知の状態(Rust `AutopostStatus`)。イベント `x-autopost-status` と起動時取得で同じ形。 */
+export type XAutopostState =
+  | 'idle'
+  | 'pending'
+  | 'awaitingApproval'
+  | 'posting'
+  | 'opened'
+  | 'posted'
+  | 'failed'
+  | 'uncertain'
+  | 'cancelled'
+  | 'skipped';
+
+export interface XAutopostStatus {
+  state: XAutopostState;
+  /** 描画済みの告知文面(猶予中・承認待ち・投稿後)。 */
+  text?: string | null;
+  /** 猶予が終わる時刻(epoch ms)。pending / awaitingApproval のみ。 */
+  fireAtMs?: number | null;
+  /** 承認待ちの失効時刻(epoch ms)。awaitingApproval のみ。 */
+  expiresAtMs?: number | null;
+  /** skipped / failed / cancelled の理由コード(stale・cooldown・Duplicate など)。 */
+  reason?: string | null;
+  tweetId?: string | null;
+  /** 猶予中・承認待ちの告知の ID。取消・承認はこれを返し、別の告知に効かないようにする。 */
+  id?: number | null;
+  /** 再試行が実際に効く時だけ true(failed / uncertain)。 */
+  canRetry?: boolean;
+}
+
+/** `preview_x_post` の結果。文字数は Rust 側で数える(UI は数えない)。 */
+export interface XPostPreview {
+  text: string;
+  weightedLen: number;
+  warnings: string[];
+}
+
+/** Rust `XPostError`。`invoke` の reject 値として届く。 */
+export interface XPostErrorInfo {
+  code: string;
+  message: string;
+}
+
+export async function getXAutopostStatus(): Promise<XAutopostStatus | null> {
+  return invoke<XAutopostStatus>('get_x_autopost_status');
+}
+
+export async function onXAutopostStatus(cb: (status: XAutopostStatus) => void): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  const unlisten = await listen<XAutopostStatus>('x-autopost-status', (event) => cb(event.payload));
+  return unlisten;
+}
+
+/** `id` はバナーに出ている告知の `XAutopostStatus.id`。 */
+export async function cancelXAutopost(id: number): Promise<void> {
+  await invoke<void>('cancel_x_autopost', { id });
+}
+
+/** `id` はバナーに出ている告知の `XAutopostStatus.id`。 */
+export async function approveXAutopost(id: number): Promise<void> {
+  await invoke<void>('approve_x_autopost', { id });
+}
+
+export async function retryXAutopost(): Promise<void> {
+  await invoke<void>('retry_x_autopost');
+}
+
+/** 見本データでテンプレートを描画する。テンプレート不正時は `XPostErrorInfo` で reject。 */
+export async function previewXPost(template: string): Promise<XPostPreview | null> {
+  return invoke<XPostPreview>('preview_x_post', { template });
+}
+
+/** 行の「自分の配信」印だけを保存する(Source は再起動しない)。key は `${platform}:${identifier}`。 */
+export async function setChannelOwnStream(key: string, own: boolean): Promise<void> {
+  await invoke<void>('set_channel_own_stream', { key, own });
+}

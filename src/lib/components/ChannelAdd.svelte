@@ -1,13 +1,16 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
   import type { ChannelConfig, ChannelStatus } from '../ipc';
-  import { addChannel, removeChannel, getConfig, onStats, openUrl } from '../ipc';
+  import { addChannel, removeChannel, getConfig, onStats, openUrl, setChannelOwnStream } from '../ipc';
+  import { ownStreamBlockedReason } from '../xAutopost';
 
   // 追加成功時に親へ通知(任意)。
   let { onAdded }: { onAdded?: (ch: ChannelConfig) => void } = $props();
 
   // 接続中チャンネル一覧(このコンポーネントがチャンネル管理を一手に担う)。
   let channels: ChannelConfig[] = $state([]);
+  // Twitch の配信検知(Helix)に要る Client ID が設定済みか。未設定なら告知印の隣に警告を出す。
+  let twitchClientIdSet = $state(true);
 
   // 配信タイトル(key=`${platform}:${identifier}`)。stats イベントで更新され、
   // チップ本文を識別子からタイトルへ差し替える。未取得のチャンネルは identifier 表示。
@@ -166,7 +169,10 @@
 
   onMount(async () => {
     const cfg = await getConfig();
-    if (cfg) channels = cfg.channels;
+    if (cfg) {
+      channels = cfg.channels;
+      twitchClientIdSet = (cfg.credentials?.twitchClientId ?? '').trim() !== '';
+    }
     const fn = await onStats((s) => {
       if (s.channelTitles && s.channelTitles.length > 0) {
         const next = new Map(titles);
@@ -195,6 +201,29 @@
 
   function sameChannel(a: ChannelConfig, b: ChannelConfig): boolean {
     return a.platform === b.platform && a.identifier === b.identifier;
+  }
+
+  function ownStreamTitle(ch: ChannelConfig): string {
+    const blocked = ownStreamBlockedReason(ch);
+    if (blocked) return blocked;
+    const base = ch.ownStream
+      ? '自分の配信(X 告知の対象)。クリックで解除'
+      : '自分の配信として印を付けると、配信開始時に X へ告知します';
+    if (ch.ownStream && ch.platform === 'twitch' && !twitchClientIdSet) {
+      return `${base}\n⚠ Twitch の Client ID が未設定のため配信検知が動かず、告知されません`;
+    }
+    return base;
+  }
+
+  async function onToggleOwn(ch: ChannelConfig) {
+    addError = '';
+    const next = !ch.ownStream;
+    try {
+      await setChannelOwnStream(chipKey(ch.platform, ch.identifier), next);
+      channels = channels.map((c) => (sameChannel(c, ch) ? { ...c, ownStream: next } : c));
+    } catch (e) {
+      addError = `印の保存に失敗しました: ${e instanceof Error ? e.message : String(e)}`;
+    }
   }
 
   async function onRemove(ch: ChannelConfig) {
@@ -623,6 +652,17 @@
           <span class="chip-dot" aria-hidden="true"></span>
           {#if isLive}<span class="live-badge">LIVE</span>{/if}
           <span class="chip-id">{bodyText}</span>
+          <button
+            type="button"
+            class="chip-own"
+            class:on={ch.ownStream === true}
+            class:warn={ch.ownStream === true && ch.platform === 'twitch' && !twitchClientIdSet}
+            disabled={ownStreamBlockedReason(ch) !== null}
+            title={ownStreamTitle(ch)}
+            aria-pressed={ch.ownStream === true}
+            aria-label="{bodyText} を自分の配信として告知する"
+            onclick={() => onToggleOwn(ch)}
+          >告知</button>
           <button class="chip-x" title="削除" aria-label="{bodyText} を削除" onclick={() => onRemove(ch)}>×</button>
         </span>
       {/each}
@@ -840,6 +880,22 @@
     border-radius: 50%;
   }
   .chip-x:hover { color: #f44336; }
+
+  .chip-own {
+    border: 1px solid rgba(255,255,255,0.18);
+    background: none;
+    color: #888;
+    cursor: pointer;
+    font-size: 10px;
+    line-height: 1.3;
+    padding: 0 5px;
+    border-radius: 8px;
+    flex-shrink: 0;
+  }
+  .chip-own:hover:not(:disabled) { color: #ddd; }
+  .chip-own.on { color: #fff; background: #1da1f2; border-color: #1da1f2; }
+  .chip-own.warn { background: #f57c00; border-color: #f57c00; }
+  .chip-own:disabled { opacity: 0.35; cursor: not-allowed; }
 
   .ctx-menu {
     position: fixed;

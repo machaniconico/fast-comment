@@ -18,6 +18,7 @@
   import Welcome from './lib/components/Welcome.svelte';
   import Settings from './lib/components/Settings.svelte';
   import ChannelAdd from './lib/components/ChannelAdd.svelte';
+  import XAutopostBanner from './lib/components/XAutopostBanner.svelte';
   import CommandPalette from './lib/components/CommandPalette.svelte';
   import CommentComposer from './lib/components/CommentComposer.svelte';
   import ShortcutHelp from './lib/components/ShortcutHelp.svelte';
@@ -665,6 +666,9 @@
       </div>
     </div>
   </header>
+
+  <!-- ── X 自動告知バナー(Intent モード。状態は Rust が決める) ── -->
+  <XAutopostBanner />
 
   <!-- ── Channel add bar (URL paste → auto-detect) ── -->
   {#if ui.activeTab === 'comments' && !standaloneOpen}
