@@ -263,6 +263,22 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
   - 同梱テンプレ `default` / `simple` / `bubble` / `ticker` / `donation` / `danmaku` が対応し、該当コメントを DOM から完全に除く(減光しない)。messageDeleted は ID、userCleared は author + `beforeMs`(`certain` に関係なく除く)、chatCleared は `beforeMs` 以前。`donation` の合計、`danmaku` の集約弾幕(×N)は要素ごと除く・合計は戻さない。
   - `ranking` / `goals` / `timer` は集計表示で本文を出さないため対象外(接続 URL も opt-in しない)。
   - 後着対策: 各テンプレが直近イベント(最大 512 件、記録から 10 秒、`performance.now()`)を覚え、後から届いたコメントを表示しない。テンプレは単体の静的サイトなので共有ファイルにせず、同一ブロック(`fc-moderation:begin`〜`end`)を各 `app.js` に複製し、`templates/obsModeration.test.mjs` が一致と挙動を検証する。
+- **コメント要素の data-* 属性(自作 CSS 用)**: コメント要素を持つ 6 テンプレが、要素を作った直後に `fcApplyAttrs(el, msg)` で次の 6 属性を付ける。値は `setAttribute` で渡し(HTML 文字列に連結しない)、`msg` が null なら 6 属性すべてを `removeAttribute` する。
+  - `data-user` / `data-owner` はわんコメの属性名に合わせた。`data-service` / `data-kind` / `data-role` / `data-user-id` は fast-comment 独自の語彙で、わんコメ用 CSS がそのまま効くとは限らない(`data-service` の値 `niconama` はわんコメ側での裏取り未了)。
+
+  | 属性 | 値の語彙 | 値が無い時 | 由来 |
+  |---|---|---|---|
+  | `data-service` | `twitch` / `youtube` / `x` / `niconama`(`msg.platform` のまま。niconico だけ `niconama` に写す) | 常に付く | 独自(わんコメの属性名に合わせたが値は未裏取り) |
+  | `data-user` | 表示名 `author.name` | 属性を外す | わんコメ |
+  | `data-owner` | `true` / `false`(`author.roles.broadcaster`) | 常に付く(`false`) | わんコメ |
+  | `data-user-id` | `author.id` | 属性を外す | 独自 |
+  | `data-kind` | `normal` / `superchat` / `membership` / `bits` / `gift` / `system`(kind を小文字化) | 常に付く(既定 `normal`) | 独自 |
+  | `data-role` | `broadcaster` `moderator` `member` `subscriber` `vip` を、この固定順で空白区切り | 属性を外す | 独自 |
+
+  - 付く要素: `default` / `simple` は `div.comment`、`bubble` は `div.bubble-card`、`donation` は `article.donation-card`、`danmaku` は `div.danmaku-item` と `div.danmaku-pin`、`ticker` は `#ticker-text`。
+  - `danmaku` の連投まとめ(×N)は先頭 1 件の値のまま(別の人の同文コメントにも先頭の `data-user` / `data-role` が付く)。`ticker` は要素 1 個を使い回すので、切り替えのたびに付け直し、キューが空なら null を渡して全属性を外す。`ranking` / `goals` / `timer` は対象外。
+  - CSS 例: `.comment[data-role~="member"] { color: #4caf50; }` / `.comment[data-user='名前'] { font-weight: bold; }` / `[data-service="niconama"] { ... }`。
+  - 各 `app.js` が同一ブロック(`fc-attrs:begin`〜`end`)を複製し、`templates/obsAttrs.test.mjs` が一致と挙動を検証する(`package.json` の test に登録済み)。
 
 ## 10. 設定永続化 (`config.rs`)
 

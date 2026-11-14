@@ -139,6 +139,7 @@
 
     const el = document.createElement('div');
     el.className = 'danmaku-item';
+    fcApplyAttrs(el, msg);
     if (OUTLINE) el.classList.add('outline');
 
     if (kind === 'superChat' || kind === 'bits') {
@@ -223,6 +224,7 @@
 
     const el = document.createElement('div');
     el.className = 'danmaku-pin';
+    fcApplyAttrs(el, msg);
     if (kind === 'superChat' || kind === 'bits') {
       el.classList.add('superchat');
     } else if (kind === 'membership') {
@@ -368,6 +370,35 @@
 
   const fcModLog = fcModCreateLog();
   // ---- fc-moderation:end ----
+
+  // ---- fc-attrs:begin ----
+  // コメント要素に data-* 属性を付ける(自作 CSS 用)。msg が null なら全属性を外す。
+  // 値は setAttribute で渡す(HTML 文字列には連結しない)。要素を使い回しても前の値が残らない。
+  // 同一ブロックを 6 テンプレの app.js に複製し、templates/obsAttrs.test.mjs が一致と挙動を検証する。
+  function fcApplyAttrs(el, msg) {
+    if (!msg) {
+      el.removeAttribute('data-service');
+      el.removeAttribute('data-user');
+      el.removeAttribute('data-owner');
+      el.removeAttribute('data-user-id');
+      el.removeAttribute('data-kind');
+      el.removeAttribute('data-role');
+      return;
+    }
+    const author = msg.author || null;
+    const roles = (author && author.roles) || {};
+    el.setAttribute('data-service', msg.platform === 'niconico' ? 'niconama' : String(msg.platform || ''));
+    if (author && author.name) el.setAttribute('data-user', String(author.name));
+    else el.removeAttribute('data-user');
+    el.setAttribute('data-owner', roles.broadcaster ? 'true' : 'false');
+    if (author && author.id) el.setAttribute('data-user-id', String(author.id));
+    else el.removeAttribute('data-user-id');
+    el.setAttribute('data-kind', String(msg.kind || 'normal').toLowerCase());
+    const list = ['broadcaster', 'moderator', 'member', 'subscriber', 'vip'].filter((r) => roles[r]);
+    if (list.length) el.setAttribute('data-role', list.join(' '));
+    else el.removeAttribute('data-role');
+  }
+  // ---- fc-attrs:end ----
 
   function applyModeration(events) {
     fcModLog.add(events);
