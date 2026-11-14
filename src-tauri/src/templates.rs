@@ -540,6 +540,8 @@ pub fn is_allowed_asset(name: &str) -> bool {
                 | "mp3"
                 | "ogg"
                 | "wav"
+                | "mp4"
+                | "webm"
                 | "txt"
                 | "md"
         )

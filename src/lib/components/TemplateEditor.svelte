@@ -3,6 +3,7 @@
   import {
     deleteTemplate,
     duplicateTemplate,
+    importTemplateZip,
     listTemplates,
     readTemplateFile,
     writeTemplateFile,
@@ -26,6 +27,7 @@
   ] as const;
   type PreviewWidthPreset = (typeof PREVIEW_WIDTH_PRESETS)[number]['value'];
 
+  const MAX_ZIP_BYTES = 100 * 1024 * 1024;
   const MIN_PREVIEW_WIDTH = 320;
   const MAX_PREVIEW_WIDTH = 3840;
 
@@ -42,6 +44,10 @@
   let copyName: string = $state('');
   let copyOpen: boolean = $state(false);
   let busy: boolean = $state(false);
+  let importOpen: boolean = $state(false);
+  let importFile: File | null = $state(null);
+  let importName: string = $state('');
+  let importMsg: string = $state('');
   let selectedTemplate: string = $state('default');
   let selectedFile: TemplateFile = $state('style.css');
   let contents: string = $state('');
@@ -252,6 +258,72 @@
     }
   }
 
+  function onZipPick(event: Event) {
+    const input = event.currentTarget as HTMLInputElement;
+    const file = input.files?.[0] ?? null;
+    input.value = '';
+    errorMsg = '';
+    importMsg = '';
+    if (!file) return;
+    if (file.size > MAX_ZIP_BYTES) {
+      importFile = null;
+      importOpen = false;
+      errorMsg = `zip が大きすぎます(${(file.size / 1024 / 1024).toFixed(1)} MiB)。上限は 100 MiB です`;
+      return;
+    }
+    importFile = file;
+    importName = file.name
+      .replace(/\.zip$/i, '')
+      .toLowerCase()
+      .replace(/[^a-z0-9_-]/g, '-');
+    importOpen = true;
+  }
+
+  async function onImport() {
+    const file = importFile;
+    if (!file) return;
+    const name = importName.trim();
+    if (!name || name.length > 64 || !/^[A-Za-z0-9_-]+$/.test(name)) {
+      errorMsg = '名前は半角英数字・- _ の 64 文字以内で入力してください';
+      return;
+    }
+    const ok = window.confirm(
+      `${file.name} を custom:${name} として取り込みますか?\n` +
+        'テンプレートの JavaScript は配信画面で実行されます。信頼できる配布元の zip だけ取り込んでください。'
+    );
+    if (!ok) return;
+    if (dirty && !window.confirm('未保存の変更があります。破棄して取り込みますか?')) return;
+    errorMsg = '';
+    saveMsg = '';
+    importMsg = '';
+    busy = true;
+    try {
+      let res: Awaited<ReturnType<typeof importTemplateZip>>;
+      try {
+        res = await importTemplateZip(name, new Uint8Array(await file.arrayBuffer()));
+      } catch (e) {
+        errorMsg = `取り込みに失敗しました: ${errorText(e)}`;
+        return;
+      }
+      templateList = applyDuplicated(templateList, res.template);
+      onTemplatesChange?.(templateList);
+      importOpen = false;
+      importFile = null;
+      selectedTemplate = res.template.id;
+      previewNonce = Date.now();
+      await loadSelectedFile();
+      const refetchError = await refetchList((list) => applyDuplicated(list, res.template));
+      if (refetchError) errorMsg = errorMsg ? `${errorMsg} / ${refetchError}` : refetchError;
+      importMsg =
+        `${res.template.id} を取り込みました(${res.files} ファイル)` +
+        (res.skipped.length > 0
+          ? `。取り込まなかったファイル ${res.skipped.length} 件: ${res.skipped.join(', ')}`
+          : '');
+    } finally {
+      busy = false;
+    }
+  }
+
   /** 一覧を取り直し、fix で直前の操作を重ねて反映する。失敗時はエラー文を返す(状態は変えない)。 */
   async function refetchList(fix: (list: TemplateInfo[]) => TemplateInfo[]): Promise<string> {
     try {
@@ -395,6 +467,44 @@
     {/if}
 
     <div class="field-row">
+      <label for="template-editor-zip">zip から取り込み</label>
+      <input
+        id="template-editor-zip"
+        type="file"
+        accept=".zip"
+        onchange={onZipPick}
+        disabled={loading || saving || busy}
+      />
+    </div>
+
+    {#if importOpen}
+      <div class="field-row">
+        <label for="template-editor-import-name">取り込み先の名前</label>
+        <input
+          id="template-editor-import-name"
+          type="text"
+          class="template-select"
+          bind:value={importName}
+          spellcheck="false"
+          disabled={busy}
+          placeholder="英小文字・数字・_・-"
+        />
+        <button
+          type="button"
+          class="save-template-btn"
+          onclick={onImport}
+          disabled={busy || importName.trim() === ''}
+        >
+          {busy ? '取り込み中...' : '取り込む'}
+        </button>
+        <button type="button" class="preview-action-btn" onclick={() => (importOpen = false)} disabled={busy}>
+          キャンセル
+        </button>
+      </div>
+    {/if}
+    {#if importMsg}<p class="status ok">{importMsg}</p>{/if}
+
+    <div class="field-row">
       <label for="template-editor-file">ファイル</label>
       <select
         id="template-editor-file"
@@ -516,6 +626,7 @@
         <iframe
           title="OBSテンプレートプレビュー"
           src={previewUrl}
+          sandbox="allow-scripts allow-same-origin"
           style:width={`${previewWidth}px`}
           style:height={`${previewHeight}px`}
         ></iframe>

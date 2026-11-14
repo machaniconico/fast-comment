@@ -43,6 +43,7 @@ chrono = { version = "0.4", default-features = false, features = ["std", "clock"
 # OBS overlay server
 axum = { version = "0.7", features = ["ws"] }
 tower-http = { version = "0.6", features = ["fs", "cors"] }
+zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 anyhow = "1"
 thiserror = "1"

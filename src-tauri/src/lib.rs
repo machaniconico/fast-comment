@@ -20,6 +20,7 @@ pub mod model;
 pub mod moderation;
 mod moderation_error;
 mod secret_store;
+mod template_import;
 pub mod sources;
 pub mod stats;
 mod templates;
@@ -1637,6 +1638,30 @@ fn delete_template(state: State<'_, AppState>, id: String) -> Result<(), String>
     state.templates.delete(&TemplateRef::parse(&id)?)
 }
 
+/// zip(raw body)をカスタムテンプレートとして取り込む。名前はヘッダ `x-template-name`。
+/// ファイルパスは受け取らない。展開はブロッキングスレッドで行う。
+#[tauri::command]
+async fn import_template_zip(
+    state: State<'_, AppState>,
+    request: tauri::ipc::Request<'_>,
+) -> Result<template_import::ImportResult, String> {
+    let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else {
+        return Err("zip のバイト列(raw body)を渡してください".to_string());
+    };
+    let name = request
+        .headers()
+        .get("x-template-name")
+        .ok_or_else(|| "ヘッダ x-template-name がありません".to_string())?
+        .to_str()
+        .map_err(|_| "ヘッダ x-template-name が UTF-8 ではありません".to_string())?
+        .to_string();
+    let bytes = bytes.clone();
+    let store = state.templates.clone();
+    tauri::async_runtime::spawn_blocking(move || template_import::import_zip(&store, &name, &bytes))
+        .await
+        .map_err(|e| format!("取り込み処理が異常終了しました: {e}"))?
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct GoalSkinInfo {
@@ -2493,6 +2518,7 @@ pub fn run() {
             write_template_file,
             duplicate_template,
             delete_template,
+            import_template_zip,
             get_goal_skin_info,
             get_participants,
             pick_next_participant,
