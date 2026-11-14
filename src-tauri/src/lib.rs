@@ -41,7 +41,7 @@ use crate::bus::{
 };
 use crate::config::{AppConfig, ChannelConfig, ChannelPlatform, TtsBackendKind, VoicevoxEngineKind};
 use crate::model::{
-    Amount, Author, Badge, ChatMessage, Fragment, MessageKind, ModerationEvent, Participant,
+    Amount, Author, Badge, ChatMessage, Fragment, LiveEvent, MessageKind, ModerationEvent, Participant,
     Platform, Roles, YoutubeReaction,
 };
 use crate::moderation::{Moderator, Verdict};
@@ -96,12 +96,14 @@ pub struct AppState {
     reaction_tx: mpsc::Sender<Vec<YoutubeReaction>>,
     /// プラットフォーム側の削除・BAN 通知 Source → moderation forwarder の bounded 送信端。
     mod_tx: mpsc::Sender<ModerationEvent>,
+    /// 配信開始/終了イベント Source → X 自動告知の bounded 送信端(満杯なら Source 側で破棄する)。
+    live_tx: mpsc::Sender<LiveEvent>,
     /// 参加型配信の参加者一覧。
     participants: Mutex<Vec<Participant>>,
     /// YouTube投稿用OAuth状態。バックグラウンド処理は持たず、操作時だけ通信する。
     youtube_auth: YoutubeAuth,
     /// Twitchモデレーション用OAuth状態。access tokenはメモリのみ。
-    twitch_auth: TwitchAuth,
+    twitch_auth: Arc<TwitchAuth>,
 }
 
 #[tauri::command]
@@ -1812,6 +1814,7 @@ fn spawn_one_channel(_app: &AppHandle, state: &AppState, ch: &ChannelConfig) {
             state.metadata_tx.clone(),
             state.reaction_tx.clone(),
             state.mod_tx.clone(),
+            Some(state.live_tx.clone()),
             token.clone(),
         );
         token
@@ -1826,7 +1829,8 @@ fn spawn_one_channel(_app: &AppHandle, state: &AppState, ch: &ChannelConfig) {
             Some(state.metadata_tx.clone()),
             Some(state.reaction_tx.clone()),
             Some(state.mod_tx.clone()),
-        );
+        )
+        .with_live_tx(Some(state.live_tx.clone()));
         manager.spawn_channel(ch)
     };
     let app_cancel = state.app_cancel.clone();
@@ -1850,7 +1854,9 @@ fn spawn_one_channel(_app: &AppHandle, state: &AppState, ch: &ChannelConfig) {
         sources::twitch_helix::spawn_twitch_viewer_poller(
             ch.identifier.clone(),
             auth,
+            state.twitch_auth.clone(),
             state.metadata_tx.clone(),
+            Some(state.live_tx.clone()),
             token.clone(),
         );
     }
@@ -2021,6 +2027,7 @@ pub fn run() {
             let (metadata_tx, metadata_rx) = mpsc::channel::<YoutubeMetadataUpdate>(64);
             let (reaction_tx, reaction_rx) = mpsc::channel::<Vec<YoutubeReaction>>(64);
             let (mod_tx, mod_rx) = mpsc::channel::<ModerationEvent>(1024);
+            let (live_tx, mut live_rx) = mpsc::channel::<LiveEvent>(64);
 
             // 下流 Bus(パイプライン → UI/OBS)。
             let bus = Bus::new(obs_port, stats_tx.clone(), timer_tx.clone());
@@ -2062,14 +2069,29 @@ pub fn run() {
                 metadata_tx,
                 reaction_tx,
                 mod_tx,
+                live_tx,
                 participants: Mutex::new(Vec::new()),
                 youtube_auth: YoutubeAuth::new()
                     .expect("YouTube投稿用HTTPクライアントの作成に失敗しました"),
-                twitch_auth: TwitchAuth::new()
-                    .expect("Twitch認証用HTTPクライアントの作成に失敗しました"),
+                twitch_auth: Arc::new(
+                    TwitchAuth::new().expect("Twitch認証用HTTPクライアントの作成に失敗しました"),
+                ),
             };
             let listener_store = state.listeners.clone();
             app.manage(state);
+            // 配信開始/終了イベントの受信側。投稿処理は後続 PR。ここではデバッグログに出すだけ。
+            let live_cancel = app_cancel.clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = live_cancel.cancelled() => break,
+                        event = live_rx.recv() => match event {
+                            Some(event) => tracing::debug!("LiveEvent: {event:?}"),
+                            None => break,
+                        },
+                    }
+                }
+            });
             let listener_cancel = app_cancel.clone();
             tauri::async_runtime::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(5));

@@ -22,7 +22,7 @@ use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{ChannelConfig, ChannelPlatform};
-use crate::model::{ChatMessage, ModerationEvent, YoutubeReaction};
+use crate::model::{ChatMessage, LiveEvent, ModerationEvent, YoutubeReaction};
 use crate::stats::YoutubeMetadataUpdate;
 
 /// 接続元の共通インタフェース。
@@ -102,6 +102,8 @@ pub struct SourceManager {
     reaction_tx: Option<mpsc::Sender<Vec<YoutubeReaction>>>,
     /// プラットフォーム側の削除・BAN 通知の side channel(Twitch / YouTube のみ使う)。
     mod_tx: Option<mpsc::Sender<ModerationEvent>>,
+    /// 配信開始/終了イベント(X 自動告知用)。ニコ生 Source が送る。
+    live_tx: Option<mpsc::Sender<LiveEvent>>,
     /// YouTube overrides 等を渡すための設定スナップショット。
     youtube_overrides: crate::config::YoutubeOverrides,
     /// 公式YouTube Data API streamList用。空ならInnerTubeのみ。
@@ -132,12 +134,19 @@ impl SourceManager {
             metadata_tx,
             reaction_tx,
             mod_tx,
+            live_tx: None,
             youtube_overrides,
             youtube_api_key,
             x_overrides,
             x_auth,
             niconico_overrides,
         }
+    }
+
+    /// 配信開始/終了イベントの送り先を設定する(`TwitchSource::with_moderation_tx` と同じ形)。
+    pub fn with_live_tx(mut self, live_tx: Option<mpsc::Sender<LiveEvent>>) -> Self {
+        self.live_tx = live_tx;
+        self
     }
 
     /// 1チャンネル分の Source を起動し、停止用トークンを返す。
@@ -194,7 +203,8 @@ impl SourceManager {
                     identifier,
                     self.niconico_overrides.clone(),
                     metadata_tx,
-                );
+                )
+                .with_live_tx(self.live_tx.clone());
                 tauri::async_runtime::spawn(async move {
                     run_with_logging(&src, tx, child).await;
                 });
@@ -202,6 +212,13 @@ impl SourceManager {
         }
 
         cancel
+    }
+}
+
+/// 配信開始/終了イベントを送る。満杯・切断でも待たず、warn を出して捨てる(Source を止めない)。
+pub(crate) fn send_live_event(tx: &mpsc::Sender<LiveEvent>, event: LiveEvent) {
+    if let Err(e) = tx.try_send(event) {
+        tracing::warn!("LiveEvent を送れず破棄しました: {e}");
     }
 }
 
@@ -216,5 +233,29 @@ async fn run_with_logging<S: Source>(
     match src.run(tx, cancel).await {
         Ok(()) => tracing::info!("Source 正常終了: {name}"),
         Err(e) => tracing::error!("Source 異常終了: {name}: {e:#}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::Platform;
+
+    /// AC-5: live_tx が満杯でも送信側は待たず、Source を止めない。
+    #[test]
+    fn send_live_event_never_blocks_when_channel_is_full() {
+        let (tx, mut rx) = mpsc::channel::<LiveEvent>(1);
+        let ended = || LiveEvent::Ended {
+            platform: Platform::Twitch,
+            channel_identifier: "c".to_string(),
+        };
+        send_live_event(&tx, ended());
+        // 2 件目は満杯だが同期関数が即座に戻る(破棄される)。
+        send_live_event(&tx, ended());
+        assert!(rx.try_recv().is_ok());
+        assert!(rx.try_recv().is_err());
+        // 受信側が閉じていても戻る。
+        drop(rx);
+        send_live_event(&tx, ended());
     }
 }

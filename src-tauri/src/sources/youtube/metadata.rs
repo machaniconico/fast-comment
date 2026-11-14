@@ -194,18 +194,34 @@ fn extract_metadata_from_html(html: &str, paths: &HashMap<String, String>) -> Me
                 .and_then(|s| parse_count_text(&s))
         })
         .or_else(|| roots.iter().find_map(|v| find_like_count(v, false)));
-    let title = extract_string_by_paths(
-        &roots,
-        &split_lines(paths, KEY_TITLE_PATHS, DEFAULT_TITLE_PATHS),
-    )
-    .or_else(|| extract_og_title(html))
-    .or_else(|| extract_html_title(html));
+    let title = extract_title_from_roots(html, &roots, paths);
 
     MetadataValues {
         concurrent_viewers: concurrent,
         likes,
         title,
     }
+}
+
+/// 視聴ページ HTML からタイトルだけを取り出す(`live_resolve` の告知用)。
+pub(super) fn extract_title_from_html(html: &str, paths: &HashMap<String, String>) -> Option<String> {
+    let mut roots = Vec::new();
+    for marker in split_lines(paths, KEY_PLAYER_RESPONSE_MARKERS, DEFAULT_PLAYER_RESPONSE_MARKERS) {
+        if let Some(value) = extract_json_value_after_marker(html, marker) {
+            roots.push(value);
+        }
+    }
+    extract_title_from_roots(html, &roots, paths)
+}
+
+fn extract_title_from_roots(
+    html: &str,
+    roots: &[Value],
+    paths: &HashMap<String, String>,
+) -> Option<String> {
+    extract_string_by_paths(roots, &split_lines(paths, KEY_TITLE_PATHS, DEFAULT_TITLE_PATHS))
+        .or_else(|| extract_og_title(html))
+        .or_else(|| extract_html_title(html))
 }
 
 fn extract_by_paths(roots: &[Value], paths: &[&str]) -> Option<u32> {

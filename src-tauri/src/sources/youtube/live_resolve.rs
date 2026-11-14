@@ -12,7 +12,9 @@ use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{ChannelConfig, ChannelPlatform, YoutubeOverrides};
-use crate::model::{ChatMessage, ModerationEvent, Platform, YoutubeReaction};
+use crate::model::{
+    ChatMessage, LiveEvent, LiveStream, ModerationEvent, Platform, YoutubeReaction,
+};
 use crate::sources::SourceManager;
 use crate::stats::{ViewerCountKind, YoutubeMetadataUpdate};
 
@@ -27,6 +29,7 @@ const KEY_PLAYER_RESPONSE_MARKERS: &str = "liveResolvePlayerResponseMarkers";
 const KEY_INITIAL_DATA_MARKERS: &str = "liveResolveInitialDataMarkers";
 const KEY_VIDEO_ID_PATHS: &str = "liveResolveVideoIdPaths";
 const KEY_VIDEO_ID_MARKER: &str = "liveResolveVideoIdMarker";
+const KEY_START_TIME_PATHS: &str = "liveResolveStartTimestampPaths";
 
 const DEFAULT_PLAYER_RESPONSE_MARKERS: &[&str] = &[
     "var ytInitialPlayerResponse =",
@@ -40,6 +43,22 @@ const DEFAULT_INITIAL_DATA_MARKERS: &[&str] = &[
 ];
 const DEFAULT_VIDEO_ID_PATHS: &[&str] = &["videoDetails>videoId"];
 const DEFAULT_VIDEO_ID_MARKER: &str = "\"videoId\":\"";
+/// 配信開始時刻(ISO 8601)のパス。実ページ未確認の推測。
+/// `youtubeOverrides.paths` の `liveResolveStartTimestampPaths`(改行区切り)で上書きできる。
+const DEFAULT_START_TIME_PATHS: &[&str] =
+    &["microformat>playerMicroformatRenderer>liveBroadcastDetails>startTimestamp"];
+
+/// 現在ライブ中の動画 1 件分の情報(X 自動告知用)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveVideoInfo {
+    pub video_id: String,
+    pub title: Option<String>,
+    /// 配信開始時刻(epoch ms)。取れなければ None。
+    pub started_at_ms: Option<u64>,
+    /// 対象 videoId とライブ確定シグナルが同じ動画オブジェクトに属すると確認できた時だけ true。
+    /// 告知(Started)はこれが true の時だけ送る。チャット接続の判定には使わない。
+    pub confirmed_live: bool,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChannelIdentifier {
@@ -95,6 +114,7 @@ pub fn parse_channel_identifier(input: &str) -> Option<ChannelIdentifier> {
     None
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_live_resolve_poller(
     identifier: String,
     overrides: YoutubeOverrides,
@@ -103,6 +123,7 @@ pub fn spawn_live_resolve_poller(
     metadata_tx: mpsc::Sender<YoutubeMetadataUpdate>,
     reaction_tx: mpsc::Sender<Vec<YoutubeReaction>>,
     mod_tx: mpsc::Sender<ModerationEvent>,
+    live_tx: Option<mpsc::Sender<LiveEvent>>,
     cancel: CancellationToken,
 ) {
     tauri::async_runtime::spawn(async move {
@@ -134,6 +155,7 @@ pub fn spawn_live_resolve_poller(
         let mut active_video_id: Option<String> = None;
         let mut active_cancel: Option<CancellationToken> = None;
         let mut live_state: Option<bool> = None;
+        let mut started_video_id: Option<String> = None;
         let mut consecutive_unresolved: u8 = 0;
 
         loop {
@@ -145,10 +167,11 @@ pub fn spawn_live_resolve_poller(
             // 進行中のフェッチを待たず即座にループを抜ける(子接続の停止遅延を防ぐ)。
             let resolved = tokio::select! {
                 _ = cancel.cancelled() => break,
-                res = resolve_live_video_id_with_client(&http, &identifier, &overrides) => res,
+                res = resolve_live_info_with_client(&http, &identifier, &overrides) => res,
             };
             match resolved {
-                Ok(Some(video_id)) if is_video_id(&video_id) => {
+                Ok(Some(info)) if is_video_id(&info.video_id) => {
+                    let video_id = info.video_id.clone();
                     consecutive_unresolved = 0;
                     if active_video_id.as_deref() != Some(video_id.as_str()) {
                         if let Some(child) = active_cancel.take() {
@@ -159,6 +182,7 @@ pub fn spawn_live_resolve_poller(
                             platform: ChannelPlatform::Youtube,
                             identifier: video_id.clone(),
                             enabled: true,
+                            own_stream: false,
                         };
                         let child = manager.spawn_channel(&child_config);
                         super::metadata::spawn_metadata_poller(
@@ -169,8 +193,16 @@ pub fn spawn_live_resolve_poller(
                             child.clone(),
                         );
                         tracing::info!("youtube:{identifier} live videoId 解決: {video_id} を接続");
-                        active_video_id = Some(video_id);
+                        active_video_id = Some(video_id.clone());
                         active_cancel = Some(child);
+                    }
+                    if info.confirmed_live
+                        && started_video_id.as_deref() != Some(video_id.as_str())
+                    {
+                        if let Some(live_tx) = &live_tx {
+                            send_live_started(live_tx, &identifier, &info);
+                        }
+                        started_video_id = Some(video_id.clone());
                     }
                     if live_state != Some(true) {
                         if !send_live_status(&metadata_tx, &identifier, true, &cancel).await {
@@ -179,10 +211,11 @@ pub fn spawn_live_resolve_poller(
                         live_state = Some(true);
                     }
                 }
-                Ok(Some(video_id)) => {
+                Ok(Some(info)) => {
                     consecutive_unresolved = 0;
                     tracing::debug!(
-                        "youtube:{identifier} live resolve が不正な videoId を返した: {video_id}"
+                        "youtube:{identifier} live resolve が不正な videoId を返した: {}",
+                        info.video_id
                     );
                 }
                 Ok(None) => {
@@ -197,11 +230,21 @@ pub fn spawn_live_resolve_poller(
                             child.cancel();
                         }
                         active_video_id = None;
+                        started_video_id = None;
                         if live_state != Some(false) {
                             if !send_live_status(&metadata_tx, &identifier, false, &cancel).await {
                                 break;
                             }
                             live_state = Some(false);
+                            if let Some(live_tx) = &live_tx {
+                                crate::sources::send_live_event(
+                                    live_tx,
+                                    LiveEvent::Ended {
+                                        platform: Platform::Youtube,
+                                        channel_identifier: identifier.clone(),
+                                    },
+                                );
+                            }
                         }
                     } else {
                         tracing::debug!(
@@ -227,6 +270,20 @@ pub fn spawn_live_resolve_poller(
         }
         tracing::info!("youtube:{identifier} live resolve poller 終了");
     });
+}
+
+fn send_live_started(tx: &mpsc::Sender<LiveEvent>, identifier: &str, info: &LiveVideoInfo) {
+    crate::sources::send_live_event(
+        tx,
+        LiveEvent::Started(LiveStream {
+            platform: Platform::Youtube,
+            channel_identifier: identifier.to_string(),
+            stream_id: info.video_id.clone(),
+            title: info.title.clone(),
+            url: format!("https://www.youtube.com/watch?v={}", info.video_id),
+            started_at_ms: info.started_at_ms,
+        }),
+    );
 }
 
 fn live_resolve_none_confirms_offline(has_active_child: bool, consecutive_misses: u8) -> bool {
@@ -273,6 +330,16 @@ pub async fn resolve_live_video_id_with_client(
     identifier: &str,
     overrides: &YoutubeOverrides,
 ) -> anyhow::Result<Option<String>> {
+    Ok(resolve_live_info_with_client(http, identifier, overrides)
+        .await?
+        .map(|info| info.video_id))
+}
+
+pub async fn resolve_live_info_with_client(
+    http: &Client,
+    identifier: &str,
+    overrides: &YoutubeOverrides,
+) -> anyhow::Result<Option<LiveVideoInfo>> {
     let target = match parse_channel_identifier(identifier) {
         Some(target) => target,
         None => return Ok(None),
@@ -286,7 +353,95 @@ pub async fn resolve_live_video_id_with_client(
         .text()
         .await?;
 
-    Ok(extract_live_video_id_from_html(&html, &overrides.paths))
+    Ok(extract_live_info_from_html(&html, &overrides.paths))
+}
+
+/// ライブ中の videoId に加え、同じ HTML からタイトルと開始時刻を取る。
+/// `isLive` 等の確定シグナルが無ければ(待機枠を含め)None。
+pub fn extract_live_info_from_html(
+    html: &str,
+    paths: &HashMap<String, String>,
+) -> Option<LiveVideoInfo> {
+    let video_id = extract_live_video_id_from_html(html, paths)?;
+    let title = super::metadata::extract_title_from_html(html, paths);
+    let started_at_ms = extract_start_time_ms(html, paths);
+    let confirmed_live = confirm_live_same_video(html, paths, &video_id);
+    Some(LiveVideoInfo {
+        video_id,
+        title,
+        started_at_ms,
+        confirmed_live,
+    })
+}
+
+/// 告知用の厳密判定。同じ player response 内で、対象 videoId を持つ動画オブジェクトが
+/// 自身で配信中(isLive / isLiveNow)を示し、かつ待機枠(isUpcoming)でない時だけ true。
+/// microformat の liveBroadcastDetails.isLiveNow も、同じ player response が対象 videoId の
+/// ものである場合に限り採用する。関連付けが不明(別動画の isLive・HTML 近傍文字列等)は false。
+fn confirm_live_same_video(
+    html: &str,
+    paths: &HashMap<String, String>,
+    video_id: &str,
+) -> bool {
+    let id_paths = split_lines(paths, KEY_VIDEO_ID_PATHS, DEFAULT_VIDEO_ID_PATHS);
+    for marker in split_lines(
+        paths,
+        KEY_PLAYER_RESPONSE_MARKERS,
+        DEFAULT_PLAYER_RESPONSE_MARKERS,
+    ) {
+        let Some(root) = extract_json_value_after_marker(html, marker) else {
+            continue;
+        };
+        for path in &id_paths {
+            if dig_path(&root, path).and_then(Value::as_str) != Some(video_id) {
+                continue;
+            }
+            let parent_path = path.rsplit_once('>').map_or("", |(parent, _)| parent);
+            let Some(parent) = dig_path(&root, parent_path).and_then(Value::as_object) else {
+                continue;
+            };
+            let upcoming = parent
+                .get("isUpcoming")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if upcoming {
+                continue;
+            }
+            let broadcast_live = root
+                .get("microformat")
+                .and_then(|v| v.get("playerMicroformatRenderer"))
+                .and_then(|v| v.get("liveBroadcastDetails"))
+                .and_then(Value::as_object)
+                .is_some_and(object_says_live);
+            if object_says_live(parent) || broadcast_live {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn extract_start_time_ms(html: &str, paths: &HashMap<String, String>) -> Option<u64> {
+    let start_paths = split_lines(paths, KEY_START_TIME_PATHS, DEFAULT_START_TIME_PATHS);
+    for marker in split_lines(
+        paths,
+        KEY_PLAYER_RESPONSE_MARKERS,
+        DEFAULT_PLAYER_RESPONSE_MARKERS,
+    ) {
+        let Some(root) = extract_json_value_after_marker(html, marker) else {
+            continue;
+        };
+        for path in &start_paths {
+            let ms = dig_path(&root, path)
+                .and_then(Value::as_str)
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s.trim()).ok())
+                .and_then(|t| u64::try_from(t.timestamp_millis()).ok());
+            if ms.is_some() {
+                return ms;
+            }
+        }
+    }
+    None
 }
 
 pub fn extract_live_video_id_from_html(
@@ -695,6 +850,67 @@ mod tests {
             parse_channel_identifier("https://www.youtube.com/watch?v=dQw4w9WgXcQ"),
             None
         );
+    }
+
+    const LIVE_PAGE: &str = r#"<html><head><title>テスト配信 - YouTube</title></head><body><script>
+        var ytInitialPlayerResponse = {
+            "videoDetails": {"videoId": "dQw4w9WgXcQ", "title": "夜のゲーム配信", "isLive": true},
+            "microformat": {"playerMicroformatRenderer": {"liveBroadcastDetails": {
+                "isLiveNow": true, "startTimestamp": "2026-11-14T10:00:00+09:00"}}}
+        };
+    </script></body></html>"#;
+
+    /// AC-3
+    #[test]
+    fn live_info_has_video_id_title_and_start_time() {
+        let info = extract_live_info_from_html(LIVE_PAGE, &empty_paths()).expect("live");
+        assert_eq!(info.video_id, "dQw4w9WgXcQ");
+        assert_eq!(info.title.as_deref(), Some("夜のゲーム配信"));
+        // 2026-11-14T01:00:00Z
+        assert_eq!(info.started_at_ms, Some(1_794_618_000_000));
+    }
+
+    #[test]
+    fn live_info_start_time_is_none_when_path_missing_and_overridable() {
+        let html = r#"<script>var ytInitialPlayerResponse = {
+            "videoDetails": {"videoId": "dQw4w9WgXcQ", "title": "t", "isLive": true},
+            "custom": {"begin": "2026-11-14T00:00:00Z"}};</script>"#;
+        let info = extract_live_info_from_html(html, &empty_paths()).expect("live");
+        assert_eq!(info.started_at_ms, None);
+        let mut paths = HashMap::new();
+        paths.insert(KEY_START_TIME_PATHS.to_string(), "custom>begin".to_string());
+        let info = extract_live_info_from_html(html, &paths).expect("live");
+        assert_eq!(info.started_at_ms, Some(1_794_614_400_000));
+    }
+
+    #[test]
+    fn live_info_is_none_without_is_live_even_with_start_time() {
+        // 待機枠(isUpcoming)・終了済み(isLiveContent のみ)は配信中ではない。
+        let html = r#"<script>var ytInitialPlayerResponse = {
+            "videoDetails": {"videoId": "dQw4w9WgXcQ", "title": "t", "isUpcoming": true, "isLiveContent": true},
+            "microformat": {"playerMicroformatRenderer": {"liveBroadcastDetails": {
+                "startTimestamp": "2026-11-14T10:00:00+09:00"}}}};</script>"#;
+        assert_eq!(extract_live_info_from_html(html, &empty_paths()), None);
+        assert_eq!(extract_live_info_from_html("<html></html>", &empty_paths()), None);
+    }
+
+    #[test]
+    fn live_info_is_not_confirmed_for_upcoming_target_with_other_video_live() {
+        // 待機枠(対象)+ 同じ JSON 内の別動画に isLive:true。広い判定では videoId が取れるが、
+        // 告知用の confirmed_live は false(Started を送らない)。
+        let html = r#"<script>var ytInitialPlayerResponse = {
+            "videoDetails": {"videoId": "dQw4w9WgXcQ", "title": "t", "isUpcoming": true},
+            "related": [{"videoId": "aaaaaaaaaaa", "isLive": true}]};</script>"#;
+        if let Some(info) = extract_live_info_from_html(html, &empty_paths()) {
+            assert!(!info.confirmed_live);
+        }
+        // 近傍文字列フォールバックも未確定。
+        let html = r#"{"isLive":true,"videoId":"dQw4w9WgXcQ"}"#;
+        let info = extract_live_info_from_html(html, &empty_paths()).expect("wide live");
+        assert!(!info.confirmed_live);
+        // 対象動画自身の isLive は確定。
+        let info = extract_live_info_from_html(LIVE_PAGE, &empty_paths()).expect("live");
+        assert!(info.confirmed_live);
     }
 
     #[test]

@@ -1198,6 +1198,8 @@
       youtubeOauthClientId: credYoutubeOauthClientId.trim(),
       xAuthToken: credXAuthToken.trim(),
       xCsrfToken: credXCsrfToken.trim(),
+      // UI は後続 PR。作り直しで消えないよう既存値を引き継ぐ。
+      xPostClientId: config.credentials?.xPostClientId,
     };
     saveWarned = false;
     try {

@@ -56,6 +56,24 @@ Platform = Twitch | YouTube
 
 JSON は `serde(rename_all = "camelCase")` で UI/OBS に流す。
 
+### 3.1 配信開始/終了イベント (`LiveEvent`、X 自動告知の入力)
+
+`ChatMessage` とは別の side channel(`mpsc`、容量 64)。UI/OBS へは流さない(JSON 化しない)。
+
+```rust
+LiveStream { platform, channel_identifier /*設定の identifier そのまま*/, stream_id, title: Option<String>,
+             url, started_at_ms: Option<u64> }
+LiveEvent  = Started(LiveStream) | Ended { platform, channel_identifier }
+```
+
+- 送出は `try_send` のみ。満杯・切断なら warn を出して破棄し、Source は止まらない(`sources::send_live_event`)。`SourceManager::with_live_tx` で渡す。
+- `stream_id`(配信 1 回を表す ID)を確定できない時は `Started` を送らない(重複防止ができないため)。
+- 配信 ID / 開始時刻 / URL:
+  - YouTube(チャンネル指定行のみ): videoId / `microformat>playerMicroformatRenderer>liveBroadcastDetails>startTimestamp`(推測。`youtubeOverrides.paths.liveResolveStartTimestampPaths` で改行区切り上書き)/ `https://www.youtube.com/watch?v={id}`。対象 videoId と `isLive` / `isLiveNow` が同じ動画オブジェクト(`videoDetails` / 同じ player response の `liveBroadcastDetails`)に属すると確認できない場合(待機枠、別動画だけが `isLive`、HTML 近傍文字列のみ)は送らない(チャット接続の判定とは別)。新しい videoId を接続した時に `Started`、未配信確定時に `Ended`(初回確認を含む)。
+  - Twitch: Helix `streams[0].id` / `started_at` / `https://www.twitch.tv/{login}`。配信 ID が変わった時だけ `Started`、未配信の確認(初回を含む。未配信が続く間は再送しない)で `Ended`。検知は `twitchOauth` / `twitchClientId`+`twitchClientSecret` に加え、`twitchClientId` だけでも Device Code ログイン(`twitch_auth.rs`)のトークンで動く(未ログインの間は何もしない)。
+  - ニコ生: embedded-data の `/program/nicoliveProgramId`(取れず設定値が `lv数字` ならそれ)/ `/program/beginTime`(epoch 秒または ms。推測)/ `https://live.nicovideo.jp/watch/{lv}`。ポインタは `niconicoOverrides.endpoints` の `programIdPointer` / `beginTimePointer` で上書き可。watch セッション開始で `Started`。`Ended` は番組が未配信と確認できた時だけ(視聴ページの `/program/status` が `ON_AIR` 以外、または watch WS の disconnect 理由が `END_PROGRAM`)。HTTP タイムアウト・解析失敗・WS エラー・正常 Close など配信状態を確認できない切断では送らない(再接続で `Started` が再送されるため、受け側は配信 ID で重複を弾く)。
+- 受信側(`lib.rs`)は現状デバッグログに出すだけ。投稿処理は後続 PR。
+
 ## 4. Source 層 (`sources/`)
 
 ### trait
@@ -253,6 +271,9 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
   - `credentials.youtubeApiKey`(空文字既定): 公式YouTube streamList用。空ならInnerTubeのみ。
   - `ui.notifySound`(bool 既定false) / `ui.notifyVolume`(f32 0.0〜1.0 既定0.5): キーワード通知の効果音設定。serde default でキー欠落の旧 config も後方互換。
   - `obs`: ポートに加え `maxRows` / `fontScalePct` / `ttlMs` / `bgOpacityPct` / `position` 等の見た目設定。範囲外値が入らないよう **Rust 側でも `normalize()` で clamp**(`maxRows` 1..=1000, `fontScalePct` 50..=200, `bgOpacityPct` 0..=100, `ttlMs` 500..=600000, `position`∈{top,bottom})。`normalize()` は config ロード時と `update_config` 適用時の両方で呼ぶ。上限定数は Rust 側に1箇所(`MAX_OBS_ROWS`)を置き UI/テンプレと値を揃える。
+  - `channels[].ownStream`(bool 既定false): 「自分の配信」の印(X 自動告知の対象)。旧 config は欠落で false。
+  - `xPost{enabled=false, mode="intent"|"api"="intent", intentOpen="button"|"auto"="button", combine=true, template, delaySecs=60, staleMinutes=15, cooldownMinutes=60, dailyLimit=5, callbackPort=47821}`: X 自動告知。`template` 既定は `【配信開始】{title}\n{url}\n{date} {time}`。全項目 serde default。`normalize_all()` で clamp(`delaySecs` 0..=600, `staleMinutes` 0..=180, `cooldownMinutes` 10..=1440, `dailyLimit` 1..=20、`mode` / `intentOpen` は不正値なら既定)。
+  - `credentials.xPostClientId`(任意): API モード用の X OAuth 2.0 Client ID。未設定なら JSON に出さない。
 - 起動時ロード、変更時保存。`config.json` をアプリ設定の正本とする。
 - **localStorage 併用**: 一部のUI/ウィンドウ局所設定は各ウィンドウの `localStorage` に保持する(`config.json` には載せない)。現状: 弾幕表示設定(`fc.danmaku`)、テーマ、最前面ピン状態、コマンドパレット履歴 等。これらはウィンドウローカルかつ低リスクなため意図的に localStorage 側に置いている。
 
