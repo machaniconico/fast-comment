@@ -33,6 +33,8 @@
   import ModerationPortability from './ModerationPortability.svelte';
   import ModerationTester from './ModerationTester.svelte';
   import TemplateEditor from './TemplateEditor.svelte';
+  import XPostSettings from './XPostSettings.svelte';
+  import { sanitizeXPostNumbers } from '../xAutopost';
 
   interface Props {
     onConfigSaved?: (config: AppConfig) => void;
@@ -1189,6 +1191,8 @@
     normalizeEffectsConfig();
     normalizeWelcomeConfig();
     normalizeParticipationConfig();
+    // 数値欄は u32。小数・負数のままだと設定全体の保存(デシリアライズ)が失敗する。
+    if (config.xPost) config.xPost = sanitizeXPostNumbers(config.xPost);
     config.credentials = {
       twitchOauth: credTwitchOauth.trim(),
       twitchUsername: credTwitchUsername.trim(),
@@ -1198,11 +1202,18 @@
       youtubeOauthClientId: credYoutubeOauthClientId.trim(),
       xAuthToken: credXAuthToken.trim(),
       xCsrfToken: credXCsrfToken.trim(),
-      // UI は後続 PR。作り直しで消えないよう既存値を引き継ぐ。
+      // このフォームでは編集しない値(API モード用)。作り直しで消えないよう既存値を引き継ぐ。
       xPostClientId: config.credentials?.xPostClientId,
     };
     saveWarned = false;
     try {
+      // 一覧で付けた「告知」印(ownStream)が、開きっぱなしの古い channels で戻らないよう保存直前に取り直す。
+      try {
+        const latest = await getConfig();
+        if (latest) config.channels = latest.channels;
+      } catch {
+        // 取れなければ手元の channels で保存する。
+      }
       const warnings = await setConfig(config);
       saveWarned = warnings.length > 0;
       try {
@@ -1939,6 +1950,13 @@
     <p class="hint">
       ⚠ トークンはこの PC の config.json に平文で保存されます。共有 PC では取り扱いに注意してください。
     </p>
+  </section>
+
+  <section id="settings-x-post">
+    <h3>X への配信開始告知</h3>
+    {#if config.xPost}
+      <XPostSettings xPost={config.xPost} />
+    {/if}
   </section>
 
   <section id="settings-tts">
