@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawn } from 'node:child_process';
-import { readFile, lstat, rm } from 'node:fs/promises';
+import { readFile, readdir, lstat, rm } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -14,6 +14,197 @@ const CONFIG_ID = 'dev.skyfade.fastcomment';
 const TEMPLATE_NAMES = ['default', 'simple', 'bubble', 'ticker', 'ranking', 'goals', 'donation', 'timer', 'danmaku'];
 const CUSTOM_NAME = 'smoke-copy';
 const CUSTOM_ID = `custom:${CUSTOM_NAME}`;
+const ZIP_NAME = 'smoke-zip';
+const ZIP_ID = `custom:${ZIP_NAME}`;
+const ZIP_STEPS = ['template-zip-import', 'template-zip-slip', 'template-zip-skipped', 'template-zip-large'];
+
+// STORE (無圧縮) ZIP: ローカルヘッダ・中央ディレクトリ・EOCD を手組みする。
+function makeStoredZip(entries) {
+  const table = Uint32Array.from({ length: 256 }, (_, value) => {
+    for (let bit = 0; bit < 8; bit += 1) value = (value >>> 1) ^ ((value & 1) ? 0xedb88320 : 0);
+    return value >>> 0;
+  });
+  const locals = [];
+  const central = [];
+  let offset = 0;
+  for (const [name, contents] of entries) {
+    const filename = Buffer.from(name, 'utf8');
+    const data = Buffer.isBuffer(contents) ? contents : Buffer.from(contents, 'utf8');
+    let crc = 0xffffffff;
+    for (const byte of data) crc = (crc >>> 8) ^ table[(crc ^ byte) & 0xff];
+    crc = (crc ^ 0xffffffff) >>> 0;
+    const local = Buffer.alloc(30);
+    local.writeUInt32LE(0x04034b50, 0);
+    local.writeUInt16LE(20, 4);
+    local.writeUInt16LE(0x800, 6); // UTF-8、圧縮方式 0
+    local.writeUInt16LE(0x21, 12); // 1980-01-01
+    local.writeUInt32LE(crc, 14);
+    local.writeUInt32LE(data.length, 18);
+    local.writeUInt32LE(data.length, 22);
+    local.writeUInt16LE(filename.length, 26);
+    const directory = Buffer.alloc(46);
+    directory.writeUInt32LE(0x02014b50, 0);
+    directory.writeUInt16LE(20, 4);
+    local.copy(directory, 6, 4, 30);
+    directory.writeUInt32LE(offset, 42);
+    locals.push(local, filename, data);
+    central.push(directory, filename);
+    offset += local.length + filename.length + data.length;
+  }
+  const directorySize = central.reduce((size, part) => size + part.length, 0);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(entries.length, 8);
+  end.writeUInt16LE(entries.length, 10);
+  end.writeUInt32LE(directorySize, 12);
+  end.writeUInt32LE(offset, 16);
+  return Buffer.concat([...locals, ...central, end]);
+}
+
+async function directoryEntries(directory) {
+  try {
+    return await readdir(directory);
+  } catch (error) {
+    if (error.code === 'ENOENT') return [];
+    throw error;
+  }
+}
+
+async function prepareZipChecks() {
+  const appDir = path.join(process.env.APPDATA, CONFIG_ID);
+  const zipDir = path.join(appDir, 'templates', ZIP_NAME);
+  const stagingDir = path.join(appDir, 'templates-staging');
+  const evilPaths = [
+    path.join(appDir, 'evil.js'),
+    path.join(path.dirname(appDir), 'evil.js'),
+    path.join(stagingDir, 'evil.js'),
+    path.join(appDir, 'templates', 'evil.js'),
+  ];
+  for (const file of [zipDir, ...evilPaths]) {
+    if (await exists(file)) throw new Error(`${file} が既に存在します。既存データは変更しません`);
+  }
+  if ((await directoryEntries(stagingDir)).length) {
+    throw new Error('templates-staging が空ではありません。既存データは変更しません');
+  }
+  return { zipDir, stagingDir, evilPaths, owned: false, stopping: false };
+}
+
+async function runZipChecks({ client, obsPort, timeoutMs, record, state }) {
+  const url = `http://127.0.0.1:${obsPort}/?template=${ZIP_ID}`;
+  const html = '<!doctype html><title>smoke zip</title>';
+  const importZip = async (entries, check, measure = false) => {
+    if (state.stopping) throw new Error('終了処理中');
+    const zip = makeStoredZip(entries);
+    // タイムアウト後に IPC が完了する場合も後始末の対象にする。
+    state.owned = true;
+    const started = performance.now();
+    let result;
+    try {
+      result = await client.invokeRaw('import_template_zip', zip, { 'x-template-name': ZIP_NAME });
+    } finally {
+      if (measure) console.log(`INFO template-zip-large: ${zip.length} bytes (${(zip.length / 1024 / 1024).toFixed(2)} MiB), CDP 転送 + raw IPC ${(performance.now() - started).toFixed(0)} ms`);
+    }
+    if (result?.template?.id !== ZIP_ID || !Number.isInteger(result.files) || !Array.isArray(result.skipped)) {
+      throw new Error('import_template_zip の戻り値が不正です');
+    }
+    check(result);
+    if (!(await client.invoke('list_templates')).some((item) => item.id === ZIP_ID)) {
+      throw new Error('取り込み後の一覧に smoke-zip がありません');
+    }
+    await expectHttp(url, 200, timeoutMs);
+    await client.invoke('delete_template', { id: ZIP_ID });
+    await expectHttp(url, 404, timeoutMs);
+    if (await exists(state.zipDir)) throw new Error('delete_template 後も smoke-zip が残っています');
+  };
+  const cases = [
+    async () => {
+      await importZip([['index.html', html]], (result) => {
+        if (result.files !== 1 || result.skipped.length !== 0) throw new Error('正常 zip の files/skipped が不正です');
+      });
+      return '正常 zip → HTML 200、delete_template 後 404';
+    },
+    async () => {
+      if (state.stopping) throw new Error('終了処理中');
+      state.owned = true;
+      let rejected = false;
+      try {
+        await client.invokeRaw('import_template_zip', makeStoredZip([
+          ['index.html', html], ['../evil.js', '/* smoke zip slip */'],
+        ]), { 'x-template-name': ZIP_NAME });
+      } catch (error) {
+        // CDP/転送失敗を zip slip の正常な拒否として扱わない。
+        if (!String(error).includes('TAURI_RAW_REJECTED:')) throw error;
+        rejected = true;
+      }
+      for (const file of state.evilPaths) {
+        if (await exists(file)) throw new Error(`zip slip により ${file} が作成されました`);
+      }
+      if (!rejected) throw new Error('zip slip が拒否されませんでした');
+      if (await exists(state.zipDir)) throw new Error('拒否された zip の取り込み先が残っています');
+      await expectHttp(url, 404, timeoutMs);
+      return '../evil.js を拒否、アプリデータ直下・親に evil.js なし';
+    },
+    async () => {
+      await importZip([['index.html', html], ['readme.exe', 'dummy executable']], (result) => {
+        if (result.files !== 1 || result.skipped.length !== 1 || result.skipped[0] !== 'readme.exe') {
+          throw new Error('readme.exe が skipped 1 件として返りません');
+        }
+      });
+      return 'readme.exe を skipped 1 件として取り込み、200 → 削除後 404';
+    },
+    async () => {
+      await importZip([['index.html', html], ['dummy.mp4', Buffer.alloc(100 * 1024 * 1024 - 64 * 1024)]], (result) => {
+        if (result.files !== 2 || result.skipped.length !== 0) throw new Error('大容量 zip の files/skipped が不正です');
+      }, true);
+      return '100 MiB 近い無圧縮 zip、所要時間を記録、200 → 削除後 404';
+    },
+  ];
+  for (let index = 0; index < cases.length; index += 1) {
+    try {
+      record(ZIP_STEPS[index], 'PASS', await cases[index]());
+    } catch (error) {
+      record(ZIP_STEPS[index], 'FAIL', error instanceof Error ? error.message : String(error));
+      for (const pending of ZIP_STEPS.slice(index + 1)) record(pending, 'FAIL', `${ZIP_STEPS[index]} 失敗のため未実行`);
+      break;
+    }
+  }
+}
+
+// 起動したアプリの停止後に呼ぶ。開始時に空であることを確認した範囲だけを掃除する。
+async function cleanupZipChecks(state, record) {
+  try {
+    if (state.owned) {
+      await rm(state.zipDir, { recursive: true, force: true });
+      for (const name of await directoryEntries(state.stagingDir)) {
+        await rm(path.join(state.stagingDir, name), { recursive: true, force: true });
+      }
+      for (const file of state.evilPaths) {
+        if (await exists(file)) {
+          record('template-zip-slip-residue', 'FAIL', `終了時に ${file} を検出、削除します`);
+          await rm(file, { force: true });
+        }
+      }
+    }
+    if (await exists(state.zipDir) || (await directoryEntries(state.stagingDir)).length) {
+      throw new Error('smoke-zip または templates-staging に残存があります');
+    }
+    record('template-zip-cleanup', 'PASS', 'smoke-zip / templates-staging の残存なし');
+  } catch (error) {
+    record('template-zip-cleanup', 'FAIL', error instanceof Error ? error.message : String(error));
+  }
+}
+
+async function checkCapabilities() {
+  const directory = path.join(repoRoot, 'src-tauri', 'capabilities');
+  const files = (await readdir(directory)).filter((name) => name.endsWith('.json'));
+  if (!files.length) throw new Error('capabilities/*.json がありません');
+  for (const name of files) {
+    if (/"remote"/.test(await readFile(path.join(directory, name), 'utf8'))) {
+      throw new Error(`${name} に "remote" があります`);
+    }
+  }
+  return `${files.length} ファイルすべて "remote" 0 件`;
+}
 
 // PR 本文案: 更新・表示の実機確認(このスクリプトはインストーラを実行しない)。
 // この PC では release/fast-comment.exe と隣の templates を使って自動確認する。
@@ -211,7 +402,7 @@ function parseArgs(argv) {
         console.log(
           'Usage: node scripts/smoke/smoke.mjs [--exe <path>] [--attach] [--cdp-port 9333] [--obs-port <n>] [--skip-updater] [--download-installer] [--timeout-ms 8000]',
         );
-        console.log('OBS ポートは --obs-port または 11180。config.json は読みません。smoke-copy が既存なら停止します。');
+        console.log('OBS ポートは --obs-port または 11180。config.json は読みません。smoke-copy / smoke-zip が既存、または staging が空でなければ停止します。');
         process.exit(0);
         break;
       default:
@@ -458,6 +649,28 @@ function makeCdpClient(ws, timeoutMs) {
       return evaluate(
         `window.__TAURI_INTERNALS__.invoke(${JSON.stringify(command)}, ${JSON.stringify(args)})`,
       );
+    },
+    async invokeRaw(command, bytes, headers = {}) {
+      // 数値配列の巨大 JSON 化を避け、CDP では小分けの base64 で運ぶ。
+      // invoke に渡す時点では Uint8Array の raw body にする。
+      const key = `__smokeZip${nextId++}`;
+      const target = `window[${JSON.stringify(key)}]`;
+      try {
+        await evaluate(`${target} = new Uint8Array(${bytes.length}); undefined`);
+        for (let offset = 0; offset < bytes.length; offset += 768 * 1024) {
+          const chunk = bytes.subarray(offset, offset + 768 * 1024).toString('base64');
+          await evaluate(`(() => {
+            const chunk = atob(${JSON.stringify(chunk)});
+            const bytes = ${target};
+            for (let i = 0; i < chunk.length; i++) bytes[${offset} + i] = chunk.charCodeAt(i);
+          })()`);
+        }
+        return await evaluate(`window.__TAURI_INTERNALS__.invoke(
+          ${JSON.stringify(command)}, ${target}, { headers: ${JSON.stringify(headers)} }
+        ).catch(error => { throw new Error('TAURI_RAW_REJECTED: ' + String(error)); })`);
+      } finally {
+        await evaluate(`delete ${target}`).catch(() => {});
+      }
     },
     close() {
       closeWebSocket(ws);
@@ -817,10 +1030,12 @@ async function main() {
   let child = null;
   let cdp = null;
   let templateState = null;
+  let zipState = null;
   let cleanupPromise = null;
   const cleanup = () => {
     if (cleanupPromise) return cleanupPromise;
     if (templateState) templateState.stopping = true;
+    if (zipState) zipState.stopping = true;
     cleanupPromise = (async () => {
       if (templateState?.owned && cdp) {
         try {
@@ -829,10 +1044,18 @@ async function main() {
           // 削除済み・IPC 失敗時も、停止後に今回作ったディレクトリだけを確認する。
         }
       }
+      if (zipState?.owned && cdp) {
+        try {
+          await cdp.invoke('delete_template', { id: ZIP_ID });
+        } catch {
+          // IPC 失敗時も停止後にディスクを掃除する。
+        }
+      }
       const stopped = await killChild(child);
       if (!stopped) record('process-cleanup', 'FAIL', '起動したアプリが 5 秒以内に終了しませんでした');
       if (cdp) cdp.close();
       if (templateState) await cleanupTemplateCopy(templateState, record);
+      if (zipState) await cleanupZipChecks(zipState, record);
     })();
     return cleanupPromise;
   };
@@ -849,7 +1072,13 @@ async function main() {
   process.on('exit', onExit);
 
   try {
+    try {
+      record('template-capabilities', 'PASS', await checkCapabilities());
+    } catch (error) {
+      record('template-capabilities', 'FAIL', error instanceof Error ? error.message : String(error));
+    }
     templateState = await prepareTemplateChecks(args.exe);
+    zipState = await prepareZipChecks();
     if (!args.attach) {
       if (await isCdpReachable(args.cdpPort)) {
         throw new Error(`CDP ポート ${args.cdpPort} は使用中です。既存アプリへ自動接続しません`);
@@ -899,11 +1128,13 @@ async function main() {
       for (const name of ['template-list', 'template-duplicate', 'template-builtin-readonly', 'template-custom-save', 'template-delete']) {
         record(name, 'FAIL', 'CDP 未接続');
       }
+      for (const name of ZIP_STEPS) record(name, 'FAIL', 'CDP 未接続');
       record('ws-chat', 'FAIL', 'CDP 未接続');
       record('ws-mod', 'FAIL', 'CDP 未接続');
       record('ws-mod-optin', 'FAIL', 'CDP 未接続');
     } else {
       await runTemplateChecks({ client: cdpClient, obsPort, timeoutMs: args.timeoutMs, record, state: templateState });
+      await runZipChecks({ client: cdpClient, obsPort, timeoutMs: args.timeoutMs, record, state: zipState });
       try {
         await runChatChecks({ client: cdpClient, obsPort, timeoutMs: args.timeoutMs, record });
       } catch (error) {

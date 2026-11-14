@@ -779,6 +779,21 @@ export async function deleteTemplate(id: string): Promise<void> {
   await invoke<void>('delete_template', { id });
 }
 
+/** zip 取り込みの結果。skipped は許可外などで取り込まなかったファイル名。 */
+export interface TemplateImportResult {
+  template: TemplateInfo;
+  files: number;
+  skipped: string[];
+}
+
+/** zip のバイト列を raw body で渡し、カスタム `name` として取り込む。失敗時は日本語のエラー文字列で reject。 */
+export async function importTemplateZip(name: string, bytes: Uint8Array): Promise<TemplateImportResult> {
+  if (!isTauri()) throw new Error('Tauri環境でのみ取り込めます');
+  return tauriInvoke<TemplateImportResult>('import_template_zip', bytes, {
+    headers: { 'x-template-name': name }
+  });
+}
+
 export interface GoalSkinInfo {
   directory: string;
   files: string[];

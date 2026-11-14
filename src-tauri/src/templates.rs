@@ -8,8 +8,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const MAX_EDITABLE_BYTES: u64 = 1024 * 1024;
-pub const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
-pub const MAX_TOTAL_BYTES: u64 = 40 * 1024 * 1024;
+// Same as the zip import limits so an imported template (e.g. with video) can be duplicated.
+pub const MAX_FILE_BYTES: u64 = 100 * 1024 * 1024;
+pub const MAX_TOTAL_BYTES: u64 = 100 * 1024 * 1024;
 pub const MAX_ENTRIES: usize = 500;
 pub const MAX_DEPTH: usize = 4;
 pub const EDITABLE_FILES: &[&str] = &["index.html", "style.css", "app.js"];
@@ -540,6 +541,8 @@ pub fn is_allowed_asset(name: &str) -> bool {
                 | "mp3"
                 | "ogg"
                 | "wav"
+                | "mp4"
+                | "webm"
                 | "txt"
                 | "md"
         )
@@ -808,37 +811,30 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_accepts_exact_8mib_asset_and_40mib_total() {
+    fn duplicate_accepts_exact_max_file_and_total() {
         let f = Fixture::new();
         let t = f.template(false, "default");
         let source = f.store.resolve(&t).unwrap();
-        // Empty editable files make the copied asset total exactly 40MiB.
+        // Empty editable files make the copied total exactly MAX_TOTAL_BYTES.
         for name in EDITABLE_FILES {
             fs::write(source.join(name), "").unwrap();
         }
-        for i in 0..5 {
-            File::create(source.join(format!("asset{i}.png")))
-                .unwrap()
-                .set_len(MAX_FILE_BYTES)
-                .unwrap();
-        }
+        assert_eq!(MAX_FILE_BYTES, MAX_TOTAL_BYTES);
+        File::create(source.join("asset.mp4"))
+            .unwrap()
+            .set_len(MAX_FILE_BYTES)
+            .unwrap();
         f.store.duplicate(&t, "copy").unwrap();
         let dest = f.store.custom_root().join("copy");
-        let total: u64 = (0..5)
-            .map(|i| {
-                let size = fs::metadata(dest.join(format!("asset{i}.png")))
-                    .unwrap()
-                    .len();
-                assert_eq!(size, MAX_FILE_BYTES);
-                size
-            })
-            .sum();
-        assert_eq!(total, MAX_TOTAL_BYTES);
+        assert_eq!(
+            fs::metadata(dest.join("asset.mp4")).unwrap().len(),
+            MAX_TOTAL_BYTES
+        );
         f.staging_empty();
     }
 
     #[test]
-    fn duplicate_rejects_asset_over_8mib_by_one_byte() {
+    fn duplicate_rejects_asset_over_max_file_by_one_byte() {
         let f = Fixture::new();
         let t = f.template(false, "default");
         let source = f.store.resolve(&t).unwrap();
@@ -856,7 +852,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_rejects_total_over_40mib_by_one_byte() {
+    fn duplicate_rejects_total_over_max_by_one_byte() {
         let f = Fixture::new();
         let t = f.template(false, "default");
         let source = f.store.resolve(&t).unwrap();
@@ -864,10 +860,11 @@ mod tests {
             fs::write(source.join(name), "").unwrap();
         }
         fs::write(source.join("index.html"), "x").unwrap();
-        for i in 0..5 {
+        // index.html (1 byte) + exactly MAX_TOTAL_BYTES of assets = total + 1.
+        for i in 0..2 {
             File::create(source.join(format!("asset{i}.png")))
                 .unwrap()
-                .set_len(MAX_FILE_BYTES)
+                .set_len(MAX_TOTAL_BYTES / 2)
                 .unwrap();
         }
         // Every file meets its own limit; only the aggregate limit is exceeded.

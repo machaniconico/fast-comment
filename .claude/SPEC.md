@@ -297,7 +297,7 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
 - **新規名の規則**(`validate_new_name`、複製先の名前): 1〜64 バイト、先頭は小文字英字か数字、使える文字は小文字英字・数字・`-`・`_`。Windows 予約デバイス名(`con` / `prn` / `aux` / `nul` / `com1`〜`com9` / `lpt1`〜`lpt9`)は不可。既存のカスタム名とは大文字小文字を区別せず重複不可。
 - **複製**(`duplicate_template(source, name)`): `source`(内蔵・カスタムとも可)を `app_config_dir/templates-staging/<uuid>/` へコピーし、`fc-template.json` を書いてから `app_config_dir/templates/<name>/` へ rename で公開する。失敗時は staging を消す。起動時に残った staging は `cleanup_stale_staging` で掃除する。
   - コピーはシンボリックリンク・許可外の名前・許可外の拡張子・深さ 4 超を黙って飛ばす。許可拡張子は html / css / js / json / png jpg jpeg gif webp svg / woff woff2 ttf otf / mp3 ogg wav / txt / md。`fc-template.json` はコピーしない。
-  - 上限は 1 ファイル 8MiB・合計 40MiB・500 エントリで、超えると失敗する。`index.html` が無い複製も失敗する。
+  - 上限は 1 ファイル 100 MiB・合計 100 MiB・500 エントリ(zip 取り込みと同じ値)で、超えると失敗する。`index.html` が無い複製も失敗する。
 - **削除**(`delete_template(id)`): カスタムのみ。ディレクトリごと消す。内蔵は Err(「内蔵テンプレートは読み取り専用です」)。
 - **編集**: `read_template_file` / `write_template_file` が扱うのは `index.html` / `style.css` / `app.js` の 3 つだけ(1MiB 以下)。書き込みは同一ディレクトリの一時ファイルに書いてから rename で置き換える。
 - **パスの安全**: ID をパスへ直接連結しない(必ず `TemplateRef::parse` を通す)。編集・複製・削除では、テンプレのディレクトリとファイルを `symlink_metadata` で通常の実体と確かめ、シンボリックリンクは拒否する(複製ではスキップ)。**OBS への配信(`/custom/...` の `ServeDir` と index.html の読み込み)はリンクを検査しない**ので、配信ルートにシンボリックリンクを置かない運用が前提(置けるのはその PC を操作できる人だけ)。`:` は Windows のファイル名に使えないので、ID を誤ってパスに連結しても解決されず失敗する。
@@ -311,6 +311,18 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
   | `appVersion` | 文字列 | 作成時のアプリ版(`CARGO_PKG_VERSION`) |
   | `createdAtMs` | 数値 | 作成時刻(UNIX エポックからのミリ秒) |
 
+- **zip 取り込み**(`import_template_zip`、実装は `src-tauri/src/template_import.rs`): UI は `<input type="file" accept=".zip">` で読んだバイト列を raw body の IPC で渡し、名前はヘッダ `x-template-name`。Rust は UI が指定したパスを開かない。成功時は `{ template, files, skipped }`、失敗時は日本語のエラー文字列(UI はそのまま表示)。UI は 100 MiB 超なら読み込む前にエラーにし、IPC を呼ばない。取り込み前に「テンプレートの JavaScript は配信画面で実行される。信頼できる配布元の zip だけ取り込む」旨を確認する。名前の既定値は zip のファイル名を小文字化し `[a-z0-9_-]` 以外を `-` にした物(新規名の規則は複製と同じ)。プレビュー iframe は `sandbox="allow-scripts allow-same-origin"`。
+  - **取り込めるのは fast-comment 形式**(`/ws` に接続する静的サイト、ルートに `index.html`)だけ。わんコメのテンプレ zip(OneSDK 前提)はそのままでは動かない。わんコメとの互換は CSS の data 属性(上の「コメント要素の data-* 属性」)だけで、OneSDK 互換層は作らない。
+  - **上限**(サイズはヘッダを信じず、実際に読んだバイト数で数える): zip 本体 100 MiB、展開後の合計 100 MiB、1 ファイル 100 MiB、編集対象 3 ファイル(`index.html` / `style.css` / `app.js`)は 1 MiB、500 エントリ、深さ 4。エントリ数は「黙って無視する物とディレクトリエントリを除いた件数」で数える(`index.html` 込みで 500 ちょうどは成功、501 は拒否)。中央ディレクトリの総件数が 5000 を超える zip は、個別の検証に入る前に拒否する。
+  - **許可拡張子**: html css js json png jpg jpeg gif webp svg woff woff2 ttf otf mp3 ogg wav txt md mp4 webm。
+  - **全体を拒否**: `..`、絶対パス、ドライブ指定(`:`)、バックスラッシュ、NUL、シンボリックリンク、暗号化(ヘッダだけ見て「暗号化された zip は取り込めません」と専用文言で拒否。展開はしない)、通常ファイル以外(この種別チェックは OS ゴミ判定より先に行うので、`__MACOSX/` や `.DS_Store` 名のシンボリックリンクも全体拒否)、大文字小文字を無視して重複するパス(フォルダ名の違い `Assets/` と `assets/` も重複)、上限超過、ルートに `index.html` が無い、名前が不正か既存(上書きしない)。
+  - **スキップして報告**(`skipped` に出る): 許可外の拡張子、拡張子なし(LICENSE 等)、先頭または末尾が `.` の名前、`[A-Za-z0-9._-]` 以外を含む名前、Windows デバイス名。UI は件数とファイル名を表示する。
+  - **黙って無視**: `__MACOSX/`、`.DS_Store`、`Thumbs.db`、`desktop.ini`、zip 内の `fc-template.json`(来歴は取り込み時にアプリが書く。`origin` は `"zip"`)。
+  - **大文字小文字**: 編集対象(`index.html` / `style.css` / `app.js`)の判定は ASCII の大文字小文字を無視する(`APP.JS` も 1 MiB 上限、ルートの `INDEX.HTML` も `index.html` として存在扱い)。展開時は正規名(小文字)で書く。
+  - **UTF-8 でない名前**: UTF-8 でないファイル名に `\` が混ざって拒否される場合、「ファイル名が UTF-8 でない zip の可能性があります(Windows 標準の圧縮で日本語名を含む等)」の趣旨を文言に足す(拒否そのものは変えない)。
+  - **エラー文言**: staging の絶対パスは出さない(zip 内の相対パスだけ)。
+  - **最上位フォルダ**: 最上位が単一フォルダなら 1 段はがして展開する。`zip` crate の `extract()` は使わず、1 エントリずつ検証して staging へ書き、成功時だけ rename で公開する。
+  - **CSP を付けない理由と信頼境界**: カスタムのテンプレの JS は `127.0.0.1` のオリジンで実行され、`/ws` のチャットを読める。ただし OBS サーバは CORS 全許可で、任意の Web ページも同じ `/ws` を読める。取り込んだ JS が届く範囲はそれと同じで、CSP で守れる物がほぼ無い(画像 URL 経由の送信も防げない)。一方で CSP を付けると Google Fonts・CDN・インラインスクリプトを使う自作テンプレが壊れる。よって CSP は付けず、**信頼できる配布元の zip だけ取り込む**運用とする。プレビュー iframe の sandbox は既存テンプレのプレビュー(WebSocket・音声)が動くことを実機で確かめる(壊れたら外し、ここに書く)。
 - **移行の注意(リリースノート用)**: これまで内蔵テンプレを直接編集していた分は引き継がれない。内蔵は読み取り専用になったので、複製してから編集する。複製したカスタムは、以後の内蔵テンプレの修正(バグ修正・新機能)を受け取らない。
 
 ## 10. 設定永続化 (`config.rs`)
