@@ -297,7 +297,7 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
 - **新規名の規則**(`validate_new_name`、複製先の名前): 1〜64 バイト、先頭は小文字英字か数字、使える文字は小文字英字・数字・`-`・`_`。Windows 予約デバイス名(`con` / `prn` / `aux` / `nul` / `com1`〜`com9` / `lpt1`〜`lpt9`)は不可。既存のカスタム名とは大文字小文字を区別せず重複不可。
 - **複製**(`duplicate_template(source, name)`): `source`(内蔵・カスタムとも可)を `app_config_dir/templates-staging/<uuid>/` へコピーし、`fc-template.json` を書いてから `app_config_dir/templates/<name>/` へ rename で公開する。失敗時は staging を消す。起動時に残った staging は `cleanup_stale_staging` で掃除する。
   - コピーはシンボリックリンク・許可外の名前・許可外の拡張子・深さ 4 超を黙って飛ばす。許可拡張子は html / css / js / json / png jpg jpeg gif webp svg / woff woff2 ttf otf / mp3 ogg wav / txt / md。`fc-template.json` はコピーしない。
-  - 上限は 1 ファイル 8MiB・合計 40MiB・500 エントリで、超えると失敗する。`index.html` が無い複製も失敗する。
+  - 上限は 1 ファイル 100 MiB・合計 100 MiB・500 エントリ(zip 取り込みと同じ値)で、超えると失敗する。`index.html` が無い複製も失敗する。
 - **削除**(`delete_template(id)`): カスタムのみ。ディレクトリごと消す。内蔵は Err(「内蔵テンプレートは読み取り専用です」)。
 - **編集**: `read_template_file` / `write_template_file` が扱うのは `index.html` / `style.css` / `app.js` の 3 つだけ(1MiB 以下)。書き込みは同一ディレクトリの一時ファイルに書いてから rename で置き換える。
 - **パスの安全**: ID をパスへ直接連結しない(必ず `TemplateRef::parse` を通す)。編集・複製・削除では、テンプレのディレクトリとファイルを `symlink_metadata` で通常の実体と確かめ、シンボリックリンクは拒否する(複製ではスキップ)。**OBS への配信(`/custom/...` の `ServeDir` と index.html の読み込み)はリンクを検査しない**ので、配信ルートにシンボリックリンクを置かない運用が前提(置けるのはその PC を操作できる人だけ)。`:` は Windows のファイル名に使えないので、ID を誤ってパスに連結しても解決されず失敗する。
