@@ -801,7 +801,7 @@ pub struct XPostConfig {
     pub callback_port: u16,
 }
 
-pub const DEFAULT_X_POST_TEMPLATE: &str = "【配信開始】{title}\n{url}\n{date} {time}";
+pub const DEFAULT_X_POST_TEMPLATE: &str = "{title}\n{url}\n{date} {time}";
 
 impl Default for XPostConfig {
     fn default() -> Self {
@@ -1080,7 +1080,7 @@ mod tests {
         assert_eq!(cfg.x_post.mode, "intent");
         assert_eq!(cfg.x_post.intent_open, "button");
         assert!(cfg.x_post.combine);
-        assert_eq!(cfg.x_post.template, "【配信開始】{title}\n{url}\n{date} {time}");
+        assert_eq!(cfg.x_post.template, "{title}\n{url}\n{date} {time}");
         assert_eq!(cfg.x_post.delay_secs, 60);
         assert_eq!(cfg.x_post.stale_minutes, 15);
         assert_eq!(cfg.x_post.cooldown_minutes, 60);
