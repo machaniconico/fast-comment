@@ -72,7 +72,7 @@ build-windows.bat
 
 ### リリース(GitHub Actions)
 
-`src-tauri/tauri.conf.json`・`src-tauri/Cargo.toml`・`package.json` の `version` を揃え、`.github/release-notes/vX.Y.Z.md` を用意してから `vX.Y.Z` の tag を push します。`.github/workflows/release.yml` が Windows ランナーで NSIS と MSI を作り、updater 用の署名と `latest.json` を付けて **draft** の Release を作ります。中身を確かめてから公開してください(`gh release edit vX.Y.Z --draft=false`)。公開するまで既存ユーザーへの自動更新は始まりません。tag とアプリのバージョンが違う時はワークフローが失敗します。
+`src-tauri/tauri.conf.json`・`src-tauri/Cargo.toml`・`package.json` の `version` を揃え、`.github/release-notes/vX.Y.Z.md` を用意してから `vX.Y.Z` の tag を push します。`.github/workflows/release.yml` が Windows ランナーで NSIS インストーラ(setup.exe)を作り、updater 用の署名と `latest.json` を付けて **draft** の Release を作ります。中身を確かめてから公開してください(`gh release edit vX.Y.Z --draft=false`)。公開するまで既存ユーザーへの自動更新は始まりません。tag とアプリのバージョンが違う時はワークフローが失敗します。
 
 ## 実機スモーク確認
 

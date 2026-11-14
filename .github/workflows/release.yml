@@ -1,6 +1,6 @@
 # Windows 版のビルドと GitHub Releases への下書き公開。
 # - tag push (v*) または手動実行で動く。
-# - NSIS (.exe) と MSI を作り、updater 用の署名 (.sig) と latest.json を Release に上げる。
+# - NSIS (.exe) を作り(MSI は v0.3.0 で廃止)、updater 用の署名 (.sig) と latest.json を Release に上げる。
 # - Release は draft で作る。公開はユーザーが確認してから手動 (GitHub 画面 or `gh release edit vX.Y.Z --draft=false`)。
 #   draft のうちは releases/latest/download/latest.json に出ないので、既存ユーザーへ更新は配られない。
 # - draft 由来の latest.json は url が公開後に使えない形になるので、最後のステップで browser URL に書き換えて上げ直す。
@@ -103,7 +103,6 @@ jobs:
           for want in \
             "fast-comment_${APP_VERSION}_x64-setup.exe" \
             "fast-comment_${APP_VERSION}_x64-setup.exe.sig" \
-            "fast-comment_${APP_VERSION}_x64_en-US.msi" \
             "latest.json"; do
             if ! grep -qxF "$want" <<<"$assets"; then
               echo "::error::missing release asset: $want"
@@ -129,12 +128,13 @@ jobs:
           const { APP_VERSION: v, REPO: repo } = process.env;
           const base = `https://github.com/${repo}/releases/download/v${v}`;
           const nsis = `fast-comment_${v}_x64-setup.exe`;
-          const msi = `fast-comment_${v}_x64_en-US.msi`;
           const json = JSON.parse(fs.readFileSync(file, 'utf8'));
           const platforms = json.platforms || {};
-          if (!Object.keys(platforms).length) { console.log('::error::latest.json has no platforms'); process.exit(1); }
+          // MSI は配らないので -msi キーは消す(残すと存在しない資産を指す)
+          for (const key of Object.keys(platforms)) if (key.endsWith('-msi')) delete platforms[key];
+          if (!platforms['windows-x86_64']) { console.log('::error::latest.json has no windows-x86_64'); process.exit(1); }
           for (const [key, entry] of Object.entries(platforms)) {
-            entry.url = `${base}/${key.endsWith('-msi') ? msi : nsis}`;
+            entry.url = `${base}/${nsis}`;
             if (!entry.signature) { console.log(`::error::latest.json platform ${key} has no signature`); process.exit(1); }
           }
           fs.writeFileSync(file, JSON.stringify(json, null, 2) + '\n');
