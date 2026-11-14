@@ -1,0 +1,111 @@
+# Windows 版のビルドと GitHub Releases への下書き公開。
+# - tag push (v*) または手動実行で動く。
+# - NSIS (.exe) と MSI を作り、updater 用の署名 (.sig) と latest.json を Release に上げる。
+# - Release は draft で作る。公開はユーザーが確認してから手動 (GitHub 画面 or `gh release edit vX.Y.Z --draft=false`)。
+#   draft のうちは releases/latest/download/latest.json に出ないので、既存ユーザーへ更新は配られない。
+# - 署名鍵は GitHub Secrets (TAURI_SIGNING_PRIVATE_KEY / TAURI_SIGNING_PRIVATE_KEY_PASSWORD) からのみ渡す。
+name: Release
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-windows:
+    name: build (windows)
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check version consistency
+        shell: bash
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          node - <<'EOF'
+          const fs = require('fs');
+          const conf = JSON.parse(fs.readFileSync('src-tauri/tauri.conf.json', 'utf8')).version;
+          const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8')).version;
+          const cargoToml = fs.readFileSync('src-tauri/Cargo.toml', 'utf8');
+          const pkgSection = cargoToml.split(/^\[/m).find((s) => s.startsWith('package]')) || '';
+          const cargo = (pkgSection.match(/^version\s*=\s*"([^"]+)"/m) || [])[1];
+          const found = { 'tauri.conf.json': conf, 'package.json': pkg, 'Cargo.toml': cargo };
+          console.log('versions:', JSON.stringify(found));
+          const fail = (msg) => { console.log(`::error::${msg}`); process.exit(1); };
+          if (new Set(Object.values(found)).size !== 1 || !conf) fail(`version mismatch: ${JSON.stringify(found)}`);
+          if (process.env.REF_TYPE === 'tag') {
+            const tagVersion = process.env.REF_NAME.replace(/^v/, '');
+            if (tagVersion !== conf) fail(`tag ${process.env.REF_NAME} does not match app version ${conf}`);
+          }
+          const notes = `.github/release-notes/v${conf}.md`;
+          if (!fs.existsSync(notes)) fail(`release notes not found: ${notes}`);
+          fs.appendFileSync(process.env.GITHUB_ENV, `APP_VERSION=${conf}\nRELEASE_NOTES=${notes}\n`);
+          EOF
+
+      - name: Load release notes
+        id: notes
+        shell: bash
+        run: |
+          {
+            echo 'body<<FC_RELEASE_NOTES_EOF'
+            cat "$RELEASE_NOTES"
+            echo
+            echo 'FC_RELEASE_NOTES_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: pnpm/action-setup@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build and upload draft release
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: v__VERSION__
+          releaseName: 'fast-comment v__VERSION__'
+          releaseBody: ${{ steps.notes.outputs.body }}
+          releaseDraft: true
+          prerelease: false
+          updaterJsonPreferNsis: true
+          tauriScript: pnpm tauri
+
+      - name: Verify release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          assets=$(gh release view "v${APP_VERSION}" --json assets --jq '.assets[].name')
+          echo "$assets"
+          for want in \
+            "fast-comment_${APP_VERSION}_x64-setup.exe" \
+            "fast-comment_${APP_VERSION}_x64-setup.exe.sig" \
+            "fast-comment_${APP_VERSION}_x64_en-US.msi" \
+            "latest.json"; do
+            if ! grep -qxF "$want" <<<"$assets"; then
+              echo "::error::missing release asset: $want"
+              exit 1
+            fi
+          done

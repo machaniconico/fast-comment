@@ -35,6 +35,8 @@
   import TemplateEditor from './TemplateEditor.svelte';
   import XPostSettings from './XPostSettings.svelte';
   import { sanitizeXPostNumbers } from '../xAutopost';
+  import { appUpdate } from '../appUpdate.svelte';
+  import { progressLabel, statusText } from '../appUpdate';
 
   interface Props {
     onConfigSaved?: (config: AppConfig) => void;
@@ -387,6 +389,7 @@
   }
 
   onMount(async () => {
+    void appUpdate.loadCurrentVersion();
     hydrateConfig(await getConfig());
     refreshLogDir();
     try {
@@ -2947,6 +2950,31 @@
       />
       <span class="hint-inline">{Math.round(config.ui.notifyVolume * 100)}%</span>
     </div>
+  </section>
+
+  <!-- ── App update ── -->
+  <section id="settings-app-update">
+    <h3>アプリの更新</h3>
+    <div class="field-row">
+      <span>現在のバージョン: {appUpdate.currentVersion ? `v${appUpdate.currentVersion}` : '取得中...'}</span>
+    </div>
+    <div class="field-row">
+      <button class="export-btn" onclick={() => void appUpdate.checkManually()} disabled={appUpdate.busy}>
+        {appUpdate.phase === 'checking' ? '確認中...' : '更新を確認'}
+      </button>
+      {#if appUpdate.phase === 'available' || (appUpdate.phase === 'installError' && appUpdate.canInstall)}
+        <button class="export-btn" onclick={() => void appUpdate.install()}>
+          {appUpdate.canInstall ? '更新して再起動' : 'ダウンロードページを開く'}
+        </button>
+      {/if}
+    </div>
+    {#if appUpdate.phase !== 'idle'}
+      <p class="hint" role="status" aria-live="polite">
+        {statusText(appUpdate.phase, appUpdate.latestVersion, appUpdate.error)}
+        {#if appUpdate.phase === 'downloading'}{progressLabel(appUpdate.progress)}{/if}
+      </p>
+    {/if}
+    <p class="hint">起動時に自動で確認します（失敗しても通知しません）。更新すると接続中の配信は一度切れます。</p>
   </section>
 
   <!-- ── Export ── -->

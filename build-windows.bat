@@ -251,7 +251,15 @@ if exist "%BUNDLE_DIR%\msi\*.msi" (
 REM --- Step 2: Tauri build (also runs "pnpm build" via beforeBuildCommand)
 REM NSIS + MSI: both are attached to GitHub Releases (WiX adds some build time).
 echo [2/2] pnpm tauri build  ^(first run compiles all Rust crates; takes several minutes^)
-call pnpm tauri build --bundles nsis,msi
+REM Updater artifacts (.sig) need the private signing key, which only CI has.
+REM Without TAURI_SIGNING_PRIVATE_KEY, merge a config that turns them off so the
+REM local build does not fail at the signing step. Installers are the same.
+set "FC_TAURI_EXTRA="
+if not defined TAURI_SIGNING_PRIVATE_KEY (
+  echo [INFO] TAURI_SIGNING_PRIVATE_KEY not set -- building without updater signatures.
+  set FC_TAURI_EXTRA=--config "%~dp0src-tauri\tauri.nosign.conf.json"
+)
+call pnpm tauri build --bundles nsis,msi %FC_TAURI_EXTRA%
 if errorlevel 1 (
   echo [ERROR] tauri build failed. Review the output above for details.
   echo         Note: if MSVC was just installed, a reboot may be required before building.

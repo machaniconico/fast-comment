@@ -2255,7 +2255,19 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        // 自動更新後の relaunch() 用。
+        .plugin(tauri_plugin_process::init())
         .setup(|app| {
+            // 自動更新(SPEC「自動更新」)。確認・DL・インストールは UI から
+            // plugin-updater の JS API で呼ぶ。登録失敗は致命にしない。
+            #[cfg(desktop)]
+            if let Err(e) = app
+                .handle()
+                .plugin(tauri_plugin_updater::Builder::new().build())
+            {
+                tracing::warn!("updater プラグイン登録失敗・自動更新なしで続行: {e}");
+            }
+
             let handle = app.handle().clone();
 
             // 設定ディレクトリ。

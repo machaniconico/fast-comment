@@ -40,8 +40,6 @@
   } from './lib/displayFilter';
   import type { MessageKind } from './lib/types';
   import {
-    checkForUpdate,
-    openReleaseUrl,
     getConfig,
     setConfig,
     getTtsQueueState,
@@ -52,14 +50,14 @@
     isDanmakuOverlayOpen,
     setAlwaysOnTop,
   } from './lib/ipc';
-  import type { AppConfig, TtsNotice, UpdateStatus } from './lib/ipc';
+  import type { AppConfig, TtsNotice } from './lib/ipc';
+  import { appUpdate } from './lib/appUpdate.svelte';
+  import { progressLabel, progressPercent } from './lib/appUpdate';
 
   let unlisten: (() => void) | null = null;
   let unlistenTtsNotice: (() => void) | null = null;
   let unlistenTtsQueueState: (() => void) | null = null;
   let config: AppConfig | null = $state(null);
-  let updateStatus = $state<UpdateStatus | null>(null);
-  let updateDismissed = $state(false);
   let ttsNotice = $state<TtsNotice | null>(null);
   let ttsNoticeTimer: ReturnType<typeof setTimeout> | null = null;
   let toolsOpen = $state(false);
@@ -182,7 +180,7 @@
     void setAlwaysOnTop(ui.alwaysOnTop);
     window.addEventListener('click', onWindowClick);
     window.addEventListener('keydown', onWindowKey);
-    void loadUpdateStatus();
+    void appUpdate.checkSilently();
     void loadConfig();
     void moderation.refreshAuth();
     {
@@ -410,18 +408,6 @@
     }
   }
 
-  async function loadUpdateStatus() {
-    try {
-      const status = await checkForUpdate();
-      if (status?.updateAvailable) {
-        updateStatus = status;
-        updateDismissed = false;
-      }
-    } catch (e) {
-      console.warn('[update] update check failed', e);
-    }
-  }
-
   async function loadConfig() {
     try {
       const loaded = await getConfig();
@@ -469,17 +455,6 @@
       goalsToggleSaving = false;
     }
   }
-
-  async function onUpdateDownloadClick(e: MouseEvent) {
-    e.preventDefault();
-    const url = updateStatus?.releaseUrl;
-    if (!url) return;
-    try {
-      await openReleaseUrl(url);
-    } catch (err) {
-      console.warn('[update] failed to open release URL', err);
-    }
-  }
 </script>
 
 {#if showEffects && config?.effects}
@@ -502,20 +477,35 @@
   data-youtube-member-name-green={config?.ui.youtubeMemberNameGreen !== false}
   data-twitch-native-style={config?.ui.twitchNativeStyle !== false}
 >
-  {#if updateStatus?.updateAvailable && !updateDismissed}
+  {#if appUpdate.bannerVisible}
+    {@const pct = progressPercent(appUpdate.progress)}
     <div class="update-banner" role="status" aria-live="polite">
-      <span class="update-banner__text">
-        新しいバージョン v{updateStatus.latestVersion} があります（現在 v{updateStatus.currentVersion}）
-      </span>
-      <a class="update-download" href={updateStatus.releaseUrl || '#'} onclick={onUpdateDownloadClick}>
-        ダウンロード
-      </a>
-      <button
-        class="update-dismiss"
-        onclick={() => (updateDismissed = true)}
-        title="閉じる"
-        aria-label="更新通知を閉じる"
-      >×</button>
+      {#if appUpdate.phase === 'downloading'}
+        <span class="update-banner__text">
+          v{appUpdate.latestVersion} をダウンロード中… {progressLabel(appUpdate.progress)}
+        </span>
+        <progress class="update-progress" max="100" value={pct ?? undefined} aria-label="更新のダウンロード進捗"></progress>
+      {:else if appUpdate.phase === 'installing'}
+        <span class="update-banner__text">インストール中… まもなくアプリが再起動します</span>
+      {:else if appUpdate.phase === 'installError'}
+        <span class="update-banner__text" title={appUpdate.error || undefined}>
+          v{appUpdate.latestVersion} の更新に失敗しました: {appUpdate.error}
+        </span>
+        <button class="update-download" onclick={() => void appUpdate.install()}>再試行</button>
+        <button class="update-later" onclick={() => appUpdate.dismiss()} aria-label="更新通知を閉じる（後で）">後で</button>
+      {:else}
+        <span class="update-banner__text" title={appUpdate.notes || undefined}>
+          新しいバージョン v{appUpdate.latestVersion} があります{appUpdate.currentVersion ? `（現在 v${appUpdate.currentVersion}）` : ''}
+        </span>
+        <button
+          class="update-download"
+          onclick={() => void appUpdate.install()}
+          title={appUpdate.canInstall ? '更新をダウンロードしてインストールし、アプリを再起動します（接続中の配信は一度切れます）' : 'リリースページを開きます'}
+        >
+          {appUpdate.canInstall ? '更新して再起動' : 'ダウンロード'}
+        </button>
+        <button class="update-later" onclick={() => appUpdate.dismiss()} aria-label="更新通知を閉じる（後で）">後で</button>
+      {/if}
     </div>
   {/if}
 
@@ -1000,22 +990,38 @@
     text-decoration: underline;
   }
 
-  .update-dismiss {
-    width: 22px;
-    height: 22px;
+  button.update-download {
     border: none;
-    border-radius: 4px;
-    background: rgba(255,255,255,0.08);
-    color: #b8e7c7;
+    background: none;
+    padding: 0 2px;
+    font: inherit;
     cursor: pointer;
-    flex-shrink: 0;
-    line-height: 1;
   }
 
-  .update-dismiss:hover {
+  .update-later {
+    border: none;
+    border-radius: 4px;
+    padding: 2px 8px;
+    background: rgba(255,255,255,0.08);
+    color: #b8e7c7;
+    font: inherit;
+    cursor: pointer;
+    flex-shrink: 0;
+    white-space: nowrap;
+  }
+
+  .update-later:hover {
     background: rgba(255,255,255,0.14);
     color: #fff;
   }
+
+  .update-progress {
+    width: 90px;
+    height: 6px;
+    flex-shrink: 0;
+    accent-color: #4ade80;
+  }
+
 
   .tts-notice-banner {
     display: flex;
