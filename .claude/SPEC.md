@@ -289,7 +289,7 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
 - **P4 TTS**: 3バックエンド + ルーティング
 - **P5 モデレーション + 設定UI仕上げ**
 - **P5+ 拡張UI(実装済み, §8.1)**: 弾幕オーバーレイ(デスクトップ窓 + danmaku テンプレ)、コメント投稿(Twitch/YouTube)、参加型/抽選、投げ銭パネル、ダッシュボード、タイマー/ゴール/エフェクト、マルチカラム、設定ポータビリティ、テンプレ編集UI、最前面ピン、追加OBSテンプレ8種
-- **P5++ X対応(実装済み, §4.3)**: X (Twitter) ライブ配信のチャット受信(ゲストトークン + chatnow WebSocket、読み取り専用・投稿非対応)
+- **P5++ X対応(実装済み, §4.3)**: X (Twitter) ライブ配信のチャット受信(`api.x.com/live-chat` の NDJSON ストリーム、認証不要・読み取り専用・投稿非対応)
 - **P5+++ niconico対応(実装済み, §4.4)**: ニコニコ生放送のコメント受信(watch WS + NDGR Protobuf、読み取り専用・投稿非対応)
 - **X 自動告知(実装済み, §13)**: Intent モード(配信開始で X の投稿画面を開く。印・バナー・テンプレート・台帳)と API モード(OAuth 2.0 PKCE で接続し `POST /2/tweets` で完全自動。接続 UI・テスト投稿)
 - **P6(後)**: OAuth実モデレーション(実BAN/削除)、さらなる追加Source、テンプレ編集のライブプレビュー強化
@@ -298,7 +298,7 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
 
 - WSLでは Tauri ビルド不可(Linuxバイナリになる)。ビルドはWindows側。
 - YouTube InnerTube は非公式 → 仕様変更リスク。寛容パース+overrides+ログで吸収。
-- X chatapi も非公式(Periscope 由来) → 同リスク。寛容パース+`xOverrides` で吸収。
+- X `live-chat` ストリームも非公式 → 同リスク。寛容パース+`xOverrides` で吸収。
 - 実モデレーションはOAuth必須(P6)。
 - YouTube 公式 streamList 経由で受けたコメントの配信側削除はアプリに反映されない(公開 `stream_list.proto` に削除イベントの定義が無い。BAN / タイムアウトは反映される)。
 - X 自動告知(Intent)は投稿の成否が分からない(状態は `opened` まで)。同一文面の繰り返しは X の規約に触れうる。Twitch の配信検知は Helix 認証(Client ID)が前提。YouTube は videoId 直接指定の行だと対象外。

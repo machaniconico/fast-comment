@@ -3,6 +3,7 @@
 # - NSIS (.exe) と MSI を作り、updater 用の署名 (.sig) と latest.json を Release に上げる。
 # - Release は draft で作る。公開はユーザーが確認してから手動 (GitHub 画面 or `gh release edit vX.Y.Z --draft=false`)。
 #   draft のうちは releases/latest/download/latest.json に出ないので、既存ユーザーへ更新は配られない。
+# - draft 由来の latest.json は url が公開後に使えない形になるので、最後のステップで browser URL に書き換えて上げ直す。
 # - 署名鍵は GitHub Secrets (TAURI_SIGNING_PRIVATE_KEY / TAURI_SIGNING_PRIVATE_KEY_PASSWORD) からのみ渡す。
 name: Release
 on:
@@ -109,3 +110,34 @@ jobs:
               exit 1
             fi
           done
+
+      # draft 中に tauri-action が作る latest.json の url は API のアセット URL になり、
+      # 公開後のクライアントからは落とせない。公開後に有効になる browser URL
+      # (releases/download/vX.Y.Z/<file>) へ書き換えて上げ直す。.sig は中身の署名なので影響しない。
+      - name: Rewrite latest.json URLs to public download URLs
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          work="$RUNNER_TEMP/latest-json"
+          mkdir -p "$work"
+          gh release download "v${APP_VERSION}" --pattern latest.json --dir "$work" --clobber
+          node - "$work/latest.json" <<'EOF'
+          const fs = require('fs');
+          const file = process.argv[2];
+          const { APP_VERSION: v, REPO: repo } = process.env;
+          const base = `https://github.com/${repo}/releases/download/v${v}`;
+          const nsis = `fast-comment_${v}_x64-setup.exe`;
+          const msi = `fast-comment_${v}_x64_en-US.msi`;
+          const json = JSON.parse(fs.readFileSync(file, 'utf8'));
+          const platforms = json.platforms || {};
+          if (!Object.keys(platforms).length) { console.log('::error::latest.json has no platforms'); process.exit(1); }
+          for (const [key, entry] of Object.entries(platforms)) {
+            entry.url = `${base}/${key.endsWith('-msi') ? msi : nsis}`;
+            if (!entry.signature) { console.log(`::error::latest.json platform ${key} has no signature`); process.exit(1); }
+          }
+          fs.writeFileSync(file, JSON.stringify(json, null, 2) + '\n');
+          console.log(JSON.stringify(Object.fromEntries(Object.entries(platforms).map(([k, e]) => [k, e.url])), null, 2));
+          EOF
+          gh release upload "v${APP_VERSION}" "$work/latest.json" --clobber
