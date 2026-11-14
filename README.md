@@ -74,6 +74,20 @@ build-windows.bat
 
 `src-tauri/tauri.conf.json`・`src-tauri/Cargo.toml`・`package.json` の `version` を揃え、`.github/release-notes/vX.Y.Z.md` を用意してから `vX.Y.Z` の tag を push します。`.github/workflows/release.yml` が Windows ランナーで NSIS と MSI を作り、updater 用の署名と `latest.json` を付けて **draft** の Release を作ります。中身を確かめてから公開してください(`gh release edit vX.Y.Z --draft=false`)。公開するまで既存ユーザーへの自動更新は始まりません。tag とアプリのバージョンが違う時はワークフローが失敗します。
 
+## 実機スモーク確認
+
+Windows でリリースビルド(`build-windows.bat`)を作ったあと、ログインや課金なしで主要経路を自動確認できます。
+
+```bat
+:: OBS(health/templates/ws/stats)と CDP 経由のコメント注入・モデレーションを確認
+pnpm smoke
+
+:: 既に CDP 付きで起動しているアプリへ接続(更新確認はスキップ)
+pnpm smoke --attach --skip-updater
+```
+
+`--download-installer` を付けると更新用インストーラーの minisign 署名まで検証します。ポートは `--obs-port` / `--cdp-port` で変更できます。
+
 ## 更新
 
 v0.2.0 以降はアプリ内で更新できます。起動時に新しい版を静かに確認し(オフラインや失敗時は何も表示しません)、見つかると画面上部に通知が出ます。「更新して再起動」でダウンロードとインストールを行い、アプリが再起動します。「後で」で通知を閉じられ、設定画面の「アプリの更新」からいつでも確認できます。更新中は接続中の配信が一度切れます。
