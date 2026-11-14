@@ -1,11 +1,179 @@
 <script lang="ts">
-  import { onDestroy } from 'svelte';
-  import { previewXPost } from '../ipc';
-  import type { XPostConfig, XPostErrorInfo, XPostPreview } from '../ipc';
+  import { onDestroy, onMount, tick } from 'svelte';
+  import {
+    cancelXPostLogin,
+    connectXPost,
+    disconnectXPost,
+    getXPostStatus,
+    openUrl,
+    previewXPost,
+    sendXTestPost,
+  } from '../ipc';
+  import type { XPostConfig, XPostErrorInfo, XPostPreview, XPostStatus } from '../ipc';
+  import { canSelectApiMode, errorText, parseCallbackPort, testPostPreview } from '../xAutopost';
 
-  // X 自動告知(Intent モード)の設定欄。値は親の config.xPost を直接編集し、保存は設定画面の保存ボタンで行う。
+  // X 自動告知の設定欄。値は親の config.xPost を直接編集し、保存は設定画面の保存ボタンで行う。
   // 文字数・警告は Rust の preview_x_post の結果をそのまま表示する(UI では数えない)。
-  let { xPost }: { xPost: XPostConfig } = $props();
+  // API モードの接続(Client ID・ポート)だけは connect_x_post がその場で保存する(YouTube OAuth と同じ流儀)。
+  let {
+    xPost,
+    clientId = '',
+    onClientIdSaved,
+  }: {
+    xPost: XPostConfig;
+    clientId?: string;
+    onClientIdSaved?: (clientId: string) => void;
+  } = $props();
+
+  // ── API モードの接続 ──
+  // svelte-ignore state_referenced_locally
+  let clientIdInput = $state(clientId);
+  // svelte-ignore state_referenced_locally
+  let portInput = $state(String(xPost.callbackPort));
+  let status = $state<XPostStatus | null>(null);
+  let connecting = $state(false);
+  let disconnecting = $state(false);
+  let authMsg = $state('');
+  let authOk = $state<boolean | null>(null);
+  let copied = $state(false);
+  let testConfirm = $state<string | null>(null);
+  let testBusy = $state(false);
+  let testMsg = $state('');
+  let testOk = $state<boolean | null>(null);
+  let testTweetUrl = $state<string | null>(null);
+  let confirmCancelEl: HTMLButtonElement | null = $state(null);
+  let testButtonEl: HTMLButtonElement | null = $state(null);
+
+  const port = $derived(parseCallbackPort(portInput));
+  const displayCallbackUrl = $derived(port !== null ? `http://127.0.0.1:${port}/callback` : '');
+  const connected = $derived(canSelectApiMode(status));
+
+  async function refreshStatus() {
+    try {
+      status = await getXPostStatus();
+    } catch (e) {
+      status = null;
+      authMsg = errorText(e);
+      authOk = false;
+    }
+  }
+
+  onMount(() => {
+    void refreshStatus();
+  });
+
+  async function connect() {
+    if (connecting) return;
+    const id = clientIdInput.trim();
+    if (!id) {
+      authMsg = 'Client ID を入力してください';
+      authOk = false;
+      return;
+    }
+    if (port === null) {
+      authMsg = 'ポートは 1024〜65535 の整数にしてください';
+      authOk = false;
+      return;
+    }
+    connecting = true;
+    authMsg = 'ブラウザで X にログインし、アプリを許可してください…';
+    authOk = null;
+    try {
+      // Client ID とポートは Rust 側で保存済み。親の未保存フォームにも反映して、設定保存で戻らないようにする。
+      onClientIdSaved?.(id);
+      xPost.callbackPort = port;
+      status = await connectXPost(id, port);
+      authMsg = status?.username ? `@${status.username} として接続しました` : 'X に接続しました';
+      authOk = true;
+    } catch (e) {
+      authMsg = errorText(e);
+      authOk = false;
+      await refreshStatus();
+    } finally {
+      connecting = false;
+    }
+  }
+
+  async function cancelLogin() {
+    try {
+      await cancelXPostLogin();
+    } catch (e) {
+      authMsg = errorText(e);
+      authOk = false;
+    }
+  }
+
+  async function disconnect() {
+    if (disconnecting) return;
+    disconnecting = true;
+    try {
+      status = await disconnectXPost();
+      authMsg = 'X との接続を切りました(この PC の認証を消しました。X 側の許可は X の設定から外せます)';
+      authOk = true;
+    } catch (e) {
+      authMsg = errorText(e);
+      authOk = false;
+      await refreshStatus();
+    } finally {
+      // Rust 側は切断の成否によらず API モードを Intent モードへ戻している。手元の未保存フォームも合わせる。
+      if (xPost.mode === 'api') xPost.mode = 'intent';
+      disconnecting = false;
+    }
+  }
+
+  async function copyCallbackUrl() {
+    if (!displayCallbackUrl) return;
+    try {
+      await navigator.clipboard.writeText(displayCallbackUrl);
+      copied = true;
+      setTimeout(() => (copied = false), 1500);
+    } catch {
+      copied = false;
+    }
+  }
+
+  async function askTestPost() {
+    testConfirm = testPostPreview(new Date());
+    await tick();
+    confirmCancelEl?.focus();
+  }
+
+  function closeConfirm() {
+    testConfirm = null;
+    void tick().then(() => testButtonEl?.focus());
+  }
+
+  async function confirmTestPost() {
+    testConfirm = null;
+    if (testBusy) return;
+    testBusy = true;
+    testMsg = '投稿しています…';
+    testOk = null;
+    testTweetUrl = null;
+    try {
+      const result = await sendXTestPost();
+      testMsg = result ? `投稿しました: ${result.text}` : '投稿しました';
+      testOk = true;
+      testTweetUrl = result?.tweetId ? `https://x.com/i/status/${encodeURIComponent(result.tweetId)}` : null;
+    } catch (e) {
+      testMsg = errorText(e);
+      testOk = false;
+    } finally {
+      // 成功時も読み直す(投稿前の refresh で保存に失敗した警告 unsavedToken を出すため)。
+      await refreshStatus();
+      testBusy = false;
+      void tick().then(() => testButtonEl?.focus());
+    }
+  }
+
+  function onConfirmKeydown(e: KeyboardEvent) {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      e.stopPropagation();
+      closeConfirm();
+    }
+  }
+
 
   const VARIABLES = ['{title}', '{url}', '{platform}', '{date}', '{time}'];
   const X_LIMIT = 280;
@@ -68,9 +236,27 @@
 </script>
 
 <p class="hint">
-  配信開始を検知すると、タイトル・URL・日時を入れた X の投稿画面をブラウザで開きます。投稿ボタンは自分で押します(無料。ログインや開発者登録は不要)。
+  {#if xPost.mode === 'api'}
+    配信開始を検知すると、猶予のあと X API で自動的に投稿します(従量課金。下の「X API で自動投稿」で接続が必要)。
+  {:else}
+    配信開始を検知すると、タイトル・URL・日時を入れた X の投稿画面をブラウザで開きます。投稿ボタンは自分で押します(無料。ログインや開発者登録は不要)。
+  {/if}
   チャンネル一覧の各チャンネルの「告知」を押して印を付けた配信だけが対象です。
 </p>
+
+<div class="field-row">
+  <label for="xpost-mode">投稿の方法</label>
+  <select id="xpost-mode" bind:value={xPost.mode} class="platform-select">
+    <option value="intent">投稿画面を開く(無料・自分で投稿)</option>
+    <option value="api" disabled={!connected && xPost.mode !== 'api'}>X API で自動投稿(有料・要接続)</option>
+  </select>
+  {#if !connected}
+    <span class="hint-inline">API で自動投稿するには、先に下で X に接続してください</span>
+  {/if}
+</div>
+{#if xPost.mode === 'api' && status && !connected}
+  <p class="xpost-warn">⚠ X に接続されていないため、API モードでは告知されません。接続し直すか「投稿画面を開く」に戻してください。</p>
+{/if}
 
 <div class="field-row">
   <label for="xpost-enabled">配信開始を X に告知</label>
@@ -78,6 +264,7 @@
   <span class="hint-inline">既定はオフ。設定を変えても、すでに始まっている配信にはさかのぼって告知しません</span>
 </div>
 
+{#if xPost.mode !== 'api'}
 <div class="field-row">
   <label for="xpost-open">投稿画面の開き方</label>
   <select id="xpost-open" bind:value={xPost.intentOpen} class="platform-select">
@@ -85,6 +272,7 @@
     <option value="auto">猶予のあと自動で開く</option>
   </select>
 </div>
+{/if}
 
 <div class="field-row">
   <label for="xpost-combine">同時配信を 1 件にまとめる</label>
@@ -154,7 +342,189 @@
   <span class="hint-inline">件(1〜20)</span>
 </div>
 
+<fieldset class="xpost-api">
+  <legend>X API で自動投稿(任意)</legend>
+  <details class="xpost-steps">
+    <summary>準備手順</summary>
+    <ol>
+      <li>X Developer Console(console.x.com)でアプリを作る。アプリの種類は Native App(公開クライアント)</li>
+      <li>User authentication settings の Callback URI に、下のコールバック URL をそのまま登録する(ポートも含めて完全一致)</li>
+      <li>権限は Read and write。クレジットを購入する(無料枠はありません)</li>
+      <li>表示された OAuth 2.0 Client ID を下に貼り、「X に接続」を押す</li>
+    </ol>
+  </details>
+
+  <div class="field-row">
+    <label for="xpost-client-id">Client ID</label>
+    <input id="xpost-client-id" type="text" bind:value={clientIdInput} class="text-input" autocomplete="off" spellcheck="false" />
+  </div>
+  <div class="field-row">
+    <label for="xpost-port">コールバックポート</label>
+    <input id="xpost-port" type="text" inputmode="numeric" bind:value={portInput} class="num-input" />
+    <span class="hint-inline">既定 47821。変えたら X の登録も直す</span>
+  </div>
+  <div class="field-row">
+    <span class="label-like">コールバック URL</span>
+    {#if displayCallbackUrl}
+      <code class="xpost-url">{displayCallbackUrl}</code>
+      <button type="button" class="btn-small" onclick={copyCallbackUrl}>{copied ? 'コピーしました' : 'コピー'}</button>
+    {:else}
+      <span class="xpost-error">ポートは 1024〜65535 の整数にしてください</span>
+    {/if}
+  </div>
+
+  <div class="field-row">
+    <span class="label-like">接続</span>
+    {#if connected}
+      <span class="xpost-connected">@{status?.username ?? '?'} として接続中</span>
+    {:else}
+      <span class="hint-inline">未接続</span>
+    {/if}
+  </div>
+  {#if status?.unsavedToken}
+    <p class="xpost-warn">⚠ 認証の保存に失敗しました。アプリを終了するまでに保存できないと、再ログインが必要になります。</p>
+  {/if}
+  <div class="field-row">
+    {#if connecting}
+      <button type="button" class="btn-small" onclick={cancelLogin}>ログインを取り消す</button>
+    {:else}
+      <button type="button" class="btn-small primary" onclick={connect} disabled={disconnecting}>
+        {connected ? '別のアカウントで接続し直す' : 'X に接続'}
+      </button>
+    {/if}
+    {#if connected}
+      <button type="button" class="btn-small" onclick={disconnect} disabled={connecting || disconnecting}>切断</button>
+    {/if}
+  </div>
+  {#if authMsg}
+    <p class="xpost-msg" class:ok={authOk === true} class:ng={authOk === false} aria-live="polite">{authMsg}</p>
+  {/if}
+
+  <div class="field-row">
+    <button
+      type="button"
+      class="btn-small"
+      bind:this={testButtonEl}
+      onclick={askTestPost}
+      disabled={!connected || testBusy || connecting}
+    >テスト投稿</button>
+    <span class="hint-inline">「fast-comment 連携テスト 日付 時刻」を実際に投稿します(URL なし)。告知の記録・上限には数えません</span>
+  </div>
+  {#if testMsg}
+    <p class="xpost-msg" class:ok={testOk === true} class:ng={testOk === false} aria-live="polite">
+      {testMsg}
+      {#if testTweetUrl}<button type="button" class="xpost-link" onclick={() => void openUrl(testTweetUrl ?? '')}>ポストを開く</button>{/if}
+    </p>
+  {/if}
+
+  <ul class="xpost-notes">
+    <li>費用の目安(2026-11 時点): 投稿 1 件 $0.015、URL 入りは 1 件 $0.20。告知は URL 入りなので 1 件 $0.20 です。正しい金額は Developer Console で確認してください</li>
+    <li>毎回同じ文面は X の規約に触れ、同一文面は X に拒否されます。タイトルか日時を文面に入れてください</li>
+    <li>X の許可はアプリ×ユーザーで 1 つです。同じ Client ID で別の PC やツールからログインすると、先の接続は切れます</li>
+    <li>しばらく(約 6 か月)使わないと認証が切れます。その時は接続し直してください</li>
+  </ul>
+</fieldset>
+
+{#if testConfirm !== null}
+  <div class="xpost-backdrop" role="presentation">
+    <div
+      class="xpost-dialog"
+      role="alertdialog"
+      aria-modal="true"
+      aria-labelledby="xpost-test-title"
+      aria-describedby="xpost-test-desc"
+      tabindex="-1"
+      onkeydown={onConfirmKeydown}
+    >
+      <h4 id="xpost-test-title">テスト投稿しますか?</h4>
+      <div id="xpost-test-desc">
+        <p>@{status?.username ?? '?'} で次の文面を投稿します。</p>
+        <pre class="xpost-preview-text">{testConfirm}</pre>
+        <p class="xpost-warn">実際に X で公開され、X API の利用料(1 件 $0.015 の目安)が課金されます。</p>
+      </div>
+      <div class="xpost-dialog-actions">
+        <button type="button" class="btn-small" bind:this={confirmCancelEl} onclick={closeConfirm}>やめる</button>
+        <button type="button" class="btn-small primary" onclick={confirmTestPost}>投稿する</button>
+      </div>
+    </div>
+  </div>
+{/if}
+
 <style>
+  .xpost-api {
+    margin-top: 14px;
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 6px;
+    padding: 8px 12px 12px;
+  }
+  .xpost-api legend { font-size: 13px; color: #ccc; padding: 0 4px; }
+  .xpost-steps { font-size: 12px; color: #bdbdbd; margin-top: 4px; }
+  .xpost-steps ol { margin: 6px 0 0 18px; padding: 0; }
+  .xpost-steps li { margin: 2px 0; }
+  .label-like { font-size: 13px; color: #ccc; min-width: 90px; }
+  .text-input {
+    flex: 1 1 260px;
+    min-width: 0;
+    background: rgba(255,255,255,0.07);
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 4px;
+    color: #e0e0e0;
+    padding: 5px 8px;
+    font-size: 13px;
+    font-family: monospace;
+  }
+  .xpost-url { font-size: 12px; color: #e0e0e0; word-break: break-all; }
+  .xpost-connected { font-size: 13px; color: #81c784; font-weight: 600; }
+  .btn-small {
+    border: 1px solid rgba(255,255,255,0.18);
+    background: rgba(255,255,255,0.08);
+    color: #e0e0e0;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 12px;
+    padding: 4px 10px;
+  }
+  .btn-small:hover:not(:disabled) { background: rgba(255,255,255,0.14); }
+  .btn-small:disabled { opacity: 0.5; cursor: not-allowed; }
+  .btn-small.primary { background: #1976d2; border-color: #1976d2; color: #fff; }
+  .btn-small.primary:hover:not(:disabled) { background: #1e88e5; }
+  .xpost-msg { font-size: 12px; margin: 4px 0 0; color: #bdbdbd; }
+  .xpost-msg.ok { color: #81c784; }
+  .xpost-msg.ng { color: #f44336; }
+  .xpost-link {
+    background: none;
+    border: none;
+    color: #64b5f6;
+    cursor: pointer;
+    font-size: 12px;
+    text-decoration: underline;
+    padding: 0 0 0 6px;
+  }
+  .xpost-notes { font-size: 11px; color: #9e9e9e; margin: 8px 0 0 16px; padding: 0; }
+  .xpost-notes li { margin: 2px 0; }
+  .xpost-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.55);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+    padding: 16px;
+  }
+  .xpost-dialog {
+    background: #1e1e1e;
+    border: 1px solid rgba(255,255,255,0.15);
+    border-radius: 8px;
+    padding: 16px;
+    max-width: 440px;
+    width: 100%;
+    color: #e0e0e0;
+    font-size: 13px;
+  }
+  .xpost-dialog h4 { margin: 0 0 8px; font-size: 15px; }
+  .xpost-dialog p { margin: 6px 0; }
+  .xpost-dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
   .field-row {
     display: flex;
     align-items: center;

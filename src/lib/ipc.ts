@@ -1042,6 +1042,48 @@ export async function previewXPost(template: string): Promise<XPostPreview | nul
   return invoke<XPostPreview>('preview_x_post', { template });
 }
 
+// ── X 自動告知(API モード) ────────────────────────────────────────────
+
+/** Rust `XPostStatus`。API モードの接続状態。 */
+export interface XPostStatus {
+  configured: boolean;
+  connected: boolean;
+  username?: string | null;
+  /** X Developer Console に登録するコールバック URL(`http://127.0.0.1:{port}/callback`)。 */
+  callbackUrl: string;
+  /** refresh 後の認証を保存できていない(アプリ終了までに保存できないと再ログインが必要)。 */
+  unsavedToken: boolean;
+}
+
+/** `send_x_test_post` の結果。 */
+export interface XTestPostResult {
+  text: string;
+  tweetId?: string | null;
+}
+
+export async function getXPostStatus(): Promise<XPostStatus | null> {
+  return invoke<XPostStatus>('get_x_post_status');
+}
+
+/** Client ID とポートだけを保存し、ブラウザで X にログインする。失敗は `XPostErrorInfo` で reject。 */
+export async function connectXPost(clientId: string, callbackPort: number): Promise<XPostStatus | null> {
+  return invoke<XPostStatus>('connect_x_post', { clientId, callbackPort });
+}
+
+export async function cancelXPostLogin(): Promise<void> {
+  await invoke<void>('cancel_x_post_login');
+}
+
+/** X の許可を取り消し、この PC の保存を消す。API モードだった時は Intent モードへ戻る。 */
+export async function disconnectXPost(): Promise<XPostStatus | null> {
+  return invoke<XPostStatus>('disconnect_x_post');
+}
+
+/** テスト投稿(実際に公開され、課金される)。呼ぶ前に必ず確認を取る。 */
+export async function sendXTestPost(): Promise<XTestPostResult | null> {
+  return invoke<XTestPostResult>('send_x_test_post');
+}
+
 /** 行の「自分の配信」印だけを保存する(Source は再起動しない)。key は `${platform}:${identifier}`。 */
 export async function setChannelOwnStream(key: string, own: boolean): Promise<void> {
   await invoke<void>('set_channel_own_stream', { key, own });

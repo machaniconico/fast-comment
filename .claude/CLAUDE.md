@@ -10,6 +10,7 @@
 - **X チャット本文は `api.x.com/live-chat` の NDJSON ストリームで取る**（認証不要、`x.rs`）。旧 Periscope chatapi（chatnow WS / history）には本文が一切流れない（2026-08 実測、X が新基盤へ移行済み）。行に username は無くゲスト解決も不可 → 既定は「ユーザー下4桁」表示、`credentials.xAuthToken`+`xCsrfToken`（ログイン cookie）設定時のみ GraphQL で実名解決。broadcaster 判定は `twitter_user_id`（`user_id` は Periscope ID で別物）。詳細は memory `x-chatapi-protocol-verified`。
 - **Twitch の PING には必ず PONG を返す**（返さないと切断される）。
 - **IPC は1フレーム単位でバッチ送出**。1コメント1emitにしない（往復過多）。
+- **X への投稿は `autopost/` の公式 API だけ**。`xAuthToken` cookie を投稿に使わない。投稿は台帳へ `posting` を先に書いてから 1 回だけ(自動再送を足さない。5xx・タイムアウトは `uncertain`)。refresh token は single-use なので、使う前に新しい方を保存する。
 - 実モデレーション(BAN/削除)は OAuth 必須で **P6**。MVP はローカル非表示/NGのみ。
 
 詳細仕様は `.claude/SPEC.md`。これが単一情報源。

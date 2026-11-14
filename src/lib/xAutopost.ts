@@ -70,3 +70,31 @@ export function ownStreamBlockedReason(ch: { platform: string; identifier: strin
   }
   return null;
 }
+
+/** コールバックポートの入力を検査する。1024〜65535 の整数だけを通す(それ以外は null)。 */
+export function parseCallbackPort(input: unknown): number | null {
+  const text = typeof input === 'number' ? String(input) : typeof input === 'string' ? input.trim() : '';
+  if (!/^\d+$/.test(text)) return null;
+  const port = Number(text);
+  return port >= 1024 && port <= 65535 ? port : null;
+}
+
+/** API モードを選べるか(接続済みの時だけ)。Rust の `update_config` も同じ条件で拒否する。 */
+export function canSelectApiMode(status: { connected?: boolean } | null | undefined): boolean {
+  return status?.connected === true;
+}
+
+/** invoke の reject 値(Rust `XPostError` か文字列か Error)を表示用の文に直す。 */
+export function errorText(e: unknown): string {
+  if (e && typeof e === 'object' && 'message' in e) {
+    const message = (e as { message?: unknown }).message;
+    if (typeof message === 'string' && message) return message;
+  }
+  return typeof e === 'string' ? e : String(e);
+}
+
+/** テスト投稿の確認ダイアログに出す文面(実際の文面は Rust が送信時刻で作る)。 */
+export function testPostPreview(now: Date): string {
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `fast-comment 連携テスト ${now.getFullYear()}/${pad(now.getMonth() + 1)}/${pad(now.getDate())} ${pad(now.getHours())}:${pad(now.getMinutes())}`;
+}

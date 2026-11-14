@@ -1955,7 +1955,13 @@
   <section id="settings-x-post">
     <h3>X への配信開始告知</h3>
     {#if config.xPost}
-      <XPostSettings xPost={config.xPost} />
+      <XPostSettings
+        xPost={config.xPost}
+        clientId={config.credentials?.xPostClientId ?? ''}
+        onClientIdSaved={(id) => {
+          if (config) config.credentials = { ...(config.credentials ?? {}), xPostClientId: id };
+        }}
+      />
     {/if}
   </section>
 

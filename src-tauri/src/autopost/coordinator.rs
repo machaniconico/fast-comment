@@ -247,9 +247,20 @@ impl Coordinator {
             Input::PostFinished(result) => {
                 if let Some(attempt) = self.in_flight.take() {
                     let (state, reason, tweet_id) = match result {
-                        Ok(posted) => (LedgerState::Posted, None, Some(posted.id)),
+                        // 2xx でも ID が取れない応答は posted(ID 不明)として扱う(§8.1)。
+                        Ok(posted) => (
+                            LedgerState::Posted,
+                            None,
+                            Some(posted.id).filter(|id| !id.is_empty()),
+                        ),
                         Err(error) => {
-                            self.retry = Some(Retry::Send(attempt.clone()));
+                            // X が同一文面で拒否した時の再試行は、そのまま再送せず描画し直す。
+                            // 失敗の記録に文面が残るので、§7.2 の末尾 {time} 追加が効く。
+                            self.retry = Some(if error.code == XPostErrorCode::Duplicate {
+                                Retry::Render(attempt.streams.clone())
+                            } else {
+                                Retry::Send(attempt.clone())
+                            });
                             let state = if error.code == XPostErrorCode::Uncertain {
                                 LedgerState::Uncertain
                             } else {
@@ -385,6 +396,7 @@ impl Coordinator {
         // Count announcements, not ledger rows: a combined post has one row per
         // stream, sharing timestamp/text/tweet ID. Posting reserves capacity
         // while an API request is in flight, preventing queued overshoot.
+        // Uncertain may already be public, so it counts too (at-most-once, §1).
         let attempts: Vec<_> = self
             .ledger
             .entries()
@@ -392,7 +404,10 @@ impl Coordinator {
             .filter(|e| {
                 matches!(
                     e.state,
-                    LedgerState::Posted | LedgerState::Opened | LedgerState::Posting
+                    LedgerState::Posted
+                        | LedgerState::Opened
+                        | LedgerState::Posting
+                        | LedgerState::Uncertain
                 )
             })
             .collect();
@@ -1180,6 +1195,74 @@ mod tests {
         );
         assert_eq!(c.ledger().entries()[0].state, LedgerState::Posted);
         assert_eq!(c.ledger().entries()[0].tweet_id.as_deref(), Some("tweet"));
+    }
+
+    /// 送信後に結果不明(Uncertain)になった告知も cooldown に数える。
+    /// 新しい配信 ID で再開しても、二重の告知は自動では出ない。
+    #[test]
+    fn uncertain_post_counts_toward_cooldown() {
+        let mut config = settings("api");
+        config.x_post.delay_secs = 0;
+        let mut c = Coordinator::new(Ledger::default(), config);
+        started(&mut c, stream(Platform::Twitch, "1"), NOW);
+        c.handle(
+            Input::PostFinished(Err(XPostError::new(XPostErrorCode::Uncertain))),
+            NOW + 1,
+        );
+        assert_eq!(c.ledger().entries()[0].state, LedgerState::Uncertain);
+        let actions = started(&mut c, stream(Platform::Twitch, "2"), NOW + 300_000);
+        assert_eq!(external(&actions), 0);
+        assert_eq!(external(&c.handle(Input::Tick, NOW + 400_000)), 0);
+        assert_eq!(
+            c.ledger().get("twitch:2").unwrap().reason.as_deref(),
+            Some("cooldown")
+        );
+    }
+
+    #[test]
+    fn x_duplicate_rejection_retries_with_rerendered_suffix_text() {
+        let mut config = settings("api");
+        config.x_post.delay_secs = 0;
+        let mut c = Coordinator::new(Ledger::default(), config);
+        let actions = started(&mut c, stream(Platform::Youtube, "1"), NOW);
+        let first = actions
+            .iter()
+            .find_map(|a| match a {
+                Action::Post { text } => Some(text.clone()),
+                _ => None,
+            })
+            .expect("post");
+        c.handle(
+            Input::PostFinished(Err(XPostError::new(XPostErrorCode::Duplicate))),
+            NOW + 1,
+        );
+        assert_eq!(c.ledger().entries()[0].state, LedgerState::Failed);
+        assert_eq!(c.ledger().entries()[0].reason.as_deref(), Some("Duplicate"));
+        assert!(c.status().can_retry);
+        let actions = c.handle(Input::UserRetry, NOW + 2);
+        assert_order(&actions);
+        let second = actions
+            .iter()
+            .find_map(|a| match a {
+                Action::Post { text } => Some(text.clone()),
+                _ => None,
+            })
+            .expect("retry posts once");
+        assert_ne!(first, second);
+        assert!(second.starts_with(&first));
+    }
+
+    #[test]
+    fn posted_without_id_is_recorded_without_tweet_id() {
+        let mut config = settings("api");
+        config.x_post.delay_secs = 0;
+        let mut c = Coordinator::new(Ledger::default(), config);
+        started(&mut c, stream(Platform::Youtube, "1"), NOW);
+        c.handle(Input::PostFinished(Ok(PostedTweet { id: String::new() })), NOW + 1);
+        assert_eq!(c.ledger().entries()[0].state, LedgerState::Posted);
+        assert_eq!(c.ledger().entries()[0].tweet_id, None);
+        assert_eq!(c.status().state, "posted");
+        assert_eq!(c.status().tweet_id, None);
     }
 
     #[test]

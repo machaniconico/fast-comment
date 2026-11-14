@@ -10,7 +10,9 @@
   } from '../ipc';
   import type { XAutopostStatus } from '../ipc';
 
-  // X 自動告知(Intent モード)の状態バナー。状態は Rust 側が決め、ここは表示と操作の送信だけ行う。
+  // X 自動告知の状態バナー。状態は Rust 側が決め、ここは表示と操作の送信だけ行う。
+  // mode は待機中の文言(投稿画面を開く / 投稿する)を分けるためだけに使う。
+  let { mode = 'intent' }: { mode?: string } = $props();
   let status = $state<XAutopostStatus | null>(null);
   // 一時表示の状態を自動で隠すための印(status の参照ごとに 1 回)。
   let hidden = $state(false);
@@ -51,9 +53,12 @@
     ReloginRequired: 'X への再ログインが必要です',
     NotLoggedIn: 'X に接続されていません',
     Forbidden: 'X に拒否されました',
-    InsufficientCredits: 'X のクレジットが不足しています',
+    InsufficientCredits: 'X のクレジットが不足しています。Developer Console でクレジットを購入してください',
     RateLimited: 'X のレート制限に達しました。しばらく待ってください',
     Cancelled: '取り消されました',
+    PortInUse: 'ログイン待受のポートが使用中です',
+    LoginTimeout: 'X へのログインが時間切れになりました',
+    TokenStore: 'X の認証を保存・読み込みできませんでした',
     Other: '告知に失敗しました',
   };
 
@@ -177,7 +182,7 @@
     <span class="xpost-label">X 告知</span>
     <div class="xpost-body">
       {#if s.state === 'pending'}
-        <span class="xpost-msg">{fireSecs} 秒後に X の投稿画面を開きます</span>
+        <span class="xpost-msg">{mode === 'api' ? `${fireSecs} 秒後に X へ告知します(取消できます)` : `${fireSecs} 秒後に X の投稿画面を開きます`}</span>
       {:else if s.state === 'awaitingApproval'}
         <span class="xpost-msg">配信開始を検知しました。投稿画面を開く準備ができています{expireSecs > 0 ? `(あと ${expireSecs} 秒で失効)` : ''}</span>
       {:else if s.state === 'posting'}
