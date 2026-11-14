@@ -37,7 +37,10 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
-use crate::autopost::{AutopostStatus, UserCommand as AutopostCommand};
+use crate::autopost::{
+    AutopostStatus, KeyringTokenStore, UserCommand as AutopostCommand, XEndpoints, XPostAuth,
+    XPostError, XPostErrorCode, XPostStatus,
+};
 use crate::bus::{
     is_valid_template_name, spawn_moderation_ui_forwarder, spawn_reaction_ui_forwarder, Bus,
 };
@@ -104,6 +107,8 @@ pub struct AppState {
     autopost_user_tx: mpsc::Sender<AutopostCommand>,
     /// X 自動告知の現在状態(駆動タスクが変化時だけ更新する)。
     autopost_status: watch::Receiver<AutopostStatus>,
+    /// X 自動告知(API モード)の OAuth 状態。access token はメモリのみ、refresh token は keyring。
+    x_post_auth: Arc<XPostAuth<KeyringTokenStore>>,
     /// 参加型配信の参加者一覧。
     participants: Mutex<Vec<Participant>>,
     /// YouTube投稿用OAuth状態。バックグラウンド処理は持たず、操作時だけ通信する。
@@ -1025,6 +1030,7 @@ async fn update_config(
     mut new_config: AppConfig,
 ) -> Result<UpdateConfigOutcome, String> {
     validate_x_post_template(&new_config.x_post.template)?;
+    validate_x_post_mode(&state, &new_config).await?;
     let (
         youtube_source_config_changed,
         youtube_oauth_client_changed,
@@ -1256,6 +1262,143 @@ fn approve_x_autopost(state: State<'_, AppState>, id: u64) -> Result<(), String>
 #[tauri::command]
 fn retry_x_autopost(state: State<'_, AppState>) -> Result<(), String> {
     send_autopost_command(&state, AutopostCommand::Retry)
+}
+
+/// API モードは X に接続済みの時だけ選べる。すでに API モードの設定を保存し直すのは
+/// (認証が切れていても)止めない。告知は `notConnected` で止まり、他の設定は保存できる。
+async fn validate_x_post_mode(state: &AppState, new_config: &AppConfig) -> Result<(), String> {
+    if new_config.x_post.mode != "api" {
+        return Ok(());
+    }
+    let current_mode = state.config.lock().unwrap().x_post.mode.clone();
+    if current_mode == "api" {
+        return Ok(());
+    }
+    let client_id = autopost::post_client_id(new_config);
+    let connected = !client_id.is_empty()
+        && state
+            .x_post_auth
+            .status(&client_id, new_config.x_post.callback_port)
+            .await
+            .connected;
+    if connected {
+        Ok(())
+    } else {
+        Err("API モードは X に接続してから選んでください".into())
+    }
+}
+
+fn x_post_target(state: &AppState) -> (String, u16) {
+    let cfg = state.config.lock().unwrap();
+    (autopost::post_client_id(&cfg), cfg.x_post.callback_port)
+}
+
+/// 駆動タスクに「接続状態が変わった」ことを伝える(満杯なら次の設定変更で追いつく)。
+fn notify_x_auth_changed(state: &AppState) {
+    let _ = state.autopost_user_tx.try_send(AutopostCommand::AuthChanged);
+}
+
+/// X 自動告知(API モード)の接続状態。
+#[tauri::command]
+async fn get_x_post_status(state: State<'_, AppState>) -> Result<XPostStatus, XPostError> {
+    let (client_id, port) = x_post_target(&state);
+    Ok(state.x_post_auth.status(&client_id, port).await)
+}
+
+/// Client ID とコールバックポートだけを保存し、ブラウザで X にログインする
+/// (`connect_youtube_oauth` と同じく他の未保存設定を巻き込まない)。
+#[tauri::command]
+async fn connect_x_post(
+    state: State<'_, AppState>,
+    client_id: String,
+    callback_port: u16,
+) -> Result<XPostStatus, XPostError> {
+    let client_id = client_id.trim().to_string();
+    if client_id.is_empty() || callback_port == 0 {
+        return Err(XPostError::new(XPostErrorCode::NotLoggedIn));
+    }
+    let next_config = {
+        let mut cfg = state.config.lock().unwrap();
+        cfg.credentials.x_post_client_id = Some(client_id.clone());
+        cfg.x_post.callback_port = callback_port;
+        cfg.save(&state.config_dir)
+            .map_err(|_| XPostError::new(XPostErrorCode::Other))?;
+        cfg.clone()
+    };
+    let _ = state.config_tx.send(next_config);
+    let result = state
+        .x_post_auth
+        .connect(&client_id, callback_port, open_url)
+        .await;
+    notify_x_auth_changed(&state);
+    result
+}
+
+/// 進行中の X ログインを取り消す(待受ポートを即座に解放する)。
+#[tauri::command]
+fn cancel_x_post_login(state: State<'_, AppState>) {
+    state.x_post_auth.cancel_login();
+}
+
+/// この PC の X 認証を消す(X 側の許可は取り消さない)。API モードなら Intent モードへ戻す。
+#[tauri::command]
+async fn disconnect_x_post(state: State<'_, AppState>) -> Result<XPostStatus, XPostError> {
+    let result = state.x_post_auth.disconnect().await;
+    let next_config = {
+        let mut cfg = state.config.lock().unwrap();
+        if cfg.x_post.mode == "api" {
+            cfg.x_post.mode = "intent".into();
+            if let Err(e) = cfg.save(&state.config_dir) {
+                tracing::warn!("X 切断後の設定保存に失敗: {e}");
+            }
+            Some(cfg.clone())
+        } else {
+            None
+        }
+    };
+    if let Some(next_config) = next_config {
+        let _ = state.config_tx.send(next_config);
+    }
+    notify_x_auth_changed(&state);
+    result?;
+    let (client_id, port) = x_post_target(&state);
+    Ok(state.x_post_auth.status(&client_id, port).await)
+}
+
+/// テスト投稿の結果。`tweetId` は X が ID を返さなかった時だけ空。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct XTestPostResult {
+    text: String,
+    tweet_id: Option<String>,
+}
+
+fn x_test_post_text(now: chrono::DateTime<chrono::Local>) -> String {
+    format!("fast-comment 連携テスト {}", now.format("%Y/%m/%d %H:%M"))
+}
+
+/// テスト投稿(§8.2)。UI が確認ダイアログを出してから呼ぶ。台帳・クールダウン・1 日上限には数えない。
+#[tauri::command]
+async fn send_x_test_post(state: State<'_, AppState>) -> Result<XTestPostResult, XPostError> {
+    let (client_id, _) = x_post_target(&state);
+    if client_id.is_empty() {
+        return Err(XPostError::new(XPostErrorCode::NotLoggedIn));
+    }
+    let text = x_test_post_text(chrono::Local::now());
+    let result = autopost::post_text(&state.x_post_auth, &client_id, &text).await;
+    if let Err(e) = &result {
+        if matches!(
+            e.code,
+            XPostErrorCode::ReloginRequired | XPostErrorCode::NotLoggedIn
+        ) {
+            notify_x_auth_changed(&state);
+        }
+    }
+    let posted = result?;
+    Ok(XTestPostResult {
+        text,
+        tweet_id: Some(posted.id).filter(|id| !id.is_empty()),
+    })
 }
 
 /// 保存前のテンプレート検査(§7.1: `{url}` の無いテンプレートは保存時に拒否)。
@@ -2147,6 +2290,13 @@ pub fn run() {
                 watch::channel::<AutopostStatus>(idle_autopost_status());
             let autopost_config_rx = config_tx.subscribe();
             let ledger_path = config_dir.join(autopost::LEDGER_FILE);
+            let x_post_auth = Arc::new(
+                XPostAuth::new(
+                    KeyringTokenStore,
+                    XEndpoints::with_overrides(&config.x_overrides.endpoints),
+                )
+                .expect("X投稿用HTTPクライアントの作成に失敗しました"),
+            );
 
             // 下流 Bus(パイプライン → UI/OBS)。
             let bus = Bus::new(obs_port, stats_tx.clone(), timer_tx.clone());
@@ -2191,6 +2341,7 @@ pub fn run() {
                 live_tx,
                 autopost_user_tx,
                 autopost_status: autopost_status.clone(),
+                x_post_auth: x_post_auth.clone(),
                 participants: Mutex::new(Vec::new()),
                 youtube_auth: YoutubeAuth::new()
                     .expect("YouTube投稿用HTTPクライアントの作成に失敗しました"),
@@ -2205,6 +2356,7 @@ pub fn run() {
                 live_rx,
                 autopost_config_rx,
                 autopost_user_rx,
+                x_post_auth,
                 ledger_path,
                 autopost_status_tx,
                 |url: &str| open_url(url.to_string()),
@@ -2342,6 +2494,11 @@ pub fn run() {
             retry_x_autopost,
             preview_x_post,
             set_channel_own_stream,
+            get_x_post_status,
+            connect_x_post,
+            cancel_x_post_login,
+            disconnect_x_post,
+            send_x_test_post,
         ])
         .build(tauri::generate_context!())
         .expect("Tauri アプリの起動に失敗しました")
@@ -2395,6 +2552,15 @@ mod followup_tests {
         assert!(validate_x_post_template("配信開始").is_err());
         assert!(validate_x_post_template("{title}\n{url}").is_ok());
         assert!(validate_x_post_template(&AppConfig::default().x_post.template).is_ok());
+    }
+
+    #[test]
+    fn x_test_post_text_has_no_url_and_includes_minute() {
+        use chrono::TimeZone;
+        let now = chrono::Local.with_ymd_and_hms(2026, 11, 14, 9, 5, 0).unwrap();
+        let text = x_test_post_text(now);
+        assert_eq!(text, "fast-comment 連携テスト 2026/11/14 09:05");
+        assert!(!text.contains("http"));
     }
 
     #[test]

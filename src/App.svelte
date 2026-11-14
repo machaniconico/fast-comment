@@ -668,7 +668,7 @@
   </header>
 
   <!-- ── X 自動告知バナー(Intent モード。状態は Rust が決める) ── -->
-  <XAutopostBanner />
+  <XAutopostBanner mode={config?.xPost?.mode ?? 'intent'} />
 
   <!-- ── Channel add bar (URL paste → auto-detect) ── -->
   {#if ui.activeTab === 'comments' && !standaloneOpen}

@@ -273,7 +273,10 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
   - `obs`: ポートに加え `maxRows` / `fontScalePct` / `ttlMs` / `bgOpacityPct` / `position` 等の見た目設定。範囲外値が入らないよう **Rust 側でも `normalize()` で clamp**(`maxRows` 1..=1000, `fontScalePct` 50..=200, `bgOpacityPct` 0..=100, `ttlMs` 500..=600000, `position`∈{top,bottom})。`normalize()` は config ロード時と `update_config` 適用時の両方で呼ぶ。上限定数は Rust 側に1箇所(`MAX_OBS_ROWS`)を置き UI/テンプレと値を揃える。
   - `channels[].ownStream`(bool 既定false): 「自分の配信」の印(X 自動告知の対象)。旧 config は欠落で false。
   - `xPost{enabled=false, mode="intent"|"api"="intent", intentOpen="button"|"auto"="button", combine=true, template, delaySecs=60, staleMinutes=15, cooldownMinutes=60, dailyLimit=5, callbackPort=47821}`: X 自動告知。`template` 既定は `【配信開始】{title}\n{url}\n{date} {time}`。全項目 serde default。`normalize_all()` で clamp(`delaySecs` 0..=600, `staleMinutes` 0..=180, `cooldownMinutes` 10..=1440, `dailyLimit` 1..=20、`mode` / `intentOpen` は不正値なら既定)。
-  - `credentials.xPostClientId`(任意): API モード用の X OAuth 2.0 Client ID。未設定なら JSON に出さない。
+  - `credentials.xPostClientId`(任意): API モード用の X OAuth 2.0 Client ID。未設定なら JSON に出さない。設定画面の「X に接続」(`connect_x_post`)が `xPost.callbackPort` と一緒にこの 2 項目だけを保存する。
+  - `xOverrides.endpoints` の `postAuthorizeUrl` / `postTokenUrl` / `postTweetsUrl` / `postUsersMeUrl`: API モードの X エンドポイントの上書き(起動時に読む。変えたらアプリを再起動)。
+  - X 投稿の認証は `config.json` に置かない: OS 資格情報ストア(`secret_store`)のエントリ `x-post-oauth-token` に `{ clientId, refreshToken, userId, username }`。access token はメモリのみ。
+  - 台帳 `<config_dir>/x-autopost-ledger.json`(§13)。
 - 起動時ロード、変更時保存。`config.json` をアプリ設定の正本とする。
 - **localStorage 併用**: 一部のUI/ウィンドウ局所設定は各ウィンドウの `localStorage` に保持する(`config.json` には載せない)。現状: 弾幕表示設定(`fc.danmaku`)、テーマ、最前面ピン状態、コマンドパレット履歴 等。これらはウィンドウローカルかつ低リスクなため意図的に localStorage 側に置いている。
 
@@ -288,7 +291,7 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
 - **P5+ 拡張UI(実装済み, §8.1)**: 弾幕オーバーレイ(デスクトップ窓 + danmaku テンプレ)、コメント投稿(Twitch/YouTube)、参加型/抽選、投げ銭パネル、ダッシュボード、タイマー/ゴール/エフェクト、マルチカラム、設定ポータビリティ、テンプレ編集UI、最前面ピン、追加OBSテンプレ8種
 - **P5++ X対応(実装済み, §4.3)**: X (Twitter) ライブ配信のチャット受信(ゲストトークン + chatnow WebSocket、読み取り専用・投稿非対応)
 - **P5+++ niconico対応(実装済み, §4.4)**: ニコニコ生放送のコメント受信(watch WS + NDGR Protobuf、読み取り専用・投稿非対応)
-- **X 自動告知 Intent モード(実装済み, §13)**: 配信開始で X の投稿画面を開く(印・バナー・テンプレート・台帳)。API モード(完全自動)は後続
+- **X 自動告知(実装済み, §13)**: Intent モード(配信開始で X の投稿画面を開く。印・バナー・テンプレート・台帳)と API モード(OAuth 2.0 PKCE で接続し `POST /2/tweets` で完全自動。接続 UI・テスト投稿)
 - **P6(後)**: OAuth実モデレーション(実BAN/削除)、さらなる追加Source、テンプレ編集のライブプレビュー強化
 
 ## 12. 既知の制約・注意
@@ -299,11 +302,17 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
 - 実モデレーションはOAuth必須(P6)。
 - YouTube 公式 streamList 経由で受けたコメントの配信側削除はアプリに反映されない(公開 `stream_list.proto` に削除イベントの定義が無い。BAN / タイムアウトは反映される)。
 - X 自動告知(Intent)は投稿の成否が分からない(状態は `opened` まで)。同一文面の繰り返しは X の規約に触れうる。Twitch の配信検知は Helix 認証(Client ID)が前提。YouTube は videoId 直接指定の行だと対象外。
+- X 自動告知(API)は従量課金で無料枠が無い(2026-11 時点の目安で 1 件 $0.015、URL 入りは $0.20。正は Developer Console)。X の許可はアプリ×ユーザーで 1 つで、同じ Client ID を別 PC・別ツールでログインすると先の接続は切れる。refresh token は約 6 か月で失効し、その後は再ログインが要る。同一文面は X が 403 で拒否する。
 - Tauri build にはアイコン(`src-tauri/icons/`)が必要。
 
-## 13. X 自動告知 — Intent モード (`autopost/`)
+## 13. X 自動告知 (`autopost/`)
 
-配信開始を検知して、X の投稿画面(Web Intent)を開く機能。**既定オフ**。投稿ボタンは本人が押すので、X の API・OAuth・開発者アプリ・クレジットは要らず無料。API で完全自動にするモード(`xPost.mode="api"`)は別 PR で追加する(本節の対象外)。
+配信開始を検知して X に告知する機能。**既定オフ**。2 つのモードがある(`xPost.mode`)。
+
+- `intent`(既定): X の投稿画面(Web Intent)を開く。投稿ボタンは本人が押すので、X の API・OAuth・開発者アプリ・クレジットは要らず無料。
+- `api`(任意): 利用者自身の X 開発者アプリ(Client ID)で OAuth 接続し、公式 API で完全自動に投稿する。接続済みの時だけ選べる(§13.1)。
+
+判定・台帳・テンプレート・猶予・取消は両モード共通。
 
 - **きっかけ**: 「自分の配信」の印(`channels[].ownStream`)が付いた YouTube のチャンネル指定行(`@ハンドル` / `UC…`)・Twitch 行・ニコ生行の `LiveEvent::Started`(§3.1)。YouTube の videoId 直接指定行と X 行は対象外。印と `xPost.enabled` の両方が要る。
 - **駆動**: `spawn_autopost` が `LiveEvent`・UI 操作・設定変更を受け、純粋な状態機械 `Coordinator` に渡す。I/O(台帳保存・ブラウザ起動)は返された `Action` を順に実行する側で行い、台帳保存が先、`OpenIntent` が後。保存に失敗したら開かない。
@@ -319,3 +328,29 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
   - 設定「X への配信開始告知」(`XPostSettings.svelte`): 有効化、`intentOpen`、`combine`、テンプレート編集と変数の挿入、プレビューと文字数(n/280)、猶予秒・取りこぼし許容分・クールダウン分・1 日の上限。保存は設定画面の保存ボタン。
 - **状態**(`x-autopost-status` の `state`): `idle` / `pending`(猶予中) / `awaitingApproval` / `posting` / `opened` / `posted` / `failed` / `uncertain` / `cancelled` / `skipped`。`skipped` / `failed` / `cancelled` は `reason`(`stale` / `unknownStart` / `cooldown` / `dailyLimit` / `notConnected` / `expired` / `ledgerFailed` / `Duplicate` / `TooLong` など)を伴う。
 - **注意**: 毎回同じ文面は X の規約に触れうるので、テンプレートにタイトルか日時を入れる。「実質同一」の判断は X 側にあり、この機能は技術的な完全一致を避けるだけ。X の `xAuthToken` cookie は告知に使わない。
+
+### 13.1 API モード(`autopost/oauth.rs`・`autopost/x_api.rs`)
+
+- **公式 API のみ**。X の `xAuthToken` / `xCsrfToken` cookie は投稿に使わない(`autopost/` に参照が無い)。
+- **接続**(`connect_x_post(clientId, callbackPort)`): OAuth 2.0 Authorization Code + PKCE(S256)、公開クライアント(client secret 無し)。認可 URL `https://x.com/i/oauth2/authorize`、スコープ `tweet.read tweet.write users.read offline.access`。コールバックは `http://127.0.0.1:{port}/callback`(`localhost` は使わない。bind も 127.0.0.1 のみ)、ポートは固定で既定 47821(`xPost.callbackPort`)。X は redirect URI を完全一致で照合するので、設定画面に出す URL をそのまま Developer Console に登録する。bind できなければ別ポートを試さず `PortInUse`。新しい接続・`cancel_x_post_login` は進行中の待受を止めてから bind する。`state` 不一致・別パスは 404 で待ち続け、`error=` は失敗。全体 180 秒・1 接続の読み取り 5 秒。受け取った code は即 `POST https://api.x.com/2/oauth2/token`(form、body に `client_id` と `code_verifier`、Authorization ヘッダ無し)で交換し、`GET /2/users/me` で `id` / `username` を取って保存する。設定画面に「@username として接続中」を出す。
+- **保存と refresh**: refresh token は `secret_store` のエントリ `x-post-oauth-token`、access token はメモリのみ(期限は `expires_in` − 60 秒)。refresh token は single-use で、refresh のたびに新しい物が返り古い物は使えなくなる。refresh と保存は 1 つの mutex の中で直列に行い、応答を受けたら使う前に新しい refresh token を保存する(最大 3 回)。保存できなければメモリの認証で投稿は続け、`unsavedToken` を立てて設定画面に警告し、次に使う時にまた保存を試す。refresh が 400/401 で拒否されたら keyring を読み直し、別の refresh token が入っていればそれで 1 回だけやり直す。同じなら保存を消して `ReloginRequired`(約 6 か月使わず失効した時もここ)。読み直しに失敗した時は保存を消さず `TokenStore`。通信失敗・5xx は保存を消さず `Network`。切断・再接続との競合は世代番号で判定し、古い世代の結果は保存しない。
+- **切断**(`disconnect_x_post`): この PC の keyring とメモリの認証を消すだけ(YouTube と同じ)。X 側の許可は取り消さない(X の設定の「連携しているアプリ」から外せる)。API モードだった設定は切断の成否によらず `intent` へ戻して保存する。
+- **モードの保存**: `update_config` は `intent` → `api` の切り替えを、今の Client ID で接続済みの時だけ受け付ける。すでに `api` の設定を保存し直すのは止めない(認証が切れていれば告知は `skipped(notConnected)`)。
+- **投稿**(`x_api::post_text`): 発火時に台帳へ `posting` を保存してから `POST https://api.x.com/2/tweets`(`{"text": …}`、Bearer)を 1 回。保存に失敗したら HTTP は呼ばない。猶予の開始時に access token を先に用意し(`PrewarmToken`)、認証切れを投稿前に知る。結果の扱い:
+
+  | 事象 | 自動再試行 | 台帳 / 状態 |
+  |---|---|---|
+  | 2xx | — | `posted`(`data.id` が無ければ ID 不明の `posted`)。バナーにポストへのリンク |
+  | 接続前の失敗(DNS・接続拒否) | 2 秒後・8 秒後の 2 回 | 最終的に `failed(Network)` |
+  | 401 | access token を捨てて refresh → 1 回だけ再送 | 再失敗で `failed(ReloginRequired)` |
+  | 403(本文の detail に duplicate) | なし | `failed(Duplicate)`。再試行は文面を描画し直す(失敗した文面が台帳に残るので末尾に ` {time}` が付く) |
+  | 403(その他) | なし | `failed(Forbidden)` |
+  | 402、または 4xx で `title` / `type` / `detail` に `credits` を含む | なし | `failed(InsufficientCredits)`(本文は 2 通り報告がある。ステータスは HTTP の値で見る) |
+  | 429 | `x-rate-limit-reset` が 90 秒以内なら待って 1 回 | `failed(RateLimited)` |
+  | 5xx、送信後のタイムアウト、応答の読み取り失敗、分類できない送信エラー | なし | `uncertain`(投稿されたか不明) |
+  | その他の 4xx | なし | `failed(Other)` |
+
+  再送は利用者の「再試行」(`retry_x_autopost`)で同じ文面を 1 回だけ。自動では送らない。成功は 2xx だけで判定し、本文の内容で成功を失敗にしない。
+- **テスト投稿**(`send_x_test_post`): 文面 `fast-comment 連携テスト YYYY/MM/DD HH:MM`(URL なし)。UI は確認ダイアログで文面と「実際に公開され、課金される」旨を出してから呼ぶ。台帳・クールダウン・1 日上限には数えない。
+- **状態取得**: `get_x_post_status` → `{ configured, connected, username, callbackUrl, unsavedToken }`。接続・切断の後は駆動タスクに `AuthChanged` を送り、投稿できるかを読み直させる。
+- **秘密値**: access / refresh token と認可コードはログ・エラー文・emit・`Debug` に出さない(`XPostError` は固定文のみ)。
