@@ -211,7 +211,7 @@ trait TtsBackend { async fn speak(&self, text: String) -> Result<()>; fn availab
   - **ピン留め**: 重要コメントを上部固定ストリップに表示。ピンは ChatMessage 実体を別保持しバッファ退避後も残る。最大5件FIFO。各行にピン/解除ボタン。
   - **キーワード通知**: ハイライト一致コメント到着で効果音(Web Audio)+控えめな画面フラッシュ。ON/OFF・音量は `config.ui.notifySound`/`notifyVolume` に永続化。store の単調 `highlightCount` を `Notifier.svelte` が監視(初回非発火)。
 - **設定画面**: チャンネル追加(Twitch名 / YouTube videoId or URL)、テンプレ選択、TTS設定、NG/ハイライト編集、OBSサーバURLコピー、通知(効果音ON/OFF+音量)。各セクションはコマンドパレットからアンカースクロールで到達可能(`id="settings-*"`)。
-- **テンプレ編集** (`TemplateEditor.svelte`, 実装済み): 設定画面からテンプレ選択 + CSS編集。ライブプレビュー強化は将来。
+- **テンプレ編集** (`TemplateEditor.svelte`, 実装済み): 設定画面からテンプレ選択 + 編集(`index.html` / `style.css` / `app.js`)。内蔵テンプレは閲覧のみ(書き込みは Err)で、複製してカスタム(`custom:<name>`)にしてから編集する。名前空間・複製・削除の仕様は §9.1。ライブプレビュー強化は将来。
 - IPC: `listen("chat", ...)` でバッチ受信。型は `src/lib/types.ts`(Rust model のミラー)。受信は ipc.ts の rAF バッチ flush(最小化/オクルージョンで rAF が止まっても 250ms タイムアウトで必ず flush)。
 
 ### 8.1 拡張UI機能(実装済み)
@@ -279,6 +279,39 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
   - `danmaku` の連投まとめ(×N)は先頭 1 件の値のまま(別の人の同文コメントにも先頭の `data-user` / `data-role` が付く)。`ticker` は要素 1 個を使い回すので、切り替えのたびに付け直し、キューが空なら null を渡して全属性を外す。`ranking` / `goals` / `timer` は対象外。
   - CSS 例: `.comment[data-role~="member"] { color: #4caf50; }` / `.comment[data-user='名前'] { font-weight: bold; }` / `[data-service="niconama"] { ... }`。
   - 各 `app.js` が同一ブロック(`fc-attrs:begin`〜`end`)を複製し、`templates/obsAttrs.test.mjs` が一致と挙動を検証する(`package.json` の test に登録済み)。
+
+### 9.1 テンプレの名前空間(内蔵 / カスタム)
+
+実装は `src-tauri/src/templates.rs`(`TemplateRef` / `TemplateStore`)。`bus.rs` の配信と `lib.rs` の `list_templates` / `read_template_file` / `write_template_file` / `duplicate_template` / `delete_template` はここへ委譲する。
+
+| | 内蔵 | カスタム |
+|---|---|---|
+| ID | `<name>` | `custom:<name>` |
+| 保存先 | リソースの `templates/<name>/`(読み取り専用) | `app_config_dir/templates/<name>/` |
+| 配信 | `/?template=<name>` と `/<name>/...`(従来どおり) | `/?template=custom:<name>` と `/custom/<name>/...` |
+| 編集・削除 | 不可(`write_template_file` / `delete_template` は Err) | 可 |
+
+- **ID の文法**: `<name>` は ASCII 英数・`-`・`_`、1〜64 バイト(`is_valid_template_name`)。`custom:` 接頭辞があればカスタム、無ければ内蔵。内蔵名 `custom` は不可(配信パス `/custom/` と衝突するため)。文法に合わない ID は `/` が 400、文法は合うがカスタムが存在しなければ 404。内蔵の URL とルーティングは変えていないので、既存の OBS ソースはそのまま動く。カスタム `custom:default` と内蔵 `default` は別物で共存する(カスタムが内蔵を隠す経路は無い)。
+- **配信**: `/?template=custom:<name>` は `<base href="/custom/<name>/">` を注入した index.html を返す。`/custom/<name>/...` は `ServeDir` で静的配信する。URL 上の `:` は `custom%3Afoo` とエンコードされても同じに解決される。
+- **カスタムの無効化**: 内蔵ルートとカスタムルートが同一または入れ子の時(`app_config_dir` の取得失敗で cwd に落ちた場合など)はカスタム全体を無効にする(一覧に出さず、`/custom` も配信せず、作成・削除・書き込みは Err)。リポジトリの `templates/` を誤って消さないため。
+- **新規名の規則**(`validate_new_name`、複製先の名前): 1〜64 バイト、先頭は小文字英字か数字、使える文字は小文字英字・数字・`-`・`_`。Windows 予約デバイス名(`con` / `prn` / `aux` / `nul` / `com1`〜`com9` / `lpt1`〜`lpt9`)は不可。既存のカスタム名とは大文字小文字を区別せず重複不可。
+- **複製**(`duplicate_template(source, name)`): `source`(内蔵・カスタムとも可)を `app_config_dir/templates-staging/<uuid>/` へコピーし、`fc-template.json` を書いてから `app_config_dir/templates/<name>/` へ rename で公開する。失敗時は staging を消す。起動時に残った staging は `cleanup_stale_staging` で掃除する。
+  - コピーはシンボリックリンク・許可外の名前・許可外の拡張子・深さ 4 超を黙って飛ばす。許可拡張子は html / css / js / json / png jpg jpeg gif webp svg / woff woff2 ttf otf / mp3 ogg wav / txt / md。`fc-template.json` はコピーしない。
+  - 上限は 1 ファイル 8MiB・合計 40MiB・500 エントリで、超えると失敗する。`index.html` が無い複製も失敗する。
+- **削除**(`delete_template(id)`): カスタムのみ。ディレクトリごと消す。内蔵は Err(「内蔵テンプレートは読み取り専用です」)。
+- **編集**: `read_template_file` / `write_template_file` が扱うのは `index.html` / `style.css` / `app.js` の 3 つだけ(1MiB 以下)。書き込みは同一ディレクトリの一時ファイルに書いてから rename で置き換える。
+- **パスの安全**: ID をパスへ直接連結しない(必ず `TemplateRef::parse` を通す)。編集・複製・削除では、テンプレのディレクトリとファイルを `symlink_metadata` で通常の実体と確かめ、シンボリックリンクは拒否する(複製ではスキップ)。**OBS への配信(`/custom/...` の `ServeDir` と index.html の読み込み)はリンクを検査しない**ので、配信ルートにシンボリックリンクを置かない運用が前提(置けるのはその PC を操作できる人だけ)。`:` は Windows のファイル名に使えないので、ID を誤ってパスに連結しても解決されず失敗する。
+- **`fc-template.json`(由来メタデータ)**: 複製時にアプリが書く。ユーザーが編集するファイルではない。
+
+  | キー | 型 | 内容 |
+  |---|---|---|
+  | `schema` | 数値 | 現在 `1` |
+  | `origin` | 文字列 | 作成経路。複製は `"duplicate"` |
+  | `source` | 文字列 | 複製元の ID(例 `"default"` / `"custom:foo"`) |
+  | `appVersion` | 文字列 | 作成時のアプリ版(`CARGO_PKG_VERSION`) |
+  | `createdAtMs` | 数値 | 作成時刻(UNIX エポックからのミリ秒) |
+
+- **移行の注意(リリースノート用)**: これまで内蔵テンプレを直接編集していた分は引き継がれない。内蔵は読み取り専用になったので、複製してから編集する。複製したカスタムは、以後の内蔵テンプレの修正(バグ修正・新機能)を受け取らない。
 
 ## 10. 設定永続化 (`config.rs`)
 

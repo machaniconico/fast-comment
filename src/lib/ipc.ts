@@ -747,8 +747,16 @@ export async function controlTimer(action: string, durationSec?: number): Promis
   await invoke<void>('control_timer', { action, durationSec });
 }
 
-export async function listTemplates(): Promise<string[]> {
-  return (await invoke<string[]>('list_templates')) ?? [];
+/** OBS テンプレート一覧の 1 件。id は内蔵 `<name>`、カスタム `custom:<name>`。 */
+export interface TemplateInfo {
+  id: string;
+  name: string;
+  kind: 'builtin' | 'custom';
+  editable: boolean;
+}
+
+export async function listTemplates(): Promise<TemplateInfo[]> {
+  return (await invoke<TemplateInfo[]>('list_templates')) ?? [];
 }
 
 export async function readTemplateFile(name: string, file: string): Promise<string> {
@@ -757,6 +765,18 @@ export async function readTemplateFile(name: string, file: string): Promise<stri
 
 export async function writeTemplateFile(name: string, file: string, contents: string): Promise<void> {
   await invoke<void>('write_template_file', { name, file, contents });
+}
+
+/** テンプレート `source`(ID)をカスタム `name` として複製し、新しい 1 件を返す。 */
+export async function duplicateTemplate(source: string, name: string): Promise<TemplateInfo> {
+  const res = await invoke<TemplateInfo>('duplicate_template', { source, name });
+  if (!res) throw new Error('Tauri環境でのみ複製できます');
+  return res;
+}
+
+/** カスタムテンプレート(ID)を削除する。内蔵は Err。 */
+export async function deleteTemplate(id: string): Promise<void> {
+  await invoke<void>('delete_template', { id });
 }
 
 export interface GoalSkinInfo {

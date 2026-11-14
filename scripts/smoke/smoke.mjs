@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { spawn } from 'node:child_process';
-import { readFile } from 'node:fs/promises';
+import { readFile, lstat, rm } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -11,6 +12,156 @@ const repoRoot = path.resolve(scriptDir, '..', '..');
 const CONFIG_ID = 'dev.skyfade.fastcomment';
 
 const TEMPLATE_NAMES = ['default', 'simple', 'bubble', 'ticker', 'ranking', 'goals', 'donation', 'timer', 'danmaku'];
+const CUSTOM_NAME = 'smoke-copy';
+const CUSTOM_ID = `custom:${CUSTOM_NAME}`;
+
+// PR 本文案: 更新・表示の実機確認(このスクリプトはインストーラを実行しない)。
+// この PC では release/fast-comment.exe と隣の templates を使って自動確認する。
+// 以下は別途インストールを許可した検証環境で実施し、実行結果を PR に追記する。
+// 1. default を未使用名に複製し、style.css に目視できる色変更を加えて保存する。
+// 2. プレビューと OBS ブラウザソースの custom:<名前> URL で変更を確認する。
+//    カスタム CSS の SHA-256 と画面を記録し、アプリを終了する(config.json は開かない)。
+// 3. 同じ NSIS インストーラを同じ場所へ上書き実行し、再起動する。
+// 4. カスタムが一覧に残り、CSS のハッシュ・プレビュー・OBS の表示が同じことを確認する。
+// 5. default / danmaku / goals / timer の既存 URL を保存済み画面と比較する。
+//    default は max=3&ttl=4000&font=150、danmaku は max=20、goals/timer は font=125 も確認する。
+// 自動の HTTP/資産比較だけでは描画とインストーラ更新後の永続は判定しない。
+
+async function exists(file) {
+  try {
+    await lstat(file);
+    return true;
+  } catch (error) {
+    if (error.code === 'ENOENT') return false;
+    throw error;
+  }
+}
+
+async function sha256(file) {
+  return createHash('sha256').update(await readFile(file)).digest('hex');
+}
+
+async function prepareTemplateChecks(exe) {
+  if (!process.env.APPDATA) throw new Error('APPDATA がありません。Windows 側で実行してください');
+  const copyDir = path.join(process.env.APPDATA, CONFIG_ID, 'templates', CUSTOM_NAME);
+  if (await exists(copyDir)) throw new Error(`${CUSTOM_ID} が既に存在します。既存データは変更しません`);
+  const builtinDir = path.join(path.dirname(exe), 'templates');
+  const cssPath = path.join(builtinDir, 'default', 'style.css');
+  return { copyDir, builtinDir, cssPath, beforeHash: await sha256(cssPath), owned: false, stopping: false };
+}
+
+async function expectHttp(url, expected, timeoutMs) {
+  return fetchWithTimeout(url, {}, timeoutMs, async (response) => {
+    if (response.status !== expected) throw new Error(`${url}: HTTP ${response.status} (期待 ${expected})`);
+    return response.text();
+  });
+}
+
+async function runTemplateChecks({ client, obsPort, timeoutMs, record, state }) {
+  let step = 'template-list';
+  const base = `http://127.0.0.1:${obsPort}`;
+  const urls = [`${base}/?template=${CUSTOM_ID}`, `${base}/custom/${CUSTOM_NAME}/style.css`];
+  try {
+    const templates = await client.invoke('list_templates');
+    const builtins = Array.isArray(templates) ? templates.filter((item) => item.kind === 'builtin') : [];
+    if (builtins.length !== TEMPLATE_NAMES.length || TEMPLATE_NAMES.some((name) =>
+      builtins.filter((item) => item.id === name && item.name === name && item.editable === false).length !== 1)) {
+      throw new Error('内蔵 9 件の id/name/kind=builtin/editable=false が一致しません');
+    }
+    if (templates.some((item) => item.id === CUSTOM_ID) || await exists(state.copyDir)) {
+      throw new Error(`${CUSTOM_ID} が既に存在します。既存データは変更しません`);
+    }
+    // 配信元が exe 隣のリソースであることも確認する。
+    const servedCss = await expectHttp(`${base}/default/style.css`, 200, timeoutMs);
+    if (servedCss !== await readFile(state.cssPath, 'utf8')) throw new Error('配信 CSS がビルド出力と一致しません');
+    record(step, 'PASS', '内蔵 9 件 kind=builtin / editable=false');
+
+    step = 'template-duplicate';
+    if (state.stopping) throw new Error('終了処理中');
+    // IPC がタイムアウトしても作成が完了しうるので、呼び出す前に後始末を予約する。
+    state.owned = true;
+    const created = await client.invoke('duplicate_template', { source: 'default', name: CUSTOM_NAME });
+    if (created?.id !== CUSTOM_ID || created.kind !== 'custom' || created.editable !== true) {
+      throw new Error('duplicate_template の TemplateInfo が不正です');
+    }
+    for (const url of urls) await expectHttp(url, 200, timeoutMs);
+    record(step, 'PASS', `${CUSTOM_ID}: HTML / CSS 200`);
+
+    step = 'template-builtin-readonly';
+    let rejection = null;
+    try {
+      await client.invoke('write_template_file', {
+        name: 'default', file: 'style.css', contents: `${servedCss}\n/* smoke readonly probe */\n`,
+      });
+    } catch (error) {
+      rejection = String(error);
+    }
+    if (!rejection || !rejection.includes('読み取り専用') || !rejection.includes('複製')) {
+      throw new Error('内蔵への書き込みが「読み取り専用」「複製」を含むエラーで拒否されませんでした');
+    }
+    record(step, 'PASS', '内蔵への書き込みを拒否');
+
+    step = 'template-custom-save';
+    const editedCss = `${servedCss}\n/* smoke custom save */\nbody { --smoke-copy: 1; }\n`;
+    await client.invoke('write_template_file', { name: CUSTOM_ID, file: 'style.css', contents: editedCss });
+    if (await client.invoke('read_template_file', { name: CUSTOM_ID, file: 'style.css' }) !== editedCss ||
+      await expectHttp(urls[1], 200, timeoutMs) !== editedCss ||
+      await readFile(path.join(state.copyDir, 'style.css'), 'utf8') !== editedCss) {
+      throw new Error('保存 CSS の IPC / HTTP / ディスクの内容が一致しません');
+    }
+    record(step, 'PASS', 'カスタム CSS の保存・読み出し・配信が一致');
+
+    step = 'template-delete';
+    await client.invoke('delete_template', { id: CUSTOM_ID });
+    for (const url of urls) await expectHttp(url, 404, timeoutMs);
+    if (await exists(state.copyDir)) throw new Error('削除後も smoke-copy が残っています');
+    if ((await client.invoke('list_templates')).some((item) => item.id === CUSTOM_ID)) {
+      throw new Error('削除後も一覧に smoke-copy が残っています');
+    }
+    record(step, 'PASS', '削除後 HTML / CSS 404、ディスク・一覧からも削除');
+  } catch (error) {
+    record(step, 'FAIL', error instanceof Error ? error.message : String(error));
+    const steps = ['template-list', 'template-duplicate', 'template-builtin-readonly', 'template-custom-save', 'template-delete'];
+    for (const pending of steps.slice(steps.indexOf(step) + 1)) record(pending, 'FAIL', `${step} 失敗のため未実行`);
+  }
+}
+
+// 呼び出し元で起動したアプリを停止してから実行する(遅れて完了する IPC との競合を防ぐ)。
+async function cleanupTemplateCopy(state, record) {
+  try {
+    if (state.owned) await rm(state.copyDir, { recursive: true, force: true });
+    if (await exists(state.copyDir)) throw new Error('既存の smoke-copy は保持しました');
+    record('template-cleanup', 'PASS', 'smoke-copy の残存なし');
+  } catch (error) {
+    record('template-cleanup', 'FAIL', error instanceof Error ? error.message : String(error));
+  }
+  try {
+    const afterHash = await sha256(state.cssPath);
+    record('template-builtin-hash', afterHash === state.beforeHash ? 'PASS' : 'FAIL',
+      `SHA-256 before=${state.beforeHash} after=${afterHash}`);
+  } catch (error) {
+    record('template-builtin-hash', 'FAIL', error instanceof Error ? error.message : String(error));
+  }
+}
+
+async function checkLegacyTemplateUrls({ obsPort, timeoutMs, state }) {
+  const queries = ['default&max=3&ttl=4000&font=150', 'danmaku&max=20', 'goals&font=125', 'timer&font=125'];
+  for (const query of queries) {
+    const name = query.split('&')[0];
+    const base = `http://127.0.0.1:${obsPort}`;
+    const html = await expectHttp(`${base}/?template=${query}`, 200, timeoutMs);
+    if (!html.includes(`<base href="/${name}/">`) || html !== await expectHttp(`${base}/?template=${name}`, 200, timeoutMs)) {
+      throw new Error(`${name}: パラメータ付き HTML / base が一致しません`);
+    }
+    for (const file of ['style.css', 'app.js']) {
+      if (await expectHttp(`${base}/${name}/${file}`, 200, timeoutMs) !==
+        await readFile(path.join(state.builtinDir, name, file), 'utf8')) {
+        throw new Error(`${name}/${file}: 配信資産がビルド出力と一致しません`);
+      }
+    }
+  }
+  return { status: 'PASS', detail: '既存 4 URL・max/ttl/font の HTML / base / CSS / JS が一致(描画は手動確認)' };
+}
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -60,6 +211,7 @@ function parseArgs(argv) {
         console.log(
           'Usage: node scripts/smoke/smoke.mjs [--exe <path>] [--attach] [--cdp-port 9333] [--obs-port <n>] [--skip-updater] [--download-installer] [--timeout-ms 8000]',
         );
+        console.log('OBS ポートは --obs-port または 11180。config.json は読みません。smoke-copy が既存なら停止します。');
         process.exit(0);
         break;
       default:
@@ -88,18 +240,8 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 8000, read = null
 }
 
 async function resolveObsPort(cliPort) {
-  if (cliPort !== null) return cliPort;
-  const appData = process.env.APPDATA;
-  if (!appData) return 11180;
-  const configPath = path.join(appData, CONFIG_ID, 'config.json');
-  try {
-    const parsed = JSON.parse(await readFile(configPath, 'utf8'));
-    const port = parsed?.obs?.port;
-    if (Number.isInteger(port) && port > 0 && port <= 65535) return port;
-  } catch {
-    // config.json が無い・壊れている時は既定ポートへ
-  }
-  return 11180;
+  // config.json には認証情報があるので開かない。変更済みのポートは CLI で指定する。
+  return cliPort ?? 11180;
 }
 
 async function checkHealth(port, timeoutMs) {
@@ -304,7 +446,8 @@ function makeCdpClient(ws, timeoutMs) {
     });
     if (result.exceptionDetails) {
       const details = result.exceptionDetails;
-      throw new Error(details.exception?.description ?? details.text ?? 'evaluate 例外');
+      // Tauri の Err(String) は CDP の description ではなく value に入る。
+      throw new Error(details.exception?.description ?? details.exception?.value ?? details.text ?? 'evaluate 例外');
     }
     return result.result?.value;
   }
@@ -632,12 +775,12 @@ async function isObsAnswering(port) {
 }
 
 function killChild(child) {
-  if (!child || child.exitCode !== null) return Promise.resolve();
+  if (!child || !child.pid || child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true);
   const exited = new Promise((resolve) => {
-    const timer = setTimeout(resolve, 5000);
+    const timer = setTimeout(() => resolve(false), 5000);
     child.once('exit', () => {
       clearTimeout(timer);
-      resolve();
+      resolve(true);
     });
   });
   try {
@@ -673,25 +816,43 @@ async function main() {
   const obsPort = await resolveObsPort(args.obsPort);
   let child = null;
   let cdp = null;
-  let cleaned = false;
+  let templateState = null;
+  let cleanupPromise = null;
   const cleanup = () => {
-    if (cleaned) return Promise.resolve();
-    cleaned = true;
-    return killChild(child);
+    if (cleanupPromise) return cleanupPromise;
+    if (templateState) templateState.stopping = true;
+    cleanupPromise = (async () => {
+      if (templateState?.owned && cdp) {
+        try {
+          await cdp.invoke('delete_template', { id: CUSTOM_ID });
+        } catch {
+          // 削除済み・IPC 失敗時も、停止後に今回作ったディレクトリだけを確認する。
+        }
+      }
+      const stopped = await killChild(child);
+      if (!stopped) record('process-cleanup', 'FAIL', '起動したアプリが 5 秒以内に終了しませんでした');
+      if (cdp) cdp.close();
+      if (templateState) await cleanupTemplateCopy(templateState, record);
+    })();
+    return cleanupPromise;
   };
-  const onSignal = () => {
-    cleanup();
-    process.exit(130);
+  const onSignal = async () => {
+    try {
+      await cleanup();
+    } finally {
+      process.exit(130);
+    }
   };
+  const onExit = () => { void killChild(child); };
   process.on('SIGINT', onSignal);
   process.on('SIGTERM', onSignal);
-  process.on('exit', cleanup);
+  process.on('exit', onExit);
 
   try {
+    templateState = await prepareTemplateChecks(args.exe);
     if (!args.attach) {
       if (await isCdpReachable(args.cdpPort)) {
-        console.warn(`WARN CDP ポート ${args.cdpPort} は既に開いています。--attach 相当で続行します`);
-        args.attach = true;
+        throw new Error(`CDP ポート ${args.cdpPort} は使用中です。既存アプリへ自動接続しません`);
       } else if (await isObsAnswering(obsPort)) {
         // CDP 無しの通常起動が残っていると、2 つ目を起動して検証対象が食い違う
         throw new Error(`OBS ポート ${obsPort} で既にアプリが動いています。終了してから再実行するか、CDP 付きで起動して --attach を使ってください`);
@@ -735,10 +896,14 @@ async function main() {
     }
 
     if (!cdpClient) {
+      for (const name of ['template-list', 'template-duplicate', 'template-builtin-readonly', 'template-custom-save', 'template-delete']) {
+        record(name, 'FAIL', 'CDP 未接続');
+      }
       record('ws-chat', 'FAIL', 'CDP 未接続');
       record('ws-mod', 'FAIL', 'CDP 未接続');
       record('ws-mod-optin', 'FAIL', 'CDP 未接続');
     } else {
+      await runTemplateChecks({ client: cdpClient, obsPort, timeoutMs: args.timeoutMs, record, state: templateState });
       try {
         await runChatChecks({ client: cdpClient, obsPort, timeoutMs: args.timeoutMs, record });
       } catch (error) {
@@ -747,6 +912,13 @@ async function main() {
         record('ws-mod', 'FAIL', reason);
         record('ws-mod-optin', 'FAIL', reason);
       }
+    }
+
+    try {
+      const legacy = await checkLegacyTemplateUrls({ obsPort, timeoutMs: args.timeoutMs, state: templateState });
+      record('template-legacy-urls', legacy.status, legacy.detail);
+    } catch (error) {
+      record('template-legacy-urls', 'FAIL', error instanceof Error ? error.message : String(error));
     }
 
     try {
@@ -774,10 +946,13 @@ async function main() {
         record('updater-signature', 'FAIL', reason);
       }
     }
+  } catch (error) {
+    record('smoke', 'FAIL', error instanceof Error ? error.message : String(error));
   } finally {
-    if (cdp) cdp.close();
     await cleanup();
-    process.removeListener('exit', cleanup);
+    process.removeListener('exit', onExit);
+    process.removeListener('SIGINT', onSignal);
+    process.removeListener('SIGTERM', onSignal);
   }
 
   const counts = results.reduce(
@@ -791,7 +966,11 @@ async function main() {
   process.exit(counts.FAIL > 0 ? 1 : 0);
 }
 
-main().catch((error) => {
-  console.error(`ERROR ${error instanceof Error ? error.stack ?? error.message : String(error)}`);
-  process.exit(1);
-});
+export { prepareTemplateChecks, runTemplateChecks, cleanupTemplateCopy, checkLegacyTemplateUrls, makeCdpClient };
+
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().catch((error) => {
+    console.error(`ERROR ${error instanceof Error ? error.stack ?? error.message : String(error)}`);
+    process.exit(1);
+  });
+}
