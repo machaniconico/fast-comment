@@ -24,6 +24,9 @@ pub struct ChannelConfig {
     /// この行を有効にするか(false なら接続しない)。
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// 「自分の配信」の印(X 自動告知の対象)。旧 config.json には無いので既定は false。
+    #[serde(default)]
+    pub own_stream: bool,
 }
 
 /// 設定上のプラットフォーム種別。`model::Platform` と1対1だが、
@@ -775,6 +778,62 @@ pub struct CredentialsConfig {
     /// X の csrf トークン(ct0 cookie)。x_auth_token とペアで設定する。
     #[serde(default)]
     pub x_csrf_token: String,
+    /// X 自動告知(API モード)用の OAuth 2.0 Client ID。秘密値ではないが他の Client ID と同じ場所に置く。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x_post_client_id: Option<String>,
+}
+
+/// X 自動告知の設定。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct XPostConfig {
+    pub enabled: bool,
+    /// "intent" | "api"
+    pub mode: String,
+    /// "button" | "auto"
+    pub intent_open: String,
+    pub combine: bool,
+    pub template: String,
+    pub delay_secs: u32,
+    pub stale_minutes: u32,
+    pub cooldown_minutes: u32,
+    pub daily_limit: u32,
+    pub callback_port: u16,
+}
+
+pub const DEFAULT_X_POST_TEMPLATE: &str = "【配信開始】{title}\n{url}\n{date} {time}";
+
+impl Default for XPostConfig {
+    fn default() -> Self {
+        XPostConfig {
+            enabled: false,
+            mode: "intent".to_string(),
+            intent_open: "button".to_string(),
+            combine: true,
+            template: DEFAULT_X_POST_TEMPLATE.to_string(),
+            delay_secs: 60,
+            stale_minutes: 15,
+            cooldown_minutes: 60,
+            daily_limit: 5,
+            callback_port: 47821,
+        }
+    }
+}
+
+impl XPostConfig {
+    /// 範囲外の値を許容範囲へ丸める。
+    pub fn normalize(&mut self) {
+        self.delay_secs = self.delay_secs.min(600);
+        self.stale_minutes = self.stale_minutes.min(180);
+        self.cooldown_minutes = self.cooldown_minutes.clamp(10, 1440);
+        self.daily_limit = self.daily_limit.clamp(1, 20);
+        if self.mode != "intent" && self.mode != "api" {
+            self.mode = "intent".to_string();
+        }
+        if self.intent_open != "button" && self.intent_open != "auto" {
+            self.intent_open = "button".to_string();
+        }
+    }
 }
 
 /// コメントログの自動保存設定。
@@ -832,6 +891,8 @@ pub struct AppConfig {
     pub niconico_overrides: NiconicoOverrides,
     #[serde(default)]
     pub credentials: CredentialsConfig,
+    #[serde(default)]
+    pub x_post: XPostConfig,
 }
 
 impl Default for AppConfig {
@@ -852,6 +913,7 @@ impl Default for AppConfig {
             x_overrides: XOverrides::default(),
             niconico_overrides: NiconicoOverrides::default(),
             credentials: CredentialsConfig::default(),
+            x_post: XPostConfig::default(),
         }
     }
 }
@@ -883,6 +945,7 @@ impl AppConfig {
         self.obs.normalize();
         self.log.normalize();
         self.tts.options.normalize();
+        self.x_post.normalize();
     }
 
     /// `config.json` へ保存する(ディレクトリは必要なら作成)。
@@ -1006,6 +1069,45 @@ fn default_welcome_count() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn legacy_config_without_own_stream_or_x_post_loads_with_defaults() {
+        let legacy = r#"{"channels":[{"platform":"twitch","identifier":"abc"}],"credentials":{"twitchOauth":"x"}}"#;
+        let cfg: AppConfig = serde_json::from_str(legacy).expect("legacy config");
+        assert!(!cfg.channels[0].own_stream);
+        assert_eq!(cfg.credentials.x_post_client_id, None);
+        assert_eq!(cfg.x_post, XPostConfig::default());
+        assert!(!cfg.x_post.enabled);
+        assert_eq!(cfg.x_post.mode, "intent");
+        assert_eq!(cfg.x_post.intent_open, "button");
+        assert!(cfg.x_post.combine);
+        assert_eq!(cfg.x_post.template, "【配信開始】{title}\n{url}\n{date} {time}");
+        assert_eq!(cfg.x_post.delay_secs, 60);
+        assert_eq!(cfg.x_post.stale_minutes, 15);
+        assert_eq!(cfg.x_post.cooldown_minutes, 60);
+        assert_eq!(cfg.x_post.daily_limit, 5);
+        assert_eq!(cfg.x_post.callback_port, 47821);
+    }
+
+    #[test]
+    fn x_post_partial_json_fills_defaults_and_normalize_clamps() {
+        let mut cfg: AppConfig = serde_json::from_str(
+            r#"{"xPost":{"enabled":true,"delaySecs":9999,"staleMinutes":999,"cooldownMinutes":1,"dailyLimit":0}}"#,
+        )
+        .expect("partial xPost");
+        assert!(cfg.x_post.enabled);
+        assert!(cfg.x_post.combine);
+        cfg.normalize_all();
+        assert_eq!(cfg.x_post.delay_secs, 600);
+        assert_eq!(cfg.x_post.stale_minutes, 180);
+        assert_eq!(cfg.x_post.cooldown_minutes, 10);
+        assert_eq!(cfg.x_post.daily_limit, 1);
+        cfg.x_post.cooldown_minutes = 99999;
+        cfg.x_post.daily_limit = 99;
+        cfg.normalize_all();
+        assert_eq!(cfg.x_post.cooldown_minutes, 1440);
+        assert_eq!(cfg.x_post.daily_limit, 20);
+    }
+
     use std::collections::HashMap;
 
     #[test]
@@ -1045,6 +1147,7 @@ mod tests {
                 platform: ChannelPlatform::Youtube,
                 identifier: "https://www.youtube.com/watch?v=abc123".to_string(),
                 enabled: false,
+                own_stream: true,
             }],
             obs: ObsConfig {
                 port: 12000,
@@ -1163,6 +1266,7 @@ mod tests {
                 youtube_oauth_client_id: "desktop-client.apps.googleusercontent.com".to_string(),
                 x_auth_token: "x-auth-cookie".to_string(),
                 x_csrf_token: "x-ct0".to_string(),
+                x_post_client_id: Some("x-post-client".to_string()),
             },
             youtube_overrides: YoutubeOverrides {
                 api_key: Some("test-api-key".to_string()),
@@ -1175,11 +1279,15 @@ mod tests {
                 live_poll_secs: Some(45),
             },
             niconico_overrides: NiconicoOverrides::default(),
+            x_post: XPostConfig::default(),
         };
 
         let text = serde_json::to_string(&cfg).expect("serialize AppConfig");
         let json: serde_json::Value = serde_json::from_str(&text).expect("parse serialized JSON");
 
+        assert_eq!(json["channels"][0]["ownStream"].as_bool(), Some(true));
+        assert_eq!(json["credentials"]["xPostClientId"].as_str(), Some("x-post-client"));
+        assert_eq!(json["xPost"]["callbackPort"].as_u64(), Some(47821));
         assert_eq!(json["obs"]["template"].as_str(), Some("compact"));
         assert_eq!(json["obs"]["fontScalePct"].as_u64(), Some(125));
         assert_eq!(json["obs"]["danmakuFontSize"].as_u64(), Some(42));

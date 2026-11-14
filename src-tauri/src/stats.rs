@@ -742,11 +742,13 @@ mod tests {
                     platform: ChannelPlatform::Youtube,
                     identifier: "yt123".to_string(),
                     enabled: true,
+                    own_stream: false,
                 },
                 ChannelConfig {
                     platform: ChannelPlatform::Twitch,
                     identifier: "twlogin".to_string(),
                     enabled: true,
+                    own_stream: false,
                 },
             ],
             ..AppConfig::default()
@@ -797,11 +799,13 @@ mod tests {
                     platform: ChannelPlatform::Youtube,
                     identifier: "yt123".to_string(),
                     enabled: true,
+                    own_stream: false,
                 },
                 ChannelConfig {
                     platform: ChannelPlatform::Niconico,
                     identifier: "lv123".to_string(),
                     enabled: true,
+                    own_stream: false,
                 },
             ],
             ..AppConfig::default()
@@ -991,6 +995,7 @@ mod tests {
                 platform: ChannelPlatform::Youtube,
                 identifier: identifier.to_string(),
                 enabled: true,
+                own_stream: false,
             }],
             ..AppConfig::default()
         }

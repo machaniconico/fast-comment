@@ -425,7 +425,24 @@ export interface AppConfig {
     youtubeOauthClientId?: string;
     xAuthToken?: string;
     xCsrfToken?: string;
+    // X 自動告知(API モード)用 Client ID。未設定なら省略。
+    xPostClientId?: string;
   };
+  // X 自動告知の設定(Rust `XPostConfig`)。古い config.json には無い。
+  xPost?: XPostConfig;
+}
+
+export interface XPostConfig {
+  enabled: boolean;
+  mode: 'intent' | 'api';
+  intentOpen: 'button' | 'auto';
+  combine: boolean;
+  template: string;
+  delaySecs: number;
+  staleMinutes: number;
+  cooldownMinutes: number;
+  dailyLimit: number;
+  callbackPort: number;
 }
 
 export interface YoutubeOauthStatus {
@@ -562,6 +579,7 @@ export interface ChannelConfig {
   platform: 'twitch' | 'youtube' | 'x' | 'niconico';
   identifier: string; // Twitch: channel name, YouTube: videoId, X: broadcast URL/ID, niconico: lv番組ID/URL
   enabled: boolean; // Rust ChannelConfig.enabled (serde default true)
+  ownStream?: boolean; // 「自分の配信」の印(X 自動告知の対象)。serde default false
 }
 
 export interface InjectTestCommentOptions {

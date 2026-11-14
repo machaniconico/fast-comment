@@ -13,7 +13,8 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::model::Platform;
+use super::twitch_auth::TwitchAuth;
+use crate::model::{LiveEvent, LiveStream, Platform};
 use crate::stats::{ViewerCountKind, YoutubeMetadataUpdate};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(20);
@@ -32,6 +33,9 @@ pub enum TwitchViewerAuth {
         client_id: String,
         client_secret: String,
     },
+    /// Device Code ログイン(`TwitchAuth`)のアクセストークン。呼び出し側が `TwitchAuth` を渡す。
+    /// 未ログインの間はポーリングしても何も起きない(ログイン後に自動で動き出す)。
+    DeviceLogin { client_id: String },
 }
 
 #[derive(Debug, Clone)]
@@ -50,12 +54,70 @@ struct AppAccessToken {
 struct TwitchStreamMetadata {
     viewer_count: Option<u32>,
     live: Option<bool>,
+    /// Helix `streams[0].id`(配信 1 回を表す ID)。
+    stream_id: Option<String>,
+    title: Option<String>,
+    started_at_ms: Option<u64>,
+}
+
+/// 配信 ID の変化から `LiveEvent` を決める(ポーラーごとに 1 つ)。
+#[derive(Debug, Default)]
+enum LiveTracker {
+    /// まだ確認していない。
+    #[default]
+    Unknown,
+    Live(String),
+    Offline,
+}
+
+impl LiveTracker {
+    /// 1 回の確認結果を取り込み、送るべきイベントを返す。
+    /// - 配信 ID が変わった時だけ Started(ID が取れなければ送らない)
+    /// - 未配信確認は Unknown / Live からの遷移時だけ Ended(初回を含む。未配信が続く間は送らない)
+    /// `identifier` は設定の識別子そのまま(イベントの照合キー)、`login` は正規化済みで URL 用。
+    fn observe(
+        &mut self,
+        identifier: &str,
+        login: &str,
+        meta: &TwitchStreamMetadata,
+    ) -> Option<LiveEvent> {
+        match meta.live {
+            Some(true) => {
+                let id = meta.stream_id.as_deref()?;
+                if matches!(self, LiveTracker::Live(prev) if prev == id) {
+                    return None;
+                }
+                *self = LiveTracker::Live(id.to_string());
+                Some(LiveEvent::Started(LiveStream {
+                    platform: Platform::Twitch,
+                    channel_identifier: identifier.to_string(),
+                    stream_id: id.to_string(),
+                    title: meta.title.clone(),
+                    url: format!("https://www.twitch.tv/{login}"),
+                    started_at_ms: meta.started_at_ms,
+                }))
+            }
+            Some(false) => {
+                if matches!(self, LiveTracker::Offline) {
+                    return None;
+                }
+                *self = LiveTracker::Offline;
+                Some(LiveEvent::Ended {
+                    platform: Platform::Twitch,
+                    channel_identifier: identifier.to_string(),
+                })
+            }
+            None => None,
+        }
+    }
 }
 
 pub fn spawn_twitch_viewer_poller(
     login: String,
     auth: TwitchViewerAuth,
+    device_auth: Arc<TwitchAuth>,
     tx: mpsc::Sender<YoutubeMetadataUpdate>,
+    live_tx: Option<mpsc::Sender<LiveEvent>>,
     cancel: CancellationToken,
 ) {
     let auth = match auth {
@@ -79,6 +141,15 @@ pub fn spawn_twitch_viewer_poller(
                 client_secret: client_secret.to_string(),
             }
         }
+        TwitchViewerAuth::DeviceLogin { client_id } => {
+            let client_id = client_id.trim();
+            if client_id.is_empty() {
+                return;
+            }
+            TwitchViewerAuth::DeviceLogin {
+                client_id: client_id.to_string(),
+            }
+        }
     };
 
     // SourceManager に資格情報を追加せず、同じチャンネルの Helix 起動経路を共有。
@@ -97,6 +168,7 @@ pub fn spawn_twitch_viewer_poller(
     }
 
     tauri::async_runtime::spawn(async move {
+        let identifier = login.clone();
         let login = login.trim().to_string();
         if login.is_empty() {
             return;
@@ -113,6 +185,7 @@ pub fn spawn_twitch_viewer_poller(
         let mut app_access_token: Option<CachedAppAccessToken> = None;
         let mut client_id_failures = 0usize;
         let mut metadata_failures = 0usize;
+        let mut live_tracker = LiveTracker::default();
 
         loop {
             if cancel.is_cancelled() {
@@ -162,12 +235,21 @@ pub fn spawn_twitch_viewer_poller(
                     )
                     .await,
                 ),
+                TwitchViewerAuth::DeviceLogin { client_id } => {
+                    fetch_device_login_stream_metadata(&http, &login, client_id, &device_auth)
+                        .await
+                }
             };
 
             if let Some(result) = metadata_result {
                 match result {
                     Ok(values) => {
                         metadata_failures = 0;
+                        if let (Some(live_tx), Some(event)) =
+                            (&live_tx, live_tracker.observe(&identifier, &login, &values))
+                        {
+                            super::send_live_event(live_tx, event);
+                        }
                         let update = YoutubeMetadataUpdate {
                             platform: Platform::Twitch,
                             channel: login.clone(),
@@ -222,7 +304,15 @@ pub fn viewer_auth(oauth: &str, client_id: &str, client_secret: &str) -> Option<
         });
     }
 
-    oauth_token_without_prefix(oauth).map(TwitchViewerAuth::UserToken)
+    // チャット用トークンも App 資格情報も無く Client ID だけある場合は、
+    // Device Code ログイン(PR #17)のトークンで検知する(未ログインなら何もしない)。
+    oauth_token_without_prefix(oauth)
+        .map(TwitchViewerAuth::UserToken)
+        .or_else(|| {
+            (!client_id.is_empty()).then(|| TwitchViewerAuth::DeviceLogin {
+                client_id: client_id.to_string(),
+            })
+        })
 }
 
 async fn fetch_client_id(http: &Client, token: &str) -> anyhow::Result<String> {
@@ -296,6 +386,28 @@ async fn fetch_app_stream_metadata(
             Err(e) => return Err(e),
         }
     }
+}
+
+/// Device Code ログインのトークンで取得する。未ログイン(取得不能)は `None`(今回は何もしない)。
+async fn fetch_device_login_stream_metadata(
+    http: &Client,
+    login: &str,
+    client_id: &str,
+    device_auth: &TwitchAuth,
+) -> Option<anyhow::Result<TwitchStreamMetadata>> {
+    // client_secret は public client の refresh では不要。
+    let access = match device_auth.access(client_id, "").await {
+        Ok(access) => access,
+        Err(e) => {
+            tracing::debug!("twitch:{login} Device Code ログインのトークンを取得できません: {}", e.message);
+            return None;
+        }
+    };
+    let result = fetch_stream_metadata(http, login, &access.token, &access.client_id).await;
+    if matches!(&result, Err(e) if is_auth_failure(e)) {
+        device_auth.invalidate_access_token().await;
+    }
+    Some(result)
 }
 
 async fn fetch_stream_metadata(
@@ -385,14 +497,34 @@ fn extract_stream_metadata(value: &Value) -> TwitchStreamMetadata {
     };
     let Some(stream) = streams.first() else {
         return TwitchStreamMetadata {
-            viewer_count: None,
             live: Some(false),
+            ..Default::default()
         };
     };
     TwitchStreamMetadata {
         viewer_count: extract_viewer_count(stream),
         live: Some(true),
+        stream_id: extract_stream_id(stream),
+        title: stream
+            .get("title")
+            .and_then(Value::as_str)
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty()),
+        started_at_ms: stream
+            .get("started_at")
+            .and_then(Value::as_str)
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s.trim()).ok())
+            .and_then(|t| u64::try_from(t.timestamp_millis()).ok()),
     }
+}
+
+fn extract_stream_id(value: &Value) -> Option<String> {
+    let s = match value.get("id")? {
+        Value::String(s) => s.trim().to_string(),
+        Value::Number(n) => n.to_string(),
+        _ => return None,
+    };
+    (!s.is_empty()).then_some(s)
 }
 
 const AVATAR_TTL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -880,6 +1012,36 @@ mod tests {
     }
 
     #[test]
+    fn live_event_uses_original_identifier_not_normalized_login() {
+        let mut t = LiveTracker::default();
+        let ev = t.observe(" Streamer ", "streamer", &meta(Some("a"), Some(true)));
+        match ev {
+            Some(LiveEvent::Started(s)) => {
+                assert_eq!(s.channel_identifier, " Streamer ");
+                assert_eq!(s.url, "https://www.twitch.tv/streamer");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert_eq!(
+            t.observe(" Streamer ", "streamer", &meta(None, Some(false))),
+            Some(LiveEvent::Ended {
+                platform: Platform::Twitch,
+                channel_identifier: " Streamer ".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn viewer_auth_falls_back_to_device_login_with_client_id_only() {
+        assert_eq!(
+            viewer_auth("", " app-client ", ""),
+            Some(TwitchViewerAuth::DeviceLogin {
+                client_id: "app-client".to_string(),
+            })
+        );
+    }
+
+    #[test]
     fn viewer_auth_returns_none_when_all_credentials_are_empty() {
         assert_eq!(viewer_auth("", "", ""), None);
     }
@@ -892,6 +1054,7 @@ mod tests {
             TwitchStreamMetadata {
                 viewer_count: Some(1234),
                 live: Some(true),
+                ..Default::default()
             }
         );
     }
@@ -904,7 +1067,93 @@ mod tests {
             TwitchStreamMetadata {
                 viewer_count: None,
                 live: Some(false),
+                ..Default::default()
             }
         );
+    }
+
+    /// AC-1
+    #[test]
+    fn extracts_stream_id_title_and_started_at() {
+        let value = json!({ "data": [{
+            "id": "4001", "title": "  朝の配信  ", "viewer_count": 3,
+            "started_at": "2026-11-14T01:02:03Z"
+        }] });
+        let meta = extract_stream_metadata(&value);
+        assert_eq!(meta.stream_id.as_deref(), Some("4001"));
+        assert_eq!(meta.title.as_deref(), Some("朝の配信"));
+        assert_eq!(meta.started_at_ms, Some(1_794_618_123_000));
+        assert_eq!(meta.live, Some(true));
+    }
+
+    #[test]
+    fn missing_stream_fields_become_none() {
+        let meta = extract_stream_metadata(&json!({ "data": [{ "viewer_count": 1 }] }));
+        assert_eq!(meta.live, Some(true));
+        assert_eq!((meta.stream_id, meta.title, meta.started_at_ms), (None, None, None));
+        let meta = extract_stream_metadata(&json!({ "data": [{ "id": "", "title": 5, "started_at": "bad" }] }));
+        assert_eq!((meta.stream_id, meta.title, meta.started_at_ms), (None, None, None));
+        // data が配列でなければ判定不能(live も None)。
+        assert_eq!(extract_stream_metadata(&json!({ "data": "x" })).live, None);
+    }
+
+    fn meta(id: Option<&str>, live: Option<bool>) -> TwitchStreamMetadata {
+        TwitchStreamMetadata {
+            live,
+            stream_id: id.map(str::to_string),
+            title: Some("t".to_string()),
+            started_at_ms: Some(1),
+            ..Default::default()
+        }
+    }
+
+    fn started_id(ev: &Option<LiveEvent>) -> Option<&str> {
+        match ev {
+            Some(LiveEvent::Started(s)) => Some(s.stream_id.as_str()),
+            _ => None,
+        }
+    }
+
+    /// AC-2
+    #[test]
+    fn live_tracker_sends_started_only_when_stream_id_changes() {
+        let mut t = LiveTracker::default();
+        let ev = t.observe("ch", "ch", &meta(Some("a"), Some(true)));
+        assert_eq!(started_id(&ev), Some("a"));
+        if let Some(LiveEvent::Started(s)) = &ev {
+            assert_eq!(s.platform, Platform::Twitch);
+            assert_eq!(s.channel_identifier, "ch");
+            assert_eq!(s.url, "https://www.twitch.tv/ch");
+            assert_eq!(s.title.as_deref(), Some("t"));
+            assert_eq!(s.started_at_ms, Some(1));
+        }
+        assert_eq!(t.observe("ch", "ch", &meta(Some("a"), Some(true))), None);
+        assert_eq!(t.observe("ch", "ch", &meta(Some("a"), Some(true))), None);
+        // 回線断などで配信 ID だけ変わる。
+        assert_eq!(started_id(&t.observe("ch", "ch", &meta(Some("b"), Some(true)))), Some("b"));
+    }
+
+    #[test]
+    fn live_tracker_sends_ended_on_first_and_transition_only() {
+        let mut t = LiveTracker::default();
+        // 初回の未配信確認でも Ended。続く間は送らない。
+        let ended = Some(LiveEvent::Ended {
+            platform: Platform::Twitch,
+            channel_identifier: "ch".to_string(),
+        });
+        assert_eq!(t.observe("ch", "ch", &meta(None, Some(false))), ended);
+        assert_eq!(t.observe("ch", "ch", &meta(None, Some(false))), None);
+        assert_eq!(started_id(&t.observe("ch", "ch", &meta(Some("a"), Some(true)))), Some("a"));
+        assert_eq!(t.observe("ch", "ch", &meta(None, Some(false))), ended);
+        // 判定不能(live=None)や配信 ID の無い配信中は何も送らない。
+        assert_eq!(t.observe("ch", "ch", &meta(None, None)), None);
+        assert_eq!(t.observe("ch", "ch", &meta(None, Some(true))), None);
+    }
+
+    #[test]
+    fn live_tracker_without_stream_id_never_sends_started() {
+        let mut t = LiveTracker::default();
+        assert_eq!(t.observe("ch", "ch", &meta(None, Some(true))), None);
+        assert!(matches!(t, LiveTracker::Unknown));
     }
 }

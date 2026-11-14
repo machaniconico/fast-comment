@@ -16,6 +16,28 @@ pub enum Platform {
     Niconico,
 }
 
+/// 配信 1 回分の情報(X 自動告知の入力)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveStream {
+    pub platform: Platform,
+    /// 設定の ChannelConfig.identifier をそのまま(印の照合キー)
+    pub channel_identifier: String,
+    /// 配信 1 回を一意に表す ID: YouTube=videoId / Twitch=Helix stream id / ニコ生=lv 番組 ID
+    pub stream_id: String,
+    pub title: Option<String>,
+    /// 視聴 URL(Source 側で組み立てる)
+    pub url: String,
+    /// 配信開始時刻(epoch ms)。取れなければ None
+    pub started_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LiveEvent {
+    Started(LiveStream),
+    /// 未配信を確認した。起動直後の最初の確認(未確認→未配信)でも送る
+    Ended { platform: Platform, channel_identifier: String },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum MessageKind {

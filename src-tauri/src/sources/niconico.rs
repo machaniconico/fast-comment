@@ -28,10 +28,16 @@ use tokio_util::sync::CancellationToken;
 
 use super::{Backoff, Source};
 use crate::config::NiconicoOverrides;
-use crate::model::{Amount, Author, ChatMessage, Fragment, MessageKind, Platform, Roles};
+use crate::model::{
+    Amount, Author, ChatMessage, Fragment, LiveEvent, LiveStream, MessageKind, Platform, Roles,
+};
 use crate::stats::{ViewerCountKind, YoutubeMetadataUpdate};
 
 const WATCH_PAGE_BASE_URL: &str = "https://live.nicovideo.jp/watch/";
+/// embedded-data 内の番組 ID / 開始時刻(epoch 秒)の JSON ポインタ(実ページ未確認の推測)。
+/// `niconicoOverrides.endpoints` の `programIdPointer` / `beginTimePointer` で上書きできる。
+const DEFAULT_PROGRAM_ID_POINTER: &str = "/program/nicoliveProgramId";
+const DEFAULT_BEGIN_TIME_POINTER: &str = "/program/beginTime";
 /// ブラウザ相当の UA。視聴ページはブラウザ以外の UA を弾くことがある。
 const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 /// 単発 HTTP リクエスト(視聴ページ取得)の全体タイムアウト。
@@ -323,12 +329,78 @@ struct WatchBootstrap {
     title: Option<String>,
     /// 放送者のユーザー ID(broadcaster ロール判定用)。
     broadcaster_id: Option<String>,
+    /// 配信 ID(lv 番組 ID)。確定できなければ None(その場合 Started を送らない)。
+    program_id: Option<String>,
+    /// 番組の開始時刻(epoch ms)。
+    begin_ms: Option<u64>,
+}
+
+/// embedded-data から番組 ID と開始時刻を取り出す。
+///
+/// JSON ポインタは推測(実ページ未確認)。`niconicoOverrides.endpoints` の
+/// `programIdPointer` / `beginTimePointer` で差し替えられる。
+/// 番組 ID が取れず設定値が `lv数字` ならそれを使う。
+fn extract_program_info(
+    props: &Value,
+    live_id: &str,
+    id_pointer: &str,
+    begin_pointer: &str,
+) -> (Option<String>, Option<u64>) {
+    let from_page = props
+        .pointer(id_pointer)
+        .and_then(|v| id_string(Some(v)))
+        .filter(|s| is_lv_id(s));
+    let program_id = from_page.or_else(|| is_lv_id(live_id).then(|| live_id.to_string()));
+    let begin_ms = props.pointer(begin_pointer).and_then(parse_epoch_ms);
+    (program_id, begin_ms)
+}
+
+fn is_lv_id(s: &str) -> bool {
+    s.strip_prefix("lv")
+        .is_some_and(|d| !d.is_empty() && d.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// 秒 / ミリ秒の epoch(数値または数字文字列)と RFC 3339 文字列を epoch ms にする。
+fn parse_epoch_ms(v: &Value) -> Option<u64> {
+    let n = v
+        .as_u64()
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()));
+    if let Some(n) = n {
+        if n == 0 {
+            return None;
+        }
+        return Some(if n < 100_000_000_000 { n * 1000 } else { n });
+    }
+    let ms = chrono::DateTime::parse_from_rfc3339(v.as_str()?.trim())
+        .ok()?
+        .timestamp_millis();
+    u64::try_from(ms).ok()
+}
+
+/// 番組が未配信(終了・未開始)だと確認できたことを表すエラー。
+/// 通信失敗・解析失敗・WS 切断とは区別し、これだけが Ended の根拠になる。
+#[derive(Debug)]
+struct ProgramNotOnAir(String);
+
+impl std::fmt::Display for ProgramNotOnAir {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "配信中ではない({})", self.0)
+    }
+}
+
+impl std::error::Error for ProgramNotOnAir {}
+
+/// watch WS の disconnect 理由が番組終了を示すか。
+fn disconnect_reason_confirms_end(reason: &str) -> bool {
+    reason.eq_ignore_ascii_case("END_PROGRAM")
 }
 
 #[derive(Debug)]
 struct NiconicoSessionError {
     error: anyhow::Error,
     stable: bool,
+    /// 未配信(終了・未開始)を確認できた時だけ true。
+    confirmed_off_air: bool,
 }
 
 impl NiconicoSessionError {
@@ -336,20 +408,27 @@ impl NiconicoSessionError {
     where
         E: Into<anyhow::Error>,
     {
+        let error = error.into();
+        let confirmed_off_air = error.downcast_ref::<ProgramNotOnAir>().is_some();
         NiconicoSessionError {
-            error: error.into(),
+            error,
             stable,
+            confirmed_off_air,
         }
     }
 }
 
 /// ニコニコ生放送1番組のコメントを購読する Source。
 pub struct NiconicoSource {
+    /// 設定の identifier(LiveStream.channel_identifier の照合キー)。
+    identifier: String,
     /// 正規化済み lv 番組 ID。
     live_id: String,
     overrides: NiconicoOverrides,
     /// チップの接続状態表示用。live/タイトル/視聴者数を送る。
     metadata_tx: Option<mpsc::Sender<YoutubeMetadataUpdate>>,
+    /// 配信開始/終了イベント(X 自動告知用)。
+    live_tx: Option<mpsc::Sender<LiveEvent>>,
 }
 
 impl NiconicoSource {
@@ -360,9 +439,46 @@ impl NiconicoSource {
     ) -> Self {
         NiconicoSource {
             live_id: extract_live_id(&identifier),
+            identifier,
             overrides,
             metadata_tx,
+            live_tx: None,
         }
+    }
+
+    pub fn with_live_tx(mut self, live_tx: Option<mpsc::Sender<LiveEvent>>) -> Self {
+        self.live_tx = live_tx;
+        self
+    }
+
+    fn send_live_ended(&self) {
+        if let Some(tx) = &self.live_tx {
+            super::send_live_event(
+                tx,
+                LiveEvent::Ended {
+                    platform: Platform::Niconico,
+                    channel_identifier: self.identifier.clone(),
+                },
+            );
+        }
+    }
+
+    /// 番組 ID を確定できた時だけ Started を送る。
+    fn send_live_started(&self, boot: &WatchBootstrap) {
+        let (Some(tx), Some(program_id)) = (&self.live_tx, &boot.program_id) else {
+            return;
+        };
+        super::send_live_event(
+            tx,
+            LiveEvent::Started(LiveStream {
+                platform: Platform::Niconico,
+                channel_identifier: self.identifier.clone(),
+                stream_id: program_id.clone(),
+                title: boot.title.clone(),
+                url: format!("{WATCH_PAGE_BASE_URL}{program_id}"),
+                started_at_ms: boot.begin_ms,
+            }),
+        );
     }
 
     /// overrides の endpoints にキーがあればそれを、無ければ既定 URL を使う。
@@ -406,6 +522,9 @@ impl Source for NiconicoSource {
                     }
                     Err(e) => {
                         self.send_live_state(false, None, None).await;
+                        if e.confirmed_off_air {
+                            self.send_live_ended();
+                        }
                         if e.stable {
                             backoff.reset();
                         }
@@ -493,6 +612,7 @@ impl NiconicoSource {
 
         tracing::info!("niconico:{} watch セッション開始", self.live_id);
         self.send_live_state(true, boot.title.clone(), None).await;
+        self.send_live_started(&boot);
 
         let connected_at = Instant::now();
         // 「安定」判定は NDGR からのコメント実受信のみで立てる(x.rs と同方針)。
@@ -589,9 +709,16 @@ impl NiconicoSource {
                                 }
                             }
                             WatchAction::Disconnect { reason } => {
+                                let stable = stable(&received_chat);
+                                if disconnect_reason_confirms_end(&reason) {
+                                    return Err(NiconicoSessionError::new(
+                                        ProgramNotOnAir(format!("disconnect: {reason}")),
+                                        stable,
+                                    ));
+                                }
                                 return Err(NiconicoSessionError::new(
                                     anyhow::anyhow!("サーバーから切断: {reason}"),
-                                    stable(&received_chat),
+                                    stable,
                                 ));
                             }
                             WatchAction::Ignore => {}
@@ -634,7 +761,7 @@ impl NiconicoSource {
             .and_then(Value::as_str)
             .unwrap_or("");
         if !status.is_empty() && status != "ON_AIR" {
-            anyhow::bail!("配信中ではない(status={status})");
+            return Err(ProgramNotOnAir(format!("status={status}")).into());
         }
 
         let web_socket_url = props
@@ -654,10 +781,19 @@ impl NiconicoSource {
             .filter(|s| !s.is_empty());
         let broadcaster_id = id_string(props.pointer("/program/supplier/programProviderId"));
 
+        let (program_id, begin_ms) = extract_program_info(
+            &props,
+            &self.live_id,
+            &self.endpoint_url("programIdPointer", DEFAULT_PROGRAM_ID_POINTER),
+            &self.endpoint_url("beginTimePointer", DEFAULT_BEGIN_TIME_POINTER),
+        );
+
         Ok(WatchBootstrap {
             web_socket_url,
             title,
             broadcaster_id,
+            program_id,
+            begin_ms,
         })
     }
 
@@ -1008,6 +1144,23 @@ mod tests {
     }
 
     #[test]
+    fn only_confirmed_off_air_errors_allow_ended() {
+        let off = NiconicoSessionError::new(ProgramNotOnAir("status=ENDED".into()), false);
+        assert!(off.confirmed_off_air);
+        // 通信・解析・WS 系のエラーは未配信の確認にならない。
+        let comm = NiconicoSessionError::new(anyhow::anyhow!("timeout"), false);
+        assert!(!comm.confirmed_off_air);
+        let wrapped = NiconicoSessionError::new(
+            anyhow::Error::from(ProgramNotOnAir("status=RELEASED".into())).context("wrap"),
+            false,
+        );
+        assert!(wrapped.confirmed_off_air);
+        assert!(disconnect_reason_confirms_end("END_PROGRAM"));
+        assert!(!disconnect_reason_confirms_end("TOO_MANY_CONNECTIONS"));
+        assert!(!disconnect_reason_confirms_end("不明"));
+    }
+
+    #[test]
     fn extracts_live_id_from_urls_and_raw_ids() {
         assert_eq!(
             extract_live_id("https://live.nicovideo.jp/watch/lv123456"),
@@ -1045,6 +1198,52 @@ mod tests {
             Some("テスト配信")
         );
         assert!(extract_embedded_data("<html>no data</html>").is_none());
+    }
+
+    /// AC-4: 番組 ID を確定できた時だけ Started を送る。
+    #[test]
+    fn program_info_is_extracted_and_falls_back_to_configured_lv_id() {
+        let props = json!({"program": {"nicoliveProgramId": "lv999", "beginTime": 1_700_000_000u64}});
+        assert_eq!(
+            extract_program_info(&props, "lv1", DEFAULT_PROGRAM_ID_POINTER, DEFAULT_BEGIN_TIME_POINTER),
+            (Some("lv999".to_string()), Some(1_700_000_000_000))
+        );
+        // ページに無ければ設定値 lv 数字。開始時刻が無ければ None。
+        let props = json!({"program": {"title": "t"}});
+        assert_eq!(
+            extract_program_info(&props, "lv123", DEFAULT_PROGRAM_ID_POINTER, DEFAULT_BEGIN_TIME_POINTER),
+            (Some("lv123".to_string()), None)
+        );
+        // どちらからも確定できなければ None(Started を送らない)。
+        assert_eq!(
+            extract_program_info(&props, "co1234", DEFAULT_PROGRAM_ID_POINTER, DEFAULT_BEGIN_TIME_POINTER),
+            (None, None)
+        );
+        // lv 形式でないページ側の値は採用しない。
+        let props = json!({"program": {"nicoliveProgramId": "bogus"}});
+        assert_eq!(
+            extract_program_info(&props, "co1", DEFAULT_PROGRAM_ID_POINTER, DEFAULT_BEGIN_TIME_POINTER).0,
+            None
+        );
+        // ポインタは上書きできる。
+        let props = json!({"x": {"id": 555, "t": "2026-11-14T00:00:00+09:00"}});
+        assert_eq!(
+            extract_program_info(&props, "co1", "/x/id", "/x/t"),
+            (None, Some(1794582000000))
+        );
+    }
+
+    #[test]
+    fn epoch_parsing_handles_seconds_millis_and_rfc3339() {
+        assert_eq!(parse_epoch_ms(&json!(1_700_000_000u64)), Some(1_700_000_000_000));
+        assert_eq!(parse_epoch_ms(&json!(1_700_000_000_123u64)), Some(1_700_000_000_123));
+        assert_eq!(parse_epoch_ms(&json!("1700000000")), Some(1_700_000_000_000));
+        assert_eq!(parse_epoch_ms(&json!(0)), None);
+        assert_eq!(parse_epoch_ms(&json!("garbage")), None);
+        assert_eq!(
+            parse_epoch_ms(&json!("1970-01-01T00:00:01Z")),
+            Some(1000)
+        );
     }
 
     #[test]
