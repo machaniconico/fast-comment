@@ -1,9 +1,9 @@
 [package]
 name = "fast-comment"
-version = "0.1.0"
+version = "0.2.0"
 description = "Fast multi-platform live chat viewer (Twitch / YouTube Live)"
 edition = "2021"
-rust-version = "1.77"
+rust-version = "1.90"
 
 [lib]
 name = "fast_comment_lib"
@@ -15,6 +15,8 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-shell = "2"
+# 自動更新後の再起動(relaunch)
+tauri-plugin-process = "2"
 arboard = { version = "3", default-features = false }
 
 serde = { version = "1", features = ["derive"] }
@@ -60,6 +62,10 @@ keyring = { version = "3.6", default-features = false, features = ["apple-native
 
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "3.6", default-features = false, features = ["linux-native-sync-persistent", "crypto-rust"] }
+
+# 自動更新(GitHub Releases の latest.json を見る)。デスクトップのみ。
+[target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
+tauri-plugin-updater = "2"
 
 # ビルド時間優先の release。fat LTO + codegen-units=1 は毎ビルド3分超かかる
 # 割にサイズ数%しか稼げないため、thin LTO + 並列 + incremental にしている。

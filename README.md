@@ -21,7 +21,7 @@ Twitch / YouTube のライブコメントを1つの画面に集約し、OBS オ�
 - **X への配信開始告知** — 「自分の配信」の印を付けたチャンネルの配信開始で X に告知。既定は投稿画面を開くだけ(無料)。自分の X 開発者アプリで接続すれば公式 API で完全自動にもできる(有料)。既定OFF
 - **コマンドパレット** — `Ctrl+K` でアクション実行・設定ジャンプ・コメント検索
 - **コメントピン留め / キーワード通知音** — 重要コメントの固定表示、一致コメント到着時の効果音通知
-- **起動時の更新チェック** — GitHub Releases の最新タグを semver 比較し、新版があれば通知バナーを表示
+- **自動更新** — 起動時に GitHub Releases の署名付き更新(`latest.json`)を確認し、新版があれば「更新して再起動」バナーを表示。設定画面の「アプリの更新」から手動確認も可能
 
 ## 技術スタック
 
@@ -67,6 +67,18 @@ build-windows.bat
 ```
 
 `build-windows.bat` は setup を統合した単一エントリです。Rust / MSVC が無ければ自動インストールし、そのままビルドまで進みます。ビルド成功後は既定で出力フォルダ(`src-tauri\target\release\bundle`)を開きます。生成されたインストーラー(`*-setup.exe`)を起動したまま再ビルドすると NSIS が `os error 5 (access denied)` で失敗するため、自動起動は既定 OFF です。自動起動させたい場合は `set FC_AUTORUN_SETUP=1` を実行してからスクリプトを起動してください。
+
+ローカルビルドでは updater 用の署名(`.sig`)を作りません。署名用の秘密鍵は GitHub Secrets にだけあり、環境変数 `TAURI_SIGNING_PRIVATE_KEY` が無い時は `src-tauri\tauri.nosign.conf.json` を重ねてビルドします。
+
+### リリース(GitHub Actions)
+
+`src-tauri/tauri.conf.json`・`src-tauri/Cargo.toml`・`package.json` の `version` を揃え、`.github/release-notes/vX.Y.Z.md` を用意してから `vX.Y.Z` の tag を push します。`.github/workflows/release.yml` が Windows ランナーで NSIS と MSI を作り、updater 用の署名と `latest.json` を付けて **draft** の Release を作ります。中身を確かめてから公開してください(`gh release edit vX.Y.Z --draft=false`)。公開するまで既存ユーザーへの自動更新は始まりません。tag とアプリのバージョンが違う時はワークフローが失敗します。
+
+## 更新
+
+v0.2.0 以降はアプリ内で更新できます。起動時に新しい版を静かに確認し(オフラインや失敗時は何も表示しません)、見つかると画面上部に通知が出ます。「更新して再起動」でダウンロードとインストールを行い、アプリが再起動します。「後で」で通知を閉じられ、設定画面の「アプリの更新」からいつでも確認できます。更新中は接続中の配信が一度切れます。
+
+v0.1.0 には自動更新がないため、[Releases](https://github.com/machaniconico/fast-comment/releases) から v0.2.0 のインストーラーを手動で入れ直してください。コード署名をしていないため、Windows の SmartScreen が警告を出したら「詳細情報」→「実行」で起動できます。
 
 開発時のフロントエンド検証のみ WSL でも可能です:
 

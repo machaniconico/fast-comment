@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "fast-comment",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "identifier": "dev.skyfade.fastcomment",
   "build": {
     "frontendDist": "../dist",
@@ -28,6 +28,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "createUpdaterArtifacts": true,
     "windows": {
       "nsis": {
         "installMode": "currentUser",
@@ -44,5 +45,16 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDE2NEQyOUZGNzgwMTY1MzIKUldReVpRRjQveWxORmc2MExqU28zVUFXQlk4azBVcUE2SXhjUXB2YS90cnU3OHJ3alRRMDkwYVQK",
+      "endpoints": [
+        "https://github.com/machaniconico/fast-comment/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
   }
 }

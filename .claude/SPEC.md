@@ -354,3 +354,18 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
 - **テスト投稿**(`send_x_test_post`): 文面 `fast-comment 連携テスト YYYY/MM/DD HH:MM`(URL なし)。UI は確認ダイアログで文面と「実際に公開され、課金される」旨を出してから呼ぶ。台帳・クールダウン・1 日上限には数えない。
 - **状態取得**: `get_x_post_status` → `{ configured, connected, username, callbackUrl, unsavedToken }`。接続・切断の後は駆動タスクに `AuthChanged` を送り、投稿できるかを読み直させる。
 - **秘密値**: access / refresh token と認可コードはログ・エラー文・emit・`Debug` に出さない(`XPostError` は固定文のみ)。
+
+## 14. 自動更新(`tauri-plugin-updater` + `tauri-plugin-process`、v0.2.0〜)
+
+- **配布元**: GitHub Releases。`plugins.updater.endpoints` は `https://github.com/machaniconico/fast-comment/releases/latest/download/latest.json` の 1 本。`latest` は draft・prerelease を指さないので、draft のまま置いた版は配られない。
+- **署名**: minisign 鍵。公開鍵の中身を `tauri.conf.json` の `plugins.updater.pubkey` に直書き。秘密鍵とパスワードは GitHub Secrets(`TAURI_SIGNING_PRIVATE_KEY` / `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`)にだけ置き、リポジトリ・ローカルに置かない。鍵を失うと既存インストールへ更新を配れなくなる(pubkey を変えた版は手動で入れ直してもらう)。
+- **成果物**: `bundle.createUpdaterArtifacts: true`。CI(`.github/workflows/release.yml`、tag `v*` または手動実行、`windows-latest`)の `tauri-action@v1` が NSIS / MSI と `.sig`、`latest.json` を draft Release に上げる。`updaterJsonPreferNsis: true` で `latest.json` は NSIS の exe を指す。ローカルビルド(`build-windows.bat`)は鍵が無ければ `tauri.nosign.conf.json` を重ねて署名を作らない。
+- **バージョン**: `tauri.conf.json` / `Cargo.toml` / `package.json` の `version` と tag(`v` を除く)が一致しないと CI が失敗する。リリースノートは `.github/release-notes/vX.Y.Z.md`(無ければ失敗)で、Release 本文と `latest.json` の `notes` になる。
+- **インストール**: Windows は `plugins.updater.windows.installMode = "passive"`(進捗バーのみ・操作不要)。NSIS は `currentUser` インストールなので管理者権限は要らない。Windows ではインストーラ起動時にアプリが終了する。他 OS は `relaunch()`(`process:allow-restart`)で再起動。
+- **UI**(`src/lib/appUpdate.svelte.ts`、純粋関数は `appUpdate.ts`):
+  - 起動時に `check()`(15 秒タイムアウト)を静かに実行。失敗(オフライン・dev ビルド・`latest.json` 欠落)はログのみで画面に出さない。
+  - 署名付き更新が使えない時は従来の `check_for_update`(GitHub Releases API の最新 tag と semver 比較、`update.rs`)へ落とし、リリースページへのリンクだけ出す。
+  - 新版があれば画面上部に控えめなバナー(新旧バージョン、「更新して再起動」「後で」)。ダウンロード中は進捗(%・バイト数、Content-Length 無しならバイト数のみ)。
+  - 設定「アプリの更新」に現在のバージョンと「更新を確認」ボタン。手動確認は「最新版です」・エラー文も表示し、閉じたバナーを再表示する。
+- **permission**: main ウィンドウの `capabilities/default.json` に `updater:default` と `process:allow-restart`。弾幕ウィンドウには付けない。
+- **v0.1.0 からの移行**: v0.1.0 は updater 無しなので自動更新できない。v0.2.0 を手動で入れてもらい、以降が自動更新の対象。
