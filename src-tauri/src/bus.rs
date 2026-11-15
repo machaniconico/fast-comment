@@ -324,33 +324,7 @@ impl Bus {
             &goals_skin_dir,
         );
         match extra {
-            Some(extra) => app.merge(extra.layer(axum::middleware::map_response(
-                |mut response: axum::response::Response| async move {
-                    use axum::http::{header, StatusCode};
-                    // Only the closed gate returns a bare 404 without API cache policy.
-                    // Match the OBS fallback here; the standalone API stays CORS-free.
-                    if response.status() == StatusCode::NOT_FOUND
-                        && !response.headers().contains_key(header::CACHE_CONTROL)
-                    {
-                        let headers = response.headers_mut();
-                        headers.insert(
-                            header::VARY,
-                            header::HeaderValue::from_static(
-                                "origin, access-control-request-method, access-control-request-headers",
-                            ),
-                        );
-                        headers.insert(
-                            header::ACCESS_CONTROL_ALLOW_ORIGIN,
-                            header::HeaderValue::from_static("*"),
-                        );
-                        headers.insert(
-                            header::ACCESS_CONTROL_EXPOSE_HEADERS,
-                            header::HeaderValue::from_static("*"),
-                        );
-                    }
-                    response
-                },
-            ))),
+            Some(extra) => app.merge(extra),
             None => app,
         }
     }
@@ -760,10 +734,10 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn closed_gate_is_indistinguishable_from_plain_404() {
+    async fn composed_api_responses_have_no_cors_headers() {
         use axum::{
             body::Body,
-            http::{Request, StatusCode},
+            http::{header, Method, Request, StatusCode},
         };
         use http_body_util::BodyExt;
         use tower::ServiceExt;
@@ -772,8 +746,10 @@ mod tests {
         let (stats_tx, _) = watch::channel(StatsSnapshot::default());
         let (timer_tx, _) = watch::channel(TimerSnapshot::default());
         let bus = Bus::new(0, stats_tx, timer_tx);
+        let gate = crate::api::ApiGate::closed();
+        let token = crate::api::generate_token();
         let extra = crate::api::router(
-            crate::api::ApiDeps::new(crate::api::ApiGate::closed(), Default::default()),
+            crate::api::ApiDeps::new(gate.clone(), Default::default()),
             1234,
         );
         let router = bus.obs_app(
@@ -782,27 +758,75 @@ mod tests {
             root.path().join("skin"),
             Some(extra),
         );
-        let hidden = router
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/api/v1/status")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let plain = router
-            .oneshot(Request::builder().uri("/nope-xyz").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(hidden.status(), StatusCode::NOT_FOUND);
-        assert_eq!(hidden.status(), plain.status());
-        assert_eq!(hidden.headers(), plain.headers());
-        assert_eq!(
-            hidden.into_body().collect().await.unwrap().to_bytes(),
-            plain.into_body().collect().await.unwrap().to_bytes()
-        );
+        for enabled in [false, true] {
+            if enabled {
+                gate.open(&token);
+            }
+            for path in ["/api", "/api/", "/api/v1/status", "/api/nope-xyz"] {
+                for (method, origin, authorized) in [
+                    (Method::GET, false, false),
+                    (Method::GET, false, true),
+                    (Method::GET, true, true),
+                    (Method::POST, false, true),
+                    (Method::OPTIONS, true, false),
+                ] {
+                    let mut request = Request::builder()
+                        .method(method.clone())
+                        .uri(path)
+                        .header(header::HOST, "127.0.0.1:1234");
+                    if origin {
+                        request = request.header(header::ORIGIN, "https://example.com");
+                    }
+                    if method == Method::OPTIONS {
+                        request = request
+                            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+                            .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "authorization");
+                    }
+                    if authorized {
+                        request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+                    }
+                    let response = router
+                        .clone()
+                        .oneshot(request.body(Body::empty()).unwrap())
+                        .await
+                        .unwrap();
+                    let expected = if !enabled {
+                        StatusCode::NOT_FOUND
+                    } else if origin {
+                        StatusCode::FORBIDDEN
+                    } else if !authorized {
+                        StatusCode::UNAUTHORIZED
+                    } else if path != "/api/v1/status" {
+                        StatusCode::NOT_FOUND
+                    } else if method != Method::GET {
+                        StatusCode::METHOD_NOT_ALLOWED
+                    } else {
+                        StatusCode::OK
+                    };
+                    assert_eq!(
+                        response.status(), expected,
+                        "enabled={enabled}, {method} {path}"
+                    );
+                    for name in response.headers().keys() {
+                        assert!(
+                            !name.as_str().starts_with("access-control-") && name != header::VARY,
+                            "unexpected {name}: enabled={enabled}, {method} {path}"
+                        );
+                    }
+                    if !enabled {
+                        assert!(!response.headers().contains_key(header::CACHE_CONTROL));
+                        assert!(!response.headers().contains_key(header::X_CONTENT_TYPE_OPTIONS));
+                        assert!(response
+                            .into_body()
+                            .collect()
+                            .await
+                            .unwrap()
+                            .to_bytes()
+                            .is_empty());
+                    }
+                }
+            }
+        }
     }
 
     // --- is_valid_template_name ---
