@@ -3,6 +3,3 @@
 
 #[test]
 fn acceptance_harness_runs() {}
-
-#[test]
-fn deliberate_failure_to_check_ci() { panic!("CI が赤になるかの確認用"); }
