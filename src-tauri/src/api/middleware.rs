@@ -121,37 +121,7 @@ fn authorized(request: &Request, gate: &super::ApiGate) -> bool {
 mod tests {
     use super::*;
     use axum::{body::Body, middleware::from_fn_with_state, routing::get, Router};
-    use http_body_util::BodyExt;
     use tower::ServiceExt;
-
-    #[tokio::test]
-    async fn closed_gate_is_indistinguishable_from_plain_404() {
-        let router = super::super::router(
-            ApiDeps::new(super::super::ApiGate::closed(), Default::default()),
-            1234,
-        );
-        let hidden = router
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/api/v1/status")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let plain = router
-            .oneshot(Request::builder().uri("/apix").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(hidden.status(), StatusCode::NOT_FOUND);
-        assert_eq!(hidden.status(), plain.status());
-        assert_eq!(hidden.headers(), plain.headers());
-        assert_eq!(
-            hidden.into_body().collect().await.unwrap().to_bytes(),
-            plain.into_body().collect().await.unwrap().to_bytes()
-        );
-    }
 
     #[tokio::test]
     async fn boundary_preserves_sse_and_text_content_types_and_normalizes_json() {

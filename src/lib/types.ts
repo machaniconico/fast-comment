@@ -152,6 +152,7 @@ export type UiChatMessage = ChatMessage & {
 
 export interface LocalApiStatus {
   enabled: boolean;
+  writesBlocked: boolean;
   hasToken: boolean;
   tokenError: string | null;
   notice: string | null;

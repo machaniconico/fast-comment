@@ -12,6 +12,7 @@ const TOKEN_ERROR: &str = "トークンを読めません。再生成してく�
 #[serde(rename_all = "camelCase")]
 pub struct LocalApiStatus {
     pub enabled: bool,
+    pub writes_blocked: bool,
     pub has_token: bool,
     pub token_error: Option<String>,
     pub notice: Option<String>,
@@ -94,6 +95,7 @@ impl<S: SecretStore> Integrations<S> {
         let status = LocalApiStatus {
             enabled: file.local_api.enabled,
             has_token,
+            writes_blocked,
             token_error,
             notice,
         };
@@ -205,7 +207,13 @@ mod tests {
         let path = dir.path().join(file::FILE_NAME);
         std::fs::create_dir(&path).unwrap();
         let secrets = MemorySecretStore::new();
+        secrets.fail_next_get();
         let service = Integrations::open(dir.path().to_path_buf(), secrets.clone(), 1).await;
+        let status = service.local_api_status();
+        assert!(status.writes_blocked);
+        assert!(status.token_error.is_some());
+        assert!(status.notice.as_deref().unwrap().contains("再起動"));
+        assert_eq!(serde_json::to_value(&status).unwrap()["writesBlocked"], true);
         std::fs::remove_dir(&path).unwrap();
         let saved = IntegrationsFile {
             webhooks: vec![crate::integrations::WebhookDef {
@@ -245,6 +253,7 @@ mod tests {
         std::fs::create_dir(dir.path().join("integrations.json.corrupt-1")).unwrap();
         let secrets = MemorySecretStore::new();
         let service = Integrations::open(dir.path().to_path_buf(), secrets.clone(), 1).await;
+        assert!(service.local_api_status().writes_blocked);
         assert!(matches!(
             service.set_local_api_enabled(true).await,
             Err(IntegrationError::FileWrite)
@@ -258,6 +267,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let secrets = MemorySecretStore::new();
         let service = Integrations::open(dir.path().join("missing"), secrets.clone(), 1).await;
+        assert!(!service.local_api_status().writes_blocked);
         assert!(service.set_local_api_enabled(true).await.is_err());
         assert!(secrets.keys().is_empty());
         assert!(!service.gate().is_open());

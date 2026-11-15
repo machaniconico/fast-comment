@@ -58,19 +58,19 @@
 <section id="settings-local-api">
   <h3>ローカル API</h3>
   <p>この節の操作はその場で保存されます。</p>
-  <label><input type="checkbox" checked={status?.enabled ?? false} disabled={busy || !status} onchange={toggle} /> 有効にする</label>
-  <p role="status">{status?.tokenError ?? status?.notice ?? (status?.enabled ? '有効' : '無効')}</p>
+  <label><input type="checkbox" checked={status?.enabled ?? false} disabled={busy || !status || status.writesBlocked} onchange={toggle} /> 有効にする</label>
+  <p role="status">{status?.writesBlocked ? (status.notice ?? '連携設定を読めませんでした。設定ファイルを確認してアプリを再起動してください') : (status?.tokenError ?? status?.notice ?? (status?.enabled ? '有効' : '無効'))}</p>
   {#if status}
     <div class="row"><code>{status.baseUrl}</code><button disabled={busy} onclick={() => run(async () => { await navigator.clipboard.writeText(status!.baseUrl); })}>URL をコピー</button></div>
     <div class="row"><span class="token">{token || '••••••••••••••••'}</span>
       <button disabled={busy || !status.hasToken} onclick={() => token ? token = '' : reveal(false)}>{token ? '隠す' : '表示'}</button>
       <button disabled={busy || !status.hasToken} onclick={() => reveal(true)}>トークンをコピー</button>
-      <button disabled={busy} onclick={() => { confirming = true; }}>再生成</button>
+      <button disabled={busy || status.writesBlocked} onclick={() => { confirming = true; }}>再生成</button>
     </div>
     {#if confirming}
       <div role="alert">
         <p>今のトークンを使っているツールは動かなくなります。再生成しますか？</p>
-        <button disabled={busy} onclick={regenerate}>再生成する</button>
+        <button disabled={busy || status.writesBlocked} onclick={regenerate}>再生成する</button>
         <button disabled={busy} onclick={() => { confirming = false; }}>キャンセル</button>
       </div>
     {/if}

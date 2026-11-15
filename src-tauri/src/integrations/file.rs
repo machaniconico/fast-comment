@@ -5,10 +5,12 @@ use std::{
 };
 pub const FILE_NAME: &str = "integrations.json";
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[serde(default, rename_all = "camelCase")]
+#[serde(rename_all = "camelCase")]
 pub struct IntegrationsFile {
     pub version: u32,
+    #[serde(default)]
     pub local_api: LocalApiSettings,
+    #[serde(default)]
     pub webhooks: Vec<WebhookDef>,
 }
 impl Default for IntegrationsFile {
@@ -117,10 +119,35 @@ mod tests {
     }
 
     #[test]
+    fn missing_version_is_backed_up_as_corrupt() {
+        for input in [
+            r#"{"localApi":{}}"#,
+            "{}",
+            r#"{"foo":1}"#,
+            r#"{"webhooks":[]}"#,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(FILE_NAME);
+            std::fs::write(&path, input).unwrap();
+            let LoadOutcome::Corrupt { backup } = load(dir.path(), 42).unwrap() else {
+                panic!("missing version must be corrupt: {input}");
+            };
+            assert!(!path.exists());
+            assert_eq!(backup, dir.path().join("integrations.json.corrupt-42"));
+            assert_eq!(std::fs::read_to_string(backup).unwrap(), input);
+        }
+    }
+
+    #[test]
     fn nested_settings_default_but_paused_requires_reason_and_time() {
-        let file: IntegrationsFile =
-            serde_json::from_str(r#"{"localApi":{},"webhooks":[{"triggers":{}}]}"#).unwrap();
-        assert_eq!(file.version, 1);
+        let file: IntegrationsFile = serde_json::from_str(
+            r#"{"version":1,"localApi":{},"webhooks":[{"triggers":{}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<IntegrationsFile>(r#"{"version":1}"#).unwrap(),
+            IntegrationsFile::default()
+        );
         assert!(!file.local_api.enabled);
         assert_eq!(file.webhooks[0], WebhookDef::default());
         for paused in [r#"{}"#, r#"{"reason":"unauthorized"}"#, r#"{"atMs":1}"#] {

@@ -324,7 +324,33 @@ impl Bus {
             &goals_skin_dir,
         );
         match extra {
-            Some(extra) => app.merge(extra),
+            Some(extra) => app.merge(extra.layer(axum::middleware::map_response(
+                |mut response: axum::response::Response| async move {
+                    use axum::http::{header, StatusCode};
+                    // Only the closed gate returns a bare 404 without API cache policy.
+                    // Match the OBS fallback here; the standalone API stays CORS-free.
+                    if response.status() == StatusCode::NOT_FOUND
+                        && !response.headers().contains_key(header::CACHE_CONTROL)
+                    {
+                        let headers = response.headers_mut();
+                        headers.insert(
+                            header::VARY,
+                            header::HeaderValue::from_static(
+                                "origin, access-control-request-method, access-control-request-headers",
+                            ),
+                        );
+                        headers.insert(
+                            header::ACCESS_CONTROL_ALLOW_ORIGIN,
+                            header::HeaderValue::from_static("*"),
+                        );
+                        headers.insert(
+                            header::ACCESS_CONTROL_EXPOSE_HEADERS,
+                            header::HeaderValue::from_static("*"),
+                        );
+                    }
+                    response
+                },
+            ))),
             None => app,
         }
     }
@@ -732,6 +758,52 @@ async fn send_timer_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn closed_gate_is_indistinguishable_from_plain_404() {
+        use axum::{
+            body::Body,
+            http::{Request, StatusCode},
+        };
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let (stats_tx, _) = watch::channel(StatsSnapshot::default());
+        let (timer_tx, _) = watch::channel(TimerSnapshot::default());
+        let bus = Bus::new(0, stats_tx, timer_tx);
+        let extra = crate::api::router(
+            crate::api::ApiDeps::new(crate::api::ApiGate::closed(), Default::default()),
+            1234,
+        );
+        let router = bus.obs_app(
+            root.path().join("builtin"),
+            root.path().join("custom"),
+            root.path().join("skin"),
+            Some(extra),
+        );
+        let hidden = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let plain = router
+            .oneshot(Request::builder().uri("/nope-xyz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(hidden.status(), StatusCode::NOT_FOUND);
+        assert_eq!(hidden.status(), plain.status());
+        assert_eq!(hidden.headers(), plain.headers());
+        assert_eq!(
+            hidden.into_body().collect().await.unwrap().to_bytes(),
+            plain.into_body().collect().await.unwrap().to_bytes()
+        );
+    }
 
     // --- is_valid_template_name ---
 
