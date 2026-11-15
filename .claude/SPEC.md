@@ -169,7 +169,7 @@ trait Source {
 - バックプレッシャ: 各クライアントごとに bounded queue、溢れたら古いものから捨てる。
 - **モデレーションイベント**(P6 Phase 3): Source → `mpsc`(容量 1024、送信は `try_send` で chat 受信をブロックしない)→ `spawn_moderation_ui_forwarder` が 16ms バッチで `emit("chat-moderation", Vec<ModerationEvent>)`。同じ forwarder で `MessageDeleted` を Moderator の hidden_ids(上限 8192 の FIFO)へ入れ、未読み上げの該当コメントを TTS キューから除く。同じ forwarder から OBS(`/ws?modEvents=1`)へも流す(§9)。
 
-- **ローカル API**: `Bus::obs_app(..., extra)` で `/api` のルータを既存 OBS ルータの CORS レイヤの外側へ merge する。内蔵テンプレ名 `api` は予約。既存ルートは Host 検査・認証を追加しない(§15)。
+- **ローカル API**: `Bus::obs_app(..., extra)` で、パスが `/api` か `/api/` で始まる要求を既存 OBS ルータの CORS レイヤより外側のミドルウェアで丸ごと API ルータへ振り分ける(末尾スラッシュ等で旧 fallback に落とさない)。API ルータは独自の fallback を持つ。内蔵テンプレ名 `api` は予約。既存ルートは Host 検査・認証を追加しない(§15)。
 
 ## 6. TTS 層 (`tts/`) — 3バックエンドをアダプタ化
 

@@ -85,6 +85,7 @@ pub fn load(dir: &Path, now_ms: u64) -> io::Result<LoadOutcome> {
 }
 /// 派生 `Deserialize` は構造体を配列(位置引数)からも受け取るので、
 /// 構造体の位置にオブジェクト以外が来たファイルは破損として扱う。
+/// 入れ子の構造体フィールドを足したら、ここと `struct_given_as_array_is_treated_as_corrupt` にも足すこと。
 fn has_expected_shape(root: &serde_json::Value) -> bool {
     fn object_or_absent(v: Option<&serde_json::Value>) -> bool {
         v.map_or(true, serde_json::Value::is_object)
