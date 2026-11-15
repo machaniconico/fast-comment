@@ -149,3 +149,12 @@ export type UiChatMessage = ChatMessage & {
   /** Session sequence number for this viewer, derived in the UI store. */
   viewerSeq?: number;
 };
+
+export interface LocalApiStatus {
+  enabled: boolean;
+  writesBlocked: boolean;
+  hasToken: boolean;
+  tokenError: string | null;
+  notice: string | null;
+  baseUrl: string;
+}

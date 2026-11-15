@@ -11,6 +11,8 @@
 //!
 //! Tauri コマンドで設定取得/更新・チャンネル追加削除・コメント非表示・OBS URL 取得を公開。
 
+pub mod api;
+pub mod integrations;
 pub mod autopost;
 pub mod bus;
 pub mod chatlog;
@@ -66,6 +68,7 @@ use crate::update::{check_for_update, open_url};
 
 /// アプリ全体で共有する実行時状態。
 pub struct AppState {
+    integrations: integrations::Integrations<integrations::KeyringSecretStore>,
     /// 現在の設定。
     config: Mutex<AppConfig>,
     listeners: Arc<listeners::ListenerStore>,
@@ -1974,6 +1977,62 @@ fn register_participant_if_needed(app: &AppHandle, state: &AppState, msg: &ChatM
     emit_participants(app, &snapshot);
 }
 
+fn local_api_status_json(state: &AppState, status: integrations::LocalApiStatus) -> serde_json::Value {
+    let mut value = serde_json::to_value(status).expect("local api status serialization");
+    value["baseUrl"] = format!(
+        "http://127.0.0.1:{}/api/v1",
+        state.obs_server.lock().unwrap().port
+    ).into();
+    value
+}
+// Tauri app commands are unrestricted by the plugin capabilities alone.
+// Check the injected caller identity before accessing settings or credentials.
+fn require_main_integrations_window(label: &str) -> Result<(), integrations::IntegrationError> {
+    if label == "main" {
+        Ok(())
+    } else {
+        Err(integrations::IntegrationError::ForbiddenWindow)
+    }
+}
+#[tauri::command]
+fn get_local_api_status(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, integrations::IntegrationError> {
+    require_main_integrations_window(window.label())?;
+    Ok(local_api_status_json(
+        &state,
+        state.integrations.local_api_status(),
+    ))
+}
+#[tauri::command]
+async fn set_local_api_enabled(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> Result<serde_json::Value, integrations::IntegrationError> {
+    require_main_integrations_window(window.label())?;
+    let status = state.integrations.set_local_api_enabled(enabled).await?;
+    Ok(local_api_status_json(&state, status))
+}
+#[tauri::command]
+async fn get_local_api_token(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+) -> Result<String, integrations::IntegrationError> {
+    require_main_integrations_window(window.label())?;
+    state.integrations.local_api_token().await
+}
+#[tauri::command]
+async fn regenerate_local_api_token(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, integrations::IntegrationError> {
+    require_main_integrations_window(window.label())?;
+    let status = state.integrations.regenerate_local_api_token().await?;
+    Ok(local_api_status_json(&state, status))
+}
+
 /// OBS サーバの待受ポートが変わったら、旧サーバを止めて新ポートで起動する。
 fn restart_obs_server_if_needed(state: &AppState, new_port: u16) -> Result<(), String> {
     let mut server = state.obs_server.lock().unwrap();
@@ -1990,6 +2049,10 @@ fn restart_obs_server_if_needed(state: &AppState, new_port: u16) -> Result<(), S
         state.goals_skin_dir.clone(),
         new_port,
         cancel.clone(),
+        Some(api::router(
+            api::ApiDeps::new(state.integrations.gate(), cancel.clone()),
+            new_port,
+        )),
     )?;
 
     server.cancel.cancel();
@@ -2348,7 +2411,19 @@ pub fn run() {
                 );
             }
 
+            let integrations = tauri::async_runtime::block_on(integrations::Integrations::open(
+                config_dir.clone(),
+                integrations::KeyringSecretStore,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default().as_millis() as u64,
+            ));
+            let api_router = api::router(
+                api::ApiDeps::new(integrations.gate(), obs_cancel.clone()),
+                obs_port,
+            );
             let state = AppState {
+                integrations,
                 listeners: Arc::new(listeners::ListenerStore::load(&config_dir)),
                 chatlog: chatlog::ChatLog::start(&config_dir, config.log.clone()),
                 config: Mutex::new(config.clone()),
@@ -2444,6 +2519,7 @@ pub fn run() {
                 templates.custom_root().to_path_buf(),
                 goals_skin_dir,
                 obs_cancel,
+                Some(api_router),
             ) {
                 tracing::error!("{e}");
             }
@@ -2475,6 +2551,10 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            get_local_api_status,
+            set_local_api_enabled,
+            get_local_api_token,
+            regenerate_local_api_token,
             get_listener,
             update_listener,
             set_listener_voice,
@@ -2559,6 +2639,17 @@ pub fn run() {
 #[cfg(test)]
 mod followup_tests {
     use super::*;
+
+    #[test]
+    fn integrations_commands_allow_only_main_window() {
+        assert!(require_main_integrations_window("main").is_ok());
+        for label in ["danmaku", "settings", "main-2", "Main", ""] {
+            assert!(matches!(
+                require_main_integrations_window(label),
+                Err(integrations::IntegrationError::ForbiddenWindow)
+            ));
+        }
+    }
 
     #[test]
     fn set_own_stream_changes_only_the_flag_of_the_matching_row() {

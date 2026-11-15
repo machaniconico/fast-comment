@@ -169,6 +169,8 @@ trait Source {
 - バックプレッシャ: 各クライアントごとに bounded queue、溢れたら古いものから捨てる。
 - **モデレーションイベント**(P6 Phase 3): Source → `mpsc`(容量 1024、送信は `try_send` で chat 受信をブロックしない)→ `spawn_moderation_ui_forwarder` が 16ms バッチで `emit("chat-moderation", Vec<ModerationEvent>)`。同じ forwarder で `MessageDeleted` を Moderator の hidden_ids(上限 8192 の FIFO)へ入れ、未読み上げの該当コメントを TTS キューから除く。同じ forwarder から OBS(`/ws?modEvents=1`)へも流す(§9)。
 
+- **ローカル API**: `Bus::obs_app(..., extra)` で、パスが `/api` か `/api/` で始まる要求を既存 OBS ルータの CORS レイヤより外側のミドルウェアで丸ごと API ルータへ振り分ける(末尾スラッシュ等で旧 fallback に落とさない)。API ルータは独自の fallback を持つ。内蔵テンプレ名 `api` は予約。既存ルートは Host 検査・認証を追加しない(§15)。
+
 ## 6. TTS 層 (`tts/`) — 3バックエンドをアダプタ化
 
 ```rust
@@ -328,6 +330,8 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
 ## 10. 設定永続化 (`config.rs`)
 
 - 保存先: Tauri の app config dir に `config.json`。
+- ローカル API は別の `integrations.json`(version 1、localApi.enabled 既定 false、webhooks 既定空)に保存。`AppConfig` / `update_config` / エクスポートには載せない。破損・非対応 version は `.corrupt-<時刻ms>` に退避。読み込みエラー(退避失敗を含む)時は保存禁止とし、変更系は FileWrite で拒否する。再起動後に正常に読み込めるまで元ファイルを保護する。同じディレクトリに create_new の一時ファイルを作成し、write → sync_all → rename で保存。
+- API トークンは OS 資格情報ストア(service `fast-comment`、key `local-api-token`)に `{token, createdAtMs}` として保存。無効化しても削除しない。
 - 内容: channels[], obs{port}, tts{backend, options}, moderation{ngWords[], ngUsers[], highlights[]}, ui{maxBuffer, notifySound, notifyVolume}, youtubeOverrides{apiKey?, clientVersion?, paths?}, credentials{youtubeApiKey?, ...}。
   - `credentials.youtubeApiKey`(空文字既定): 公式YouTube streamList用。空ならInnerTubeのみ。
   - `ui.notifySound`(bool 既定false) / `ui.notifyVolume`(f32 0.0〜1.0 既定0.5): キーワード通知の効果音設定。serde default でキー欠落の旧 config も後方互換。
@@ -430,3 +434,16 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
   - 設定「アプリの更新」に現在のバージョンと「更新を確認」ボタン。手動確認は「最新版です」・エラー文も表示し、閉じたバナーを再表示する。
 - **permission**: main ウィンドウの `capabilities/default.json` に `updater:default` と `process:allow-restart`。弾幕ウィンドウには付けない。
 - **v0.1.0 からの移行**: v0.1.0 は updater 無しなので自動更新できない。v0.2.0 を手動で入れてもらい、以降が自動更新の対象。
+
+
+## 15. ローカル API (PR1: 土台と認証)
+
+- ベース URL: `http://127.0.0.1:<obs.port>/api/v1`。既定 OFF。PR1 は `GET /status` のみ。
+- 有効化時、32 バイトの OS 乱数を base64url(パディングなし)にして `fc_` を付けた 46 文字のトークンを生成。資格情報 → 設定ファイル → ゲートの順で保存・反映する。メモリに常駐させるのは SHA-256 ダイジェストだけ。
+- 無効時は `/api`・`/api/`・`/api/*` に本文なし 404。他の検査より先に行う。有効時は Host → Origin → Bearer → ルーティングの順。
+- Host は `127.0.0.1:<port>`・`localhost:<port>`・`[::1]:<port>` の完全一致(大小無視)。Origin は値によらず付いていれば 403。API に CORS ヘッダを付けない。
+- 認証は `Authorization: Bearer <token>` のみ(スキーム大小無視)。複数ヘッダ・512 バイト超・非 UTF-8・余分な空白は 401。クエリ・Cookie は使わない。ダイジェストを定数時間比較し、401 に `WWW-Authenticate: Bearer` を付ける。401 の warn ログはプロセス全体で 1 分に 1 回まで。トークン・Authorization ヘッダ・クエリ文字列はログに出さない。
+- `/status` は `{app:"fast-comment",version,apiVersion:1,epoch,headCursor:null}`。epoch はプロセス起動ごとの 12 桁 hex(ポート変更でも維持)。認証後の未知パスは JSON 404、メソッド違いは JSON 405。JSON の Content-Type は `application/json; charset=utf-8`、有効時の API 応答に `Cache-Control: no-store`・`X-Content-Type-Options: nosniff`。
+- 起動時に資格情報が欠落・読込失敗ならゲートを閉じ、設定画面に再生成を案内。再生成は資格情報の保存成功後だけゲートを更新する。失敗時は旧トークンを維持。設定操作は専用 mutex で直列化。
+- 設定画面の「ローカル API」は専用コマンドで即時保存。通常の「保存」とは独立。4 つのローカル API コマンドは呼び出し元が main ウィンドウの場合だけ許可する。トークンの表示・コピー時のみ資格情報から平文を取得する。トークンを OBS のソース URL やテンプレートに書かない。
+- コメント取得・SSE・操作・Webhook の実装は後続 PR。

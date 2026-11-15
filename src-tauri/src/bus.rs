@@ -236,6 +236,7 @@ impl Bus {
         custom_templates_dir: PathBuf,
         goals_skin_dir: PathBuf,
         cancel: CancellationToken,
+        extra: Option<Router>,
     ) -> Result<tauri::async_runtime::JoinHandle<()>, String> {
         self.spawn_obs_server_on_port(
             templates_dir,
@@ -243,6 +244,7 @@ impl Bus {
             goals_skin_dir,
             self.obs_port,
             cancel,
+            extra,
         )
     }
 
@@ -256,6 +258,7 @@ impl Bus {
         goals_skin_dir: PathBuf,
         port: u16,
         cancel: CancellationToken,
+        extra: Option<Router>,
     ) -> Result<tauri::async_runtime::JoinHandle<()>, String> {
         let addr = SocketAddr::from(([127, 0, 0, 1], port));
         let std_listener = StdTcpListener::bind(addr).map_err(|e| {
@@ -269,10 +272,12 @@ impl Bus {
             msg
         })?;
 
-        let state = self.obs_state(TemplateStore::new(
+        let app = self.obs_app(
             templates_dir.clone(),
             custom_templates_dir.clone(),
-        ));
+            goals_skin_dir.clone(),
+            extra,
+        );
 
         let handle = tauri::async_runtime::spawn(async move {
             let listener = match tokio::net::TcpListener::from_std(std_listener) {
@@ -282,8 +287,6 @@ impl Bus {
                     return;
                 }
             };
-
-            let app = obs_router(state, &goals_skin_dir);
 
             tracing::info!(
                 "OBS overlay サーバ起動: http://{addr}/  (templates: {}, custom: {}, skins: {})",
@@ -306,6 +309,42 @@ impl Bus {
         });
 
         Ok(handle)
+    }
+
+    /// Compose additional routes outside the legacy OBS CORS layer.
+    pub fn obs_app(
+        &self,
+        templates_dir: PathBuf,
+        custom_templates_dir: PathBuf,
+        goals_skin_dir: PathBuf,
+        extra: Option<Router>,
+    ) -> Router {
+        let app = obs_router(
+            self.obs_state(TemplateStore::new(templates_dir, custom_templates_dir)),
+            &goals_skin_dir,
+        );
+        match extra {
+            Some(api) => app.layer(axum::middleware::from_fn(
+                // `/api` 配下はルータの照合(末尾スラッシュ等)に任せず、CORS レイヤより外側で
+                // 丸ごと API ルータへ渡す。旧ルートの fallback や CORS に落とさないため。
+                move |req: axum::extract::Request, next: axum::middleware::Next| {
+                    let api = api.clone();
+                    async move {
+                        let path = req.uri().path();
+                        if path == "/api" || path.starts_with("/api/") {
+                            use tower::ServiceExt;
+                            match api.oneshot(req).await {
+                                Ok(response) => response,
+                                Err(never) => match never {},
+                            }
+                        } else {
+                            next.run(req).await
+                        }
+                    }
+                },
+            )),
+            None => app,
+        }
     }
 
     fn obs_state(&self, templates: TemplateStore) -> ObsState {
@@ -712,6 +751,111 @@ async fn send_timer_snapshot(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn composed_api_responses_have_no_cors_headers() {
+        use axum::{
+            body::Body,
+            http::{header, Method, Request, StatusCode},
+        };
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let (stats_tx, _) = watch::channel(StatsSnapshot::default());
+        let (timer_tx, _) = watch::channel(TimerSnapshot::default());
+        let bus = Bus::new(0, stats_tx, timer_tx);
+        let gate = crate::api::ApiGate::closed();
+        let token = crate::api::generate_token();
+        let extra = crate::api::router(
+            crate::api::ApiDeps::new(gate.clone(), Default::default()),
+            1234,
+        );
+        let router = bus.obs_app(
+            root.path().join("builtin"),
+            root.path().join("custom"),
+            root.path().join("skin"),
+            Some(extra),
+        );
+        for enabled in [false, true] {
+            if enabled {
+                gate.open(&token);
+            }
+            for path in [
+                "/api",
+                "/api/",
+                "/api/v1",
+                "/api/v1/",
+                "/api/v1/status",
+                "/api/v1/status/",
+                "/api/v1/status/x",
+                "/api/nope-xyz",
+            ] {
+                for (method, origin, authorized) in [
+                    (Method::GET, false, false),
+                    (Method::GET, false, true),
+                    (Method::GET, true, true),
+                    (Method::POST, false, true),
+                    (Method::OPTIONS, true, false),
+                ] {
+                    let mut request = Request::builder()
+                        .method(method.clone())
+                        .uri(path)
+                        .header(header::HOST, "127.0.0.1:1234");
+                    if origin {
+                        request = request.header(header::ORIGIN, "https://example.com");
+                    }
+                    if method == Method::OPTIONS {
+                        request = request
+                            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+                            .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "authorization");
+                    }
+                    if authorized {
+                        request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+                    }
+                    let response = router
+                        .clone()
+                        .oneshot(request.body(Body::empty()).unwrap())
+                        .await
+                        .unwrap();
+                    let expected = if !enabled {
+                        StatusCode::NOT_FOUND
+                    } else if origin {
+                        StatusCode::FORBIDDEN
+                    } else if !authorized {
+                        StatusCode::UNAUTHORIZED
+                    } else if path != "/api/v1/status" {
+                        StatusCode::NOT_FOUND
+                    } else if method != Method::GET {
+                        StatusCode::METHOD_NOT_ALLOWED
+                    } else {
+                        StatusCode::OK
+                    };
+                    assert_eq!(
+                        response.status(), expected,
+                        "enabled={enabled}, {method} {path}"
+                    );
+                    for name in response.headers().keys() {
+                        assert!(
+                            !name.as_str().starts_with("access-control-") && name != header::VARY,
+                            "unexpected {name}: enabled={enabled}, {method} {path}"
+                        );
+                    }
+                    if !enabled {
+                        assert!(!response.headers().contains_key(header::CACHE_CONTROL));
+                        assert!(!response.headers().contains_key(header::X_CONTENT_TYPE_OPTIONS));
+                        assert!(response
+                            .into_body()
+                            .collect()
+                            .await
+                            .unwrap()
+                            .to_bytes()
+                            .is_empty());
+                    }
+                }
+            }
+        }
+    }
+
     // --- is_valid_template_name ---
 
     #[test]
@@ -1027,7 +1171,7 @@ mod tests {
         assert!(templates.join("default").is_dir(), "{}", templates.display());
         // timer は既存の内蔵テンプレ。`/timer` は完全一致ルートなので、`/timer/...` のアセットは
         // fallback の ServeDir に届く(既存の OBS URL を壊さないため名前は変えない)。
-        for reserved in ["custom", "skin", "ws", "stats"] {
+        for reserved in ["custom", "skin", "ws", "stats", "api"] {
             assert!(!templates.join(reserved).exists(), "templates/{reserved} が配信ルートと衝突する");
         }
     }
