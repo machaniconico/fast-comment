@@ -14,6 +14,13 @@
 
   const COMMANDS: Command[] = [
     {
+      id: 'settings-local-api',
+      title: 'ローカル API 設定へ',
+      keywords: ['api', 'local', 'token', 'ローカル', 'トークン'],
+      icon: '🔌',
+      run: () => { ui.gotoSetting('localApi'); },
+    },
+    {
       id: 'filter-all',
       title: 'フィルタ: ALL',
       keywords: ['all', 'filter', 'フィルタ', 'すべて'],

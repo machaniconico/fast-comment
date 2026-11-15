@@ -35,6 +35,7 @@
   import ModerationTester from './ModerationTester.svelte';
   import TemplateEditor from './TemplateEditor.svelte';
   import XPostSettings from './XPostSettings.svelte';
+  import IntegrationsSettings from './IntegrationsSettings.svelte';
   import { sanitizeXPostNumbers } from '../xAutopost';
   import { appUpdate } from '../appUpdate.svelte';
   import { progressLabel, statusText } from '../appUpdate';
@@ -45,6 +46,7 @@
   }
 
   let { onConfigSaved, focus = 'all' }: Props = $props();
+  let localApiSettings: { refreshStatus: () => Promise<void> } | undefined = $state();
 
   function onThemeChange(event: Event) {
     theme.setTheme((event.currentTarget as HTMLSelectElement).value as AppearanceTheme);
@@ -1228,6 +1230,7 @@
         // 取れなければ手元の channels で保存する。
       }
       const warnings = await setConfig(config);
+      void localApiSettings?.refreshStatus();
       saveWarned = warnings.length > 0;
       try {
         youtubeOauthStatus = await getYoutubeOauthStatus();
@@ -2382,6 +2385,8 @@
   </section>
 
   <!-- ── OBS URL ── -->
+  <IntegrationsSettings bind:this={localApiSettings} />
+
   <section id="settings-obs">
     <h3>OBSオーバーレイ URL</h3>
     <div class="field-row">

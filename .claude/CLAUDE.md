@@ -14,4 +14,6 @@
 - **OBS テンプレの内蔵は読み取り専用**。書き換えず、カスタムは `custom:<name>` 名前空間でユーザーデータ側(`app_config_dir/templates`)に置く。テンプレ ID をパスに直接連結しない(`TemplateRef::parse` 経由)。配信ルートに symlink を作らない。仕様は SPEC §9.1。
 - 実モデレーション(BAN/削除)は OAuth 必須で **P6**。MVP はローカル非表示/NGのみ。
 
+- **ローカル API / Webhook の設定は `integrations.json` と資格情報ストア**。`config.json`・`update_config` に載せない。トークン・URL をログ・エラー文・emit に出さない。
+
 詳細仕様は `.claude/SPEC.md`。これが単一情報源。

@@ -20,6 +20,7 @@ export type ToolSettingsView = 'goals' | 'danmaku';
 export type SettingsAnchor =
   | 'appearance'
   | 'tts'
+  | 'localApi'
   | 'obs'
   | 'goals'
   | 'timer'
@@ -34,6 +35,7 @@ export type SettingsAnchor =
 export const SETTINGS_ANCHOR_IDS: Record<SettingsAnchor, string> = {
   appearance: 'settings-appearance',
   tts: 'settings-tts',
+  localApi: 'settings-local-api',
   obs: 'settings-obs',
   goals: 'settings-goals',
   timer: 'settings-timer',

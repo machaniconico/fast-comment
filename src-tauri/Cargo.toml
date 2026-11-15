@@ -45,6 +45,11 @@ axum = { version = "0.7", features = ["ws"] }
 tower-http = { version = "0.6", features = ["fs", "cors"] }
 zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
+sha2 = "0.10"
+subtle = "2"
+getrandom = "0.2"
+base64 = "0.22"
+
 anyhow = "1"
 thiserror = "1"
 tracing = "0.1"
@@ -67,6 +72,13 @@ keyring = { version = "3.6", default-features = false, features = ["linux-native
 # 自動更新(GitHub Releases の latest.json を見る)。デスクトップのみ。
 [target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
 tauri-plugin-updater = "2"
+
+# API / integrations の受け入れテスト(tests/acceptance)用。
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+tokio = { version = "1", features = ["full", "test-util"] }
+tempfile = "3"
 
 # ビルド時間優先の release。fat LTO + codegen-units=1 は毎ビルド3分超かかる
 # 割にサイズ数%しか稼げないため、thin LTO + 並列 + incremental にしている。

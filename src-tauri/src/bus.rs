@@ -236,6 +236,7 @@ impl Bus {
         custom_templates_dir: PathBuf,
         goals_skin_dir: PathBuf,
         cancel: CancellationToken,
+        extra: Option<Router>,
     ) -> Result<tauri::async_runtime::JoinHandle<()>, String> {
         self.spawn_obs_server_on_port(
             templates_dir,
@@ -243,6 +244,7 @@ impl Bus {
             goals_skin_dir,
             self.obs_port,
             cancel,
+            extra,
         )
     }
 
@@ -256,6 +258,7 @@ impl Bus {
         goals_skin_dir: PathBuf,
         port: u16,
         cancel: CancellationToken,
+        extra: Option<Router>,
     ) -> Result<tauri::async_runtime::JoinHandle<()>, String> {
         let addr = SocketAddr::from(([127, 0, 0, 1], port));
         let std_listener = StdTcpListener::bind(addr).map_err(|e| {
@@ -269,10 +272,12 @@ impl Bus {
             msg
         })?;
 
-        let state = self.obs_state(TemplateStore::new(
+        let app = self.obs_app(
             templates_dir.clone(),
             custom_templates_dir.clone(),
-        ));
+            goals_skin_dir.clone(),
+            extra,
+        );
 
         let handle = tauri::async_runtime::spawn(async move {
             let listener = match tokio::net::TcpListener::from_std(std_listener) {
@@ -282,8 +287,6 @@ impl Bus {
                     return;
                 }
             };
-
-            let app = obs_router(state, &goals_skin_dir);
 
             tracing::info!(
                 "OBS overlay サーバ起動: http://{addr}/  (templates: {}, custom: {}, skins: {})",
@@ -306,6 +309,24 @@ impl Bus {
         });
 
         Ok(handle)
+    }
+
+    /// Compose additional routes outside the legacy OBS CORS layer.
+    pub fn obs_app(
+        &self,
+        templates_dir: PathBuf,
+        custom_templates_dir: PathBuf,
+        goals_skin_dir: PathBuf,
+        extra: Option<Router>,
+    ) -> Router {
+        let app = obs_router(
+            self.obs_state(TemplateStore::new(templates_dir, custom_templates_dir)),
+            &goals_skin_dir,
+        );
+        match extra {
+            Some(extra) => app.merge(extra),
+            None => app,
+        }
     }
 
     fn obs_state(&self, templates: TemplateStore) -> ObsState {
@@ -1027,7 +1048,7 @@ mod tests {
         assert!(templates.join("default").is_dir(), "{}", templates.display());
         // timer は既存の内蔵テンプレ。`/timer` は完全一致ルートなので、`/timer/...` のアセットは
         // fallback の ServeDir に届く(既存の OBS URL を壊さないため名前は変えない)。
-        for reserved in ["custom", "skin", "ws", "stats"] {
+        for reserved in ["custom", "skin", "ws", "stats", "api"] {
             assert!(!templates.join(reserved).exists(), "templates/{reserved} が配信ルートと衝突する");
         }
     }
