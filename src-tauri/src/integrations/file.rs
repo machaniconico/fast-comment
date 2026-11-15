@@ -5,7 +5,7 @@ use std::{
 };
 pub const FILE_NAME: &str = "integrations.json";
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[serde(rename_all = "camelCase")]
+#[serde(default, rename_all = "camelCase")]
 pub struct IntegrationsFile {
     pub version: u32,
     pub local_api: LocalApiSettings,
@@ -21,12 +21,12 @@ impl Default for IntegrationsFile {
     }
 }
 #[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
-#[serde(rename_all = "camelCase")]
+#[serde(default, rename_all = "camelCase")]
 pub struct LocalApiSettings {
     pub enabled: bool,
 }
 #[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
-#[serde(rename_all = "camelCase")]
+#[serde(default, rename_all = "camelCase")]
 pub struct WebhookDef {
     pub id: String,
     pub name: String,
@@ -44,7 +44,7 @@ pub enum WebhookFormat {
     Generic,
 }
 #[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
-#[serde(rename_all = "camelCase")]
+#[serde(default, rename_all = "camelCase")]
 pub struct WebhookTriggers {
     pub donation: bool,
     pub membership: bool,
@@ -94,4 +94,37 @@ pub fn save(dir: &Path, file: &IntegrationsFile) -> io::Result<()> {
         let _ = std::fs::remove_file(temp);
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_webhooks_loads_with_defaults_without_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(FILE_NAME),
+            r#"{"version":1,"localApi":{"enabled":true}}"#,
+        )
+        .unwrap();
+        let LoadOutcome::Loaded(file) = load(dir.path(), 1).unwrap() else {
+            panic!("optional fields must not make the file corrupt");
+        };
+        assert!(file.local_api.enabled);
+        assert!(file.webhooks.is_empty());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn nested_settings_default_but_paused_requires_reason_and_time() {
+        let file: IntegrationsFile =
+            serde_json::from_str(r#"{"localApi":{},"webhooks":[{"triggers":{}}]}"#).unwrap();
+        assert_eq!(file.version, 1);
+        assert!(!file.local_api.enabled);
+        assert_eq!(file.webhooks[0], WebhookDef::default());
+        for paused in [r#"{}"#, r#"{"reason":"unauthorized"}"#, r#"{"atMs":1}"#] {
+            assert!(serde_json::from_str::<Paused>(paused).is_err());
+        }
+    }
 }

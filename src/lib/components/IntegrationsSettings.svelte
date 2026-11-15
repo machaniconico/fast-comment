@@ -11,14 +11,29 @@
     if (busy) return;
     busy = true;
     error = '';
-    try { await action(); } catch { error = '操作に失敗しました。もう一度お試しください。'; }
+    try { await action(); } catch (cause) {
+      token = '';
+      // Render only fixed messages: an IPC error must never expose a token value.
+      switch (cause) {
+        case 'SecretRead': error = 'トークンを読めません。再生成してください。'; break;
+        case 'SecretWrite': error = '資格情報を保存できませんでした。OS の資格情報ストアを確認してください。'; break;
+        case 'FileWrite': error = '連携設定を保存できませんでした。設定ファイルと保存先の権限を確認してください。読み込みに失敗した場合はアプリの再起動が必要です。'; break;
+        case 'ForbiddenWindow': error = 'メインウィンドウから操作してください。'; break;
+        default: error = '操作に失敗しました。もう一度お試しください。';
+      }
+      try { status = await invoke<LocalApiStatus>('get_local_api_status'); }
+      catch { status = null; }
+    }
     finally { busy = false; }
   }
   export async function refreshStatus() {
     await run(async () => { status = await invoke<LocalApiStatus>('get_local_api_status'); });
   }
   onMount(() => { void refreshStatus(); });
-  async function toggle() {
+  async function toggle(event: Event) {
+    // The browser changes checked before onchange. Restore the confirmed value
+    // while the operation runs, including when a failed enable stays disabled.
+    (event.currentTarget as HTMLInputElement).checked = status?.enabled ?? false;
     await run(async () => {
       status = await invoke<LocalApiStatus>('set_local_api_enabled', { enabled: !status?.enabled });
       token = '';

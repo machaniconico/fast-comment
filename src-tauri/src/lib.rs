@@ -1985,29 +1985,51 @@ fn local_api_status_json(state: &AppState, status: integrations::LocalApiStatus)
     ).into();
     value
 }
+// Tauri app commands are unrestricted by the plugin capabilities alone.
+// Check the injected caller identity before accessing settings or credentials.
+fn require_main_integrations_window(label: &str) -> Result<(), integrations::IntegrationError> {
+    if label == "main" {
+        Ok(())
+    } else {
+        Err(integrations::IntegrationError::ForbiddenWindow)
+    }
+}
 #[tauri::command]
-fn get_local_api_status(state: State<'_, AppState>) -> serde_json::Value {
-    local_api_status_json(&state, state.integrations.local_api_status())
+fn get_local_api_status(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, integrations::IntegrationError> {
+    require_main_integrations_window(window.label())?;
+    Ok(local_api_status_json(
+        &state,
+        state.integrations.local_api_status(),
+    ))
 }
 #[tauri::command]
 async fn set_local_api_enabled(
+    window: tauri::WebviewWindow,
     state: State<'_, AppState>,
     enabled: bool,
-) -> Result<serde_json::Value, String> {
-    let status = state.integrations.set_local_api_enabled(enabled)
-        .await.map_err(|e| e.to_string())?;
+) -> Result<serde_json::Value, integrations::IntegrationError> {
+    require_main_integrations_window(window.label())?;
+    let status = state.integrations.set_local_api_enabled(enabled).await?;
     Ok(local_api_status_json(&state, status))
 }
 #[tauri::command]
-async fn get_local_api_token(state: State<'_, AppState>) -> Result<String, String> {
-    state.integrations.local_api_token().await.map_err(|e| e.to_string())
+async fn get_local_api_token(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+) -> Result<String, integrations::IntegrationError> {
+    require_main_integrations_window(window.label())?;
+    state.integrations.local_api_token().await
 }
 #[tauri::command]
 async fn regenerate_local_api_token(
+    window: tauri::WebviewWindow,
     state: State<'_, AppState>,
-) -> Result<serde_json::Value, String> {
-    let status = state.integrations.regenerate_local_api_token()
-        .await.map_err(|e| e.to_string())?;
+) -> Result<serde_json::Value, integrations::IntegrationError> {
+    require_main_integrations_window(window.label())?;
+    let status = state.integrations.regenerate_local_api_token().await?;
     Ok(local_api_status_json(&state, status))
 }
 
@@ -2617,6 +2639,17 @@ pub fn run() {
 #[cfg(test)]
 mod followup_tests {
     use super::*;
+
+    #[test]
+    fn integrations_commands_allow_only_main_window() {
+        assert!(require_main_integrations_window("main").is_ok());
+        for label in ["danmaku", "settings", "main-2", "Main", ""] {
+            assert!(matches!(
+                require_main_integrations_window(label),
+                Err(integrations::IntegrationError::ForbiddenWindow)
+            ));
+        }
+    }
 
     #[test]
     fn set_own_stream_changes_only_the_flag_of_the_matching_row() {
