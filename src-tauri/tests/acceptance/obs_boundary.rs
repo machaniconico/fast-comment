@@ -182,24 +182,3 @@ async fn composed_app_without_extra_router_behaves_as_before() {
     let legacy = send(&fx.app, get("/?template=default")).await;
     assert_eq!(legacy.status, StatusCode::OK);
 }
-
-#[tokio::test]
-async fn api_paths_never_carry_cors_headers_on_composed_app() {
-    let (open, _t) = open_fixture();
-    let closed = fixture(PORT, Some(&ApiGate::closed()));
-    for (label, fx) in [("ゲート開", &open), ("ゲート閉", &closed)] {
-        let cases = [
-            ("Origin 付き /api/v1/status", get("/api/v1/status").origin("http://evil.example")),
-            ("Origin なし /api/v1/status", get("/api/v1/status")),
-            ("/api/v1/nope", get("/api/v1/nope")),
-        ];
-        for (name, r) in cases {
-            let resp = send(&fx.app, r).await;
-            assert!(
-                resp.cors_header_names().is_empty(),
-                "{label} {name}: CORS ヘッダが付いた: {:?}",
-                resp.cors_header_names()
-            );
-        }
-    }
-}

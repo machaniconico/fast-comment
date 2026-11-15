@@ -71,7 +71,10 @@ pub fn load(dir: &Path, now_ms: u64) -> io::Result<LoadOutcome> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(LoadOutcome::Missing),
         Err(e) => return Err(e),
     };
-    if let Ok(file) = serde_json::from_slice::<IntegrationsFile>(&bytes) {
+    let shaped = serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()
+        .filter(has_expected_shape);
+    if let Some(file) = shaped.and_then(|v| serde_json::from_value::<IntegrationsFile>(v).ok()) {
         if file.version == 1 {
             return Ok(LoadOutcome::Loaded(file));
         }
@@ -79,6 +82,30 @@ pub fn load(dir: &Path, now_ms: u64) -> io::Result<LoadOutcome> {
     let backup = dir.join(format!("{FILE_NAME}.corrupt-{now_ms}"));
     std::fs::rename(path, &backup)?;
     Ok(LoadOutcome::Corrupt { backup })
+}
+/// 派生 `Deserialize` は構造体を配列(位置引数)からも受け取るので、
+/// 構造体の位置にオブジェクト以外が来たファイルは破損として扱う。
+fn has_expected_shape(root: &serde_json::Value) -> bool {
+    fn object_or_absent(v: Option<&serde_json::Value>) -> bool {
+        v.map_or(true, serde_json::Value::is_object)
+    }
+    let Some(root) = root.as_object() else {
+        return false;
+    };
+    if !object_or_absent(root.get("localApi")) {
+        return false;
+    }
+    match root.get("webhooks") {
+        None => true,
+        Some(serde_json::Value::Array(items)) => items.iter().all(|item| {
+            item.as_object().is_some_and(|w| {
+                object_or_absent(w.get("triggers"))
+                    && w.get("paused")
+                        .map_or(true, |p| p.is_null() || p.is_object())
+            })
+        }),
+        Some(_) => false,
+    }
 }
 pub fn save(dir: &Path, file: &IntegrationsFile) -> io::Result<()> {
     let temp = dir.join(format!(".{FILE_NAME}.{}.tmp", uuid::Uuid::new_v4()));
@@ -101,6 +128,38 @@ pub fn save(dir: &Path, file: &IntegrationsFile) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn struct_given_as_array_is_treated_as_corrupt() {
+        for input in [
+            r#"[1,{"enabled":true},[]]"#,
+            r#"{"version":1,"localApi":[true]}"#,
+            r#"{"version":1,"webhooks":[["a","b"]]}"#,
+            r#"{"version":1,"webhooks":[{"triggers":[true,true,true]}]}"#,
+            r#"{"version":1,"webhooks":[{"paused":["x",1]}]}"#,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join(FILE_NAME), input).unwrap();
+            assert!(
+                matches!(load(dir.path(), 7).unwrap(), LoadOutcome::Corrupt { .. }),
+                "受理された: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn object_shaped_file_with_null_paused_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(FILE_NAME),
+            r#"{"version":1,"localApi":{"enabled":true},"webhooks":[{"paused":null,"triggers":{}}]}"#,
+        )
+        .unwrap();
+        match load(dir.path(), 7).unwrap() {
+            LoadOutcome::Loaded(file) => assert!(file.local_api.enabled),
+            other => panic!("{other:?}"),
+        }
+    }
 
     #[test]
     fn missing_webhooks_loads_with_defaults_without_backup() {
@@ -140,10 +199,9 @@ mod tests {
 
     #[test]
     fn nested_settings_default_but_paused_requires_reason_and_time() {
-        let file: IntegrationsFile = serde_json::from_str(
-            r#"{"version":1,"localApi":{},"webhooks":[{"triggers":{}}]}"#,
-        )
-        .unwrap();
+        let file: IntegrationsFile =
+            serde_json::from_str(r#"{"version":1,"localApi":{},"webhooks":[{"triggers":{}}]}"#)
+                .unwrap();
         assert_eq!(
             serde_json::from_str::<IntegrationsFile>(r#"{"version":1}"#).unwrap(),
             IntegrationsFile::default()

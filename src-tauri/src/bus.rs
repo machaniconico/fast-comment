@@ -324,7 +324,25 @@ impl Bus {
             &goals_skin_dir,
         );
         match extra {
-            Some(extra) => app.merge(extra),
+            Some(api) => app.layer(axum::middleware::from_fn(
+                // `/api` 配下はルータの照合(末尾スラッシュ等)に任せず、CORS レイヤより外側で
+                // 丸ごと API ルータへ渡す。旧ルートの fallback や CORS に落とさないため。
+                move |req: axum::extract::Request, next: axum::middleware::Next| {
+                    let api = api.clone();
+                    async move {
+                        let path = req.uri().path();
+                        if path == "/api" || path.starts_with("/api/") {
+                            use tower::ServiceExt;
+                            match api.oneshot(req).await {
+                                Ok(response) => response,
+                                Err(never) => match never {},
+                            }
+                        } else {
+                            next.run(req).await
+                        }
+                    }
+                },
+            )),
             None => app,
         }
     }
@@ -762,7 +780,16 @@ mod tests {
             if enabled {
                 gate.open(&token);
             }
-            for path in ["/api", "/api/", "/api/v1/status", "/api/nope-xyz"] {
+            for path in [
+                "/api",
+                "/api/",
+                "/api/v1",
+                "/api/v1/",
+                "/api/v1/status",
+                "/api/v1/status/",
+                "/api/v1/status/x",
+                "/api/nope-xyz",
+            ] {
                 for (method, origin, authorized) in [
                     (Method::GET, false, false),
                     (Method::GET, false, true),

@@ -16,7 +16,9 @@ impl ApiDeps {
             gate,
             epoch: {
                 static EPOCH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-                EPOCH.get_or_init(|| uuid::Uuid::new_v4().simple().to_string()[..12].to_owned()).clone()
+                EPOCH
+                    .get_or_init(|| uuid::Uuid::new_v4().simple().to_string()[..12].to_owned())
+                    .clone()
             },
             _shutdown: shutdown,
         }
@@ -35,6 +37,7 @@ pub fn router(deps: ApiDeps, port: u16) -> axum::Router {
         .route("/api", any(error::not_found))
         .route("/api/", any(error::not_found))
         .route("/api/*path", any(error::not_found))
+        .fallback(error::not_found)
         .with_state(deps.clone())
         .layer(from_fn_with_state(
             middleware::Boundary { deps, port },
