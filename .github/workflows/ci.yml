@@ -47,3 +47,32 @@ jobs:
             echo "file in the repo root to explicitly opt out (NOT a real safety gate)."
             exit 1
           fi
+
+      # Rust のテスト(lib + tests/acceptance)。R3 の受け入れテストをマージ条件に含めるため、
+      # 必須チェック "test" と同じジョブで走らせる。
+      - name: Install Tauri system dependencies
+        if: ${{ hashFiles('src-tauri/Cargo.toml') != '' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev libssl-dev libdbus-1-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: ${{ hashFiles('src-tauri/Cargo.toml') != '' }}
+
+      - uses: swatinem/rust-cache@v2
+        if: ${{ hashFiles('src-tauri/Cargo.toml') != '' }}
+        with:
+          workspaces: src-tauri
+
+      - name: Build frontend (tauri generate_context needs dist/)
+        if: ${{ hashFiles('src-tauri/Cargo.toml') != '' }}
+        run: pnpm build
+
+      - name: Run Rust tests
+        if: ${{ hashFiles('src-tauri/Cargo.toml') != '' }}
+        working-directory: src-tauri
+        run: |
+          cargo test --locked --lib
+          cargo test --locked --test acceptance
