@@ -8,5 +8,9 @@ mod api_gate;
 mod integrations_store;
 mod obs_boundary;
 
+// PR2: コメント取得と SSE(設計書 §5.4)
+mod api_events;
+mod api_feed;
+
 #[test]
 fn acceptance_harness_runs() {}
