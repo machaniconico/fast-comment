@@ -12,5 +12,8 @@ mod obs_boundary;
 mod api_events;
 mod api_feed;
 
+// PR3: アプリ内操作(設計書 §5.5)
+mod api_ops;
+
 #[test]
 fn acceptance_harness_runs() {}

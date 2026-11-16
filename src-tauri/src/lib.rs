@@ -12,6 +12,7 @@
 //! Tauri コマンドで設定取得/更新・チャンネル追加削除・コメント非表示・OBS URL 取得を公開。
 
 pub mod api;
+pub mod inject;
 pub mod integrations;
 pub mod autopost;
 pub mod bus;
@@ -49,7 +50,7 @@ use crate::bus::{spawn_moderation_ui_forwarder, spawn_reaction_ui_forwarder, Bus
 use crate::templates::{TemplateInfo, TemplateRef, TemplateStore};
 use crate::config::{AppConfig, ChannelConfig, ChannelPlatform, TtsBackendKind, VoicevoxEngineKind};
 use crate::model::{
-    Amount, Author, Badge, ChatMessage, Fragment, LiveEvent, LiveStream, MessageKind, ModerationEvent, Participant,
+    Author, Badge, ChatMessage, Fragment, LiveEvent, LiveStream, MessageKind, ModerationEvent, Participant,
     Platform, Roles, YoutubeReaction,
 };
 use crate::moderation::{Moderator, Verdict};
@@ -70,6 +71,7 @@ use crate::update::{check_for_update, open_url};
 pub struct AppState {
     integrations: integrations::Integrations<integrations::KeyringSecretStore>,
     api_feed: api::ApiFeed,
+    api_rate_limit: Arc<api::RateLimit>,
     /// 現在の設定。
     config: Mutex<AppConfig>,
     listeners: Arc<listeners::ListenerStore>,
@@ -311,6 +313,49 @@ async fn wait_for_bouyomi_socket(host: &str, port: u16) -> bool {
     false
 }
 
+fn clear_tts_queue_impl(app: &AppHandle, state: &AppState) {
+    state.tts.clear(app);
+}
+fn skip_current_tts_impl(app: &AppHandle, state: &AppState) {
+    state.tts.skip_current(app);
+}
+
+struct TauriAppOps(AppHandle);
+impl api::AppOps for TauriAppOps {
+    fn inject_test_comments(
+        &self,
+        req: &api::TestCommentRequest,
+    ) -> Result<Vec<String>, api::OpsError> {
+        inject_test_comments_impl(&self.0.state::<AppState>(), req).map_err(api::OpsError)
+    }
+    fn tts_state(&self) -> TtsQueueStatePayload {
+        current_tts_queue_state(&self.0.state::<AppState>())
+    }
+    fn tts_set_paused(&self, paused: bool) {
+        set_tts_paused_impl(&self.0, &self.0.state::<AppState>(), paused);
+    }
+    fn tts_skip(&self) {
+        skip_current_tts_impl(&self.0, &self.0.state::<AppState>());
+    }
+    fn tts_clear(&self) {
+        clear_tts_queue_impl(&self.0, &self.0.state::<AppState>());
+    }
+    fn timer_state(&self) -> TimerSnapshot {
+        self.0.state::<AppState>().timer_tx.borrow().clone()
+    }
+    fn timer_control(
+        &self,
+        action: api::TimerAction,
+        duration_sec: Option<u32>,
+    ) -> Result<TimerSnapshot, api::OpsError> {
+        Ok(control_timer_impl(
+            &self.0.state::<AppState>(),
+            action,
+            duration_sec,
+        ))
+    }
+}
+
 // ============ Tauri コマンド ============
 
 /// 現在の設定を取得する。
@@ -322,7 +367,11 @@ fn get_config(state: State<'_, AppState>) -> Result<AppConfig, String> {
 /// TTS 読み上げを一時停止/再開する。paused 中に届いたメッセージは保持せず破棄する。
 #[tauri::command]
 fn set_tts_paused(app: AppHandle, state: State<'_, AppState>, paused: bool) {
-    state.tts.set_paused(&app, paused);
+    set_tts_paused_impl(&app, &state, paused);
+}
+
+fn set_tts_paused_impl(app: &AppHandle, state: &AppState, paused: bool) {
+    state.tts.set_paused(app, paused);
 
     let tts_config = state.config.lock().unwrap().tts.clone();
     if tts_config.backend == TtsBackendKind::Bouyomi {
@@ -365,14 +414,14 @@ fn get_tts_queue_state(state: State<'_, AppState>) -> TtsQueueStatePayload {
 /// 未送出の TTS キューと合成を破棄し、UI の現在発話も即時停止させる。
 #[tauri::command]
 fn clear_tts_queue(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    state.tts.clear(&app);
+    clear_tts_queue_impl(&app, &state);
     Ok(())
 }
 
 /// 再生中ならその発話を停止し、それ以外は合成中の一件を破棄する。
 #[tauri::command]
 fn skip_current_tts(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    state.tts.skip_current(&app);
+    skip_current_tts_impl(&app, &state);
     Ok(())
 }
 
@@ -1076,7 +1125,7 @@ async fn update_config(
         .update_config(&new_config.moderation);
 
     // OBS ポート反映。ポートが変わった場合は旧サーバを停止し、新ポートで再 bind する。
-    restart_obs_server_if_needed(&state, new_config.obs.port)?;
+    restart_obs_server_if_needed(&app, &state, new_config.obs.port)?;
 
     let mut warnings = Vec::new();
     if let Some(w) = configure_chatlog_nonfatal(&state.chatlog, new_config.log.clone()).await {
@@ -1518,56 +1567,40 @@ fn control_timer(
     action: String,
     duration_sec: Option<u32>,
 ) -> Result<(), String> {
-    let timer_config = {
-        let cfg = state.config.lock().unwrap();
-        cfg.timer.clone()
-    };
-    let now_ms = timer_now_ms();
-    let timer_rx = state.timer_tx.subscribe();
-    let mut next = timer_rx.borrow().clone();
-
-    match action.as_str() {
-        "start" => {
-            let dur = duration_sec.unwrap_or(timer_config.default_duration_sec);
-            next = TimerSnapshot {
-                state: "running".to_string(),
-                mode: normalize_timer_mode(&timer_config.mode),
-                duration_sec: dur,
-                base_elapsed_sec: 0,
-                running_since_ms: now_ms,
-                updated_at: now_ms,
-            };
-        }
-        "pause" => {
-            if next.state == "running" {
-                let elapsed_sec = now_ms.saturating_sub(next.running_since_ms) / 1000;
-                let elapsed_sec = u32::try_from(elapsed_sec).unwrap_or(u32::MAX);
-                next.base_elapsed_sec = next.base_elapsed_sec.saturating_add(elapsed_sec);
-            }
-            next.state = "paused".to_string();
-            next.running_since_ms = 0;
-            next.updated_at = now_ms;
-        }
-        "resume" => {
-            next.state = "running".to_string();
-            next.running_since_ms = now_ms;
-            next.updated_at = now_ms;
-        }
-        "reset" => {
-            next.state = "idle".to_string();
-            next.base_elapsed_sec = 0;
-            next.running_since_ms = 0;
-            next.updated_at = now_ms;
-        }
+    let action = match action.as_str() {
+        "start" => api::TimerAction::Start,
+        "pause" => api::TimerAction::Pause,
+        "resume" => api::TimerAction::Resume,
+        "reset" => api::TimerAction::Reset,
         other => {
             return Err(format!(
                 "不正な timer action です: {other} (start/pause/resume/reset)"
-            ));
+            ))
         }
-    }
-
-    let _ = state.timer_tx.send_replace(next);
+    };
+    control_timer_impl(&state, action, duration_sec);
     Ok(())
+}
+
+fn control_timer_impl(
+    state: &AppState,
+    action: api::TimerAction,
+    duration_sec: Option<u32>,
+) -> TimerSnapshot {
+    let cfg = state.config.lock().unwrap().timer.clone();
+    let mut next = TimerSnapshot::default();
+    state.timer_tx.send_modify(|current| {
+        next = stats::next_timer_snapshot(
+            current,
+            action,
+            duration_sec,
+            cfg.default_duration_sec,
+            &cfg.mode,
+            timer_now_ms(),
+        );
+        *current = next.clone();
+    });
+    next
 }
 
 /// OBS Timer overlay 用 URL を返す。
@@ -1577,14 +1610,6 @@ fn get_obs_timer_url(state: State<'_, AppState>) -> Result<String, String> {
     Ok(format!(
         "http://127.0.0.1:{port}/?template=timer&ws=ws://127.0.0.1:{port}/timer"
     ))
-}
-
-fn normalize_timer_mode(mode: &str) -> String {
-    if mode == "elapsed" {
-        "elapsed".to_string()
-    } else {
-        "countdown".to_string()
-    }
 }
 
 fn timer_now_ms() -> u64 {
@@ -1840,13 +1865,22 @@ fn inject_test_comment(
     amount: Option<f64>,
     count: Option<u32>,
 ) -> Result<(), String> {
-    for msg in build_injected_test_messages(&platform, &name, &text, kind.as_deref(), amount, count)? {
-        let _ = state.source_tx.send(msg);
-    }
-    Ok(())
+    inject_test_comments_impl(
+        &state,
+        &api::TestCommentRequest {
+            platform,
+            name,
+            text,
+            kind: kind.unwrap_or_else(|| "normal".into()),
+            amount,
+            count: count.unwrap_or(1).clamp(1, 20),
+        },
+    )
+    .map(|_| ())
 }
 
 /// inject_test_comment が流すメッセージを組み立てる(テスト可能な純関数部分)。
+#[cfg(test)]
 fn build_injected_test_messages(
     platform: &str,
     name: &str,
@@ -1855,72 +1889,27 @@ fn build_injected_test_messages(
     amount: Option<f64>,
     count: Option<u32>,
 ) -> Result<Vec<ChatMessage>, String> {
-    let platform = match platform {
-        "twitch" => Platform::Twitch,
-        "youtube" => Platform::Youtube,
-        "x" => Platform::X,
-        "niconico" => Platform::Niconico,
-        other => return Err(format!("不正な platform です: {other}")),
-    };
-    let kind = match kind.unwrap_or("normal") {
-        "normal" => MessageKind::Normal,
-        "superChat" => MessageKind::SuperChat,
-        "membership" => MessageKind::Membership,
-        "bits" => MessageKind::Bits,
-        "gift" => MessageKind::Gift,
-        other => return Err(format!("不正な kind です: {other}")),
-    };
-    let count = count.unwrap_or(1).clamp(1, 20);
-    let epoch_millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|e| format!("現在時刻取得失敗: {e}"))?
-        .as_millis();
-    let timestamp_ms = i64::try_from(epoch_millis).unwrap_or(i64::MAX);
-    let author_name = name.trim();
-    let author_name = if author_name.is_empty() {
-        "テストユーザー"
-    } else {
-        author_name
-    };
-    let body = text.trim();
-    let body = if body.is_empty() {
-        "テストコメントです"
-    } else {
-        body
-    };
+    inject::build_test_messages(&api::TestCommentRequest {
+        platform: platform.into(),
+        name: name.into(),
+        text: text.into(),
+        kind: kind.unwrap_or("normal").into(),
+        amount,
+        count: count.unwrap_or(1).clamp(1, 20),
+    })
+}
 
-    let mut messages = Vec::with_capacity(count as usize);
-    for i in 0..count {
-        let value = amount.filter(|_| matches!(kind, MessageKind::SuperChat | MessageKind::Bits));
-        messages.push(ChatMessage {
-            listener: None,
-            native_id: false,
-            id: format!("injected-test:{epoch_millis}-{i}"),
-            platform,
-            channel: "test".to_string(),
-            author: Author {
-                nickname: None,
-                avatar_url: None,
-                id: format!("test{i}"),
-                name: author_name.to_string(),
-                display_color: None,
-                badges: Vec::new(),
-                roles: Roles::default(),
-            },
-            fragments: vec![Fragment::text(body.to_string())],
-            kind,
-            amount: value.map(|value| Amount {
-                value,
-                currency: "JPY".to_string(),
-                raw_text: format!("¥{value}"),
-            }),
-            timestamp_ms: timestamp_ms.saturating_add(i64::from(i)),
-            raw: None,
-            skip_tts: false,
-            injected_test: true,
-        });
+fn inject_test_comments_impl(
+    state: &AppState,
+    req: &api::TestCommentRequest,
+) -> Result<Vec<String>, String> {
+    let messages = inject::build_test_messages(req)?;
+    let mut ids = Vec::with_capacity(messages.len());
+    for msg in messages {
+        ids.push(msg.id.clone());
+        let _ = state.source_tx.send(msg);
     }
-    Ok(messages)
+    Ok(ids)
 }
 
 // ============ 内部ヘルパ ============
@@ -2035,7 +2024,11 @@ async fn regenerate_local_api_token(
 }
 
 /// OBS サーバの待受ポートが変わったら、旧サーバを止めて新ポートで起動する。
-fn restart_obs_server_if_needed(state: &AppState, new_port: u16) -> Result<(), String> {
+fn restart_obs_server_if_needed(
+    app: &AppHandle,
+    state: &AppState,
+    new_port: u16,
+) -> Result<(), String> {
     let mut server = state.obs_server.lock().unwrap();
     if server.port == new_port {
         return Ok(());
@@ -2051,7 +2044,10 @@ fn restart_obs_server_if_needed(state: &AppState, new_port: u16) -> Result<(), S
         new_port,
         cancel.clone(),
         Some(api::router(
-            api::ApiDeps::new(state.integrations.gate(), cancel.clone()).with_feed(state.api_feed.clone()),
+            api::ApiDeps::new(state.integrations.gate(), cancel.clone())
+                .with_feed(state.api_feed.clone())
+                .with_ops(Arc::new(TauriAppOps(app.clone())))
+                .with_rate_limit(state.api_rate_limit.clone()),
             new_port,
         )),
     )?;
@@ -2421,13 +2417,18 @@ pub fn run() {
             ));
             let api_feed = api::ApiFeed::new(1000);
             api_feed.bind(&bus, &integrations.gate(), app_cancel.clone());
+            let api_rate_limit = Arc::new(api::RateLimit::new());
             let api_router = api::router(
-                api::ApiDeps::new(integrations.gate(), obs_cancel.clone()).with_feed(api_feed.clone()),
+                api::ApiDeps::new(integrations.gate(), obs_cancel.clone())
+                    .with_feed(api_feed.clone())
+                    .with_ops(Arc::new(TauriAppOps(handle.clone())))
+                    .with_rate_limit(api_rate_limit.clone()),
                 obs_port,
             );
             let state = AppState {
                 integrations,
                 api_feed,
+                api_rate_limit,
                 listeners: Arc::new(listeners::ListenerStore::load(&config_dir)),
                 chatlog: chatlog::ChatLog::start(&config_dir, config.log.clone()),
                 config: Mutex::new(config.clone()),

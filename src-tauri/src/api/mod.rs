@@ -1,4 +1,8 @@
 mod comments;
+mod ops;
+pub(crate) use ops::RateLimit;
+pub use ops::{AppOps, OpsError, TestCommentRequest, TimerAction};
+use std::sync::Arc;
 pub mod dto;
 mod events;
 mod feed;
@@ -16,6 +20,8 @@ pub struct ApiDeps {
     pub(crate) epoch: String,
     pub(crate) shutdown: CancellationToken,
     pub(crate) feed: ApiFeed,
+    pub(crate) ops: Option<Arc<dyn AppOps>>,
+    pub(crate) rate_limit: Arc<ops::RateLimit>,
 }
 impl ApiDeps {
     pub fn new(gate: ApiGate, shutdown: CancellationToken) -> Self {
@@ -29,7 +35,17 @@ impl ApiDeps {
             },
             shutdown,
             feed: ApiFeed::new(1000),
+            ops: None,
+            rate_limit: Arc::new(ops::RateLimit::new()),
         }
+    }
+    pub fn with_ops(mut self, ops: Arc<dyn AppOps>) -> Self {
+        self.ops = Some(ops);
+        self
+    }
+    pub(crate) fn with_rate_limit(mut self, limit: Arc<RateLimit>) -> Self {
+        self.rate_limit = limit;
+        self
     }
     pub fn with_feed(mut self, feed: ApiFeed) -> Self {
         self.feed = feed;
@@ -39,7 +55,7 @@ impl ApiDeps {
 pub fn router(deps: ApiDeps, port: u16) -> axum::Router {
     use axum::{
         middleware::from_fn_with_state,
-        routing::{any, get},
+        routing::{any, get, post},
     };
     axum::Router::new()
         .route(
@@ -53,6 +69,50 @@ pub fn router(deps: ApiDeps, port: u16) -> axum::Router {
         .route(
             "/api/v1/events",
             get(events::events).fallback(error::method_not_allowed),
+        )
+        .route(
+            "/api/v1/test-comments",
+            post(ops::inject).fallback(error::method_not_allowed),
+        )
+        .route(
+            "/api/v1/tts",
+            get(ops::tts).fallback(error::method_not_allowed),
+        )
+        .route(
+            "/api/v1/timer",
+            get(ops::timer).fallback(error::method_not_allowed),
+        )
+        .route(
+            "/api/v1/tts/pause",
+            post(ops::mutate).fallback(error::method_not_allowed),
+        )
+        .route(
+            "/api/v1/tts/resume",
+            post(ops::mutate).fallback(error::method_not_allowed),
+        )
+        .route(
+            "/api/v1/tts/skip",
+            post(ops::mutate).fallback(error::method_not_allowed),
+        )
+        .route(
+            "/api/v1/tts/clear",
+            post(ops::mutate).fallback(error::method_not_allowed),
+        )
+        .route(
+            "/api/v1/timer/start",
+            post(ops::mutate).fallback(error::method_not_allowed),
+        )
+        .route(
+            "/api/v1/timer/pause",
+            post(ops::mutate).fallback(error::method_not_allowed),
+        )
+        .route(
+            "/api/v1/timer/resume",
+            post(ops::mutate).fallback(error::method_not_allowed),
+        )
+        .route(
+            "/api/v1/timer/reset",
+            post(ops::mutate).fallback(error::method_not_allowed),
         )
         .route("/api", any(error::not_found))
         .route("/api/", any(error::not_found))
