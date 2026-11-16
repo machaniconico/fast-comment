@@ -391,12 +391,12 @@ fn set_tts_paused_impl(app: &AppHandle, state: &AppState, paused: bool) {
             } else {
                 backend.resume().await
             };
-            if result.is_err() {
+            if let Err(e) = result {
                 emit_tts_notice(
                     &app_for_notice,
                     "warn",
                     format!(
-                        "棒読みちゃんの{}命令に失敗しました",
+                        "棒読みちゃんの{}命令に失敗しました: {e}",
                         if paused { "停止" } else { "再開" }
                     ),
                 );

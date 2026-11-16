@@ -2,7 +2,9 @@
 use crate::api::TestCommentRequest;
 use crate::model::{Amount, Author, ChatMessage, Fragment, MessageKind, Platform, Roles};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::LazyLock;
 use std::time::{SystemTime, UNIX_EPOCH};
+static SESSION_ID: LazyLock<uuid::Uuid> = LazyLock::new(uuid::Uuid::new_v4);
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 pub fn build_test_messages(req: &TestCommentRequest) -> Result<Vec<ChatMessage>, String> {
@@ -44,11 +46,16 @@ pub fn build_test_messages(req: &TestCommentRequest) -> Result<Vec<ChatMessage>,
     for i in 0..count {
         let value = req
             .amount
-            .filter(|_| matches!(kind, MessageKind::SuperChat | MessageKind::Bits));
+            .filter(|_| matches!(kind, MessageKind::SuperChat | MessageKind::Bits))
+            .map(|value| if value == 0.0 { 0.0 } else { value });
         messages.push(ChatMessage {
             listener: None,
             native_id: false,
-            id: format!("injected-test:{}", NEXT_ID.fetch_add(1, Ordering::Relaxed)),
+            id: format!(
+                "injected-test:{}-{}",
+                *SESSION_ID,
+                NEXT_ID.fetch_add(1, Ordering::Relaxed)
+            ),
             platform,
             channel: "test".to_string(),
             author: Author {
@@ -74,4 +81,27 @@ pub fn build_test_messages(req: &TestCommentRequest) -> Result<Vec<ChatMessage>,
         });
     }
     Ok(messages)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn negative_zero_amount_is_normalized() {
+        for kind in ["superChat", "bits"] {
+            let req: TestCommentRequest = serde_json::from_value(serde_json::json!({
+                "platform": "youtube",
+                "kind": kind,
+                "amount": -0.0,
+            }))
+            .unwrap();
+            assert!(req.amount.unwrap().is_sign_negative());
+            let messages = build_test_messages(&req).unwrap();
+            let amount = messages[0].amount.as_ref().unwrap();
+            assert_eq!(amount.value, 0.0);
+            assert!(amount.value.is_sign_positive());
+            assert_eq!(amount.raw_text, "¥0");
+        }
+    }
 }
