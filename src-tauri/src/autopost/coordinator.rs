@@ -771,6 +771,7 @@ mod tests {
                 mode: mode.into(),
                 intent_open: "auto".into(),
                 delay_secs: 60,
+                combine: true,
                 ..XPostConfig::default()
             },
             channels: vec![
