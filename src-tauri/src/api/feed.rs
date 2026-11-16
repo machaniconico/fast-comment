@@ -154,12 +154,26 @@ impl ApiFeed {
             return;
         }
         state.expire_deletions();
-        if state.recent_deletions.len() == RECENT_DELETION_LIMIT {
-            state.recent_deletions.pop_front();
+        // Unbounded clears (before_ms: None) would also hide comments posted
+        // after the clear, so they apply only to what is already held.
+        let bounded = !matches!(
+            event,
+            ModerationEvent::UserCleared {
+                before_ms: None,
+                ..
+            } | ModerationEvent::ChatCleared {
+                before_ms: None,
+                ..
+            }
+        );
+        if bounded {
+            if state.recent_deletions.len() == RECENT_DELETION_LIMIT {
+                state.recent_deletions.pop_front();
+            }
+            state
+                .recent_deletions
+                .push_back((Instant::now(), event.clone()));
         }
-        state
-            .recent_deletions
-            .push_back((Instant::now(), event.clone()));
         state.history.retain(|item| !event.matches(&item.target));
         let value = json!(event);
         state.clients.retain(|client| {
@@ -365,27 +379,91 @@ mod tests {
     }
     #[test]
     fn bus_user_and_chat_clear_before_comment_never_resurrects() {
-        for before_ms in [Some(1), None] {
-            assert_bus_order(
-                ModerationEvent::UserCleared {
-                    platform: Platform::Twitch,
-                    channel: "chan".into(),
-                    author_id: "user".into(),
-                    duration_secs: None,
-                    certain: true,
-                    before_ms,
-                },
-                true,
-            );
-            assert_bus_order(
-                ModerationEvent::ChatCleared {
-                    platform: Platform::Twitch,
-                    channel: "chan".into(),
-                    before_ms,
-                },
-                true,
-            );
+        assert_bus_order(
+            ModerationEvent::UserCleared {
+                platform: Platform::Twitch,
+                channel: "chan".into(),
+                author_id: "user".into(),
+                duration_secs: None,
+                certain: true,
+                before_ms: Some(1),
+            },
+            true,
+        );
+        assert_bus_order(
+            ModerationEvent::ChatCleared {
+                platform: Platform::Twitch,
+                channel: "chan".into(),
+                before_ms: Some(1),
+            },
+            true,
+        );
+    }
+    #[test]
+    fn bus_unbounded_clear_does_not_hide_later_comments() {
+        let events = [
+            ModerationEvent::UserCleared {
+                platform: Platform::Twitch,
+                channel: "chan".into(),
+                author_id: "user".into(),
+                duration_secs: None,
+                certain: true,
+                before_ms: None,
+            },
+            ModerationEvent::ChatCleared {
+                platform: Platform::Twitch,
+                channel: "chan".into(),
+                before_ms: None,
+            },
+        ];
+        for event in events {
+            let bus = bus();
+            let mut chat = bus.subscribe();
+            let mut moderation = bus.subscribe_moderation();
+            let feed = ApiFeed::new(1000);
+            feed.set_enabled(true);
+            let (_, pending) = feed.subscribe().unwrap();
+            bus.publish(message("before"));
+            feed.drain_bus(&mut chat, &mut moderation);
+            bus.publish_moderation(event);
+            feed.drain_bus(&mut chat, &mut moderation);
+            assert!(feed.snapshot().entries.is_empty());
+            bus.publish(message("after"));
+            feed.drain_bus(&mut chat, &mut moderation);
+            assert_eq!(feed.snapshot().entries.len(), 1);
+            assert_eq!(pending.lock().unwrap().chat.len(), 2);
         }
+    }
+    #[test]
+    fn unbounded_user_clear_keeps_later_comment() {
+        let feed = ApiFeed::new(1000);
+        feed.set_enabled(true);
+        feed.push_moderation(&ModerationEvent::UserCleared {
+            platform: Platform::Twitch,
+            channel: "chan".into(),
+            author_id: "user".into(),
+            duration_secs: Some(1),
+            certain: true,
+            before_ms: None,
+        });
+        let mut m = message("after");
+        m.timestamp_ms = i64::MAX / 2;
+        feed.push_chat(&m);
+        assert_eq!(feed.snapshot().entries.len(), 1);
+    }
+    #[test]
+    fn unbounded_chat_clear_keeps_later_comment() {
+        let feed = ApiFeed::new(1000);
+        feed.set_enabled(true);
+        feed.push_chat(&message("before"));
+        feed.push_moderation(&ModerationEvent::ChatCleared {
+            platform: Platform::Twitch,
+            channel: "chan".into(),
+            before_ms: None,
+        });
+        assert!(feed.snapshot().entries.is_empty());
+        feed.push_chat(&message("after"));
+        assert_eq!(feed.snapshot().entries.len(), 1);
     }
     #[tokio::test(start_paused = true)]
     async fn deletion_conditions_expire_on_idle_tick() {
