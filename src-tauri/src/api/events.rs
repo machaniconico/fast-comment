@@ -35,6 +35,9 @@ pub async fn events(
             params.after = Some(value.to_owned());
         }
     }
+    if !comments::valid_after(params.after.as_deref(), &deps.feed.snapshot(), &deps.epoch) {
+        return comments::invalid("after / Last-Event-ID");
+    }
     let Some((history, pending)) = deps.feed.subscribe() else {
         return error::response(
             StatusCode::TOO_MANY_REQUESTS,
@@ -42,9 +45,6 @@ pub async fn events(
             "同時接続数の上限です",
         );
     };
-    if !comments::valid_after(params.after.as_deref(), &history, &deps.epoch) {
-        return comments::invalid("after / Last-Event-ID");
-    }
     let mut output = VecDeque::new();
     if params.after.is_some() {
         let (history, gap, dropped) =

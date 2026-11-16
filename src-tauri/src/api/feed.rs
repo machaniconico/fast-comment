@@ -6,6 +6,10 @@ use std::{
     collections::VecDeque,
     sync::{Arc, Mutex, Weak},
 };
+use tokio::time::{Duration, Instant};
+
+const RECENT_DELETION_LIMIT: usize = 4096;
+const RECENT_DELETION_TTL: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
 pub struct ApiFeed(Arc<Mutex<FeedState>>);
@@ -16,6 +20,19 @@ struct FeedState {
     discarded_through: u64,
     history: VecDeque<Arc<Entry>>,
     clients: Vec<Weak<Mutex<Pending>>>,
+    recent_deletions: VecDeque<(Instant, ModerationEvent)>,
+}
+impl FeedState {
+    fn expire_deletions(&mut self) {
+        let now = Instant::now();
+        while self
+            .recent_deletions
+            .front()
+            .is_some_and(|(at, _)| now.duration_since(*at) >= RECENT_DELETION_TTL)
+        {
+            self.recent_deletions.pop_front();
+        }
+    }
 }
 pub(super) struct History {
     pub entries: Vec<Arc<Entry>>,
@@ -57,6 +74,7 @@ impl ApiFeed {
             discarded_through: 0,
             history: VecDeque::new(),
             clients: Vec::new(),
+            recent_deletions: VecDeque::new(),
         })))
     }
     pub fn set_enabled(&self, enabled: bool) {
@@ -64,6 +82,7 @@ impl ApiFeed {
         if state.enabled != enabled {
             state.discarded_through = state.seq;
             state.history.clear();
+            state.recent_deletions.clear();
             for client in state.clients.iter().filter_map(Weak::upgrade) {
                 *client.lock().unwrap() = Pending::default();
             }
@@ -76,6 +95,16 @@ impl ApiFeed {
             return;
         }
         state.seq += 1;
+        state.expire_deletions();
+        // Apply the same predicate before both history and live SSE enqueueing.
+        // Keep seq monotonic even for comments suppressed by moderation.
+        if state
+            .recent_deletions
+            .iter()
+            .any(|(_, event)| event.matches(msg))
+        {
+            return;
+        }
         let entry = Arc::new(Entry {
             seq: state.seq,
             value: api_comment_json(state.seq, msg),
@@ -124,6 +153,13 @@ impl ApiFeed {
         if !state.enabled {
             return;
         }
+        state.expire_deletions();
+        if state.recent_deletions.len() == RECENT_DELETION_LIMIT {
+            state.recent_deletions.pop_front();
+        }
+        state
+            .recent_deletions
+            .push_back((Instant::now(), event.clone()));
         state.history.retain(|item| !event.matches(&item.target));
         let value = json!(event);
         state.clients.retain(|client| {
@@ -176,7 +212,6 @@ impl ApiFeed {
         gate: &super::ApiGate,
         shutdown: tokio_util::sync::CancellationToken,
     ) {
-        use tokio::sync::broadcast::error::TryRecvError;
         let active = Arc::new(Mutex::new(None));
         let notify = Arc::new(tokio::sync::Notify::new());
         let feed = self.clone();
@@ -203,45 +238,56 @@ impl ApiFeed {
                 }
                 let mut active = active.lock().unwrap();
                 if let Some((chat, moderation)) = active.as_mut() {
-                    // Freeze actual moderation events BEFORE the chat boundary.
-                    // Every chat published before these deletions must be consumed
-                    // (or accounted for as lost) before applying the deletions.
-                    // Merely freezing receiver lengths is insufficient if a lag
-                    // advances the moderation receiver to newer events meanwhile.
-                    let mut events = Vec::new();
-                    let mut moderation_lost = 0;
-                    for _ in 0..moderation.len() {
-                        match moderation.try_recv() {
-                            Ok(event) => events.push(event),
-                            Err(TryRecvError::Lagged(n)) => moderation_lost += n,
-                            Err(_) => break,
-                        }
-                    }
-                    let mut remaining = chat.len();
-                    while remaining > 0 {
-                        match chat.try_recv() {
-                            Ok(msg) => {
-                                feed.push_chat(&msg);
-                                remaining -= 1;
-                            }
-                            Err(TryRecvError::Lagged(n)) => {
-                                feed.record_dropped(n, false);
-                                remaining = remaining.saturating_sub(n as usize);
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                    if moderation_lost > 0 {
-                        feed.record_dropped(moderation_lost, true);
-                    }
-                    for event in events {
-                        feed.push_moderation(&event);
-                    }
+                    feed.drain_bus(chat, moderation);
                 }
             }
             *active.lock().unwrap() = None;
             feed.set_enabled(false);
         });
+    }
+    // One feed tick, also driven explicitly by tests to fix cross-tick ordering.
+    fn drain_bus(
+        &self,
+        chat: &mut tokio::sync::broadcast::Receiver<ChatMessage>,
+        moderation: &mut tokio::sync::broadcast::Receiver<ModerationEvent>,
+    ) {
+        use tokio::sync::broadcast::error::TryRecvError;
+        // Expire even on idle ticks so stale conditions release their allocations.
+        self.0.lock().unwrap().expire_deletions();
+        // Freeze actual moderation events BEFORE the chat boundary.
+        // Every chat published before these deletions must be consumed
+        // (or accounted for as lost) before applying the deletions.
+        // Merely freezing receiver lengths is insufficient if a lag
+        // advances the moderation receiver to newer events meanwhile.
+        let mut events = Vec::new();
+        let mut moderation_lost = 0;
+        for _ in 0..moderation.len() {
+            match moderation.try_recv() {
+                Ok(event) => events.push(event),
+                Err(TryRecvError::Lagged(n)) => moderation_lost += n,
+                Err(_) => break,
+            }
+        }
+        let mut remaining = chat.len();
+        while remaining > 0 {
+            match chat.try_recv() {
+                Ok(msg) => {
+                    self.push_chat(&msg);
+                    remaining -= 1;
+                }
+                Err(TryRecvError::Lagged(n)) => {
+                    self.record_dropped(n, false);
+                    remaining = remaining.saturating_sub(n as usize);
+                }
+                Err(_) => break,
+            }
+        }
+        if moderation_lost > 0 {
+            self.record_dropped(moderation_lost, true);
+        }
+        for event in events {
+            self.push_moderation(&event);
+        }
     }
     fn record_dropped(&self, count: u64, moderation_lost: bool) {
         let mut state = self.0.lock().unwrap();
@@ -275,51 +321,143 @@ mod tests {
             message_id: id.into(),
         }
     }
-    #[tokio::test]
-    async fn concurrent_bus_deletions_never_resurrect_in_history() {
+    fn bus() -> crate::bus::Bus {
         let (stats, _) = tokio::sync::watch::channel(Default::default());
         let (timer, _) = tokio::sync::watch::channel(Default::default());
-        let bus = crate::bus::Bus::new(1234, stats, timer);
-        let gate = super::super::ApiGate::closed();
+        crate::bus::Bus::new(1234, stats, timer)
+    }
+    fn assert_bus_order(event: ModerationEvent, reverse: bool) {
+        let bus = bus();
+        let mut chat = bus.subscribe();
+        let mut moderation = bus.subscribe_moderation();
         let feed = ApiFeed::new(1000);
-        let stop = tokio_util::sync::CancellationToken::new();
-        feed.bind(&bus, &gate, stop.clone());
-        gate.open("regression-token");
-        let publisher = std::thread::spawn(move || {
-            for n in 0..20_000 {
-                let id = format!("m{n}");
-                bus.publish(message(&id));
-                std::thread::yield_now();
-                bus.publish_moderation(deleted(&id));
-                std::thread::sleep(std::time::Duration::from_micros(50));
+        feed.set_enabled(true);
+        let (_, pending) = feed.subscribe().unwrap();
+        // No background tick: each drain completes before the next publish.
+        if reverse {
+            bus.publish_moderation(event);
+            feed.drain_bus(&mut chat, &mut moderation);
+            assert_eq!(pending.lock().unwrap().moderation.len(), 1);
+            bus.publish(message("target"));
+        } else {
+            bus.publish(message("target"));
+            feed.drain_bus(&mut chat, &mut moderation);
+            assert_eq!(feed.snapshot().entries.len(), 1);
+            bus.publish_moderation(event);
+        }
+        feed.drain_bus(&mut chat, &mut moderation);
+        assert!(feed.snapshot().entries.is_empty());
+        if reverse {
+            assert!(
+                pending.lock().unwrap().chat.is_empty(),
+                "deleted chat reached live SSE queue"
+            );
+        }
+        // Same-ID combo updates arriving in a later tick are also suppressed.
+        bus.publish(message("target"));
+        feed.drain_bus(&mut chat, &mut moderation);
+        assert!(feed.snapshot().entries.is_empty());
+    }
+    #[test]
+    fn bus_deletion_before_and_after_comment_never_resurrects() {
+        assert_bus_order(deleted("target"), false);
+        assert_bus_order(deleted("target"), true);
+    }
+    #[test]
+    fn bus_user_and_chat_clear_before_comment_never_resurrects() {
+        for before_ms in [Some(1), None] {
+            assert_bus_order(
+                ModerationEvent::UserCleared {
+                    platform: Platform::Twitch,
+                    channel: "chan".into(),
+                    author_id: "user".into(),
+                    duration_secs: None,
+                    certain: true,
+                    before_ms,
+                },
+                true,
+            );
+            assert_bus_order(
+                ModerationEvent::ChatCleared {
+                    platform: Platform::Twitch,
+                    channel: "chan".into(),
+                    before_ms,
+                },
+                true,
+            );
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn deletion_conditions_expire_on_idle_tick() {
+        let bus = bus();
+        let mut chat = bus.subscribe();
+        let mut moderation = bus.subscribe_moderation();
+        let feed = ApiFeed::new(1000);
+        feed.set_enabled(true);
+        let (_, pending) = feed.subscribe().unwrap();
+        bus.publish_moderation(deleted("target"));
+        feed.drain_bus(&mut chat, &mut moderation);
+        tokio::time::advance(RECENT_DELETION_TTL).await;
+        feed.drain_bus(&mut chat, &mut moderation);
+        assert!(feed.0.lock().unwrap().recent_deletions.is_empty());
+        bus.publish(message("target"));
+        feed.drain_bus(&mut chat, &mut moderation);
+        assert_eq!(feed.snapshot().entries.len(), 1);
+        assert_eq!(pending.lock().unwrap().chat.len(), 1);
+    }
+    #[test]
+    fn deletion_conditions_are_bounded_and_cleared_when_disabled() {
+        let feed = ApiFeed::new(1000);
+        feed.set_enabled(true);
+        for n in 0..=RECENT_DELETION_LIMIT {
+            feed.push_moderation(&deleted(&format!("m{n}")));
+        }
+        assert_eq!(
+            feed.0.lock().unwrap().recent_deletions.len(),
+            RECENT_DELETION_LIMIT
+        );
+        feed.push_chat(&message("m0"));
+        assert_eq!(feed.snapshot().entries.len(), 1);
+        feed.set_enabled(false);
+        assert!(feed.0.lock().unwrap().recent_deletions.is_empty());
+    }
+    #[test]
+    fn retained_conditions_use_shared_matching_semantics() {
+        let events = [
+            deleted("target"),
+            ModerationEvent::UserCleared {
+                platform: Platform::Twitch,
+                channel: "chan".into(),
+                author_id: "user".into(),
+                duration_secs: None,
+                certain: true,
+                before_ms: Some(1),
+            },
+            ModerationEvent::ChatCleared {
+                platform: Platform::Twitch,
+                channel: "chan".into(),
+                before_ms: Some(1),
+            },
+        ];
+        for event in events {
+            let feed = ApiFeed::new(1000);
+            feed.set_enabled(true);
+            let (_, pending) = feed.subscribe().unwrap();
+            feed.push_moderation(&event);
+            let original = message("target");
+            let mut variants = vec![original.clone(); 6];
+            variants[1].platform = Platform::Youtube;
+            variants[2].channel = "other".into();
+            variants[3].author.id = "other".into();
+            variants[4].timestamp_ms = 2;
+            variants[5].id = "other".into();
+            let expected = variants.iter().filter(|msg| !event.matches(msg)).count();
+            for msg in variants {
+                feed.push_chat(&msg);
             }
-            // A final marker proves that both receivers have been drained.
-            bus.publish(message("finished"));
-            bus.publish_moderation(deleted("finished"));
-        });
-        tokio::task::spawn_blocking(move || publisher.join().unwrap())
-            .await
-            .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                let state = feed.0.lock().unwrap();
-                let drained = state.seq == 20_001
-                    && !state
-                        .history
-                        .iter()
-                        .any(|entry| entry.target.id == "finished");
-                drop(state);
-                if drained {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .unwrap();
-        stop.cancel();
-        let remaining = feed.snapshot().entries.len();
-        assert_eq!(remaining, 0, "deleted comments resurrected in API history");
+            assert_eq!(feed.snapshot().entries.len(), expected);
+            assert_eq!(pending.lock().unwrap().chat.len(), expected);
+        }
     }
     #[test]
     fn mixed_events_share_one_queue_and_drop_oldest_across_types() {

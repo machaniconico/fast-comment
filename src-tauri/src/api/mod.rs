@@ -129,6 +129,28 @@ mod query_tests {
     }
 
     #[tokio::test]
+    async fn invalid_sse_cursor_is_400_even_when_all_slots_are_taken() {
+        let (deps, _) = setup();
+        let clients: Vec<_> = (0..8).map(|_| deps.feed.subscribe().unwrap().1).collect();
+        for cursor in ["invalid".to_owned(), format!("{}.1", deps.epoch)] {
+            assert_eq!(
+                status(&deps, &format!("/api/v1/events?after={cursor}"), None).await,
+                StatusCode::BAD_REQUEST
+            );
+            assert_eq!(
+                status(&deps, "/api/v1/events", Some(&cursor)).await,
+                StatusCode::BAD_REQUEST
+            );
+        }
+        assert_eq!(
+            status(&deps, "/api/v1/events", None).await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        drop(clients);
+        assert_eq!(status(&deps, "/api/v1/events", None).await, StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn deleted_head_cursor_remains_valid() {
         let (deps, msg) = setup();
         deps.feed.push_chat(&msg);
