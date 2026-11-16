@@ -23,6 +23,7 @@ impl SecretStore for KeyringSecretStore {
             // 壊れた JSON もそのまま取得し、上書き・削除の失敗時に復元できるようにする。
             // 内容の検証は load_webhook_secrets で行う。
             let key = key.to_owned();
+            let _guard = crate::secret_store::keyring_lock().lock().await;
             return tokio::task::spawn_blocking(move || {
                 let entry = keyring::Entry::new("fast-comment", &key)
                     .map_err(|_| "資格情報を読めません".to_string())?;
@@ -43,6 +44,7 @@ impl SecretStore for KeyringSecretStore {
     async fn put(&self, key: &str, value: &str) -> Result<(), String> {
         if key.starts_with("webhook:") {
             let (key, value) = (key.to_owned(), value.to_owned());
+            let _guard = crate::secret_store::keyring_lock().lock().await;
             return tokio::task::spawn_blocking(move || {
                 keyring::Entry::new("fast-comment", &key)
                     .and_then(|entry| entry.set_password(&value))

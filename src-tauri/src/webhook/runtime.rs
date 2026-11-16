@@ -456,7 +456,8 @@ async fn run_worker<S: SecretStore, T: Sender>(
                 } = &out
                 {
                     let now = Instant::now();
-                    ready_at = ready_at.max(now + (*d).min(expires.saturating_duration_since(now)));
+                    // 送り先全体の待ちは、現在項目の寿命で短縮しない。
+                    ready_at = ready_at.max(now + (*d).min(Duration::from_secs(600)));
                 }
             }
             let mut pause = None;
@@ -470,7 +471,7 @@ async fn run_worker<S: SecretStore, T: Sender>(
                     // 429 の待機は最後の試行でも後続の配送へ引き継ぐ。
                     let delay = wait.unwrap_or_else(|| jitter([2, 8, 30][(attempt - 1).min(2)]));
                     let now = Instant::now();
-                    let retry_at = now + delay.min(expires.saturating_duration_since(now));
+                    let retry_at = now + delay.min(Duration::from_secs(600));
                     if matches!(out, Outcome::Status { code: 429, .. }) {
                         ready_at = ready_at.max(retry_at);
                     }
@@ -765,5 +766,109 @@ mod tests {
         settle().await;
         assert_eq!(*sender.calls.lock().unwrap(), 3);
         assert_eq!(rules::COMPILES.with(|n| n.get()), before);
+    }
+    #[tokio::test(start_paused = true)]
+    async fn unrelated_save_must_not_resume_after_pause_persistence_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let it = Integrations::open(dir.path().into(), MemorySecretStore::new(), 1).await;
+        it.save_webhook(input("https://example.test/hook"))
+            .await
+            .unwrap();
+        let sender = Script::default();
+        sender.outcomes.lock().unwrap().push_back(status(404));
+        let rt = WebhookRuntime::new(it.clone(), sender.clone());
+        rt.reload().await;
+        let path = dir.path().join(crate::integrations::FILE_NAME);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        rt.handle_message(&message("a"));
+        settle().await;
+        assert_eq!(rt.status()[0].state, "paused");
+        std::fs::remove_dir(&path).unwrap();
+        it.save_webhook(input("https://example.test/hook"))
+            .await
+            .unwrap(); // 元の送り先は再開せず、別の送り先だけを保存する。
+        rt.reload().await;
+        rt.handle_message(&message("b"));
+        settle().await;
+        assert_eq!(*sender.calls.lock().unwrap(), 2);
+        assert_eq!(
+            rt.status()[0].state,
+            "paused",
+            "unrelated save must not resume an auto-paused worker"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expiring_item_must_not_shorten_retry_after_for_new_item() {
+        let dir = tempfile::tempdir().unwrap();
+        let it = Integrations::open(dir.path().into(), MemorySecretStore::new(), 1).await;
+        it.save_webhook(input("https://example.test/hook"))
+            .await
+            .unwrap();
+        let sender = Script::default();
+        for seconds in [590, 30] {
+            sender.outcomes.lock().unwrap().push_back(Outcome::Status {
+                code: 429,
+                header_retry_after: Some(Duration::from_secs(seconds)),
+                body_retry_after: None,
+                remaining_zero_reset_after: None,
+            });
+        }
+        let rt = WebhookRuntime::new(it, sender.clone());
+        rt.reload().await;
+        rt.handle_message(&message("old"));
+        settle().await;
+        assert_eq!(*sender.calls.lock().unwrap(), 1);
+        tokio::time::advance(Duration::from_secs(590)).await;
+        settle().await;
+        assert_eq!(*sender.calls.lock().unwrap(), 2);
+        rt.handle_message(&message("new"));
+        tokio::time::advance(Duration::from_secs(10)).await;
+        settle().await;
+        assert_eq!(
+            *sender.calls.lock().unwrap(),
+            2,
+            "Retry-After 30 received at t=590 must block new deliveries until t=620 (now t=600)"
+        );
+        tokio::time::advance(Duration::from_secs(20)).await;
+        settle().await;
+        assert_eq!(*sender.calls.lock().unwrap(), 3);
+        assert_eq!(rt.status()[0].delivered, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expiring_item_must_not_shorten_discord_reset_after_for_new_item() {
+        let dir = tempfile::tempdir().unwrap();
+        let it = Integrations::open(dir.path().into(), MemorySecretStore::new(), 1).await;
+        let mut def = input("https://discord.com/api/webhooks/id/token");
+        def.format = WebhookFormat::Discord;
+        it.save_webhook(def).await.unwrap();
+        let sender = Script::default();
+        for seconds in [590, 30] {
+            sender.outcomes.lock().unwrap().push_back(Outcome::Status {
+                code: 204,
+                header_retry_after: None,
+                body_retry_after: None,
+                remaining_zero_reset_after: Some(Duration::from_secs(seconds)),
+            });
+        }
+        let rt = WebhookRuntime::new(it, sender.clone());
+        rt.reload().await;
+        rt.handle_message(&message("first"));
+        rt.handle_message(&message("old"));
+        settle().await;
+        assert_eq!(*sender.calls.lock().unwrap(), 1);
+        tokio::time::advance(Duration::from_secs(590)).await;
+        settle().await;
+        assert_eq!(*sender.calls.lock().unwrap(), 2);
+        rt.handle_message(&message("new"));
+        tokio::time::advance(Duration::from_secs(10)).await;
+        settle().await;
+        assert_eq!(*sender.calls.lock().unwrap(), 2);
+        tokio::time::advance(Duration::from_secs(20)).await;
+        settle().await;
+        assert_eq!(*sender.calls.lock().unwrap(), 3);
+        assert_eq!(rt.status()[0].delivered, 3);
     }
 }

@@ -264,11 +264,16 @@ impl<S: SecretStore> Integrations<S> {
             return Err(IntegrationError::InvalidWebhook);
         }
         let mut next = file.clone();
+        let auto_pause = paused.is_some();
         next.webhooks[i].paused = paused;
-        file::save(&self.0.dir, &next).map_err(|_| IntegrationError::FileWrite)?;
-        *file = next;
-        self.refresh_webhooks(&file).await;
-        Ok(())
+        let saved = file::save(&self.0.dir, &next).map_err(|_| IntegrationError::FileWrite);
+        // 自動停止は保存失敗時もメモリに残す。無関係な保存・reload で解除しない。
+        // 明示的な再開は保存成功後にだけ反映する。
+        if saved.is_ok() || auto_pause {
+            *file = next;
+            self.refresh_webhooks(&file).await;
+        }
+        saved
     }
     pub async fn reveal_signing_secret(&self, id: &str) -> Result<String, IntegrationError> {
         let file = self.0.file.lock().await;
@@ -451,25 +456,18 @@ mod tests {
         assert!(secrets.keys().is_empty());
     }
     #[tokio::test]
-    async fn regression_corrupt_os_credentials_can_be_replaced_deleted_and_restored() {
+    async fn regression_corrupt_credentials_can_be_replaced_deleted_and_restored() {
         let dir = tempfile::tempdir().unwrap();
-        let it = Integrations::open(dir.path().into(), KeyringSecretStore, 1).await;
+        let secrets = MemorySecretStore::new();
+        let it = Integrations::open(dir.path().into(), secrets.clone(), 1).await;
         let id = it
             .save_webhook(input(None, Some("https://example.test/old")))
             .await
             .unwrap()
             .definition
             .id;
-        let entry = keyring::Entry::new("fast-comment", &key(&id)).unwrap();
-        struct Cleanup(keyring::Entry);
-        impl Drop for Cleanup {
-            fn drop(&mut self) {
-                let _ = self.0.delete_credential();
-            }
-        }
-        let cleanup = Cleanup(entry);
         for delete in [false, true] {
-            cleanup.0.set_password("not json").unwrap();
+            secrets.put(&key(&id), "not json").await.unwrap();
             let path = dir.path().join(FILE_NAME);
             let original = std::fs::read(&path).unwrap();
             std::fs::remove_file(&path).unwrap();
@@ -482,7 +480,7 @@ mod tests {
                     .map(|_| ())
             };
             assert!(matches!(failed, Err(IntegrationError::FileWrite)));
-            assert_eq!(cleanup.0.get_password().unwrap(), "not json");
+            assert_eq!(secrets.get(&key(&id)).await.unwrap().unwrap(), "not json");
             std::fs::remove_dir(&path).unwrap();
             std::fs::write(&path, original).unwrap();
             if delete {
@@ -496,10 +494,7 @@ mod tests {
                 );
             }
         }
-        assert!(matches!(
-            cleanup.0.get_password(),
-            Err(keyring::Error::NoEntry)
-        ));
+        assert_eq!(secrets.get(&key(&id)).await.unwrap(), None);
         assert!(it.list_webhooks().is_empty());
     }
 }

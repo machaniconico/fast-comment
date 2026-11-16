@@ -12,7 +12,7 @@ use tokio::sync::Mutex;
 
 const SERVICE: &str = "fast-comment";
 
-fn keyring_lock() -> &'static Mutex<()> {
+pub(crate) fn keyring_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
 }
