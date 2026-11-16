@@ -809,7 +809,7 @@ impl Default for XPostConfig {
             enabled: false,
             mode: "intent".to_string(),
             intent_open: "button".to_string(),
-            combine: true,
+            combine: false,
             template: DEFAULT_X_POST_TEMPLATE.to_string(),
             delay_secs: 60,
             stale_minutes: 15,
@@ -1079,7 +1079,7 @@ mod tests {
         assert!(!cfg.x_post.enabled);
         assert_eq!(cfg.x_post.mode, "intent");
         assert_eq!(cfg.x_post.intent_open, "button");
-        assert!(cfg.x_post.combine);
+        assert!(!cfg.x_post.combine);
         assert_eq!(cfg.x_post.template, "{title}\n{url}\n{date} {time}");
         assert_eq!(cfg.x_post.delay_secs, 60);
         assert_eq!(cfg.x_post.stale_minutes, 15);
@@ -1095,7 +1095,7 @@ mod tests {
         )
         .expect("partial xPost");
         assert!(cfg.x_post.enabled);
-        assert!(cfg.x_post.combine);
+        assert!(!cfg.x_post.combine);
         cfg.normalize_all();
         assert_eq!(cfg.x_post.delay_secs, 600);
         assert_eq!(cfg.x_post.stale_minutes, 180);
