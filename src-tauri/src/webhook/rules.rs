@@ -4,52 +4,72 @@ use crate::{
     model::{ChatMessage, MessageKind, Platform},
 };
 use std::collections::{HashSet, VecDeque};
+#[cfg(test)]
+thread_local! { pub(crate) static COMPILES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 pub fn decide(def: &WebhookDef, msg: &ChatMessage) -> Option<Matched> {
-    if !def.enabled
-        || def.paused.is_some()
-        || msg.injected_test
-        || msg.skip_tts
-        || msg.kind == MessageKind::System
-    {
-        return None;
+    CompiledRules::new(def).decide(def, msg)
+}
+pub(crate) struct CompiledRules {
+    keywords: Vec<(String, regex::Regex)>,
+}
+impl CompiledRules {
+    pub(crate) fn new(def: &WebhookDef) -> Self {
+        let keywords = def
+            .keywords
+            .iter()
+            .filter(|k| !k.trim().is_empty())
+            .filter_map(|k| {
+                #[cfg(test)]
+                COMPILES.with(|n| n.set(n.get() + 1));
+                regex::RegexBuilder::new(&regex::escape(k))
+                    .case_insensitive(true)
+                    .build()
+                    .ok()
+                    .map(|re| (k.clone(), re))
+            })
+            .collect();
+        Self { keywords }
     }
-    if def.triggers.donation
-        && matches!(
-            msg.kind,
-            MessageKind::SuperChat | MessageKind::Bits | MessageKind::Gift
-        )
-    {
-        return Some(Matched {
-            trigger: Trigger::Donation,
-            keyword: None,
-        });
-    }
-    if def.triggers.membership && msg.kind == MessageKind::Membership {
-        return Some(Matched {
-            trigger: Trigger::Membership,
-            keyword: None,
-        });
-    }
-    if def.triggers.keyword {
-        for k in &def.keywords {
-            if k.trim().is_empty() {
-                continue;
-            }
-            if let Ok(re) = regex::RegexBuilder::new(&regex::escape(k))
-                .case_insensitive(true)
-                .build()
-            {
+    pub(crate) fn decide(&self, def: &WebhookDef, msg: &ChatMessage) -> Option<Matched> {
+        if !def.enabled
+            || def.paused.is_some()
+            || msg.injected_test
+            || msg.skip_tts
+            || msg.kind == MessageKind::System
+        {
+            return None;
+        }
+        if def.triggers.donation
+            && matches!(
+                msg.kind,
+                MessageKind::SuperChat | MessageKind::Bits | MessageKind::Gift
+            )
+        {
+            return Some(Matched {
+                trigger: Trigger::Donation,
+                keyword: None,
+            });
+        }
+        if def.triggers.membership && msg.kind == MessageKind::Membership {
+            return Some(Matched {
+                trigger: Trigger::Membership,
+                keyword: None,
+            });
+        }
+        if def.triggers.keyword {
+            for (keyword, re) in &self.keywords {
                 if msg.text_fragments().any(|t| re.is_match(t)) {
                     return Some(Matched {
                         trigger: Trigger::Keyword,
-                        keyword: Some(k.clone()),
+                        keyword: Some(keyword.clone()),
                     });
                 }
             }
         }
+        None
     }
-    None
 }
+
 pub struct Dedup {
     capacity: usize,
     queue: VecDeque<(u8, String)>,

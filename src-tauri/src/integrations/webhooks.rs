@@ -450,4 +450,56 @@ mod tests {
         ));
         assert!(secrets.keys().is_empty());
     }
+    #[tokio::test]
+    async fn regression_corrupt_os_credentials_can_be_replaced_deleted_and_restored() {
+        let dir = tempfile::tempdir().unwrap();
+        let it = Integrations::open(dir.path().into(), KeyringSecretStore, 1).await;
+        let id = it
+            .save_webhook(input(None, Some("https://example.test/old")))
+            .await
+            .unwrap()
+            .definition
+            .id;
+        let entry = keyring::Entry::new("fast-comment", &key(&id)).unwrap();
+        struct Cleanup(keyring::Entry);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = self.0.delete_credential();
+            }
+        }
+        let cleanup = Cleanup(entry);
+        for delete in [false, true] {
+            cleanup.0.set_password("not json").unwrap();
+            let path = dir.path().join(FILE_NAME);
+            let original = std::fs::read(&path).unwrap();
+            std::fs::remove_file(&path).unwrap();
+            std::fs::create_dir(&path).unwrap();
+            let failed = if delete {
+                it.delete_webhook(&id).await.map(|_| ())
+            } else {
+                it.save_webhook(input(Some(id.clone()), Some("https://example.test/new")))
+                    .await
+                    .map(|_| ())
+            };
+            assert!(matches!(failed, Err(IntegrationError::FileWrite)));
+            assert_eq!(cleanup.0.get_password().unwrap(), "not json");
+            std::fs::remove_dir(&path).unwrap();
+            std::fs::write(&path, original).unwrap();
+            if delete {
+                it.delete_webhook(&id).await.unwrap();
+            } else {
+                assert!(
+                    it.save_webhook(input(Some(id.clone()), Some("https://example.test/new")))
+                        .await
+                        .unwrap()
+                        .has_url
+                );
+            }
+        }
+        assert!(matches!(
+            cleanup.0.get_password(),
+            Err(keyring::Error::NoEntry)
+        ));
+        assert!(it.list_webhooks().is_empty());
+    }
 }

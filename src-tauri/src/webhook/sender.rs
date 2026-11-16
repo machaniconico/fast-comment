@@ -41,6 +41,7 @@ impl ReqwestSender {
     pub fn with_timeouts(connect: Duration, total: Duration) -> Self {
         Self(
             reqwest::Client::builder()
+                .no_proxy()
                 .connect_timeout(connect)
                 .timeout(total)
                 .redirect(reqwest::redirect::Policy::none())
@@ -50,10 +51,17 @@ impl ReqwestSender {
     }
 }
 fn seconds(s: &str) -> Option<Duration> {
-    s.parse::<f64>()
-        .ok()
-        .and_then(|n| Duration::try_from_secs_f64(n).ok())
+    s.parse::<f64>().ok().and_then(retry_seconds)
 }
+// 項目の最大寿命を超える待ちは意味がない。Duration の範囲を超える有限値も
+// 無視せず上限へ丸め、早すぎる再送と巨大な ready_at の両方を防ぐ。
+fn retry_seconds(n: f64) -> Option<Duration> {
+    if !n.is_finite() || n < 0.0 {
+        return None;
+    }
+    Duration::try_from_secs_f64(n.min(600.0)).ok()
+}
+
 impl Sender for ReqwestSender {
     async fn send(&self, request: OutboundRequest) -> Outcome {
         let mut builder = self.0.post(&request.url);
@@ -102,6 +110,14 @@ impl Sender for ReqwestSender {
                 }
                 Some(Err(e)) => {
                     let _ = e.without_url();
+                    if code == 429 {
+                        return Outcome::Status {
+                            code,
+                            header_retry_after,
+                            body_retry_after: None,
+                            remaining_zero_reset_after,
+                        };
+                    }
                     return Outcome::ReadFailed;
                 }
                 None => break,
@@ -110,7 +126,7 @@ impl Sender for ReqwestSender {
         let body_retry_after = serde_json::from_slice::<serde_json::Value>(&bytes)
             .ok()
             .and_then(|v| v.get("retry_after").and_then(|n| n.as_f64()))
-            .and_then(|n| Duration::try_from_secs_f64(n).ok());
+            .and_then(retry_seconds);
         Outcome::Status {
             code,
             header_retry_after,
@@ -184,5 +200,104 @@ mod tests {
         assert!(
             matches!(outcome, Outcome::Status { code: 200, body_retry_after: Some(d), .. } if d == Duration::from_secs(3))
         );
+    }
+    #[tokio::test]
+    async fn regression_429_body_failure_preserves_headers() {
+        let url = serve(axum::Router::new().route(
+            "/",
+            axum::routing::post(|| async {
+                let stream = futures_util::stream::once(async {
+                    Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"{"))
+                })
+                .chain(futures_util::stream::once(async {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    Err(std::io::Error::other("broken body"))
+                }));
+                (
+                    axum::http::StatusCode::TOO_MANY_REQUESTS,
+                    [("retry-after", "12")],
+                    axum::body::Body::from_stream(stream),
+                )
+            }),
+        ))
+        .await;
+        assert_eq!(
+            ReqwestSender::new()
+                .send(OutboundRequest::new(&url, vec![], vec![]))
+                .await,
+            Outcome::Status {
+                code: 429,
+                header_retry_after: Some(Duration::from_secs(12)),
+                body_retry_after: None,
+                remaining_zero_reset_after: None
+            }
+        );
+    }
+    #[tokio::test]
+    async fn regression_sender_ignores_environment_proxy() {
+        const CHILD: &str = "FC_WEBHOOK_PROXY_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "webhook::sender::tests::regression_sender_ignores_environment_proxy",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("HTTP_PROXY", "http://127.0.0.1:1")
+                .env("ALL_PROXY", "http://127.0.0.1:1")
+                .env("NO_PROXY", "")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            return;
+        }
+        let url = serve(axum::Router::new().route(
+            "/",
+            axum::routing::post(|| async { axum::http::StatusCode::NO_CONTENT }),
+        ))
+        .await;
+        assert!(matches!(
+            ReqwestSender::new()
+                .send(OutboundRequest::new(&url, vec![], vec![]))
+                .await,
+            Outcome::Status { code: 204, .. }
+        ));
+    }
+    #[tokio::test]
+    async fn regression_oversized_retry_numbers_are_capped_not_ignored() {
+        let url = serve(axum::Router::new().route(
+            "/",
+            axum::routing::post(|| async {
+                (
+                    axum::http::StatusCode::TOO_MANY_REQUESTS,
+                    [
+                        ("retry-after", "1e100"),
+                        ("x-ratelimit-remaining", "0"),
+                        ("x-ratelimit-reset-after", "1e100"),
+                    ],
+                    r#"{"retry_after":1e100}"#,
+                )
+            }),
+        ))
+        .await;
+        assert_eq!(
+            ReqwestSender::new()
+                .send(OutboundRequest::new(&url, vec![], vec![]))
+                .await,
+            Outcome::Status {
+                code: 429,
+                header_retry_after: Some(Duration::from_secs(600)),
+                body_retry_after: Some(Duration::from_secs(600)),
+                remaining_zero_reset_after: Some(Duration::from_secs(600))
+            }
+        );
+        for invalid in ["-1", "NaN", "inf"] {
+            assert_eq!(seconds(invalid), None);
+        }
     }
 }

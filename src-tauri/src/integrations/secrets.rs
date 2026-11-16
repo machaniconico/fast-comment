@@ -20,10 +20,20 @@ struct TokenRecord {
 impl SecretStore for KeyringSecretStore {
     async fn get(&self, key: &str) -> Result<Option<String>, String> {
         if key.starts_with("webhook:") {
-            return crate::secret_store::load::<serde_json::Value>(key)
-                .await
-                .map(|v| v.map(|r| r.to_string()))
-                .map_err(|_| "資格情報を読めません".into());
+            // 壊れた JSON もそのまま取得し、上書き・削除の失敗時に復元できるようにする。
+            // 内容の検証は load_webhook_secrets で行う。
+            let key = key.to_owned();
+            return tokio::task::spawn_blocking(move || {
+                let entry = keyring::Entry::new("fast-comment", &key)
+                    .map_err(|_| "資格情報を読めません".to_string())?;
+                match entry.get_password() {
+                    Ok(raw) => Ok(Some(raw)),
+                    Err(keyring::Error::NoEntry) => Ok(None),
+                    Err(_) => Err("資格情報を読めません".into()),
+                }
+            })
+            .await
+            .map_err(|_| "資格情報を読めません".to_string())?;
         }
         crate::secret_store::load::<TokenRecord>(key)
             .await
@@ -32,11 +42,14 @@ impl SecretStore for KeyringSecretStore {
     }
     async fn put(&self, key: &str, value: &str) -> Result<(), String> {
         if key.starts_with("webhook:") {
-            let record: serde_json::Value = serde_json::from_str(value)
-                .map_err(|_| "資格情報の形式が正しくありません".to_string())?;
-            return crate::secret_store::save(key, &record)
-                .await
-                .map_err(|_| "資格情報を保存できません".into());
+            let (key, value) = (key.to_owned(), value.to_owned());
+            return tokio::task::spawn_blocking(move || {
+                keyring::Entry::new("fast-comment", &key)
+                    .and_then(|entry| entry.set_password(&value))
+                    .map_err(|_| "資格情報を保存できません".to_string())
+            })
+            .await
+            .map_err(|_| "資格情報を保存できません".to_string())?;
         }
         let record = TokenRecord {
             token: value.into(),
