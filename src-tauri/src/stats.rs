@@ -102,6 +102,58 @@ impl Default for TimerSnapshot {
     }
 }
 
+/// Tauri コマンドと HTTP API に共通のタイマー遷移。
+pub fn next_timer_snapshot(
+    current: &TimerSnapshot,
+    action: crate::api::TimerAction,
+    duration_sec: Option<u32>,
+    default_duration_sec: u32,
+    mode: &str,
+    now_ms: u64,
+) -> TimerSnapshot {
+    let mut next = current.clone();
+    match action {
+        crate::api::TimerAction::Start => {
+            let dur = duration_sec.unwrap_or(default_duration_sec);
+            next = TimerSnapshot {
+                state: "running".to_string(),
+                mode: if mode == "elapsed" {
+                    "elapsed"
+                } else {
+                    "countdown"
+                }
+                .to_string(),
+                duration_sec: dur,
+                base_elapsed_sec: 0,
+                running_since_ms: now_ms,
+                updated_at: now_ms,
+            };
+        }
+        crate::api::TimerAction::Pause => {
+            if next.state == "running" {
+                let elapsed_sec = now_ms.saturating_sub(next.running_since_ms) / 1000;
+                let elapsed_sec = u32::try_from(elapsed_sec).unwrap_or(u32::MAX);
+                next.base_elapsed_sec = next.base_elapsed_sec.saturating_add(elapsed_sec);
+            }
+            next.state = "paused".to_string();
+            next.running_since_ms = 0;
+            next.updated_at = now_ms;
+        }
+        crate::api::TimerAction::Resume => {
+            next.state = "running".to_string();
+            next.running_since_ms = now_ms;
+            next.updated_at = now_ms;
+        }
+        crate::api::TimerAction::Reset => {
+            next.state = "idle".to_string();
+            next.base_elapsed_sec = 0;
+            next.running_since_ms = 0;
+            next.updated_at = now_ms;
+        }
+    }
+    next
+}
+
 /// 設定由来の目標値。0 は目標未設定として 0% のゲージを表示する。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
