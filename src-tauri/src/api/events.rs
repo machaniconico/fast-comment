@@ -1,4 +1,5 @@
-use super::{comments, error, ApiDeps};
+use super::{comments, error, feed::Item, ApiDeps};
+use crate::model::ModerationEvent;
 use axum::{
     extract::{Extension, Query, State},
     http::{HeaderMap, StatusCode},
@@ -91,32 +92,33 @@ pub async fn events(
                 }
                 {
                     let mut batch = pending.lock().unwrap();
-                    batch.order.clear();
                     if batch.dropped > 0 {
                         output.push_back(lagged(std::mem::take(&mut batch.dropped)));
                     }
-                    let entries: Vec<_> = batch
-                        .chat
-                        .drain(..)
-                        .filter(|e| {
-                            params
-                                .after
-                                .as_deref()
-                                .and_then(comments::cursor)
-                                .is_none_or(|(epoch, seq)| epoch != deps.epoch || e.seq > seq)
-                        })
-                        .collect();
-                    if !entries.is_empty() {
-                        output.push_back(chat(&deps.epoch, &entries));
+                    // Per frame: chat, then moderation. A chat that a queued clear
+                    // would match arrived after it, so it starts a new chat/moderation pair.
+                    let cursor = params.after.as_deref().and_then(comments::cursor);
+                    let mut entries = Vec::new();
+                    let mut events = Vec::new();
+                    for item in batch.items.drain(..) {
+                        match item {
+                            Item::Chat(entry) => {
+                                if events
+                                    .iter()
+                                    .any(|e: &ModerationEvent| e.matches(&entry.target))
+                                {
+                                    flush(&mut output, &deps.epoch, &mut entries, &mut events);
+                                }
+                                if cursor.is_none_or(|(epoch, seq)| {
+                                    epoch != deps.epoch || entry.seq > seq
+                                }) {
+                                    entries.push(entry);
+                                }
+                            }
+                            Item::Moderation(event) => events.push(event),
+                        }
                     }
-                    if !batch.moderation.is_empty() {
-                        let items: Vec<_> = batch.moderation.drain(..).collect();
-                        output.push_back(
-                            Event::default()
-                                .event("moderation")
-                                .data(json!({"items":items}).to_string()),
-                        );
-                    }
+                    flush(&mut output, &deps.epoch, &mut entries, &mut events);
                 }
                 if output.is_empty() && last_sent.elapsed() >= Duration::from_secs(15) {
                     output.push_back(Event::default().comment("ping"));
@@ -130,6 +132,24 @@ fn lagged(dropped: u64) -> Event {
     Event::default()
         .event("lagged")
         .data(json!({"dropped":dropped}).to_string())
+}
+fn flush(
+    output: &mut VecDeque<Event>,
+    epoch: &str,
+    entries: &mut Vec<std::sync::Arc<super::feed::Entry>>,
+    events: &mut Vec<ModerationEvent>,
+) {
+    if !entries.is_empty() {
+        output.push_back(chat(epoch, &std::mem::take(entries)));
+    }
+    if !events.is_empty() {
+        let items = std::mem::take(events);
+        output.push_back(
+            Event::default()
+                .event("moderation")
+                .data(json!({"items":items}).to_string()),
+        );
+    }
 }
 fn chat(epoch: &str, entries: &[std::sync::Arc<super::feed::Entry>]) -> Event {
     let items: Vec<_> = entries.iter().map(|e| &e.value).collect();

@@ -174,6 +174,48 @@ mod query_tests {
     }
 
     #[tokio::test]
+    async fn sse_emits_unbounded_clear_before_later_chat_in_arrival_order() {
+        use futures_util::StreamExt;
+        let (deps, mut msg) = setup();
+        let request = Request::builder()
+            .uri("/api/v1/events")
+            .header("host", "127.0.0.1:1234")
+            .header("authorization", "Bearer test-token");
+        let response = router(deps.clone(), 1234)
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        // Both land in one 16ms frame before the stream drains the queue.
+        deps.feed
+            .push_moderation(&crate::model::ModerationEvent::UserCleared {
+                platform: crate::model::Platform::Twitch,
+                channel: "chan".into(),
+                author_id: "user".into(),
+                duration_secs: Some(1),
+                certain: true,
+                before_ms: None,
+            });
+        msg.id = "brand-new".into();
+        msg.timestamp_ms = 200;
+        deps.feed.push_chat(&msg);
+        let mut body = response.into_body().into_data_stream();
+        let mut wire = String::new();
+        while !(wire.contains("event: chat") && wire.contains("event: moderation")) {
+            let bytes = tokio::time::timeout(std::time::Duration::from_secs(2), body.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            wire.push_str(std::str::from_utf8(&bytes).unwrap());
+        }
+        assert!(
+            wire.find("event: moderation") < wire.find("event: chat"),
+            "clear reordered after the later chat: {wire}"
+        );
+        assert_eq!(deps.feed.snapshot().entries.len(), 1);
+    }
+
+    #[tokio::test]
     async fn events_ignore_undocumented_parameters_like_comments_ignore_unknown_ones() {
         let (deps, _) = setup();
         for path in [

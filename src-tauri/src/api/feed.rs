@@ -1,7 +1,7 @@
 //! API 専用のメモリ履歴と、接続ごとの bounded queue。
 use super::dto::api_comment_json;
 use crate::model::{Author, ChatMessage, ModerationEvent};
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::{
     collections::VecDeque,
     sync::{Arc, Mutex, Weak},
@@ -43,26 +43,36 @@ pub(super) struct Entry {
     pub seq: u64,
     pub value: Value,
     // Only identity and timestamp are retained for the shared moderation predicate.
-    target: ChatMessage,
+    pub(super) target: ChatMessage,
 }
+pub(super) enum Item {
+    Chat(Arc<Entry>),
+    Moderation(ModerationEvent),
+}
+// Kept in arrival (bus) order so SSE can tell which chats follow a clear.
 #[derive(Default)]
 pub(super) struct Pending {
-    pub chat: VecDeque<Arc<Entry>>,
-    pub moderation: VecDeque<Value>,
+    pub items: VecDeque<Item>,
     pub dropped: u64,
-    pub order: VecDeque<bool>,
 }
 impl Pending {
-    fn reserve(&mut self, chat: bool) {
-        if self.order.len() == 256 {
-            if self.order.pop_front() == Some(true) {
-                self.chat.pop_front();
-            } else {
-                self.moderation.pop_front();
-            }
+    fn push(&mut self, item: Item) {
+        if self.items.len() == 256 {
+            self.items.pop_front();
             self.dropped += 1;
         }
-        self.order.push_back(chat);
+        self.items.push_back(item);
+    }
+    #[cfg(test)]
+    fn chats(&self) -> usize {
+        self.items
+            .iter()
+            .filter(|i| matches!(i, Item::Chat(_)))
+            .count()
+    }
+    #[cfg(test)]
+    fn moderations(&self) -> usize {
+        self.items.len() - self.chats()
     }
 }
 impl ApiFeed {
@@ -142,9 +152,7 @@ impl ApiFeed {
             let Some(client) = client.upgrade() else {
                 return false;
             };
-            let mut pending = client.lock().unwrap();
-            pending.reserve(true);
-            pending.chat.push_back(entry.clone());
+            client.lock().unwrap().push(Item::Chat(entry.clone()));
             true
         });
     }
@@ -174,17 +182,52 @@ impl ApiFeed {
                 .recent_deletions
                 .push_back((Instant::now(), event.clone()));
         }
-        state.history.retain(|item| !event.matches(&item.target));
-        let value = json!(event);
+        // For unbounded clears, retain the IDs actually removed (as MessageDeleted
+        // conditions) so same-ID redeliveries cannot resurrect them.
+        let mut removed = Vec::new();
+        let mut collect = |target: &ChatMessage| {
+            if !bounded && event.matches(target) && !removed.iter().any(|id| id == &target.id) {
+                removed.push(target.id.clone());
+            }
+        };
+        state.history.retain(|item| {
+            collect(&item.target);
+            !event.matches(&item.target)
+        });
         state.clients.retain(|client| {
             let Some(client) = client.upgrade() else {
                 return false;
             };
             let mut pending = client.lock().unwrap();
-            pending.reserve(false);
-            pending.moderation.push_back(value.clone());
+            for item in &pending.items {
+                if let Item::Chat(entry) = item {
+                    collect(&entry.target);
+                }
+            }
+            pending.push(Item::Moderation(event.clone()));
             true
         });
+        if let ModerationEvent::UserCleared {
+            platform, channel, ..
+        }
+        | ModerationEvent::ChatCleared {
+            platform, channel, ..
+        } = event
+        {
+            for message_id in removed {
+                if state.recent_deletions.len() == RECENT_DELETION_LIMIT {
+                    state.recent_deletions.pop_front();
+                }
+                let condition = ModerationEvent::MessageDeleted {
+                    platform: *platform,
+                    channel: channel.clone(),
+                    message_id,
+                };
+                state
+                    .recent_deletions
+                    .push_back((Instant::now(), condition));
+            }
+        }
     }
     pub(super) fn head(&self) -> Option<u64> {
         self.0.lock().unwrap().history.back().map(|e| e.seq)
@@ -322,6 +365,7 @@ impl ApiFeed {
 mod tests {
     use super::*;
     use crate::model::Platform;
+    use serde_json::json;
     fn message(id: &str) -> ChatMessage {
         serde_json::from_value(json!({"id": id, "platform":"twitch", "channel":"chan",
             "author":{"id":"user","name":"Alice"}, "fragments":[],
@@ -351,7 +395,7 @@ mod tests {
         if reverse {
             bus.publish_moderation(event);
             feed.drain_bus(&mut chat, &mut moderation);
-            assert_eq!(pending.lock().unwrap().moderation.len(), 1);
+            assert_eq!(pending.lock().unwrap().moderations(), 1);
             bus.publish(message("target"));
         } else {
             bus.publish(message("target"));
@@ -363,7 +407,7 @@ mod tests {
         assert!(feed.snapshot().entries.is_empty());
         if reverse {
             assert!(
-                pending.lock().unwrap().chat.is_empty(),
+                pending.lock().unwrap().chats() == 0,
                 "deleted chat reached live SSE queue"
             );
         }
@@ -431,7 +475,7 @@ mod tests {
             bus.publish(message("after"));
             feed.drain_bus(&mut chat, &mut moderation);
             assert_eq!(feed.snapshot().entries.len(), 1);
-            assert_eq!(pending.lock().unwrap().chat.len(), 2);
+            assert_eq!(pending.lock().unwrap().chats(), 2);
         }
     }
     #[test]
@@ -450,6 +494,51 @@ mod tests {
         m.timestamp_ms = i64::MAX / 2;
         feed.push_chat(&m);
         assert_eq!(feed.snapshot().entries.len(), 1);
+    }
+    #[test]
+    fn unbounded_clear_retains_removed_ids_against_same_id_updates() {
+        let feed = ApiFeed::new(1000);
+        feed.set_enabled(true);
+        let (_, pending) = feed.subscribe().unwrap();
+        let mut gift = message("old-gift");
+        gift.platform = Platform::Youtube;
+        feed.push_chat(&gift);
+        feed.push_moderation(&ModerationEvent::UserCleared {
+            platform: Platform::Youtube,
+            channel: "chan".into(),
+            author_id: "user".into(),
+            duration_secs: Some(1),
+            certain: true,
+            before_ms: None,
+        });
+        assert!(feed.snapshot().entries.is_empty());
+        let mut update = gift.clone();
+        update.fragments = vec![crate::model::Fragment::text("gift combo x2")];
+        feed.push_chat(&update);
+        assert!(feed.snapshot().entries.is_empty(), "cleared ID resurrected");
+        assert_eq!(pending.lock().unwrap().chats(), 1);
+        // Only the removed ID is retained, not the user-wide condition.
+        let mut fresh = gift.clone();
+        fresh.id = "brand-new".into();
+        feed.push_chat(&fresh);
+        assert_eq!(feed.snapshot().entries.len(), 1);
+    }
+    #[test]
+    fn pending_queue_keeps_arrival_order_across_types() {
+        let feed = ApiFeed::new(1000);
+        feed.set_enabled(true);
+        let (_, pending) = feed.subscribe().unwrap();
+        feed.push_moderation(&ModerationEvent::ChatCleared {
+            platform: Platform::Twitch,
+            channel: "chan".into(),
+            before_ms: None,
+        });
+        feed.push_chat(&message("after"));
+        let pending = pending.lock().unwrap();
+        assert!(matches!(
+            pending.items.iter().collect::<Vec<_>>()[..],
+            [Item::Moderation(_), Item::Chat(_)]
+        ));
     }
     #[test]
     fn unbounded_chat_clear_keeps_later_comment() {
@@ -481,7 +570,7 @@ mod tests {
         bus.publish(message("target"));
         feed.drain_bus(&mut chat, &mut moderation);
         assert_eq!(feed.snapshot().entries.len(), 1);
-        assert_eq!(pending.lock().unwrap().chat.len(), 1);
+        assert_eq!(pending.lock().unwrap().chats(), 1);
     }
     #[test]
     fn deletion_conditions_are_bounded_and_cleared_when_disabled() {
@@ -534,7 +623,7 @@ mod tests {
                 feed.push_chat(&msg);
             }
             assert_eq!(feed.snapshot().entries.len(), expected);
-            assert_eq!(pending.lock().unwrap().chat.len(), expected);
+            assert_eq!(pending.lock().unwrap().chats(), expected);
         }
     }
     #[test]
@@ -549,8 +638,8 @@ mod tests {
         feed.push_chat(&message("new"));
         let pending = pending.lock().unwrap();
         assert_eq!(pending.dropped, 1);
-        assert_eq!(pending.moderation.len(), 127);
-        assert_eq!(pending.chat.len(), 129);
+        assert_eq!(pending.moderations(), 127);
+        assert_eq!(pending.chats(), 129);
     }
     #[test]
     fn moderation_holes_are_not_reported_as_capacity_loss() {
