@@ -165,7 +165,12 @@ impl Bus {
         }
     }
 
-    /// 新規購読者を得る。
+    /// 削除・BAN イベントの購読者を得る。
+    pub fn subscribe_moderation(&self) -> broadcast::Receiver<ModerationEvent> {
+        self.mod_tx.subscribe()
+    }
+
+    /// 新規コメント購読者を得る。
     pub fn subscribe(&self) -> broadcast::Receiver<ChatMessage> {
         self.tx.subscribe()
     }

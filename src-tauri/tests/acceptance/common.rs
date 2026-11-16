@@ -4,7 +4,8 @@
 use axum::body::Body;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode};
 use axum::Router;
-use fast_comment_lib::api::{self, ApiDeps, ApiGate};
+use fast_comment_lib::api::{self, ApiDeps, ApiFeed, ApiGate};
+use fast_comment_lib::model::{Author, ChatMessage, Fragment, MessageKind, Platform, Roles};
 use http_body_util::BodyExt;
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
@@ -125,4 +126,62 @@ pub async fn send(app: &Router, r: Req) -> Resp {
     let (parts, body) = resp.into_parts();
     let body = body.collect().await.expect("本文を読める").to_bytes().to_vec();
     Resp { status: parts.status, headers: parts.headers, body }
+}
+
+// ---- PR2: コメント取得・SSE 用の小道具(付録 D の ApiFeed / with_feed だけに依存) ----
+
+/// 開いたゲート + 有効化済みフィードを積んだルータ一式。
+pub struct FeedEnv {
+    pub app: Router,
+    pub feed: ApiFeed,
+    pub gate: ApiGate,
+    pub token: String,
+}
+
+pub fn feed_env(capacity: usize) -> FeedEnv {
+    let (gate, token) = open_gate();
+    let feed = ApiFeed::new(capacity);
+    feed.set_enabled(true);
+    let deps = ApiDeps::new(gate.clone(), CancellationToken::new()).with_feed(feed.clone());
+    FeedEnv { app: api::router(deps, PORT), feed, gate, token }
+}
+
+impl FeedEnv {
+    /// 認証付き GET(`path` は `/api/v1/...` から)。
+    pub async fn get(&self, path: &str) -> Resp {
+        send(&self.app, get(path).bearer(&self.token)).await
+    }
+    /// 今の epoch(`GET /status`)。
+    pub async fn epoch(&self) -> String {
+        let r = self.get("/api/v1/status").await;
+        assert_eq!(r.status, StatusCode::OK);
+        r.json()["epoch"].as_str().expect("epoch は文字列").to_string()
+    }
+}
+
+/// 既定の ChatMessage(twitch / チャンネル "chan" / 著者 "u1" / 本文 "hello <id>")。
+pub fn msg(id: &str) -> ChatMessage {
+    ChatMessage {
+        listener: None,
+        id: id.to_string(),
+        native_id: false,
+        platform: Platform::Twitch,
+        channel: "chan".to_string(),
+        author: Author {
+            nickname: None,
+            avatar_url: None,
+            id: "u1".to_string(),
+            name: "Alice".to_string(),
+            display_color: None,
+            badges: vec![],
+            roles: Roles::default(),
+        },
+        fragments: vec![Fragment::text(format!("hello {id}"))],
+        kind: MessageKind::Normal,
+        amount: None,
+        timestamp_ms: 1_731_600_000_000,
+        raw: None,
+        skip_tts: false,
+        injected_test: false,
+    }
 }
