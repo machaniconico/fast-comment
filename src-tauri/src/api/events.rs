@@ -1,7 +1,4 @@
-use super::{
-    comments::{self, Params},
-    error, ApiDeps,
-};
+use super::{comments, error, ApiDeps};
 use axum::{
     extract::{Extension, Query, State},
     http::{HeaderMap, StatusCode},
@@ -11,9 +8,15 @@ use axum::{
     },
 };
 use futures_util::stream;
+use serde::Deserialize;
 use serde_json::json;
 use std::{collections::VecDeque, convert::Infallible, time::Duration};
 use tokio::time::{Instant, MissedTickBehavior};
+
+#[derive(Default, Deserialize)]
+pub(super) struct Params {
+    after: Option<String>,
+}
 
 pub async fn events(
     State(deps): State<ApiDeps>,
@@ -28,10 +31,9 @@ pub async fn events(
         let Ok(value) = header.to_str() else {
             return comments::invalid("Last-Event-ID");
         };
-        params.after = Some(value.to_owned());
-    }
-    if let Err(field) = params.validate() {
-        return comments::invalid(field);
+        if !value.is_empty() {
+            params.after = Some(value.to_owned());
+        }
     }
     let Some((history, pending)) = deps.feed.subscribe() else {
         return error::response(
@@ -40,6 +42,9 @@ pub async fn events(
             "同時接続数の上限です",
         );
     };
+    if !comments::valid_after(params.after.as_deref(), &history, &deps.epoch) {
+        return comments::invalid("after / Last-Event-ID");
+    }
     let mut output = VecDeque::new();
     if params.after.is_some() {
         let (history, gap, dropped) =
@@ -47,7 +52,6 @@ pub async fn events(
         if gap {
             output.push_back(lagged(dropped));
         }
-        let history: Vec<_> = history.into_iter().filter(|e| params.matches(e)).collect();
         for chunk in history.chunks(500) {
             output.push_back(chat(&deps.epoch, chunk));
         }
@@ -95,12 +99,11 @@ pub async fn events(
                         .chat
                         .drain(..)
                         .filter(|e| {
-                            params.matches(e)
-                                && params
-                                    .after
-                                    .as_deref()
-                                    .and_then(comments::cursor)
-                                    .is_none_or(|(epoch, seq)| epoch != deps.epoch || e.seq > seq)
+                            params
+                                .after
+                                .as_deref()
+                                .and_then(comments::cursor)
+                                .is_none_or(|(epoch, seq)| epoch != deps.epoch || e.seq > seq)
                         })
                         .collect();
                     if !entries.is_empty() {

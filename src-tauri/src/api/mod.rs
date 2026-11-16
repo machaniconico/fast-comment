@@ -64,3 +64,140 @@ pub fn router(deps: ApiDeps, port: u16) -> axum::Router {
             middleware::boundary,
         ))
 }
+
+#[cfg(test)]
+mod query_tests {
+    use super::*;
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use serde_json::json;
+    use tower::ServiceExt;
+
+    fn setup() -> (ApiDeps, crate::model::ChatMessage) {
+        let gate = ApiGate::closed();
+        gate.open("test-token");
+        let feed = ApiFeed::new(1000);
+        feed.set_enabled(true);
+        let deps = ApiDeps::new(gate, CancellationToken::new()).with_feed(feed);
+        let msg = serde_json::from_value(json!({
+            "id":"m", "platform":"twitch", "channel":"chan",
+            "author":{"id":"user","name":"Alice"}, "fragments":[],
+            "kind":"normal", "timestampMs":1
+        }))
+        .unwrap();
+        (deps, msg)
+    }
+
+    async fn status(deps: &ApiDeps, path: &str, last_event_id: Option<&str>) -> StatusCode {
+        let mut request = Request::builder()
+            .uri(path)
+            .header("host", "127.0.0.1:1234")
+            .header("authorization", "Bearer test-token");
+        if let Some(value) = last_event_id {
+            request = request.header("last-event-id", value);
+        }
+        router(deps.clone(), 1234)
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn future_cursors_are_400_for_comments_and_both_sse_inputs() {
+        let (deps, msg) = setup();
+        for latest in [0, 1] {
+            if latest == 1 {
+                deps.feed.push_chat(&msg);
+            }
+            for seq in [latest + 1, u64::MAX] {
+                let cursor = format!("{}.{seq}", deps.epoch);
+                for route in ["comments", "events"] {
+                    assert_eq!(
+                        status(&deps, &format!("/api/v1/{route}?after={cursor}"), None).await,
+                        StatusCode::BAD_REQUEST
+                    );
+                }
+                assert_eq!(
+                    status(&deps, "/api/v1/events", Some(&cursor)).await,
+                    StatusCode::BAD_REQUEST
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn deleted_head_cursor_remains_valid() {
+        let (deps, msg) = setup();
+        deps.feed.push_chat(&msg);
+        deps.feed
+            .push_moderation(&crate::model::ModerationEvent::MessageDeleted {
+                platform: msg.platform,
+                channel: msg.channel,
+                message_id: msg.id,
+            });
+        for route in ["comments", "events"] {
+            assert_eq!(
+                status(
+                    &deps,
+                    &format!("/api/v1/{route}?after={}.1", deps.epoch),
+                    None
+                )
+                .await,
+                StatusCode::OK
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn events_ignore_undocumented_parameters_like_comments_ignore_unknown_ones() {
+        let (deps, _) = setup();
+        for path in [
+            "/api/v1/events?limit=0&kind=unknown&channel=chan",
+            "/api/v1/events?limit=%2B5",
+            "/api/v1/comments?unknown=0",
+        ] {
+            assert_eq!(status(&deps, path, None).await, StatusCode::OK);
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_last_event_id_falls_back_to_query_and_nonempty_header_takes_precedence() {
+        let (deps, _) = setup();
+        let valid = format!("{}.0", deps.epoch);
+        assert_eq!(
+            status(&deps, "/api/v1/events", Some("")).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status(&deps, &format!("/api/v1/events?after={valid}"), Some("")).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status(&deps, "/api/v1/events?after=invalid", Some("")).await,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            status(&deps, "/api/v1/events?after=invalid", Some(&valid)).await,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn comments_limit_accepts_only_ascii_digits() {
+        let (deps, _) = setup();
+        for limit in ["%2B5", "+5", "-5", "", "5.0", "%EF%BC%95"] {
+            assert_eq!(
+                status(&deps, &format!("/api/v1/comments?limit={limit}"), None).await,
+                StatusCode::BAD_REQUEST,
+                "limit={limit}"
+            );
+        }
+        assert_eq!(
+            status(&deps, "/api/v1/comments?limit=5", None).await,
+            StatusCode::OK
+        );
+    }
+}

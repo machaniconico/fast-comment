@@ -20,6 +20,7 @@ struct FeedState {
 pub(super) struct History {
     pub entries: Vec<Arc<Entry>>,
     pub discarded_through: u64,
+    pub latest_seq: u64,
 }
 pub(super) struct Entry {
     pub seq: u64,
@@ -143,6 +144,7 @@ impl ApiFeed {
         History {
             entries: state.history.iter().cloned().collect(),
             discarded_through: state.discarded_through,
+            latest_seq: state.seq,
         }
     }
     // 履歴確定とライブ購読を同じロックで行い、境界での欠落・重複を防ぐ。
@@ -158,6 +160,7 @@ impl ApiFeed {
             History {
                 entries: state.history.iter().cloned().collect(),
                 discarded_through: state.discarded_through,
+                latest_seq: state.seq,
             },
             pending,
         ))
@@ -200,19 +203,39 @@ impl ApiFeed {
                 }
                 let mut active = active.lock().unwrap();
                 if let Some((chat, moderation)) = active.as_mut() {
-                    for _ in 0..chat.len() {
-                        match chat.try_recv() {
-                            Ok(msg) => feed.push_chat(&msg),
-                            Err(TryRecvError::Lagged(n)) => feed.record_dropped(n, false),
+                    // Freeze actual moderation events BEFORE the chat boundary.
+                    // Every chat published before these deletions must be consumed
+                    // (or accounted for as lost) before applying the deletions.
+                    // Merely freezing receiver lengths is insufficient if a lag
+                    // advances the moderation receiver to newer events meanwhile.
+                    let mut events = Vec::new();
+                    let mut moderation_lost = 0;
+                    for _ in 0..moderation.len() {
+                        match moderation.try_recv() {
+                            Ok(event) => events.push(event),
+                            Err(TryRecvError::Lagged(n)) => moderation_lost += n,
                             Err(_) => break,
                         }
                     }
-                    for _ in 0..moderation.len() {
-                        match moderation.try_recv() {
-                            Ok(event) => feed.push_moderation(&event),
-                            Err(TryRecvError::Lagged(n)) => feed.record_dropped(n, true),
+                    let mut remaining = chat.len();
+                    while remaining > 0 {
+                        match chat.try_recv() {
+                            Ok(msg) => {
+                                feed.push_chat(&msg);
+                                remaining -= 1;
+                            }
+                            Err(TryRecvError::Lagged(n)) => {
+                                feed.record_dropped(n, false);
+                                remaining = remaining.saturating_sub(n as usize);
+                            }
                             Err(_) => break,
                         }
+                    }
+                    if moderation_lost > 0 {
+                        feed.record_dropped(moderation_lost, true);
+                    }
+                    for event in events {
+                        feed.push_moderation(&event);
                     }
                 }
             }
@@ -251,6 +274,52 @@ mod tests {
             channel: "chan".into(),
             message_id: id.into(),
         }
+    }
+    #[tokio::test]
+    async fn concurrent_bus_deletions_never_resurrect_in_history() {
+        let (stats, _) = tokio::sync::watch::channel(Default::default());
+        let (timer, _) = tokio::sync::watch::channel(Default::default());
+        let bus = crate::bus::Bus::new(1234, stats, timer);
+        let gate = super::super::ApiGate::closed();
+        let feed = ApiFeed::new(1000);
+        let stop = tokio_util::sync::CancellationToken::new();
+        feed.bind(&bus, &gate, stop.clone());
+        gate.open("regression-token");
+        let publisher = std::thread::spawn(move || {
+            for n in 0..20_000 {
+                let id = format!("m{n}");
+                bus.publish(message(&id));
+                std::thread::yield_now();
+                bus.publish_moderation(deleted(&id));
+                std::thread::sleep(std::time::Duration::from_micros(50));
+            }
+            // A final marker proves that both receivers have been drained.
+            bus.publish(message("finished"));
+            bus.publish_moderation(deleted("finished"));
+        });
+        tokio::task::spawn_blocking(move || publisher.join().unwrap())
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let state = feed.0.lock().unwrap();
+                let drained = state.seq == 20_001
+                    && !state
+                        .history
+                        .iter()
+                        .any(|entry| entry.target.id == "finished");
+                drop(state);
+                if drained {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        stop.cancel();
+        let remaining = feed.snapshot().entries.len();
+        assert_eq!(remaining, 0, "deleted comments resurrected in API history");
     }
     #[test]
     fn mixed_events_share_one_queue_and_drop_oldest_across_types() {

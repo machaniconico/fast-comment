@@ -40,12 +40,11 @@ pub(super) fn cursor(value: &str) -> Option<(&str, u64)> {
 }
 impl Params {
     pub fn validate(&self) -> Result<usize, &'static str> {
-        let limit = self
-            .limit
-            .as_deref()
-            .unwrap_or("100")
-            .parse::<usize>()
-            .map_err(|_| "limit")?;
+        let limit = self.limit.as_deref().unwrap_or("100");
+        if limit.is_empty() || !limit.bytes().all(|b| b.is_ascii_digit()) {
+            return Err("limit");
+        }
+        let limit = limit.parse::<usize>().map_err(|_| "limit")?;
         if !(1..=500).contains(&limit) {
             return Err("limit");
         }
@@ -78,6 +77,13 @@ impl Params {
                 .as_ref()
                 .is_none_or(|k| k.split(',').any(|k| entry.value["kind"] == k))
     }
+}
+pub(super) fn valid_after(after: Option<&str>, history: &History, epoch: &str) -> bool {
+    after.is_none_or(|value| {
+        cursor(value).is_some_and(|(previous_epoch, seq)| {
+            previous_epoch != epoch || seq <= history.latest_seq
+        })
+    })
 }
 pub(super) fn select(
     history: History,
@@ -112,7 +118,11 @@ pub async fn comments(
         Ok(limit) => limit,
         Err(field) => return invalid(field),
     };
-    let (entries, gap, _) = select(deps.feed.snapshot(), params.after.as_deref(), &deps.epoch);
+    let history = deps.feed.snapshot();
+    if !valid_after(params.after.as_deref(), &history, &deps.epoch) {
+        return invalid("after");
+    }
+    let (entries, gap, _) = select(history, params.after.as_deref(), &deps.epoch);
     let mut entries: Vec<_> = entries.into_iter().filter(|e| params.matches(e)).collect();
     let tail = params
         .after
