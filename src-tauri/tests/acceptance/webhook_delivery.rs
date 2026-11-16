@@ -435,6 +435,27 @@ async fn runtime_paused_webhook_sends_only_after_resume() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn runtime_auto_paused_webhook_resumes_after_resume_and_reload() {
+    let env = wh_env().await;
+    let id = env.add_generic(GENERIC_URL_A).await;
+    env.sender.script("hook-a", vec![st(401), st(204)]);
+
+    env.rt.handle_message(&superchat("a", "¥500"));
+    advance(30).await;
+    let s = env.status_of(&id);
+    assert_eq!(s["state"], "paused");
+    assert_eq!(s["pausedReason"], "unauthorized");
+
+    env.it.resume_webhook(&id).await.expect("再開できる");
+    env.rt.reload().await;
+    env.rt.handle_message(&superchat("b", "¥500"));
+    advance(30).await;
+
+    assert_eq!(env.sender.calls().len(), 2, "再開後の b は再起動なしで送られる");
+    assert_eq!(env.status_of(&id)["state"], "active");
+}
+
+#[tokio::test(start_paused = true)]
 async fn runtime_disable_or_delete_discards_pending_items() {
     let env = wh_env().await;
     let a = env.add_generic(GENERIC_URL_A).await;
