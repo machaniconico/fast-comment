@@ -14,6 +14,7 @@
 pub mod api;
 pub mod inject;
 pub mod integrations;
+pub mod webhook;
 pub mod autopost;
 pub mod bus;
 pub mod chatlog;
@@ -72,6 +73,7 @@ pub struct AppState {
     integrations: integrations::Integrations<integrations::KeyringSecretStore>,
     api_feed: api::ApiFeed,
     api_rate_limit: Arc<api::RateLimit>,
+    webhook: webhook::WebhookRuntime<integrations::KeyringSecretStore, webhook::ReqwestSender>,
     /// 現在の設定。
     config: Mutex<AppConfig>,
     listeners: Arc<listeners::ListenerStore>,
@@ -2023,6 +2025,133 @@ async fn regenerate_local_api_token(
     Ok(local_api_status_json(&state, status))
 }
 
+#[tauri::command]
+fn list_webhooks(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+) -> Result<Vec<serde_json::Value>, integrations::IntegrationError> {
+    require_main_integrations_window(window.label())?;
+    let statuses = state.webhook.status();
+    Ok(state
+        .integrations
+        .list_webhooks()
+        .into_iter()
+        .map(|v| {
+            let mut json = serde_json::to_value(&v).expect("Webhook view");
+            json["status"] =
+                serde_json::to_value(statuses.iter().find(|s| s.id == v.definition.id))
+                    .expect("Webhook status");
+            json
+        })
+        .collect())
+}
+#[tauri::command]
+async fn save_webhook(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    input: integrations::WebhookInput,
+) -> Result<integrations::WebhookView, integrations::IntegrationError> {
+    require_main_integrations_window(window.label())?;
+    let view = state.integrations.save_webhook(input).await?;
+    state.webhook.reload().await;
+    Ok(view)
+}
+#[tauri::command]
+async fn delete_webhook(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<(), integrations::IntegrationError> {
+    require_main_integrations_window(window.label())?;
+    state.integrations.delete_webhook(&id).await?;
+    state.webhook.reload().await;
+    Ok(())
+}
+#[tauri::command]
+async fn resume_webhook(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<(), integrations::IntegrationError> {
+    require_main_integrations_window(window.label())?;
+    state.integrations.resume_webhook(&id).await?;
+    state.webhook.reload().await;
+    Ok(())
+}
+#[tauri::command]
+async fn test_webhook(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<webhook::TestSendResult, integrations::IntegrationError> {
+    require_main_integrations_window(window.label())?;
+    Ok(state.webhook.test_send(&id).await)
+}
+#[tauri::command]
+async fn reveal_webhook_signing_secret(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<String, integrations::IntegrationError> {
+    require_main_integrations_window(window.label())?;
+    state.integrations.reveal_signing_secret(&id).await
+}
+#[tauri::command]
+async fn regenerate_webhook_signing_secret(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<String, integrations::IntegrationError> {
+    require_main_integrations_window(window.label())?;
+    let secret = state.integrations.regenerate_signing_secret(&id).await?;
+    state.webhook.reload().await;
+    Ok(secret)
+}
+
+/// Bus 購読は有効な送り先が存在する間だけ。状態 emit は差分がある時に最大毎秒 1 回。
+fn spawn_webhook_forwarder(app: AppHandle, cancel: CancellationToken) {
+    tauri::async_runtime::spawn(async move {
+        let (runtime, bus) = {
+            let state = app.state::<AppState>();
+            (state.webhook.clone(), state.bus.clone())
+        };
+        runtime.reload().await;
+        let mut rx = None;
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last = runtime.status();
+        let mut lagged = 0u64;
+        loop {
+            if runtime.has_active_webhooks() {
+                if rx.is_none() {
+                    rx = Some(bus.subscribe());
+                }
+            } else {
+                rx = None;
+            }
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => { runtime.shutdown(); break; },
+                _ = runtime.changed() => {},
+                _ = tick.tick() => {
+                    let status = runtime.status();
+                    if status != last { let _ = app.emit("webhook-status", &status); last = status; }
+                },
+                incoming = async { match rx.as_mut() { Some(rx) => rx.recv().await, None => std::future::pending().await } } => {
+                    match incoming {
+                        Ok(msg) => runtime.handle_message(&msg),
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            lagged = lagged.saturating_add(n);
+                            tracing::warn!(lagged, "Webhook Bus の遅延分を破棄しました");
+                        },
+                        Err(broadcast::error::RecvError::Closed) => { runtime.shutdown(); break; },
+                    }
+                }
+            }
+        }
+    });
+}
+
 /// OBS サーバの待受ポートが変わったら、旧サーバを止めて新ポートで起動する。
 fn restart_obs_server_if_needed(
     app: &AppHandle,
@@ -2425,7 +2554,9 @@ pub fn run() {
                     .with_rate_limit(api_rate_limit.clone()),
                 obs_port,
             );
+            let webhook = webhook::WebhookRuntime::new(integrations.clone(), webhook::ReqwestSender::new());
             let state = AppState {
+                webhook,
                 integrations,
                 api_feed,
                 api_rate_limit,
@@ -2541,6 +2672,7 @@ pub fn run() {
 
             // moderation + TTS パイプライン起動。
             spawn_pipeline(handle.clone(), app_cancel.clone());
+            spawn_webhook_forwarder(handle.clone(), app_cancel.clone());
 
             // 単一の長命 TTS ワーカー起動。
             spawn_tts_worker(handle.clone(), app_cancel.clone());
@@ -2556,6 +2688,13 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            list_webhooks,
+            save_webhook,
+            delete_webhook,
+            resume_webhook,
+            test_webhook,
+            reveal_webhook_signing_secret,
+            regenerate_webhook_signing_secret,
             get_local_api_status,
             set_local_api_enabled,
             get_local_api_token,

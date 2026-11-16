@@ -21,6 +21,10 @@ pub struct LocalApiStatus {
 pub enum IntegrationError {
     #[error("メインウィンドウからのみ操作できます")]
     ForbiddenWindow,
+    #[error("Webhook の設定が正しくありません")]
+    InvalidWebhook,
+    #[error("Webhook の資格情報を読めません。URL を設定し直してください")]
+    WebhookSecretRead,
     #[error("資格情報を保存できませんでした")]
     SecretWrite,
     #[error("トークンを読めません。再生成してください")]
@@ -28,17 +32,18 @@ pub enum IntegrationError {
     #[error("連携設定を保存できませんでした")]
     FileWrite,
 }
-struct Inner<S> {
-    dir: PathBuf,
+pub(super) struct Inner<S> {
+    pub(super) dir: PathBuf,
     // A failed load may conceal user data. Only a successful reopen can permit mutations.
     writes_blocked: bool,
-    secrets: S,
-    file: Mutex<IntegrationsFile>,
+    pub(super) secrets: S,
+    pub(super) file: Mutex<IntegrationsFile>,
+    pub(super) webhooks: RwLock<super::WebhookSnapshot>,
     status: RwLock<LocalApiStatus>,
     gate: ApiGate,
 }
 #[derive(Clone)]
-pub struct Integrations<S: SecretStore>(Arc<Inner<S>>);
+pub struct Integrations<S: SecretStore>(pub(super) Arc<Inner<S>>);
 fn valid_token(token: &str) -> bool {
     token.len() == 46
         && token.starts_with("fc_")
@@ -92,6 +97,7 @@ impl<S: SecretStore> Integrations<S> {
                 gate.open(&token);
             }
         }
+        let webhooks = super::load_webhook_secrets(&file, &secrets).await;
         let status = LocalApiStatus {
             enabled: file.local_api.enabled,
             has_token,
@@ -104,6 +110,7 @@ impl<S: SecretStore> Integrations<S> {
             writes_blocked,
             secrets,
             file: Mutex::new(file),
+            webhooks: RwLock::new(webhooks),
             status: RwLock::new(status),
             gate,
         }))
@@ -114,7 +121,7 @@ impl<S: SecretStore> Integrations<S> {
     pub fn local_api_status(&self) -> LocalApiStatus {
         self.0.status.read().unwrap().clone()
     }
-    fn ensure_writable(&self) -> Result<(), IntegrationError> {
+    pub(super) fn ensure_writable(&self) -> Result<(), IntegrationError> {
         if self.0.writes_blocked {
             Err(IntegrationError::FileWrite)
         } else {
@@ -213,7 +220,10 @@ mod tests {
         assert!(status.writes_blocked);
         assert!(status.token_error.is_some());
         assert!(status.notice.as_deref().unwrap().contains("再起動"));
-        assert_eq!(serde_json::to_value(&status).unwrap()["writesBlocked"], true);
+        assert_eq!(
+            serde_json::to_value(&status).unwrap()["writesBlocked"],
+            true
+        );
         std::fs::remove_dir(&path).unwrap();
         let saved = IntegrationsFile {
             webhooks: vec![crate::integrations::WebhookDef {

@@ -330,7 +330,7 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
 ## 10. 設定永続化 (`config.rs`)
 
 - 保存先: Tauri の app config dir に `config.json`。
-- ローカル API は別の `integrations.json`(version 1、localApi.enabled 既定 false、webhooks 既定空)に保存。`AppConfig` / `update_config` / エクスポートには載せない。破損・非対応 version は `.corrupt-<時刻ms>` に退避。読み込みエラー(退避失敗を含む)時は保存禁止とし、変更系は FileWrite で拒否する。再起動後に正常に読み込めるまで元ファイルを保護する。同じディレクトリに create_new の一時ファイルを作成し、write → sync_all → rename で保存。
+- ローカル API と Webhook は別の `integrations.json`(version 1、localApi.enabled 既定 false、webhooks 既定空)に保存。`AppConfig` / `update_config` / エクスポートには載せない。破損・非対応 version は `.corrupt-<時刻ms>` に退避。読み込みエラー(退避失敗を含む)時は保存禁止とし、変更系は FileWrite で拒否する。再起動後に正常に読み込めるまで元ファイルを保護する。同じディレクトリに create_new の一時ファイルを作成し、write → sync_all → rename で保存。
 - API トークンは OS 資格情報ストア(service `fast-comment`、key `local-api-token`)に `{token, createdAtMs}` として保存。無効化しても削除しない。
 - 内容: channels[], obs{port}, tts{backend, options}, moderation{ngWords[], ngUsers[], highlights[]}, ui{maxBuffer, notifySound, notifyVolume}, youtubeOverrides{apiKey?, clientVersion?, paths?}, credentials{youtubeApiKey?, ...}。
   - `credentials.youtubeApiKey`(空文字既定): 公式YouTube streamList用。空ならInnerTubeのみ。
@@ -362,6 +362,7 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
 ## 12. 既知の制約・注意
 
 - WSLでは Tauri ビルド不可(Linuxバイナリになる)。ビルドはWindows側。
+- Webhook のキューと重複排除はメモリのみ。終了時に未送信を捨てる。送信済みコメントの削除は通知を取り消さない。キーワードは全角/半角・ひらがな/カタカナを正規化しない。Discord の素の URL の自動リンク化は防げない。設定 UI は PR5。
 - YouTube InnerTube は非公式 → 仕様変更リスク。寛容パース+overrides+ログで吸収。
 - X `live-chat` ストリームも非公式 → 同リスク。寛容パース+`xOverrides` で吸収。
 - 実モデレーションはOAuth必須(P6)。
@@ -455,4 +456,23 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
 - `GET /tts` は `{paused,depth,items:[{id,preview}]}`。`POST /tts/pause`・`resume`・`skip`・`clear` は既存コマンドの共通処理を使い、操作後のキュー状態を返す。pause / resume は冪等。UI の停止表示・発話停止・棒読みちゃんの停止/再開命令も既存どおり。
 - `GET /timer` は既存の TimerSnapshot。`POST /timer/start` は本文なし、または `{durationSec:1〜359999}`。省略時は設定の既定秒数。`POST /timer/pause`・`resume`・`reset` は本文なし。遷移は既存コマンドと共通の純関数で処理し、操作が返すスナップショットを応答する。UI / OBS の watch 通知も共用。
 - 操作本文は JSON オブジェクトのみ、最大 16 KiB(413 payload_too_large)。本文ありで JSON 以外なら 415 unsupported_media_type。本文なし操作に JSON 本文が来た場合も 400。変更系 POST 全体で容量 20・毎秒 10 補充のトークンバケット(tokio::time)を共有し、OBS ポート変更でも枠を維持する。認証・入力検証後に消費。超過時は 429 rate_limited と Retry-After: 1、操作を実行しない。GET は制限しない。依存未提供は 503 unavailable、操作内部エラーは詳細を伏せた 500 internal。
-- config / webhooks / token / chat/send / moderation/ban / tts/speak のルートは提供しない。Webhook の送信は後続 PR。
+- config / webhooks / token / chat/send / moderation/ban / tts/speak のルートは提供しない。Webhook は §16。
+
+
+## 16. Webhook (PR4: 中核と保存)
+
+- 公開モジュール `webhook` / `integrations` で判定・配送・保存を提供し、Tauri に依存しない。外部送信は `Sender` trait 経由。設定 UI は PR5。
+- 定義は `integrations.json` の `webhooks` のみ。最大 10 件、名前は trim 後 1〜64 文字、キーワードは trim・空語除去後 20 語以内・各 1〜64 文字。自動停止は `paused: {reason, atMs}` として保存。
+- URL と署名シークレットは OS 資格情報ストアの `webhook:<id>` に `{url, signingSecret?}` として保存。汎用 JSON のシークレットは暗号学的乱数 32 バイトの小文字 hex。変更は既存の async mutex で API 設定と共に直列化する。新規・編集・削除とも資格情報を先に変更し、ファイル保存失敗なら元の資格情報を復元(新規なら削除)する。復元失敗時は秘密を含まない固定文で警告する。読み込み不能な資格情報は URL 未設定として送らない。
+- メインウィンドウだけが `list_webhooks` / `save_webhook` / `delete_webhook` / `resume_webhook` / `test_webhook` / `reveal_webhook_signing_secret` / `regenerate_webhook_signing_secret` を呼べる。一覧は URL の有無と伏せ字プレビューのみ。完全な URL を取得するコマンドは作らない。署名シークレットは明示的な表示・再生成時だけ返す。`AppConfig` / `update_config` / HTTP API には追加しない。
+- 判定はモデレーション後の Bus を購読し、投げ銭(SuperChat/Bits/Gift) > メンバー加入 > キーワードの順に 1 件だけ選ぶ。キーワードは文字列を regex::escape した大文字小文字無視の部分一致で Text 断片ごとに照合する。エモート名・著者名・断片境界を照合対象にしない。System / injected_test / skip_tts / 無効・停止中は除外。(platform,id) を直近 8192 件保持して重複排除。有効な送り先が無い時は購読しない。Bus の lag は数えて破棄する。
+- Discord は username=fast-comment、allowed_mentions.parse=[]、embed 1 件。Markdown の 12 文字を本文・著者名・タイトル内の利用者入力でエスケープ。description は 1000 文字、author.name と title は各 256 文字、全体は 6000 文字以内(省略記号を含む)。アイコンは HTTPS のみ。時刻はコメント時刻の UTC ISO 8601 ミリ秒。署名ヘッダ無し。
+- 汎用 JSON は schema=fast-comment.webhook.v1、UUID v4 の eventId、trigger、sentAtMs、ApiComment から seq を除いた comment。matchedKeyword は keyword の時だけ。Content-Type とバージョン付き User-Agent を設定。X-FastComment-Event-Id / Timestamp(UNIX 秒) / Signature(v1=小文字 HMAC-SHA256) を必ず付ける。鍵は保存文字列の UTF-8 バイト列、対象は `<timestamp>.<本文バイト列>`。再送で本文・eventId は不変。
+- URL は生の空白・制御文字・userinfo・fragment・900 バイト超を拒否して url crate で検査。Discord は HTTPS、指定 4 ホストの完全一致、ポート指定無し、`/api/webhooks/<id>/<token>` または数字版付きのパス。汎用は HTTPS の任意ホストと、HTTP の localhost・ループバック/プライベート/リンクローカル IP リテラルを許可。DNS 検索による制限はしない。形式変更時も再検証する。
+- HTTP クライアントは専用 1 個、接続 5 秒・全体 10 秒、リダイレクトと Cookie 保存無し。応答本文は最大 64 KiB。reqwest エラーは without_url で URL を除去し、外部には固定の分類だけを返す。URL を持つ型は Debug を伏せる。
+- 送り先ごとのワーカーは同時 1 送信・到着順、100 件のキューから溢れた最古を破棄。入列から 10 分で期限切れ。トークンバケットは満杯 5 から開始し 2 秒に 1 個補充。再送もトークンを消費。Discord の Remaining=0 と Reset-After を尊重する。
+- 最大 4 試行、待機は 2/8/30 秒の ±20%。接続前の失敗・408/425/5xx を再送。送信後タイムアウト・読み取り失敗は Discord では uncertain、汎用では再送。429 は Discord なら Retry-After と本文 retry_after の大きい方 +250ms、汎用なら Retry-After(無ければ通常待機)で送り先のキュー全体を止める。残り寿命を超える再送は破棄。
+- 401/403 は unauthorized、404/410 は notFound、3xx は redirected として停止。他の 4xx は停止せず失敗。試行を尽くした配送が連続 10 件なら unreachable で停止し、成功で連続数を戻す。停止・無効化・削除・設定変更は待機キューを破棄し、変更した送り先だけワーカーを作り直す。再開は専用コマンドのみ。
+- 状態は active/disabled/paused/noUrl、成功・失敗・破棄・uncertain 件数、待ち件数、最後の結果。`webhook-status` は変化時のみ最大毎秒 1 回 emit。テスト送信は固定文・trigger=test で規則・キューを通さず 1 回だけ、無効・停止中でも送れ、停止は解除しない。
+
+- 設計書からの補足: Discord の title にも 256 文字の上限を適用する(全体 6000 文字だけでは HTTP 400 になるため。[公式 Embed Limits](https://discord.com/developers/docs/resources/message#embed-object-embed-limits))。

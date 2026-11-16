@@ -19,12 +19,25 @@ struct TokenRecord {
 }
 impl SecretStore for KeyringSecretStore {
     async fn get(&self, key: &str) -> Result<Option<String>, String> {
+        if key.starts_with("webhook:") {
+            return crate::secret_store::load::<serde_json::Value>(key)
+                .await
+                .map(|v| v.map(|r| r.to_string()))
+                .map_err(|_| "資格情報を読めません".into());
+        }
         crate::secret_store::load::<TokenRecord>(key)
             .await
             .map(|v| v.map(|r| r.token))
             .map_err(|_| "資格情報を読めません".into())
     }
     async fn put(&self, key: &str, value: &str) -> Result<(), String> {
+        if key.starts_with("webhook:") {
+            let record: serde_json::Value = serde_json::from_str(value)
+                .map_err(|_| "資格情報の形式が正しくありません".to_string())?;
+            return crate::secret_store::save(key, &record)
+                .await
+                .map_err(|_| "資格情報を保存できません".into());
+        }
         let record = TokenRecord {
             token: value.into(),
             created_at_ms: std::time::SystemTime::now()
