@@ -436,14 +436,19 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
 - **v0.1.0 からの移行**: v0.1.0 は updater 無しなので自動更新できない。v0.2.0 を手動で入れてもらい、以降が自動更新の対象。
 
 
-## 15. ローカル API (PR1: 土台と認証)
+## 15. ローカル API (PR2: コメント取得と SSE)
 
-- ベース URL: `http://127.0.0.1:<obs.port>/api/v1`。既定 OFF。PR1 は `GET /status` のみ。
+- ベース URL: `http://127.0.0.1:<obs.port>/api/v1`。既定 OFF。`GET /status`・`GET /comments`・`GET /events` を提供する。
 - 有効化時、32 バイトの OS 乱数を base64url(パディングなし)にして `fc_` を付けた 46 文字のトークンを生成。資格情報 → 設定ファイル → ゲートの順で保存・反映する。メモリに常駐させるのは SHA-256 ダイジェストだけ。
 - 無効時は `/api`・`/api/`・`/api/*` に本文なし 404。他の検査より先に行う。有効時は Host → Origin → Bearer → ルーティングの順。
 - Host は `127.0.0.1:<port>`・`localhost:<port>`・`[::1]:<port>` の完全一致(大小無視)。Origin は値によらず付いていれば 403。API に CORS ヘッダを付けない。
 - 認証は `Authorization: Bearer <token>` のみ(スキーム大小無視)。複数ヘッダ・512 バイト超・非 UTF-8・余分な空白は 401。クエリ・Cookie は使わない。ダイジェストを定数時間比較し、401 に `WWW-Authenticate: Bearer` を付ける。401 の warn ログはプロセス全体で 1 分に 1 回まで。トークン・Authorization ヘッダ・クエリ文字列はログに出さない。
-- `/status` は `{app:"fast-comment",version,apiVersion:1,epoch,headCursor:null}`。epoch はプロセス起動ごとの 12 桁 hex(ポート変更でも維持)。認証後の未知パスは JSON 404、メソッド違いは JSON 405。JSON の Content-Type は `application/json; charset=utf-8`、有効時の API 応答に `Cache-Control: no-store`・`X-Content-Type-Options: nosniff`。
+- `/status` は `{app:"fast-comment",version,apiVersion:1,epoch,headCursor}`。headCursor は履歴内の最新コメントのカーソル(空なら null)。epoch はプロセス起動ごとの 12 桁 hex(ポート変更でも維持)。認証後の未知パスは JSON 404、メソッド違いは JSON 405。JSON の Content-Type は `application/json; charset=utf-8`、有効時の API 応答に `Cache-Control: no-store`・`X-Content-Type-Options: nosniff`。
 - 起動時に資格情報が欠落・読込失敗ならゲートを閉じ、設定画面に再生成を案内。再生成は資格情報の保存成功後だけゲートを更新する。失敗時は旧トークンを維持。設定操作は専用 mutex で直列化。
 - 設定画面の「ローカル API」は専用コマンドで即時保存。通常の「保存」とは独立。4 つのローカル API コマンドは呼び出し元が main ウィンドウの場合だけ許可する。トークンの表示・コピー時のみ資格情報から平文を取得する。トークンを OBS のソース URL やテンプレートに書かない。
-- コメント取得・SSE・操作・Webhook の実装は後続 PR。
+- `GET /comments`: 有効な間だけ Bus のモデレーション判定後のコメントと削除イベントを購読し、直近 1000 件をメモリ保持。無効化で購読・履歴を破棄。有効化で空から始め、連番は起動中に巻き戻さない。
+- カーソルは `<epoch>.<seq>`。`after` なしは最新 `limit` 件(既定 100、1〜500)を古い順、ありは指定より後を古い順に返す。`channel` は完全一致、`kind` は normal / superChat / membership / bits / gift / system のカンマ区切り。不正な値は 400。応答は `{items,nextCursor,gap}`。0 件の nextCursor は after を維持(指定なしなら null)。別 epoch は最新側を返し gap=true、容量超過で必要な履歴が消えた場合も gap=true。
+- ApiComment は専用 DTO から生成し、seq / id / platform / channel / author / fragments / text / kind / amount / timestampMs / highlight のみ公開。text は plain_text()、highlight バッジは badges から除く。raw / listener / nativeId / skipTts / injectedTest は非公開。任意値は欠落時キーごと省略。削除イベントの対象は OBS と同じ ID・platform・channel・author・beforeMs(同時刻を含む)で履歴から除く。同じ id の再受信は新しい seq で追記し、クライアントは後着を上書きとして扱う。
+- `GET /events` は SSE。16ms ごとに空でない chat / moderation をこの順に送る(data は `{items:[…]}`)。chat のみ最後のカーソルを id に付ける。接続ごとに合計 256 件の待ち行列を持ち、溢れたら古い物から破棄し、送出前に lagged (`{dropped}`) を 1 回送る。Bus 購読側で検出した欠落も通知し、欠落分の連番を予約して GET の gap に反映する。削除通知の取りこぼし時は、削除済みコメントを返さないため履歴を破棄する。
+- SSE は Last-Event-ID 優先、なければ after から再開。履歴確定とライブ購読を同じロックで行い、境界の重複・欠落を防ぐ。再送は 1 イベント 500 件まで、古いカーソルには lagged を先行。不明な欠落数は 0。無通信 15 秒で `: ping`。同時 8 本、9 本目は 429 too_many_streams、切断で枠を返す。無効化・トークン再生成・OBS サーバ停止で直ちに切断。timer / tts イベントは送らない。
+- 操作・Webhook の実装は後続 PR。

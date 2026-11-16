@@ -69,6 +69,7 @@ use crate::update::{check_for_update, open_url};
 /// アプリ全体で共有する実行時状態。
 pub struct AppState {
     integrations: integrations::Integrations<integrations::KeyringSecretStore>,
+    api_feed: api::ApiFeed,
     /// 現在の設定。
     config: Mutex<AppConfig>,
     listeners: Arc<listeners::ListenerStore>,
@@ -2050,7 +2051,7 @@ fn restart_obs_server_if_needed(state: &AppState, new_port: u16) -> Result<(), S
         new_port,
         cancel.clone(),
         Some(api::router(
-            api::ApiDeps::new(state.integrations.gate(), cancel.clone()),
+            api::ApiDeps::new(state.integrations.gate(), cancel.clone()).with_feed(state.api_feed.clone()),
             new_port,
         )),
     )?;
@@ -2418,12 +2419,15 @@ pub fn run() {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default().as_millis() as u64,
             ));
+            let api_feed = api::ApiFeed::new(1000);
+            api_feed.bind(&bus, &integrations.gate(), app_cancel.clone());
             let api_router = api::router(
-                api::ApiDeps::new(integrations.gate(), obs_cancel.clone()),
+                api::ApiDeps::new(integrations.gate(), obs_cancel.clone()).with_feed(api_feed.clone()),
                 obs_port,
             );
             let state = AppState {
                 integrations,
+                api_feed,
                 listeners: Arc::new(listeners::ListenerStore::load(&config_dir)),
                 chatlog: chatlog::ChatLog::start(&config_dir, config.log.clone()),
                 config: Mutex::new(config.clone()),

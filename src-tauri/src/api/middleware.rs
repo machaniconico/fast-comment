@@ -10,7 +10,7 @@ pub struct Boundary {
     pub deps: ApiDeps,
     pub port: u16,
 }
-pub async fn boundary(State(state): State<Boundary>, request: Request, next: Next) -> Response {
+pub async fn boundary(State(state): State<Boundary>, mut request: Request, next: Next) -> Response {
     if !state.deps.gate.is_open() {
         return StatusCode::NOT_FOUND.into_response();
     }
@@ -26,11 +26,12 @@ pub async fn boundary(State(state): State<Boundary>, request: Request, next: Nex
             "origin_not_allowed",
             "ブラウザからは利用できません",
         )
-    } else if !authorized(&request, &state.deps.gate) {
+    } else if let Some(session) = authorized(&request, &state.deps.gate) {
+        request.extensions_mut().insert(session);
+        next.run(request).await
+    } else {
         warn_unauthorized();
         error::response(StatusCode::UNAUTHORIZED, "unauthorized", "認証が必要です")
-    } else {
-        next.run(request).await
     };
     let headers = response.headers_mut();
     headers.insert(
@@ -97,24 +98,24 @@ fn host_allowed(request: &Request, port: u16) -> bool {
         .any(|allowed| host.eq_ignore_ascii_case(allowed))
     })
 }
-fn authorized(request: &Request, gate: &super::ApiGate) -> bool {
+fn authorized(
+    request: &Request,
+    gate: &super::ApiGate,
+) -> Option<tokio_util::sync::CancellationToken> {
     let mut values = request.headers().get_all(header::AUTHORIZATION).iter();
-    let Some(value) = values.next() else {
-        return false;
-    };
+    let value = values.next()?;
     if values.next().is_some() || value.as_bytes().len() > 512 {
-        return false;
+        return None;
     }
-    let Ok(value) = value.to_str() else {
-        return false;
-    };
-    let Some((scheme, token)) = value.split_once(' ') else {
-        return false;
-    };
-    scheme.eq_ignore_ascii_case("Bearer")
-        && !token.is_empty()
-        && !token.chars().any(char::is_whitespace)
-        && gate.verify(token)
+    let value = value.to_str().ok()?;
+    let (scheme, token) = value.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("Bearer")
+        || token.is_empty()
+        || token.chars().any(char::is_whitespace)
+    {
+        return None;
+    }
+    gate.authenticate(token)
 }
 
 #[cfg(test)]
