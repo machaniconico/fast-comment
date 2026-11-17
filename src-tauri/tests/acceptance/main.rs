@@ -22,5 +22,8 @@ mod webhook_rules;
 mod webhook_store;
 mod webhook_url;
 
+// PR1(ツイキャス): OAuth と保存(設計書 twitcasting §5.2)
+mod twitcasting_auth;
+
 #[test]
 fn acceptance_harness_runs() {}
