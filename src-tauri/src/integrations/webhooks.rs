@@ -102,7 +102,7 @@ impl<S: SecretStore> Integrations<S> {
         *current = snapshot;
     }
     /// 自動停止を await せずにメモリへ反映する。永続化は後から pause_webhook で行う。
-    /// URL/署名鍵の変更後など、送った時の定義と違えば反映せず false を返す。
+    /// 名前などの変更は問わず、URL/署名鍵が送った時と違えば反映せず false を返す。
     pub(crate) fn mark_auto_paused(
         &self,
         def: &WebhookDef,
@@ -112,7 +112,7 @@ impl<S: SecretStore> Integrations<S> {
         let mut snapshot = self.0.webhooks.write().unwrap();
         let Some((d, _)) = snapshot
             .iter_mut()
-            .find(|(d, s)| d == def && s.as_ref() == Some(secret))
+            .find(|(d, s)| d.id == def.id && s.as_ref() == Some(secret))
         else {
             return false;
         };
@@ -207,6 +207,13 @@ impl<S: SecretStore> Integrations<S> {
             self.restore_secret(&id, old_raw.as_deref()).await;
             return Err(IntegrationError::FileWrite);
         }
+        // 送り先(URL・署名鍵・形式)が変われば、旧送り先の自動停止の記録は使わない。
+        // 戻した時にメモリだけの停止が蘇らないよう消す。
+        if old.as_ref() != Some(&secret)
+            || existing.is_some_and(|i| file.webhooks[i].format != d.format)
+        {
+            self.0.auto_paused.lock().unwrap().remove(&id);
+        }
         *file = next;
         self.refresh_webhooks(&file).await;
         Ok(view(&d, Some(&secret)))
@@ -278,29 +285,19 @@ impl<S: SecretStore> Integrations<S> {
             .position(|d| d.id == id)
             .ok_or(IntegrationError::InvalidWebhook)?;
         // URL/署名鍵を変更した直後に、旧ワーカーの失敗で新しい送り先を停止しない。
-        // メモリ側の停止は先に反映済みなので、停止状態の差は比べない。
-        // 反映後に明示的な再開・削除があれば記録が消えており、保存しない。
-        let same = |current: &WebhookDef, d: &WebhookDef| {
-            WebhookDef {
-                paused: None,
-                ..current.clone()
-            } == WebhookDef {
-                paused: None,
-                ..d.clone()
-            }
-        };
+        // 照合は mark_auto_paused と同じく id と資格情報だけ。名前などの変更と競合しても
+        // 停止は保存する。反映後に再開・削除・送り先変更があれば記録が消えており、保存しない。
         if expected.is_some_and(|(d, secret)| {
             let marked =
                 matches!(self.0.auto_paused.lock().unwrap().get(id), Some((_, s)) if s == secret);
             !marked
-                || !same(&file.webhooks[i], d)
                 || !self
                     .0
                     .webhooks
                     .read()
                     .unwrap()
                     .iter()
-                    .any(|(current, s)| same(current, d) && s.as_ref() == Some(secret))
+                    .any(|(current, s)| current.id == d.id && s.as_ref() == Some(secret))
         }) {
             return Err(IntegrationError::InvalidWebhook);
         }
@@ -363,6 +360,7 @@ impl<S: SecretStore> Integrations<S> {
             )
             .await
             .map_err(|_| IntegrationError::SecretWrite)?;
+        self.0.auto_paused.lock().unwrap().remove(id);
         self.refresh_webhooks(&file).await;
         Ok(new)
     }

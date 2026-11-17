@@ -888,6 +888,99 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn rename_during_pause_persistence_keeps_pause_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = HoldGet::default();
+        let it = Integrations::open(dir.path().into(), store.clone(), 1).await;
+        let id = it
+            .save_webhook(input("https://example.test/hook"))
+            .await
+            .unwrap()
+            .definition
+            .id;
+        let sender = Script::default();
+        sender.outcomes.lock().unwrap().push_back(status(404));
+        let rt = WebhookRuntime::new(it.clone(), sender.clone());
+        rt.reload().await;
+        // 名前だけの保存が file ロックを握ったまま資格情報を読んでいる間に 404 が来る。
+        store.hold.store(true, std::sync::atomic::Ordering::SeqCst);
+        let it2 = it.clone();
+        let rename = tokio::spawn(async move {
+            it2.save_webhook(WebhookInput {
+                id: Some(id),
+                name: "改名".into(),
+                url: None,
+                ..input("https://example.test/hook")
+            })
+            .await
+            .unwrap();
+        });
+        store.entered.notified().await;
+        rt.handle_message(&message("a"));
+        settle().await;
+        store.release.notify_one();
+        rename.await.unwrap();
+        rt.reload().await;
+        settle().await;
+        assert!(it.list_webhooks()[0].definition.paused.is_some());
+        assert_eq!(rt.status()[0].state, "paused");
+        let crate::integrations::LoadOutcome::Loaded(file) =
+            crate::integrations::load(dir.path(), 2).unwrap()
+        else {
+            panic!("saved file");
+        };
+        assert!(file.webhooks[0].paused.is_some());
+    }
+    #[tokio::test(start_paused = true)]
+    async fn url_change_and_back_does_not_revive_unsaved_pause() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = HoldGet::default();
+        let it = Integrations::open(dir.path().into(), store.clone(), 1).await;
+        let id = it
+            .save_webhook(input("https://a.example.test/hook"))
+            .await
+            .unwrap()
+            .definition
+            .id;
+        let sender = Script::default();
+        sender.outcomes.lock().unwrap().push_back(status(404));
+        let rt = WebhookRuntime::new(it.clone(), sender.clone());
+        rt.reload().await;
+        // URL を B へ変える保存の最中に、A への送信が 404 で自動停止する。
+        // 停止は B には及ばず保存もされない。A へ戻しても停止が蘇ってはならない。
+        store.hold.store(true, std::sync::atomic::Ordering::SeqCst);
+        let it2 = it.clone();
+        let id2 = id.clone();
+        let to_b = tokio::spawn(async move {
+            it2.save_webhook(WebhookInput {
+                id: Some(id2),
+                ..input("https://b.example.test/hook")
+            })
+            .await
+            .unwrap();
+        });
+        store.entered.notified().await;
+        rt.handle_message(&message("a"));
+        settle().await;
+        store.release.notify_one();
+        to_b.await.unwrap();
+        settle().await;
+        assert!(it.list_webhooks()[0].definition.paused.is_none());
+        it.save_webhook(WebhookInput {
+            id: Some(id),
+            ..input("https://a.example.test/hook")
+        })
+        .await
+        .unwrap();
+        rt.reload().await;
+        assert!(it.list_webhooks()[0].definition.paused.is_none());
+        rt.handle_message(&message("b"));
+        settle().await;
+        assert_eq!(*sender.calls.lock().unwrap(), 2);
+        assert_eq!(rt.status()[0].state, "active");
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn expiring_item_must_not_shorten_retry_after_for_new_item() {
         let dir = tempfile::tempdir().unwrap();
         let it = Integrations::open(dir.path().into(), MemorySecretStore::new(), 1).await;

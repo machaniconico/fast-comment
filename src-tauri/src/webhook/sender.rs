@@ -110,7 +110,11 @@ impl Sender for ReqwestSender {
                 }
                 Some(Err(e)) => {
                     let _ = e.without_url();
-                    // ステータスは受け取れている。本文が読めなくてもステータスで判定する。
+                    // 2xx で本文が切れたら配送は未確定。読み取り失敗として扱う(設計 §3.5)。
+                    // それ以外はステータスを受け取れているので、ステータスで判定する。
+                    if (200..300).contains(&code) {
+                        return Outcome::ReadFailed;
+                    }
                     return Outcome::Status {
                         code,
                         header_retry_after,
@@ -251,18 +255,36 @@ mod tests {
                 }),
             ))
             .await;
-            assert_eq!(
-                ReqwestSender::new()
-                    .send(OutboundRequest::new(&url, vec![], vec![]))
-                    .await,
-                Outcome::Status {
-                    code,
-                    header_retry_after: None,
-                    body_retry_after: None,
-                    remaining_zero_reset_after: None
-                },
-                "code={code}"
-            );
+            let outcome = ReqwestSender::new()
+                .send(OutboundRequest::new(&url, vec![], vec![]))
+                .await;
+            if code == 200 {
+                // 2xx で本文が切れたら配送は未確定。読み取り失敗の方針(設計 §3.5)に従う。
+                use crate::{
+                    integrations::WebhookFormat,
+                    webhook::delivery::{classify, Decision},
+                };
+                assert_eq!(outcome, Outcome::ReadFailed);
+                assert_eq!(
+                    classify(WebhookFormat::Discord, &outcome),
+                    Decision::Drop { uncertain: true }
+                );
+                assert_eq!(
+                    classify(WebhookFormat::Generic, &outcome),
+                    Decision::Retry { wait: None }
+                );
+            } else {
+                assert_eq!(
+                    outcome,
+                    Outcome::Status {
+                        code,
+                        header_retry_after: None,
+                        body_retry_after: None,
+                        remaining_zero_reset_after: None
+                    },
+                    "code={code}"
+                );
+            }
         }
     }
     #[tokio::test]
