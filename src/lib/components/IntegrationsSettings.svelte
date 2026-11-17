@@ -11,6 +11,7 @@
     pauseReasonLabel,
     resultKindLabel,
     splitKeywords,
+    trimWhite,
     stateLabel,
     testResultLabel,
     textLength,
@@ -138,7 +139,7 @@
   async function saveHook() {
     const form = editing;
     if (!form) return;
-    const input: WebhookInput = { ...form, name: form.name.trim(), keywords: splitKeywords(formKeywords) };
+    const input: WebhookInput = { ...form, name: trimWhite(form.name), keywords: splitKeywords(formKeywords) };
     const url = formUrl.trim();
     if (url) input.url = url; else delete input.url;
     await runHook(async () => {
