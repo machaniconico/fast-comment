@@ -19,12 +19,40 @@ struct TokenRecord {
 }
 impl SecretStore for KeyringSecretStore {
     async fn get(&self, key: &str) -> Result<Option<String>, String> {
+        if key.starts_with("webhook:") {
+            // 壊れた JSON もそのまま取得し、上書き・削除の失敗時に復元できるようにする。
+            // 内容の検証は load_webhook_secrets で行う。
+            let key = key.to_owned();
+            let _guard = crate::secret_store::keyring_lock().lock().await;
+            return tokio::task::spawn_blocking(move || {
+                let entry = keyring::Entry::new("fast-comment", &key)
+                    .map_err(|_| "資格情報を読めません".to_string())?;
+                match entry.get_password() {
+                    Ok(raw) => Ok(Some(raw)),
+                    Err(keyring::Error::NoEntry) => Ok(None),
+                    Err(_) => Err("資格情報を読めません".into()),
+                }
+            })
+            .await
+            .map_err(|_| "資格情報を読めません".to_string())?;
+        }
         crate::secret_store::load::<TokenRecord>(key)
             .await
             .map(|v| v.map(|r| r.token))
             .map_err(|_| "資格情報を読めません".into())
     }
     async fn put(&self, key: &str, value: &str) -> Result<(), String> {
+        if key.starts_with("webhook:") {
+            let (key, value) = (key.to_owned(), value.to_owned());
+            let _guard = crate::secret_store::keyring_lock().lock().await;
+            return tokio::task::spawn_blocking(move || {
+                keyring::Entry::new("fast-comment", &key)
+                    .and_then(|entry| entry.set_password(&value))
+                    .map_err(|_| "資格情報を保存できません".to_string())
+            })
+            .await
+            .map_err(|_| "資格情報を保存できません".to_string())?;
+        }
         let record = TokenRecord {
             token: value.into(),
             created_at_ms: std::time::SystemTime::now()

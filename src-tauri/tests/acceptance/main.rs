@@ -14,6 +14,13 @@ mod api_feed;
 
 // PR3: アプリ内操作(設計書 §5.5)
 mod api_ops;
+// PR4: Webhook の中核と保存(設計書 §5.6)
+mod webhook_common;
+mod webhook_delivery;
+mod webhook_payload;
+mod webhook_rules;
+mod webhook_store;
+mod webhook_url;
 
 #[test]
 fn acceptance_harness_runs() {}

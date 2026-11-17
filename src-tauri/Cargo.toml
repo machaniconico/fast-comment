@@ -47,6 +47,9 @@ tower = { version = "0.5", features = ["util"] }
 zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4"
+url = "2"
 subtle = "2"
 getrandom = "0.2"
 base64 = "0.22"
