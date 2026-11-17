@@ -113,7 +113,10 @@ impl Sender for ReqwestSender {
                     // 2xx で本文が切れたら配送は未確定。読み取り失敗として扱う(設計 §3.5)。
                     // それ以外はステータスを受け取れているので、ステータスで判定する。
                     if (200..300).contains(&code) {
-                        return Outcome::ReadFailed;
+                        return Outcome::ReadFailedWithRateLimit {
+                            header_retry_after,
+                            remaining_zero_reset_after,
+                        };
                     }
                     return Outcome::Status {
                         code,
@@ -141,6 +144,142 @@ impl Sender for ReqwestSender {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        integrations::{
+            Integrations, MemorySecretStore, WebhookFormat, WebhookInput, WebhookTriggers,
+        },
+        model::ChatMessage,
+        webhook::WebhookRuntime,
+    };
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    #[derive(Clone)]
+    struct Forward {
+        calls: Arc<AtomicUsize>,
+        url: String,
+    }
+    impl Sender for Forward {
+        async fn send(&self, _: OutboundRequest) -> Outcome {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                ReqwestSender::new()
+                    .send(OutboundRequest::new(&self.url, vec![], vec![]))
+                    .await
+            } else {
+                Outcome::Status {
+                    code: 204,
+                    header_retry_after: None,
+                    body_retry_after: None,
+                    remaining_zero_reset_after: None,
+                }
+            }
+        }
+    }
+
+    // 外部レビューの review_rate.rs から取り込んだ回帰テスト。
+    #[tokio::test]
+    async fn truncated_2xx_must_preserve_discord_reset_after() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = socket.read(&mut buf).unwrap();
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nX-RateLimit-Remaining: 0\r\nX-RateLimit-Reset-After: 30\r\nConnection: close\r\n\r\nx").unwrap();
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let it = Integrations::open(dir.path().into(), MemorySecretStore::new(), 1).await;
+        it.save_webhook(WebhookInput {
+            id: None,
+            name: "test".into(),
+            format: WebhookFormat::Discord,
+            enabled: true,
+            triggers: WebhookTriggers {
+                donation: true,
+                ..Default::default()
+            },
+            keywords: vec![],
+            url: Some("https://discord.com/api/webhooks/id/token".into()),
+        })
+        .await
+        .unwrap();
+        let sender = Forward {
+            calls: Arc::new(AtomicUsize::new(0)),
+            url,
+        };
+        let rt = WebhookRuntime::new(it, sender.clone());
+        rt.reload().await;
+        for id in ["a", "b"] {
+            let msg: ChatMessage = serde_json::from_value(serde_json::json!({"id":id,"platform":"youtube","channel":"test","author":{"id":"a","name":"A"},"kind":"superChat","timestampMs":1,"fragments":[{"type":"text","text":"hi"}]})).unwrap();
+            rt.handle_message(&msg);
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        server.join().unwrap();
+        assert_eq!(rt.status()[0].uncertain, 1);
+        assert_eq!(sender.calls.load(Ordering::SeqCst), 1, "Remaining=0 / Reset-After=30 must block the next item even if the 200 body is truncated");
+        rt.shutdown();
+    }
+
+    #[tokio::test]
+    async fn truncated_2xx_must_preserve_generic_retry_after() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = socket.read(&mut buf).unwrap();
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nRetry-After: 4\r\nX-RateLimit-Remaining: 0\r\nX-RateLimit-Reset-After: 30\r\nConnection: close\r\n\r\nx").unwrap();
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let it = Integrations::open(dir.path().into(), MemorySecretStore::new(), 1).await;
+        it.save_webhook(WebhookInput {
+            id: None,
+            name: "test".into(),
+            format: WebhookFormat::Generic,
+            enabled: true,
+            triggers: WebhookTriggers {
+                donation: true,
+                ..Default::default()
+            },
+            keywords: vec![],
+            url: Some(url.clone()),
+        })
+        .await
+        .unwrap();
+        let sender = Forward {
+            calls: Arc::new(AtomicUsize::new(0)),
+            url,
+        };
+        let rt = WebhookRuntime::new(it, sender.clone());
+        rt.reload().await;
+        for id in ["a", "b"] {
+            let msg: ChatMessage = serde_json::from_value(serde_json::json!({"id":id,"platform":"youtube","channel":"test","author":{"id":"a","name":"A"},"kind":"superChat","timestampMs":1,"fragments":[{"type":"text","text":"hi"}]})).unwrap();
+            rt.handle_message(&msg);
+        }
+        // 通常の初回バックオフ(最大 2.4 秒)を超えても Retry-After が優先される。
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        server.join().unwrap();
+        assert_eq!(
+            sender.calls.load(Ordering::SeqCst),
+            1,
+            "Retry-After must delay both the retry and the next item after a truncated 200 body"
+        );
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while rt.status()[0].delivered < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("generic delivery must retry after Retry-After, ignoring Discord bucket headers");
+        assert_eq!(sender.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(rt.status()[0].uncertain, 0);
+        rt.shutdown();
+    }
+
     async fn serve(app: axum::Router) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -264,7 +403,13 @@ mod tests {
                     integrations::WebhookFormat,
                     webhook::delivery::{classify, Decision},
                 };
-                assert_eq!(outcome, Outcome::ReadFailed);
+                assert_eq!(
+                    outcome,
+                    Outcome::ReadFailedWithRateLimit {
+                        header_retry_after: None,
+                        remaining_zero_reset_after: None,
+                    }
+                );
                 assert_eq!(
                     classify(WebhookFormat::Discord, &outcome),
                     Decision::Drop { uncertain: true }

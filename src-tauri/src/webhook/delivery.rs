@@ -11,6 +11,10 @@ pub enum Outcome {
     ConnectFailed,
     TimedOutAfterSend,
     ReadFailed,
+    ReadFailedWithRateLimit {
+        header_retry_after: Option<Duration>,
+        remaining_zero_reset_after: Option<Duration>,
+    },
 }
 #[derive(Clone, Debug, PartialEq)]
 pub enum Decision {
@@ -22,11 +26,20 @@ pub enum Decision {
 pub fn classify(format: WebhookFormat, outcome: &Outcome) -> Decision {
     match outcome {
         Outcome::ConnectFailed => Decision::Retry { wait: None },
-        Outcome::TimedOutAfterSend | Outcome::ReadFailed => {
+        Outcome::TimedOutAfterSend
+        | Outcome::ReadFailed
+        | Outcome::ReadFailedWithRateLimit { .. } => {
             if format == WebhookFormat::Discord {
                 Decision::Drop { uncertain: true }
             } else {
-                Decision::Retry { wait: None }
+                Decision::Retry {
+                    wait: match outcome {
+                        Outcome::ReadFailedWithRateLimit {
+                            header_retry_after, ..
+                        } => *header_retry_after,
+                        _ => None,
+                    },
+                }
             }
         }
         Outcome::Status {

@@ -386,7 +386,7 @@ fn kind(out: &Outcome) -> &'static str {
     match out {
         Outcome::ConnectFailed => "connectFailed",
         Outcome::TimedOutAfterSend => "timedOutAfterSend",
-        Outcome::ReadFailed => "readFailed",
+        Outcome::ReadFailed | Outcome::ReadFailedWithRateLimit { .. } => "readFailed",
         Outcome::Status {
             code: 200..=299, ..
         } => "delivered",
@@ -457,16 +457,27 @@ async fn run_worker<S: SecretStore, T: Sender>(
                     kind: kind(&out).into(),
                 });
             }
-            if w.def.format == WebhookFormat::Discord {
-                if let Outcome::Status {
-                    remaining_zero_reset_after: Some(d),
+            let rate_limit_wait = match &out {
+                Outcome::Status {
+                    remaining_zero_reset_after,
                     ..
-                } = &out
-                {
-                    let now = Instant::now();
-                    // 送り先全体の待ちは、現在項目の寿命で短縮しない。
-                    ready_at = ready_at.max(now + (*d).min(Duration::from_secs(600)));
+                } if w.def.format == WebhookFormat::Discord => *remaining_zero_reset_after,
+                Outcome::ReadFailedWithRateLimit {
+                    header_retry_after,
+                    remaining_zero_reset_after,
+                } => {
+                    if w.def.format == WebhookFormat::Discord {
+                        (*header_retry_after).max(*remaining_zero_reset_after)
+                    } else {
+                        *header_retry_after
+                    }
                 }
+                _ => None,
+            };
+            if let Some(d) = rate_limit_wait {
+                let now = Instant::now();
+                // 本文の読み取りに失敗しても、送り先全体の待ちは現在項目の寿命で短縮しない。
+                ready_at = ready_at.max(now + d.min(Duration::from_secs(600)));
             }
             let mut pause = None;
             match classify(w.def.format.clone(), &out) {
