@@ -781,6 +781,9 @@ pub struct CredentialsConfig {
     /// X 自動告知(API モード)用の OAuth 2.0 Client ID。秘密値ではないが他の Client ID と同じ場所に置く。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub x_post_client_id: Option<String>,
+    /// 公開 ClientID の上書き。トークンは資格情報ストアにのみ保存する。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub twitcasting_client_id: Option<String>,
 }
 
 /// X 自動告知の設定。
@@ -1267,6 +1270,7 @@ mod tests {
                 x_auth_token: "x-auth-cookie".to_string(),
                 x_csrf_token: "x-ct0".to_string(),
                 x_post_client_id: Some("x-post-client".to_string()),
+                twitcasting_client_id: None,
             },
             youtube_overrides: YoutubeOverrides {
                 api_key: Some("test-api-key".to_string()),

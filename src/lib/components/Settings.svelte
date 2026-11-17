@@ -35,6 +35,7 @@
   import ModerationTester from './ModerationTester.svelte';
   import TemplateEditor from './TemplateEditor.svelte';
   import XPostSettings from './XPostSettings.svelte';
+  import TwitcastingSettings from './TwitcastingSettings.svelte';
   import IntegrationsSettings from './IntegrationsSettings.svelte';
   import { sanitizeXPostNumbers } from '../xAutopost';
   import { appUpdate } from '../appUpdate.svelte';
@@ -1219,6 +1220,7 @@
       xCsrfToken: credXCsrfToken.trim(),
       // このフォームでは編集しない値(API モード用)。作り直しで消えないよう既存値を引き継ぐ。
       xPostClientId: config.credentials?.xPostClientId,
+      twitcastingClientId: config.credentials?.twitcastingClientId,
     };
     saveWarned = false;
     try {
@@ -1966,6 +1968,12 @@
     <p class="hint">
       ⚠ トークンはこの PC の config.json に平文で保存されます。共有 PC では取り扱いに注意してください。
     </p>
+    <TwitcastingSettings
+      clientId={config.credentials?.twitcastingClientId ?? ''}
+      onClientIdSaved={(id) => {
+        if (config) config.credentials = { ...(config.credentials ?? {}), twitcastingClientId: id || undefined };
+      }}
+    />
   </section>
 
   <section id="settings-x-post">

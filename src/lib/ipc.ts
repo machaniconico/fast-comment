@@ -427,6 +427,7 @@ export interface AppConfig {
     xCsrfToken?: string;
     // X 自動告知(API モード)用 Client ID。未設定なら省略。
     xPostClientId?: string;
+    twitcastingClientId?: string;
   };
   // X 自動告知の設定(Rust `XPostConfig`)。古い config.json には無い。
   xPost?: XPostConfig;
@@ -1122,4 +1123,18 @@ export async function sendXTestPost(): Promise<XTestPostResult | null> {
 /** 行の「自分の配信」印だけを保存する(Source は再起動しない)。key は `${platform}:${identifier}`。 */
 export async function setChannelOwnStream(key: string, own: boolean): Promise<void> {
   await invoke<void>('set_channel_own_stream', { key, own });
+}
+
+
+export async function getTwitcastingStatus(): Promise<import('./types').TwitcastingStatus | null> {
+  return invoke<import('./types').TwitcastingStatus>('get_twitcasting_status');
+}
+export async function connectTwitcasting(clientId?: string): Promise<import('./types').TwitcastingStatus | null> {
+  return invoke<import('./types').TwitcastingStatus>('connect_twitcasting', { clientId: clientId || null });
+}
+export async function cancelTwitcastingLogin(): Promise<void> {
+  await invoke<void>('cancel_twitcasting_login');
+}
+export async function disconnectTwitcasting(): Promise<import('./types').TwitcastingStatus | null> {
+  return invoke<import('./types').TwitcastingStatus>('disconnect_twitcasting');
 }

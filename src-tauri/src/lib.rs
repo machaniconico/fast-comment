@@ -56,6 +56,10 @@ use crate::model::{
 };
 use crate::moderation::{Moderator, Verdict};
 use crate::moderation_error::{ModerationError, ModerationErrorCode};
+use crate::sources::twitcasting_auth::{
+    effective_client_id, AuthOptions, TwitcastingAuth, TwitcastingAuthError,
+    TwitcastingAuthErrorCode, TwitcastingEndpoints, TwitcastingStatus,
+};
 use crate::sources::twitch_auth::{TwitchAuth, TwitchDeviceLogin, TwitchOauthStatus};
 use crate::sources::youtube_send::{YoutubeAuth, YoutubeOauthStatus};
 use crate::sources::SourceManager;
@@ -122,6 +126,7 @@ pub struct AppState {
     youtube_auth: YoutubeAuth,
     /// Twitchモデレーション用OAuth状態。access tokenはメモリのみ。
     twitch_auth: Arc<TwitchAuth>,
+    twitcasting_auth: Arc<TwitcastingAuth<integrations::KeyringSecretStore>>,
 }
 
 #[tauri::command]
@@ -1352,6 +1357,66 @@ fn notify_x_auth_changed(state: &AppState) {
     let _ = state.autopost_user_tx.try_send(AutopostCommand::AuthChanged);
 }
 
+fn twitcasting_client_id(state: &AppState) -> Option<String> {
+    effective_client_id(
+        state
+            .config
+            .lock()
+            .unwrap()
+            .credentials
+            .twitcasting_client_id
+            .as_deref(),
+    )
+}
+
+#[tauri::command]
+fn get_twitcasting_status(state: State<'_, AppState>) -> TwitcastingStatus {
+    state
+        .twitcasting_auth
+        .status(twitcasting_client_id(&state).as_deref(), timer_now_ms())
+}
+
+#[tauri::command]
+async fn connect_twitcasting(
+    state: State<'_, AppState>,
+    client_id: Option<String>,
+) -> Result<TwitcastingStatus, TwitcastingAuthError> {
+    let override_id = client_id
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty());
+    let effective = effective_client_id(override_id.as_deref())
+        .ok_or_else(|| TwitcastingAuthError::new(TwitcastingAuthErrorCode::NotConfigured))?;
+    let next = {
+        let mut cfg = state.config.lock().unwrap();
+        let mut next = cfg.clone();
+        next.credentials.twitcasting_client_id = override_id;
+        next.save(&state.config_dir)
+            .map_err(|_| TwitcastingAuthError::new(TwitcastingAuthErrorCode::Other))?;
+        *cfg = next.clone();
+        next
+    };
+    state.config_tx.send_replace(next);
+    state
+        .twitcasting_auth
+        .connect(&effective, timer_now_ms(), open_url)
+        .await
+}
+
+#[tauri::command]
+fn cancel_twitcasting_login(state: State<'_, AppState>) {
+    state.twitcasting_auth.cancel_login();
+}
+
+#[tauri::command]
+async fn disconnect_twitcasting(
+    state: State<'_, AppState>,
+) -> Result<TwitcastingStatus, TwitcastingAuthError> {
+    state.twitcasting_auth.disconnect().await?;
+    Ok(state
+        .twitcasting_auth
+        .status(twitcasting_client_id(&state).as_deref(), timer_now_ms()))
+}
+
 /// X 自動告知(API モード)の接続状態。
 #[tauri::command]
 async fn get_x_post_status(state: State<'_, AppState>) -> Result<XPostStatus, XPostError> {
@@ -2508,6 +2573,15 @@ pub fn run() {
                 .expect("X投稿用HTTPクライアントの作成に失敗しました"),
             );
 
+            let twitcasting_auth = TwitcastingAuth::new(
+                integrations::KeyringSecretStore,
+                TwitcastingEndpoints::default(),
+                AuthOptions::default(),
+            );
+            let auth_load = twitcasting_auth.clone();
+            let client_id = effective_client_id(config.credentials.twitcasting_client_id.as_deref());
+            tauri::async_runtime::block_on(auth_load.load(client_id.as_deref(), timer_now_ms()));
+
             // 下流 Bus(パイプライン → UI/OBS)。
             let bus = Bus::new(obs_port, stats_tx.clone(), timer_tx.clone());
 
@@ -2585,6 +2659,7 @@ pub fn run() {
                 autopost_user_tx,
                 autopost_status: autopost_status.clone(),
                 x_post_auth: x_post_auth.clone(),
+                twitcasting_auth,
                 participants: Mutex::new(Vec::new()),
                 youtube_auth: YoutubeAuth::new()
                     .expect("YouTube投稿用HTTPクライアントの作成に失敗しました"),
@@ -2758,6 +2833,10 @@ pub fn run() {
             retry_x_autopost,
             preview_x_post,
             set_channel_own_stream,
+            get_twitcasting_status,
+            connect_twitcasting,
+            cancel_twitcasting_login,
+            disconnect_twitcasting,
             get_x_post_status,
             connect_x_post,
             cancel_x_post_login,

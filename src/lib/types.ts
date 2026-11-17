@@ -226,3 +226,18 @@ export interface WebhookTestResult {
   status: number | null;
   errorKind: string | null;
 }
+
+
+export interface TwitcastingStatus {
+  configured: boolean;
+  state: 'loggedOut' | 'ready' | 'reloginRequired';
+  screenId: string | null;
+  name: string | null;
+  expiresAtMs: number | null;
+  callbackUrl: string;
+  customClientId: boolean;
+}
+export interface TwitcastingAuthError {
+  code: 'notConfigured' | 'portInUse' | 'loginTimeout' | 'cancelled' | 'denied' | 'clientMismatch' | 'tokenStore' | 'network' | 'other';
+  message: string;
+}

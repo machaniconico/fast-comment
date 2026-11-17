@@ -1,0 +1,111 @@
+<script lang="ts">
+  import { onMount } from 'svelte';
+  import { getTwitcastingStatus, connectTwitcasting, cancelTwitcastingLogin, disconnectTwitcasting } from '../ipc';
+  import type { TwitcastingStatus } from '../types';
+  import { errorText } from '../xAutopost';
+
+  let { clientId = '', onClientIdSaved }: { clientId?: string; onClientIdSaved?: (id: string) => void } = $props();
+  // svelte-ignore state_referenced_locally
+  let clientIdInput = $state(clientId);
+  let status = $state<TwitcastingStatus | null>(null);
+  let connecting = $state(false);
+  let disconnecting = $state(false);
+  let message = $state('');
+  let failed = $state(false);
+  let now = $state(Date.now());
+  const expiring = $derived(status?.expiresAtMs != null && status.expiresAtMs - now <= 14 * 86400000);
+
+  async function refresh() {
+    try { status = await getTwitcastingStatus(); }
+    catch (e) { message = errorText(e); failed = true; }
+    now = Date.now();
+  }
+  onMount(() => {
+    void refresh();
+    const timer = setInterval(() => void refresh(), 30000);
+    return () => {
+      clearInterval(timer);
+      if (connecting) void cancelTwitcastingLogin().catch(() => {});
+    };
+  });
+  async function connect() {
+    if (connecting || disconnecting) return;
+    connecting = true;
+    failed = false;
+    message = 'ブラウザでツイキャスにログインし、アプリを許可してください…';
+    const id = clientIdInput.trim();
+    // コマンドはログインに先立って ClientID だけを保存する。親の未保存フォームにも反映する。
+    onClientIdSaved?.(id);
+    try {
+      status = await connectTwitcasting(id);
+      message = 'ツイキャスにログインしました';
+    } catch (e) { message = errorText(e); failed = true; await refresh(); }
+    finally { connecting = false; }
+  }
+  async function cancel() {
+    try { await cancelTwitcastingLogin(); }
+    catch (e) { message = errorText(e); failed = true; }
+  }
+  async function disconnect() {
+    disconnecting = true;
+    try { status = await disconnectTwitcasting(); message = 'この PC の認証情報を削除しました'; failed = false; }
+    catch (e) { message = errorText(e); failed = true; await refresh(); }
+    finally { disconnecting = false; }
+  }
+</script>
+
+<fieldset>
+  <legend>ツイキャス</legend>
+  <div class="field-row" aria-live="polite">
+    {#if status?.state === 'ready'}
+      <span class="connected">@{status.screenId} ({status.name}) としてログイン中</span>
+    {:else if status?.state === 'reloginRequired'}
+      <span class="warn">再ログインしてください</span>
+    {:else}
+      <span>未ログイン</span>
+    {/if}
+  </div>
+  {#if status?.expiresAtMs != null}
+    <p class:warn={expiring}>有効期限: {new Date(status.expiresAtMs).toLocaleString()}{expiring ? ' (期限が近いか、期限切れです。再ログインしてください)' : ''}</p>
+  {:else if status?.state === 'ready'}
+    <p>有効期限は不明です。認証が切れたら再ログインしてください。</p>
+  {/if}
+  <div class="field-row">
+    {#if connecting}
+      <button type="button" onclick={cancel}>取り消す</button>
+    {:else}
+      <button type="button" class="primary" onclick={connect} disabled={disconnecting}>ログイン</button>
+    {/if}
+    {#if status && status.state !== 'loggedOut'}
+      <button type="button" onclick={disconnect} disabled={connecting || disconnecting}>ログアウト</button>
+    {/if}
+  </div>
+  {#if message}<p class:warn={failed} aria-live="polite">{message}</p>{/if}
+  <details>
+    <summary>詳細: 自分の ClientID を使う</summary>
+    <div class="field-row">
+      <label for="twitcasting-client-id">ClientID</label>
+      <input id="twitcasting-client-id" type="text" bind:value={clientIdInput} disabled={connecting || disconnecting} autocomplete="off" spellcheck="false" />
+    </div>
+    <p>空欄ならアプリ既定値を使います。現在は既定値が未登録のため、自分の ClientID が必要です。ログイン時にこの項目だけ保存します。</p>
+    <p>ツイキャスの開発者ページでアプリを登録し、次のコールバック URL をそのまま設定してください。</p>
+    <code>{status?.callbackUrl ?? 'http://localhost:47822/twitcasting/callback'}</code>
+  </details>
+  <p>認証の有効期間は通常約 180 日です。ログアウト後は、ツイキャスの連携アプリ設定から解除できます。</p>
+</fieldset>
+
+<style>
+  fieldset { margin-top: 14px; border: 1px solid rgba(255,255,255,0.12); border-radius: 6px; padding: 8px 12px 12px; color: #ccc; }
+  legend { font-size: 13px; padding: 0 4px; }
+  .field-row { display: flex; align-items: center; gap: 8px; margin: 8px 0; flex-wrap: wrap; font-size: 13px; }
+  p, details, code { font-size: 12px; }
+  p { color: #bdbdbd; margin: 6px 0; }
+  code { word-break: break-all; }
+  input { flex: 1 1 260px; min-width: 0; background: rgba(255,255,255,0.07); border: 1px solid rgba(255,255,255,0.12); border-radius: 4px; color: #e0e0e0; padding: 5px 8px; font: 13px monospace; }
+  button { border: 1px solid rgba(255,255,255,0.18); background: rgba(255,255,255,0.08); color: #e0e0e0; border-radius: 4px; cursor: pointer; font-size: 12px; padding: 4px 10px; }
+  button:hover:not(:disabled) { background: rgba(255,255,255,0.14); }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  button.primary { background: #1976d2; border-color: #1976d2; color: #fff; }
+  .connected { color: #81c784; }
+  .warn { color: #ffb74d; }
+</style>

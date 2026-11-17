@@ -18,6 +18,17 @@
 - **OBS配信サーバ**: axum (HTTP + WebSocket) + tower-http (静的テンプレ配信)
 - **ビルド/実行ターゲット**: **Windows**（WSLでは編集のみ、ビルドはWindows側）
 
+### 1.3 ツイキャス認証 (`sources/twitcasting_auth.rs`、PR1)
+
+- 公式 API v2 の Implicit (`response_type=token`) のみ。ClientSecret は扱わない。公開 ClientID は `DEFAULT_CLIENT_ID` (未登録のため空文字) + 任意の上書き `credentials.twitcastingClientId`。空白だけの上書きは既定へ戻す。
+- ログイン中だけ `127.0.0.1:47822` と `[::1]:47822` を bind。IPv6 無効(アドレス使用不可)のみ IPv4 だけに劣化し、いずれかが使用中なら開始しない。コールバックは `http://localhost:47822/twitcasting/callback`。180 秒・取消・次のログインで終了し、コマンドが返るまでにポートを解放する。
+- 固定 HTML がフラグメントを読み、直ちに `history.replaceState` で除去して同一オリジンの `POST /twitcasting/token` 本文へ渡す。Host / Origin を 3 種のループバックだけに限定、本文 4096 バイト、32 バイト乱数の state を定数時間比較、トークンは 1〜2048 バイトの可視 ASCII。拒否 (`result=denied`) は Host / Origin 検査後に終了。不正 state / トークンでは待受を継続し、成功は一回限り。全応答に no-store / no-referrer / nosniff / 外部リソース禁止 CSP を付ける。
+- 保存前に `/verify_credentials` を Bearer、`X-Api-Version: 2.0`、JSON Accept で呼び、`app.client_id` を照合する。トークン・state はログ、エラー文、Debug、emit、状態 JSON に出さない。
+- 資格情報ストア (`integrations::SecretStore`、service `fast-comment`、キー `twitcasting-oauth-token`) に `{clientId, accessToken, userId, screenId, name, expiresAtMs, obtainedAtMs}` を保存する。`expires_in` が不明なら期限も不明。起動時に復元する。
+- `LoggedOut` / `Ready` / `ReloginRequired` を watch 通知。期限切れ (`now >= expiresAtMs`)、ClientID 不一致、401 通知で再ログインが必要になる。Bearer は Ready かつ期限内かつ ClientID 一致時のみ取得できる。失効では保存値を残し、明示ログアウトで削除してメモリも消す(削除失敗時もメモリは消す)。
+- 設定の認証情報に状態、アカウント、期限(残り 14 日以下は警告)、ログイン / 取消 / ログアウト、ClientID 上書きとコールバック URL を表示。`get_twitcasting_status` / `connect_twitcasting` / `cancel_twitcasting_login` / `disconnect_twitcasting` を使い、接続時は ClientID だけ即時保存する。ツイキャス側の許可解除は連携アプリ設定で行う。
+- 残るリスク: Implicit のフラグメント付き URL が一瞬ブラウザ履歴に載る。待受終了後のコールバックでは接続拒否画面の URL 欄にトークンが残る場合がある。PR1 は認証のみで、コメント受信は後続 PR。
+
 ## 2. 全体アーキテクチャ
 
 ```
@@ -338,6 +349,7 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
   - `obs`: ポートに加え `maxRows` / `fontScalePct` / `ttlMs` / `bgOpacityPct` / `position` 等の見た目設定。範囲外値が入らないよう **Rust 側でも `normalize()` で clamp**(`maxRows` 1..=1000, `fontScalePct` 50..=200, `bgOpacityPct` 0..=100, `ttlMs` 500..=600000, `position`∈{top,bottom})。`normalize()` は config ロード時と `update_config` 適用時の両方で呼ぶ。上限定数は Rust 側に1箇所(`MAX_OBS_ROWS`)を置き UI/テンプレと値を揃える。
   - `channels[].ownStream`(bool 既定false): 「自分の配信」の印(X 自動告知の対象)。旧 config は欠落で false。
   - `xPost{enabled=false, mode="intent"|"api"="intent", intentOpen="button"|"auto"="button", combine=false, template, delaySecs=60, staleMinutes=15, cooldownMinutes=60, dailyLimit=5, callbackPort=47821}`: X 自動告知。`template` 既定は `{title}\n{url}\n{date} {time}`。全項目 serde default。`normalize_all()` で clamp(`delaySecs` 0..=600, `staleMinutes` 0..=180, `cooldownMinutes` 10..=1440, `dailyLimit` 1..=20、`mode` / `intentOpen` は不正値なら既定)。
+  - `credentials.twitcastingClientId`(任意): ツイキャス公開 ClientID の上書き。未設定は JSON から省略し、空欄なら既定値を使用する。トークンは資格情報一覧の `twitcasting-oauth-token` にのみ保存する(§1.3)。
   - `credentials.xPostClientId`(任意): API モード用の X OAuth 2.0 Client ID。未設定なら JSON に出さない。設定画面の「X に接続」(`connect_x_post`)が `xPost.callbackPort` と一緒にこの 2 項目だけを保存する。
   - `xOverrides.endpoints` の `postAuthorizeUrl` / `postTokenUrl` / `postTweetsUrl` / `postUsersMeUrl`: API モードの X エンドポイントの上書き(起動時に読む。変えたらアプリを再起動)。
   - X 投稿の認証は `config.json` に置かない: OS 資格情報ストア(`secret_store`)のエントリ `x-post-oauth-token` に `{ clientId, refreshToken, userId, username }`。access token はメモリのみ。
