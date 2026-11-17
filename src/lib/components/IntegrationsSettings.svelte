@@ -231,7 +231,10 @@
         <strong>{h.name}</strong>
         <span>{h.format === 'generic' ? '汎用 JSON' : 'Discord'}</span>
         <span>{h.enabled ? '有効' : '無効'}</span>
-        <span role="status">{stateLabel(h.status?.state ?? (h.enabled ? null : 'disabled'))}</span>
+        {#if h.enabled}
+          <!-- 無効の時は直前の「無効」と同じ語になるので出さない -->
+          <span role="status">{stateLabel(h.status?.state ?? null)}</span>
+        {/if}
       </div>
       <div class="row"><code>{h.hasUrl ? (h.urlPreview ?? 'URL 設定済み') : 'URL 未設定'}</code><span>{triggerSummary(h)}{h.triggers.keyword && h.keywords.length ? `(${h.keywords.length} 語)` : ''}</span></div>
       {#if h.status}
