@@ -173,6 +173,8 @@ curl.exe -H "Authorization: Bearer <token>" http://127.0.0.1:<port>/api/v1/statu
 
 署名の対象は `"<Timestamp>.<リクエスト本文のバイト列>"`、鍵は署名シークレット(文字列そのまま)です。タイムスタンプが古い(例 5 分超)リクエストは拒否してください。
 
+`X-FastComment-Timestamp` は各送信試行の時刻です。本文の `sentAtMs` はキュー投入時の UNIX ミリ秒で、再送でも変わりません。重複排除には、同じく再送で変わらない `eventId` を使えます。
+
 Node.js の例です(本文は JSON に直す前の生のバイト列で検証します。不正な入力は例外にせず `false` を返します)。
 
 ```js

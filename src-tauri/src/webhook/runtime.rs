@@ -47,23 +47,19 @@ pub struct TestSendResult {
     pub error_kind: Option<String>,
 }
 #[derive(Clone)]
-struct Clock {
-    origin: Instant,
-    epoch_ms: u64,
-}
+struct Clock(Arc<dyn Fn() -> u64 + Send + Sync>);
 impl Clock {
     fn new() -> Self {
-        Self {
-            origin: Instant::now(),
-            epoch_ms: std::time::SystemTime::now()
+        Self(Arc::new(|| {
+            // スリープ復帰や時刻補正も反映するため、毎回実時計を読む。
+            std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
-                .as_millis() as u64,
-        }
+                .as_millis() as u64
+        }))
     }
     fn now_ms(&self) -> u64 {
-        self.epoch_ms
-            .saturating_add(self.origin.elapsed().as_millis() as u64)
+        (self.0)()
     }
 }
 struct Item {
@@ -117,6 +113,9 @@ impl<S: SecretStore, T: Sender> Drop for RuntimeInner<S, T> {
 pub struct WebhookRuntime<S: SecretStore, T: Sender>(Arc<RuntimeInner<S, T>>);
 impl<S: SecretStore, T: Sender> WebhookRuntime<S, T> {
     pub fn new(integrations: Integrations<S>, sender: T) -> Self {
+        Self::with_clock(integrations, sender, Clock::new())
+    }
+    fn with_clock(integrations: Integrations<S>, sender: T, clock: Clock) -> Self {
         Self(Arc::new(RuntimeInner {
             integrations,
             sender,
@@ -124,7 +123,7 @@ impl<S: SecretStore, T: Sender> WebhookRuntime<S, T> {
             dedup: Mutex::new(Dedup::new(8192)),
             reload_lock: tokio::sync::Mutex::new(()),
             pause_gate: Arc::new(Mutex::new(())),
-            clock: Clock::new(),
+            clock,
             changed: Arc::new(Notify::new()),
         }))
     }
@@ -728,6 +727,16 @@ mod tests {
         assert!(mac.verify_slice(&hex::decode(signature).unwrap()).is_ok());
     }
     #[tokio::test(start_paused = true)]
+    async fn production_clock_reads_wall_time_independently_of_tokio_time() {
+        let clock = Clock::new();
+        tokio::time::advance(Duration::from_secs(320)).await;
+        let before = std::time::SystemTime::now();
+        let actual = std::time::UNIX_EPOCH + Duration::from_millis(clock.now_ms());
+        let after = std::time::SystemTime::now();
+        assert!(actual >= before - Duration::from_millis(1));
+        assert!(actual <= after);
+    }
+    #[tokio::test(start_paused = true)]
     async fn signatures_use_each_attempt_time_for_retries_and_queued_deliveries() {
         let dir = tempfile::tempdir().unwrap();
         let it = Integrations::open(dir.path().into(), MemorySecretStore::new(), 1).await;
@@ -736,7 +745,11 @@ mod tests {
             .unwrap();
         let secret = it.webhook_snapshot()[0].1.clone().unwrap();
         let sender = RetryCapture::default();
-        let rt = WebhookRuntime::new(it, sender.clone());
+        let origin = Instant::now();
+        let clock = Clock(Arc::new(move || {
+            1_700_000_000_000 + origin.elapsed().as_millis() as u64
+        }));
+        let rt = WebhookRuntime::with_clock(it, sender.clone(), clock);
         rt.reload().await;
         let first_timestamp = rt.0.clock.now_ms() / 1000;
         rt.handle_message(&message("first"));
@@ -778,16 +791,27 @@ mod tests {
             .id;
         let secret = it.webhook_snapshot()[0].1.clone().unwrap();
         let sender = Capture::default();
-        let rt = WebhookRuntime::new(it, sender.clone());
-        tokio::time::advance(Duration::from_secs(320)).await;
-        let expected = rt.0.clock.now_ms() / 1000;
+        let queued_at_ms = 1_700_000_000_000;
+        let sent_at_ms = queued_at_ms + 320_000;
+        // コメントと本文を作った後、署名の直前に実時計が進む状況を再現する。
+        let reads = std::sync::atomic::AtomicUsize::new(0);
+        let clock = Clock(Arc::new(move || {
+            if reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2 {
+                queued_at_ms
+            } else {
+                sent_at_ms
+            }
+        }));
+        let rt = WebhookRuntime::with_clock(it, sender.clone(), clock);
         assert!(rt.test_send(&id).await.ok);
         let requests = sender.0.lock().unwrap();
         assert_eq!(requests.len(), 1);
         assert_eq!(
             header(&requests[0], "X-FastComment-Timestamp"),
-            expected.to_string()
+            (sent_at_ms / 1000).to_string()
         );
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["sentAtMs"], queued_at_ms);
         verify_signature(&requests[0], secret.signing_secret.as_deref().unwrap());
     }
     #[tokio::test(start_paused = true)]
