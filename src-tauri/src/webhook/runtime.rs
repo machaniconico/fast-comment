@@ -311,20 +311,17 @@ impl<S: SecretStore, T: Sender> WebhookRuntime<S, T> {
             "id":"webhook-test", "platform":"youtube", "channel":"", "kind":"normal", "timestampMs":self.0.clock.now_ms(),
             "author":{"id":"fast-comment", "name":"fast-comment"}, "fragments":[{"type":"text","text":"Webhook テスト送信"}]
         })).expect("fixed test message");
-        let out = self
-            .0
-            .sender
-            .send(request(
-                &def,
-                &secret,
-                &Matched {
-                    trigger: Trigger::Test,
-                    keyword: None,
-                },
-                &msg,
-                self.0.clock.now_ms(),
-            ))
-            .await;
+        let request = request(
+            &def,
+            &secret,
+            &Matched {
+                trigger: Trigger::Test,
+                keyword: None,
+            },
+            &msg,
+            self.0.clock.now_ms(),
+        );
+        let out = send_request(&self.0.sender, &def, &secret, request, &self.0.clock).await;
         let ok = classify(def.format, &out) == Decision::Delivered;
         TestSendResult {
             ok,
@@ -355,9 +352,21 @@ fn request(
         ),
     ];
     if def.format == WebhookFormat::Generic {
-        let ts = now / 1000;
-        headers.extend([
-            ("X-FastComment-Event-Id".into(), event_id),
+        headers.push(("X-FastComment-Event-Id".into(), event_id));
+    }
+    OutboundRequest::new(&secret.url, headers, body)
+}
+async fn send_request<T: Sender>(
+    sender: &T,
+    def: &WebhookDef,
+    secret: &WebhookSecret,
+    mut request: OutboundRequest,
+    clock: &Clock,
+) -> Outcome {
+    // 本文・eventId はキュー投入時のまま、Timestamp と署名だけを試行ごとに付ける。
+    if def.format == WebhookFormat::Generic {
+        let ts = clock.now_ms() / 1000;
+        request.headers.extend([
             ("X-FastComment-Timestamp".into(), ts.to_string()),
             (
                 "X-FastComment-Signature".into(),
@@ -368,12 +377,12 @@ fn request(
                         .unwrap_or_default()
                         .as_bytes(),
                     ts,
-                    &body,
+                    &request.body,
                 ),
             ),
         ]);
     }
-    OutboundRequest::new(&secret.url, headers, body)
+    sender.send(request).await
 }
 fn http_status(out: &Outcome) -> Option<u16> {
     if let Outcome::Status { code, .. } = out {
@@ -447,7 +456,14 @@ async fn run_worker<S: SecretStore, T: Sender>(
             tokens = (tokens + (now - refill_at).as_secs_f64() / 2.0).min(5.0);
             refill_at = now;
             tokens -= 1.0;
-            let out = sender.send(item.request.clone()).await;
+            let out = send_request(
+                &sender,
+                &w.def,
+                w.secret.as_ref().expect("active worker has credentials"),
+                item.request.clone(),
+                &clock,
+            )
+            .await;
             attempt += 1;
             {
                 let mut s = w.state.lock().unwrap();
@@ -676,6 +692,103 @@ mod tests {
         for _ in 0..100 {
             tokio::task::yield_now().await;
         }
+    }
+    #[derive(Clone, Default)]
+    struct RetryCapture(Arc<Mutex<Vec<OutboundRequest>>>);
+    impl Sender for RetryCapture {
+        async fn send(&self, request: OutboundRequest) -> Outcome {
+            let mut requests = self.0.lock().unwrap();
+            requests.push(request);
+            if requests.len() == 1 {
+                Outcome::TimedOutAfterSend
+            } else {
+                status(204)
+            }
+        }
+    }
+    fn header<'a>(request: &'a OutboundRequest, name: &str) -> &'a str {
+        let values: Vec<_> = request
+            .headers
+            .iter()
+            .filter(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str())
+            .collect();
+        assert_eq!(values.len(), 1, "expected exactly one {name} header");
+        values[0]
+    }
+    fn verify_signature(request: &OutboundRequest, secret: &str) {
+        use hmac::{Hmac, Mac};
+        let timestamp = header(request, "X-FastComment-Timestamp");
+        let signature = header(request, "X-FastComment-Signature")
+            .strip_prefix("v1=")
+            .unwrap();
+        let mut mac = Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(format!("{timestamp}.").as_bytes());
+        mac.update(&request.body);
+        assert!(mac.verify_slice(&hex::decode(signature).unwrap()).is_ok());
+    }
+    #[tokio::test(start_paused = true)]
+    async fn signatures_use_each_attempt_time_for_retries_and_queued_deliveries() {
+        let dir = tempfile::tempdir().unwrap();
+        let it = Integrations::open(dir.path().into(), MemorySecretStore::new(), 1).await;
+        it.save_webhook(input("https://a.example.test/hook"))
+            .await
+            .unwrap();
+        let secret = it.webhook_snapshot()[0].1.clone().unwrap();
+        let sender = RetryCapture::default();
+        let rt = WebhookRuntime::new(it, sender.clone());
+        rt.reload().await;
+        let first_timestamp = rt.0.clock.now_ms() / 1000;
+        rt.handle_message(&message("first"));
+        rt.handle_message(&message("queued"));
+        settle().await;
+        assert_eq!(sender.0.lock().unwrap().len(), 1);
+
+        // キュー待ちが受け側の推奨許容時間(5 分)を超えても、送信時に署名する。
+        tokio::time::advance(Duration::from_secs(320)).await;
+        settle().await;
+        let requests = sender.0.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        let timestamps: Vec<u64> = requests
+            .iter()
+            .map(|request| header(request, "X-FastComment-Timestamp").parse().unwrap())
+            .collect();
+        assert_eq!(timestamps[0], first_timestamp);
+        assert_eq!(timestamps[1], first_timestamp + 320);
+        assert_eq!(timestamps[2], first_timestamp + 320);
+        assert_eq!(requests[0].body, requests[1].body);
+        assert_eq!(
+            header(&requests[0], "X-FastComment-Event-Id"),
+            header(&requests[1], "X-FastComment-Event-Id")
+        );
+        for request in requests.iter() {
+            verify_signature(request, secret.signing_secret.as_deref().unwrap());
+        }
+        assert_eq!(rt.status()[0].delivered, 2);
+    }
+    #[tokio::test(start_paused = true)]
+    async fn test_send_signs_with_current_timestamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let it = Integrations::open(dir.path().into(), MemorySecretStore::new(), 1).await;
+        let id = it
+            .save_webhook(input("https://a.example.test/hook"))
+            .await
+            .unwrap()
+            .definition
+            .id;
+        let secret = it.webhook_snapshot()[0].1.clone().unwrap();
+        let sender = Capture::default();
+        let rt = WebhookRuntime::new(it, sender.clone());
+        tokio::time::advance(Duration::from_secs(320)).await;
+        let expected = rt.0.clock.now_ms() / 1000;
+        assert!(rt.test_send(&id).await.ok);
+        let requests = sender.0.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            header(&requests[0], "X-FastComment-Timestamp"),
+            expected.to_string()
+        );
+        verify_signature(&requests[0], secret.signing_secret.as_deref().unwrap());
     }
     #[tokio::test(start_paused = true)]
     async fn regression_resume_restarts_auto_stopped_workers() {
