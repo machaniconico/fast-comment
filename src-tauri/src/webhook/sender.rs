@@ -110,15 +110,13 @@ impl Sender for ReqwestSender {
                 }
                 Some(Err(e)) => {
                     let _ = e.without_url();
-                    if code == 429 {
-                        return Outcome::Status {
-                            code,
-                            header_retry_after,
-                            body_retry_after: None,
-                            remaining_zero_reset_after,
-                        };
-                    }
-                    return Outcome::ReadFailed;
+                    // ステータスは受け取れている。本文が読めなくてもステータスで判定する。
+                    return Outcome::Status {
+                        code,
+                        header_retry_after,
+                        body_retry_after: None,
+                        remaining_zero_reset_after,
+                    };
                 }
                 None => break,
             }
@@ -232,6 +230,40 @@ mod tests {
                 remaining_zero_reset_after: None
             }
         );
+    }
+    #[tokio::test]
+    async fn regression_body_failure_keeps_received_status() {
+        for code in [404u16, 200] {
+            let url = serve(axum::Router::new().route(
+                "/",
+                axum::routing::post(move || async move {
+                    let stream = futures_util::stream::once(async {
+                        Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"0123456789"))
+                    })
+                    .chain(futures_util::stream::once(async {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        Err(std::io::Error::other("broken body"))
+                    }));
+                    (
+                        axum::http::StatusCode::from_u16(code).unwrap(),
+                        axum::body::Body::from_stream(stream),
+                    )
+                }),
+            ))
+            .await;
+            assert_eq!(
+                ReqwestSender::new()
+                    .send(OutboundRequest::new(&url, vec![], vec![]))
+                    .await,
+                Outcome::Status {
+                    code,
+                    header_retry_after: None,
+                    body_retry_after: None,
+                    remaining_zero_reset_after: None
+                },
+                "code={code}"
+            );
+        }
     }
     #[tokio::test]
     async fn regression_sender_ignores_environment_proxy() {

@@ -88,8 +88,41 @@ impl<S: SecretStore> Integrations<S> {
         self.0.webhooks.read().unwrap().clone()
     }
     async fn refresh_webhooks(&self, file: &IntegrationsFile) {
-        let snapshot = load_webhook_secrets(file, &self.0.secrets).await;
-        *self.0.webhooks.write().unwrap() = snapshot;
+        let mut snapshot = load_webhook_secrets(file, &self.0.secrets).await;
+        // mark_auto_paused と同じ順(webhooks → auto_paused)で取り、記録を取りこぼさない。
+        let mut current = self.0.webhooks.write().unwrap();
+        let auto = self.0.auto_paused.lock().unwrap();
+        for (d, s) in &mut snapshot {
+            if let Some((p, secret)) = auto.get(&d.id) {
+                if d.paused.is_none() && s.as_ref() == Some(secret) {
+                    d.paused = Some(p.clone());
+                }
+            }
+        }
+        *current = snapshot;
+    }
+    /// 自動停止を await せずにメモリへ反映する。永続化は後から pause_webhook で行う。
+    /// URL/署名鍵の変更後など、送った時の定義と違えば反映せず false を返す。
+    pub(crate) fn mark_auto_paused(
+        &self,
+        def: &WebhookDef,
+        secret: &WebhookSecret,
+        paused: Paused,
+    ) -> bool {
+        let mut snapshot = self.0.webhooks.write().unwrap();
+        let Some((d, _)) = snapshot
+            .iter_mut()
+            .find(|(d, s)| d == def && s.as_ref() == Some(secret))
+        else {
+            return false;
+        };
+        d.paused = Some(paused.clone());
+        self.0
+            .auto_paused
+            .lock()
+            .unwrap()
+            .insert(def.id.clone(), (paused, secret.clone()));
+        true
     }
     pub async fn save_webhook(&self, input: WebhookInput) -> Result<WebhookView, IntegrationError> {
         let mut file = self.0.file.lock().await;
@@ -214,28 +247,22 @@ impl<S: SecretStore> Integrations<S> {
             return Err(IntegrationError::FileWrite);
         }
         *file = next;
+        self.0.auto_paused.lock().unwrap().remove(id);
         self.refresh_webhooks(&file).await;
         Ok(())
     }
     pub async fn resume_webhook(&self, id: &str) -> Result<(), IntegrationError> {
         self.set_paused(id, None, None).await
     }
+    /// mark_auto_paused で反映した自動停止をディスクへ保存する。
     pub(crate) async fn pause_webhook(
         &self,
         def: &WebhookDef,
         secret: &WebhookSecret,
-        reason: &str,
-        at_ms: u64,
+        paused: Paused,
     ) -> Result<(), IntegrationError> {
-        self.set_paused(
-            &def.id,
-            Some(Paused {
-                reason: reason.into(),
-                at_ms,
-            }),
-            Some((def, secret)),
-        )
-        .await
+        self.set_paused(&def.id, Some(paused), Some((def, secret)))
+            .await
     }
     async fn set_paused(
         &self,
@@ -251,15 +278,29 @@ impl<S: SecretStore> Integrations<S> {
             .position(|d| d.id == id)
             .ok_or(IntegrationError::InvalidWebhook)?;
         // URL/署名鍵を変更した直後に、旧ワーカーの失敗で新しい送り先を停止しない。
+        // メモリ側の停止は先に反映済みなので、停止状態の差は比べない。
+        // 反映後に明示的な再開・削除があれば記録が消えており、保存しない。
+        let same = |current: &WebhookDef, d: &WebhookDef| {
+            WebhookDef {
+                paused: None,
+                ..current.clone()
+            } == WebhookDef {
+                paused: None,
+                ..d.clone()
+            }
+        };
         if expected.is_some_and(|(d, secret)| {
-            d != &file.webhooks[i]
+            let marked =
+                matches!(self.0.auto_paused.lock().unwrap().get(id), Some((_, s)) if s == secret);
+            !marked
+                || !same(&file.webhooks[i], d)
                 || !self
                     .0
                     .webhooks
                     .read()
                     .unwrap()
                     .iter()
-                    .any(|(current, s)| current == d && s.as_ref() == Some(secret))
+                    .any(|(current, s)| same(current, d) && s.as_ref() == Some(secret))
         }) {
             return Err(IntegrationError::InvalidWebhook);
         }
@@ -270,6 +311,9 @@ impl<S: SecretStore> Integrations<S> {
         // 自動停止は保存失敗時もメモリに残す。無関係な保存・reload で解除しない。
         // 明示的な再開は保存成功後にだけ反映する。
         if saved.is_ok() || auto_pause {
+            if !auto_pause {
+                self.0.auto_paused.lock().unwrap().remove(id);
+            }
             *file = next;
             self.refresh_webhooks(&file).await;
         }
@@ -421,7 +465,14 @@ mod tests {
             .await
             .unwrap();
         assert!(it
-            .pause_webhook(&old_def, old_secret.as_ref().unwrap(), "unauthorized", 2)
+            .pause_webhook(
+                &old_def,
+                old_secret.as_ref().unwrap(),
+                Paused {
+                    reason: "unauthorized".into(),
+                    at_ms: 2
+                }
+            )
             .await
             .is_err());
         assert!(it.list_webhooks()[0].definition.paused.is_none());

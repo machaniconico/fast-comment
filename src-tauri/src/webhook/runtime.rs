@@ -5,7 +5,7 @@ use super::{
     sign, Matched, OutboundRequest, Sender, Trigger,
 };
 use crate::{
-    integrations::{Integrations, SecretStore, WebhookDef, WebhookFormat, WebhookSecret},
+    integrations::{Integrations, Paused, SecretStore, WebhookDef, WebhookFormat, WebhookSecret},
     model::ChatMessage,
 };
 use serde::Serialize;
@@ -101,6 +101,8 @@ struct RuntimeInner<S: SecretStore, T: Sender> {
     workers: Mutex<HashMap<String, Arc<Worker>>>,
     dedup: Mutex<Dedup>,
     reload_lock: tokio::sync::Mutex<()>,
+    // reload の「定義を読む → ワーカーを決める」と、ワーカーの自動停止の反映を直列にする。
+    pause_gate: Arc<Mutex<()>>,
     clock: Clock,
     changed: Arc<Notify>,
 }
@@ -121,12 +123,16 @@ impl<S: SecretStore, T: Sender> WebhookRuntime<S, T> {
             workers: Mutex::new(HashMap::new()),
             dedup: Mutex::new(Dedup::new(8192)),
             reload_lock: tokio::sync::Mutex::new(()),
+            pause_gate: Arc::new(Mutex::new(())),
             clock: Clock::new(),
             changed: Arc::new(Notify::new()),
         }))
     }
     pub async fn reload(&self) {
         let _guard = self.0.reload_lock.lock().await;
+        // 自動停止はスナップショットと状態の両方へ同時に反映される。読み取りの途中に
+        // 割り込ませず、古い定義(未停止)で停止中のワーカーを作り直さない。
+        let _gate = self.0.pause_gate.lock().unwrap();
         let snapshot: Vec<_> = self
             .0
             .integrations
@@ -202,15 +208,16 @@ impl<S: SecretStore, T: Sender> WebhookRuntime<S, T> {
                 cancel: CancellationToken::new(),
             });
             if w.active() {
-                let (worker, integrations, sender, clock, changed) = (
+                let (worker, integrations, sender, clock, changed, gate) = (
                     w.clone(),
                     self.0.integrations.clone(),
                     self.0.sender.clone(),
                     self.0.clock.clone(),
                     self.0.changed.clone(),
+                    self.0.pause_gate.clone(),
                 );
                 let task = tokio::spawn(async move {
-                    tokio::select! { biased; _ = worker.cancel.cancelled() => {}, _ = run_worker(worker.clone(), integrations, sender, clock, changed) => {} }
+                    tokio::select! { biased; _ = worker.cancel.cancelled() => {}, _ = run_worker(worker.clone(), integrations, sender, clock, changed, gate) => {} }
                 });
                 *w.task.lock().unwrap() = Some(task.abort_handle());
             }
@@ -401,6 +408,7 @@ async fn run_worker<S: SecretStore, T: Sender>(
     sender: T,
     clock: Clock,
     changed: Arc<Notify>,
+    gate: Arc<Mutex<()>>,
 ) {
     let mut tokens = 5.0f64;
     let mut refill_at = Instant::now();
@@ -507,26 +515,35 @@ async fn run_worker<S: SecretStore, T: Sender>(
                 }
             }
             if let Some(reason) = pause {
-                {
+                let secret = w.secret.clone().expect("active worker has credentials");
+                let paused = Paused {
+                    reason: reason.into(),
+                    at_ms: clock.now_ms(),
+                };
+                let marked = {
+                    let _gate = gate.lock().unwrap();
+                    let marked = integrations.mark_auto_paused(&w.def, &secret, paused.clone());
                     let mut s = w.state.lock().unwrap();
                     s.status.state = "paused".into();
                     s.status.paused_reason = Some(reason.into());
                     s.status.dropped += s.queue.len() as u64;
                     s.queue.clear();
                     s.status.queued = 0;
-                }
+                    marked
+                };
                 changed.notify_one();
-                if integrations
-                    .pause_webhook(
-                        &w.def,
-                        w.secret.as_ref().expect("active worker has credentials"),
-                        reason,
-                        clock.now_ms(),
-                    )
-                    .await
-                    .is_err()
-                {
-                    tracing::warn!("Webhook 停止状態の保存に失敗しました");
+                // 保存はワーカーの cancel(reload での作り直し)に巻き込まない。
+                if marked {
+                    let def = w.def.clone();
+                    tokio::spawn(async move {
+                        if integrations
+                            .pause_webhook(&def, &secret, paused)
+                            .await
+                            .is_err()
+                        {
+                            tracing::warn!("Webhook 停止状態の保存に失敗しました");
+                        }
+                    });
                 }
                 return;
             }
@@ -797,6 +814,77 @@ mod tests {
             "paused",
             "unrelated save must not resume an auto-paused worker"
         );
+    }
+
+    /// 一度だけ get を止め、停止の永続化(refresh)の途中に reload を割り込ませる。
+    #[derive(Clone, Default)]
+    struct HoldGet {
+        inner: MemorySecretStore,
+        hold: Arc<std::sync::atomic::AtomicBool>,
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+    impl SecretStore for HoldGet {
+        async fn get(&self, k: &str) -> Result<Option<String>, String> {
+            if self.hold.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            self.inner.get(k).await
+        }
+        async fn put(&self, k: &str, v: &str) -> Result<(), String> {
+            self.inner.put(k, v).await
+        }
+        async fn delete(&self, k: &str) -> Result<(), String> {
+            self.inner.delete(k).await
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn reload_during_pause_persistence_must_not_resume() {
+        reload_during_pause(false).await;
+    }
+    #[tokio::test(start_paused = true)]
+    async fn reload_during_failed_pause_persistence_must_not_resume() {
+        reload_during_pause(true).await;
+    }
+    async fn reload_during_pause(save_fails: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = HoldGet::default();
+        let it = Integrations::open(dir.path().into(), store.clone(), 1).await;
+        it.save_webhook(input("https://example.test/hook"))
+            .await
+            .unwrap();
+        let sender = Script::default();
+        sender.outcomes.lock().unwrap().push_back(status(404));
+        let rt = WebhookRuntime::new(it.clone(), sender.clone());
+        rt.reload().await;
+        let path = dir.path().join(crate::integrations::FILE_NAME);
+        if save_fails {
+            std::fs::remove_file(&path).unwrap();
+            std::fs::create_dir(&path).unwrap();
+        }
+        store.hold.store(true, std::sync::atomic::Ordering::SeqCst);
+        rt.handle_message(&message("a"));
+        store.entered.notified().await;
+        rt.reload().await;
+        store.release.notify_one();
+        settle().await;
+        assert_eq!(rt.status()[0].state, "paused", "save_fails={save_fails}");
+        assert!(
+            it.list_webhooks()[0].definition.paused.is_some(),
+            "save_fails={save_fails}"
+        );
+        rt.handle_message(&message("b"));
+        settle().await;
+        assert_eq!(*sender.calls.lock().unwrap(), 1, "save_fails={save_fails}");
+        if !save_fails {
+            let crate::integrations::LoadOutcome::Loaded(file) =
+                crate::integrations::load(dir.path(), 2).unwrap()
+            else {
+                panic!("saved file");
+            };
+            assert!(file.webhooks[0].paused.is_some());
+        }
     }
 
     #[tokio::test(start_paused = true)]

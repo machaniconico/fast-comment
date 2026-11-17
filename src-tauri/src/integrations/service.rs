@@ -39,6 +39,10 @@ pub(super) struct Inner<S> {
     pub(super) secrets: S,
     pub(super) file: Mutex<IntegrationsFile>,
     pub(super) webhooks: RwLock<super::WebhookSnapshot>,
+    // 自動停止をメモリへ同期で反映した記録(id → 停止, 停止時の資格情報)。
+    // ディスク保存の成否や他の保存の refresh で失われない。明示的な再開と削除だけが消す。
+    pub(super) auto_paused:
+        std::sync::Mutex<std::collections::HashMap<String, (super::Paused, super::WebhookSecret)>>,
     status: RwLock<LocalApiStatus>,
     gate: ApiGate,
 }
@@ -111,6 +115,7 @@ impl<S: SecretStore> Integrations<S> {
             secrets,
             file: Mutex::new(file),
             webhooks: RwLock::new(webhooks),
+            auto_paused: Default::default(),
             status: RwLock::new(status),
             gate,
         }))
