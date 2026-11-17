@@ -29,6 +29,12 @@ test('splitKeywords: 重複は除かない(Rust と同じ)', () => {
   assert.deepEqual(splitKeywords('a\na'), ['a', 'a']);
 });
 
+test('splitKeywords: trim は Rust と同じ(U+0085 は除き、U+FEFF は残す)', () => {
+  assert.deepEqual(splitKeywords('\u0085a\u0085'), ['a']);
+  assert.deepEqual(splitKeywords('\ufeffa\ufeff'), ['\ufeffa\ufeff']);
+  assert.deepEqual(splitKeywords('\u00a0\u2003a\u3000'), ['a']);
+});
+
 test('textLength: サロゲートペアを 1 文字と数える', () => {
   assert.equal(textLength('a😀'), 2);
 });

@@ -3,7 +3,7 @@
   import { onDestroy } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-  import type { LocalApiStatus, WebhookInput, WebhookStatus, WebhookTestResult, WebhookView } from '../types';
+  import type { LocalApiStatus, WebhookInput, WebhookStatus, WebhookListItem, WebhookTestResult, WebhookView } from '../types';
   import {
     WEBHOOK_KEYWORDS_MAX,
     WEBHOOK_MAX,
@@ -70,7 +70,7 @@
   // ── Webhook ──
   // 検証・判定・停止はすべて Rust 側。URL・署名シークレットは console にも
   // エラー表示にも出さない(一覧に載るのは Rust が返す伏せ字プレビューだけ)。
-  let hooks = $state<WebhookView[]>([]);
+  let hooks = $state<WebhookListItem[]>([]);
   let hooksBusy = $state(false);
   let hooksError = $state('');
   let editing = $state<WebhookInput | null>(null);
@@ -98,7 +98,7 @@
   }
 
   async function loadHooks() {
-    hooks = await invoke<WebhookView[]>('list_webhooks');
+    hooks = await invoke<WebhookListItem[]>('list_webhooks');
   }
 
   async function runHook(action: () => Promise<void>) {
@@ -129,7 +129,7 @@
     editing = { name: '', format: 'discord', enabled: true, triggers: { donation: true, membership: true, keyword: false }, keywords: [] };
     editingPreview = null; formUrl = ''; formKeywords = '';
   }
-  function startEdit(h: WebhookView) {
+  function startEdit(h: WebhookListItem) {
     editing = { id: h.id, name: h.name, format: h.format, enabled: h.enabled, triggers: { ...h.triggers }, keywords: [...h.keywords] };
     editingPreview = h.urlPreview; formUrl = ''; formKeywords = h.keywords.join('\n');
   }
@@ -143,6 +143,8 @@
     if (url) input.url = url; else delete input.url;
     await runHook(async () => {
       await invoke<WebhookView>('save_webhook', { input });
+      // 形式変更などで Rust がシークレットを作り直すことがあるため、表示キャッシュを捨てる。
+      if (input.id) delete secrets[input.id];
       editing = null; formUrl = ''; formKeywords = '';
       await loadHooks();
     });
@@ -182,7 +184,7 @@
     });
   }
 
-  function triggerSummary(h: WebhookView): string {
+  function triggerSummary(h: WebhookListItem): string {
     const names: string[] = [];
     if (h.triggers.donation) names.push('投げ銭');
     if (h.triggers.membership) names.push('メンバー加入');

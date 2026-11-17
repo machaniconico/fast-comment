@@ -192,7 +192,7 @@ export interface WebhookStatus {
   last: WebhookLastResult | null;
 }
 
-/** `list_webhooks` の 1 件(定義 + URL の有無・伏せ字プレビュー + 状態)。URL 本体は返らない。 */
+/** `save_webhook` の応答(定義 + URL の有無・伏せ字プレビュー)。URL 本体は返らない。 */
 export interface WebhookView {
   id: string;
   name: string;
@@ -203,6 +203,10 @@ export interface WebhookView {
   paused: WebhookPaused | null;
   hasUrl: boolean;
   urlPreview: string | null;
+}
+
+/** `list_webhooks` の 1 件。`WebhookView` に実行時の状態が付く。 */
+export interface WebhookListItem extends WebhookView {
   status: WebhookStatus | null;
 }
 

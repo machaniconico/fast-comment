@@ -6,6 +6,15 @@ export const WEBHOOK_MAX = 10;
 export const WEBHOOK_KEYWORDS_MAX = 20;
 export const WEBHOOK_TEXT_MAX = 64;
 
+// Rust `char::is_whitespace`(Unicode White_Space)。JS の `trim()` は U+FEFF を消し U+0085 を残すので使わない。
+const WS = '[\\t-\\r \\u0085\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000]';
+const WS_EDGE = new RegExp(`^${WS}+|${WS}+$`, 'g');
+
+/** Rust `str::trim` と同じ文字集合で前後を除く。 */
+export function trimWhite(text: string): string {
+  return text.replace(WS_EDGE, '');
+}
+
 /**
  * キーワード欄を 1 行 1 件に分ける。Rust と同じく前後の空白(全角スペース含む)を
  * 除き、空行を捨てる。重複は除かない(Rust も除かない)。
@@ -13,7 +22,7 @@ export const WEBHOOK_TEXT_MAX = 64;
 export function splitKeywords(text: string): string[] {
   return text
     .split(/\r\n|\r|\n/)
-    .map((line) => line.trim())
+    .map(trimWhite)
     .filter((line) => line !== '');
 }
 

@@ -173,31 +173,35 @@ curl.exe -H "Authorization: Bearer <token>" http://127.0.0.1:<port>/api/v1/statu
 
 署名の対象は `"<Timestamp>.<リクエスト本文のバイト列>"`、鍵は署名シークレット(文字列そのまま)です。タイムスタンプが古い(例 5 分超)リクエストは拒否してください。
 
-Node.js の例です(本文は JSON に直す前の生のバイト列で検証します)。
+Node.js の例です(本文は JSON に直す前の生のバイト列で検証します。不正な入力は例外にせず `false` を返します)。
 
 ```js
 import { createHmac, timingSafeEqual } from 'node:crypto';
 
 export function verify(secret, headers, rawBody) {
-  const ts = headers['x-fastcomment-timestamp'];
+  const ts = String(headers['x-fastcomment-timestamp'] ?? '');
+  const sig = String(headers['x-fastcomment-signature'] ?? '');
+  if (!/^[0-9]{1,15}$/.test(ts) || !/^v1=[0-9a-f]{64}$/.test(sig)) return false;
   if (Math.abs(Date.now() / 1000 - Number(ts)) > 300) return false;
-  const expected = 'v1=' + createHmac('sha256', secret).update(`${ts}.`).update(rawBody).digest('hex');
-  const got = String(headers['x-fastcomment-signature'] ?? '');
-  return got.length === expected.length && timingSafeEqual(Buffer.from(got), Buffer.from(expected));
+  const expected = createHmac('sha256', secret).update(`${ts}.`).update(rawBody).digest();
+  return timingSafeEqual(Buffer.from(sig.slice(3), 'hex'), expected);
 }
 ```
 
 Python の例です。
 
 ```python
-import hashlib, hmac, time
+import hashlib, hmac, re, time
 
 def verify(secret: str, headers: dict, raw_body: bytes) -> bool:
-    ts = headers["X-FastComment-Timestamp"]
+    ts = headers.get("X-FastComment-Timestamp") or ""
+    sig = headers.get("X-FastComment-Signature") or ""
+    if not re.fullmatch(r"[0-9]{1,15}", ts) or not re.fullmatch(r"v1=[0-9a-f]{64}", sig):
+        return False
     if abs(time.time() - int(ts)) > 300:
         return False
-    mac = hmac.new(secret.encode(), ts.encode() + b"." + raw_body, hashlib.sha256)
-    return hmac.compare_digest("v1=" + mac.hexdigest(), headers["X-FastComment-Signature"])
+    expected = hmac.new(secret.encode(), ts.encode() + b"." + raw_body, hashlib.sha256).digest()
+    return hmac.compare_digest(bytes.fromhex(sig[3:]), expected)
 ```
 
 #### 注意
