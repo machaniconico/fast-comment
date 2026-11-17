@@ -212,7 +212,7 @@ trait TtsBackend { async fn speak(&self, text: String) -> Result<()>; fn availab
   - **投げ銭サマリー**: SuperChat/Bits を通貨別に合計金額・件数、メンバーシップ件数をヘッダーに集計表示。store側でセッション累積(バッファ退避後も保持、一覧クリアでリセット)。bits は通貨キー `bits` に正規化。
   - **ピン留め**: 重要コメントを上部固定ストリップに表示。ピンは ChatMessage 実体を別保持しバッファ退避後も残る。最大5件FIFO。各行にピン/解除ボタン。
   - **キーワード通知**: ハイライト一致コメント到着で効果音(Web Audio)+控えめな画面フラッシュ。ON/OFF・音量は `config.ui.notifySound`/`notifyVolume` に永続化。store の単調 `highlightCount` を `Notifier.svelte` が監視(初回非発火)。
-- **設定画面**: チャンネル追加(Twitch名 / YouTube videoId or URL)、テンプレ選択、TTS設定、NG/ハイライト編集、OBSサーバURLコピー、通知(効果音ON/OFF+音量)。各セクションはコマンドパレットからアンカースクロールで到達可能(`id="settings-*"`)。
+- **設定画面**: チャンネル追加(Twitch名 / YouTube videoId or URL)、テンプレ選択、TTS設定、NG/ハイライト編集、OBSサーバURLコピー、通知(効果音ON/OFF+音量)。各セクションはコマンドパレットからアンカースクロールで到達可能(`id="settings-*"`)。**連携設定**(`IntegrationsSettings.svelte`): 「ローカル API」(`settings-local-api`、§15)と「Webhook」(`settings-webhooks`、§16)は通常の「保存」とは独立で、操作ごとに専用コマンドで即時保存する。URL・トークン・署名シークレットは console・エラー表示に出さず、一覧は Rust が返す `urlPreview` だけを表示する。純関数は `integrations.ts`(キーワード欄の行分割・状態ラベル)。
 - **テンプレ編集** (`TemplateEditor.svelte`, 実装済み): 設定画面からテンプレ選択 + 編集(`index.html` / `style.css` / `app.js`)。内蔵テンプレは閲覧のみ(書き込みは Err)で、複製してカスタム(`custom:<name>`)にしてから編集する。名前空間・複製・削除の仕様は §9.1。ライブプレビュー強化は将来。
 - IPC: `listen("chat", ...)` でバッチ受信。型は `src/lib/types.ts`(Rust model のミラー)。受信は ipc.ts の rAF バッチ flush(最小化/オクルージョンで rAF が止まっても 250ms タイムアウトで必ず flush)。
 
@@ -362,7 +362,7 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
 ## 12. 既知の制約・注意
 
 - WSLでは Tauri ビルド不可(Linuxバイナリになる)。ビルドはWindows側。
-- Webhook のキューと重複排除はメモリのみ。終了時に未送信を捨てる。送信済みコメントの削除は通知を取り消さない。キーワードは全角/半角・ひらがな/カタカナを正規化しない。Discord の素の URL の自動リンク化は防げない。設定 UI は PR5。
+- Webhook のキューと重複排除はメモリのみ。終了時に未送信を捨てる。送信済みコメントの削除は通知を取り消さない。キーワードは全角/半角・ひらがな/カタカナを正規化しない。Discord の素の URL の自動リンク化は防げない。設定 UI は §8。
 - YouTube InnerTube は非公式 → 仕様変更リスク。寛容パース+overrides+ログで吸収。
 - X `live-chat` ストリームも非公式 → 同リスク。寛容パース+`xOverrides` で吸収。
 - 実モデレーションはOAuth必須(P6)。
@@ -476,3 +476,4 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
 - 状態は active/disabled/paused/noUrl、成功・失敗・破棄・uncertain 件数、待ち件数、最後の結果。`webhook-status` は変化時のみ最大毎秒 1 回 emit。テスト送信は固定文・trigger=test で規則・キューを通さず 1 回だけ、無効・停止中でも送れ、停止は解除しない。
 
 - 設計書からの補足: Discord の title にも 256 文字の上限を適用する(全体 6000 文字だけでは HTTP 400 になるため。[公式 Embed Limits](https://discord.com/developers/docs/resources/message#embed-object-embed-limits))。
+- 設定 UI(PR5): 設定画面「Webhook」(`id="settings-webhooks"`)。一覧は名前・形式・有効/無効・状態ラベル(active/disabled/paused/noUrl)・URL の伏せ字プレビュー・件数・直近の結果を出し、状態は `list_webhooks` の `status` で取得、以降は `webhook-status` イベントで更新する。追加・編集フォームは名前・形式・URL(伏せ字入力。編集時に空欄なら `url` を送らず保存済みの URL を維持)・きっかけ 3 種・キーワード(1 行 1 語。trim して空行を除く。重複は除かない)・有効。10 件で追加を無効化。削除と署名シークレット再生成は確認つき。汎用 JSON のみ署名シークレットの表示・コピー・再生成。停止中は理由(unauthorized / notFound / redirected / unreachable)を日本語で出して「再開」を出す。エラーは IPC の種別(InvalidWebhook 等)を固定文に変換して表示する。使い方・署名の検証例は README「Webhook の設定」。

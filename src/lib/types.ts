@@ -158,3 +158,71 @@ export interface LocalApiStatus {
   notice: string | null;
   baseUrl: string;
 }
+
+// Webhook(Rust `integrations::webhooks` / `webhook::runtime` の DTO。すべて camelCase)。
+export type WebhookFormat = 'discord' | 'generic';
+
+export interface WebhookTriggers {
+  donation: boolean;
+  membership: boolean;
+  keyword: boolean;
+}
+
+export interface WebhookPaused {
+  reason: string;
+  atMs: number;
+}
+
+export interface WebhookLastResult {
+  atMs: number;
+  httpStatus: number | null;
+  kind: string;
+}
+
+/** `webhook-status` イベントと `list_webhooks` の `status` に載る送り先ごとの状態。 */
+export interface WebhookStatus {
+  id: string;
+  state: string;
+  pausedReason: string | null;
+  delivered: number;
+  failed: number;
+  dropped: number;
+  uncertain: number;
+  queued: number;
+  last: WebhookLastResult | null;
+}
+
+/** `save_webhook` の応答(定義 + URL の有無・伏せ字プレビュー)。URL 本体は返らない。 */
+export interface WebhookView {
+  id: string;
+  name: string;
+  format: WebhookFormat;
+  enabled: boolean;
+  triggers: WebhookTriggers;
+  keywords: string[];
+  paused: WebhookPaused | null;
+  hasUrl: boolean;
+  urlPreview: string | null;
+}
+
+/** `list_webhooks` の 1 件。`WebhookView` に実行時の状態が付く。 */
+export interface WebhookListItem extends WebhookView {
+  status: WebhookStatus | null;
+}
+
+/** `save_webhook` の入力。`id` 無しは新規、`url` 無しは保存済みの URL を変えない。 */
+export interface WebhookInput {
+  id?: string;
+  name: string;
+  format: WebhookFormat;
+  enabled: boolean;
+  triggers: WebhookTriggers;
+  keywords: string[];
+  url?: string;
+}
+
+export interface WebhookTestResult {
+  ok: boolean;
+  status: number | null;
+  errorKind: string | null;
+}
