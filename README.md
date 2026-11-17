@@ -137,6 +137,75 @@ Twitchの配信側モデレーション（コメント削除・タイムアウ�
 
   費用の目安は 2026-11 時点で投稿 1 件 $0.015、URL 入りは 1 件 $0.20 です(告知は URL 入り)。正しい金額は Developer Console で確認してください。更新トークンは `config.json` ではなく OS の資格情報ストアへ保存されます。X の許可はアプリ×ユーザーで 1 つなので、同じ Client ID で別の PC やツールからログインすると先の接続は切れます。毎回同じ文面は X に拒否されるので、テンプレートにタイトルか日時を入れてください。
 
+### ローカル API の使い方
+
+外部ツール(OBS のスクリプト、Bot、n8n など)からコメントを読んだり操作したりするための API です。既定はオフです。
+
+1. 設定画面の「ローカル API」で「有効にする」を入れると、トークンが作られます。
+2. 「トークンをコピー」で取り出し、ツール側の `Authorization: Bearer <トークン>` に設定します。
+3. ベース URL は `http://127.0.0.1:<OBS サーバのポート>/api/v1` です(設定画面の「URL をコピー」)。
+
+```powershell
+curl.exe -H "Authorization: Bearer <token>" http://127.0.0.1:<port>/api/v1/status
+```
+
+主なエンドポイントは `GET /status`・`GET /comments`・`GET /events`(SSE)・`POST /test-comments`・`GET /tts` と `POST /tts/pause|resume|skip|clear`・`GET /timer` と `POST /timer/start|pause|resume|reset` です。詳細は `.claude/SPEC.md` §15 を参照してください。
+
+### Webhook の設定
+
+投げ銭・メンバー加入・キーワード一致のコメントを、Discord や自作のサーバへ自動で送れます。設定画面の「Webhook」で送り先(最大 10 件)を追加します。
+
+- **形式**: 「Discord」はチャンネルの Webhook URL(`https://discord.com/api/webhooks/…`)へ埋め込みメッセージを送ります。「汎用 JSON」は任意の URL へ JSON を POST し、署名を付けます。汎用 JSON の `http` は `localhost` とプライベート IP のみ使えます。それ以外は `https` が必要です。
+- **きっかけ**: 投げ銭・メンバー加入・キーワード一致。キーワードは 1 行 1 語で、大文字小文字は区別しませんが、全角 / 半角・ひらがな / カタカナは区別します。1 つのコメントが複数に当たっても送るのは 1 回です。
+- **テスト送信**: 保存後に「テスト送信」で届くか確認できます(無効・停止中でも送れます)。
+- **自動停止**: 401/403・404/410・リダイレクト・連続失敗が続くと、その送り先は自動で停止します。画面に理由が出るので、直してから「再開」を押してください。自動では再開しません。
+- 配信中に届いたコメントだけが対象で、アプリを閉じると未送信の分は捨てられます。
+
+#### 汎用 JSON の署名の検証
+
+汎用 JSON の送信には、次のヘッダが付きます。署名シークレットは設定画面の「表示」「コピー」で取り出します。
+
+| ヘッダ | 内容 |
+|---|---|
+| `X-FastComment-Event-Id` | イベント ID(再送でも同じ。重複排除に使えます) |
+| `X-FastComment-Timestamp` | UNIX 秒 |
+| `X-FastComment-Signature` | `v1=` + HMAC-SHA256 の 16 進小文字 |
+
+署名の対象は `"<Timestamp>.<リクエスト本文のバイト列>"`、鍵は署名シークレット(文字列そのまま)です。タイムスタンプが古い(例 5 分超)リクエストは拒否してください。
+
+Node.js の例です(本文は JSON に直す前の生のバイト列で検証します)。
+
+```js
+import { createHmac, timingSafeEqual } from 'node:crypto';
+
+export function verify(secret, headers, rawBody) {
+  const ts = headers['x-fastcomment-timestamp'];
+  if (Math.abs(Date.now() / 1000 - Number(ts)) > 300) return false;
+  const expected = 'v1=' + createHmac('sha256', secret).update(`${ts}.`).update(rawBody).digest('hex');
+  const got = String(headers['x-fastcomment-signature'] ?? '');
+  return got.length === expected.length && timingSafeEqual(Buffer.from(got), Buffer.from(expected));
+}
+```
+
+Python の例です。
+
+```python
+import hashlib, hmac, time
+
+def verify(secret: str, headers: dict, raw_body: bytes) -> bool:
+    ts = headers["X-FastComment-Timestamp"]
+    if abs(time.time() - int(ts)) > 300:
+        return False
+    mac = hmac.new(secret.encode(), ts.encode() + b"." + raw_body, hashlib.sha256)
+    return hmac.compare_digest("v1=" + mac.hexdigest(), headers["X-FastComment-Signature"])
+```
+
+#### 注意
+
+- Discord へは `allowed_mentions` を空にして送るため、コメント内の `@everyone` などで通知は飛びません。Markdown も無効化され、`[文字](URL)` の偽装リンクにもなりません。
+- Webhook の URL と署名シークレットは OS の資格情報ストアに保存します。`integrations.json`・`config.json`・ログには書かれず、設定のエクスポートにも含まれません。画面には URL の末尾 4 文字だけが出ます。
+- ローカル API のトークンを OBS のソース URL やテンプレートに書かないでください。ローカル API と Webhook の設定はブラウザからは呼べません(`Origin` 付きのリクエストは拒否され、Webhook の設定はアプリの画面からだけ行えます)。
+
 ## ロードマップ
 
 - [x] P0 足場（設定/モデル/Tauri・Svelte雛形/ビルド導線）
