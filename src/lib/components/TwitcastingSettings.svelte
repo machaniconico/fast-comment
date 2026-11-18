@@ -34,6 +34,7 @@
     otherLoginKept: '別の場所でのログインは残しました',
     recordUnrecognized: '保存済みの認証情報を照合できなかったため、そのまま残しました。',
     unreadableRecordDeleted: '読み取れなかった認証情報を削除しました。',
+    lockTimedOut: '別の場所でツイキャスの認証情報を使用中のため、待ちきれませんでした。しばらく待ってからログアウトを再試行してください。',
   };
 
   async function refresh() {

@@ -206,6 +206,8 @@ enum LogoutIssue {
     OtherLoginKept,
     RecordUnrecognized,
     UnreadableRecordDeleted,
+    // Another session held the credential lock past the wait limit.
+    LockTimedOut,
 }
 
 enum LogoutMarker {
@@ -272,6 +274,7 @@ struct Session {
     memory: Mutex<Memory>,
     changes: watch::Sender<AuthState>,
     logout_marker: LogoutMarker,
+    lock_wait: Duration,
     #[cfg(test)]
     marker_io_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
@@ -332,6 +335,7 @@ impl<S: SecretStore> TwitcastingAuth<S> {
         logout_marker: LogoutMarker,
     ) -> Arc<Self> {
         let (changes, _) = watch::channel(AuthState::LoggedOut);
+        let lock_wait = options.read_timeout;
         Arc::new(Self {
             store,
             endpoints,
@@ -340,6 +344,7 @@ impl<S: SecretStore> TwitcastingAuth<S> {
                 memory: Mutex::new(Memory::default()),
                 changes,
                 logout_marker,
+                lock_wait,
                 #[cfg(test)]
                 marker_io_hook: Mutex::new(None),
             }),
@@ -745,10 +750,9 @@ impl<S: SecretStore> TwitcastingAuth<S> {
             }
 
             if let Ok(Logout::Preserved(record)) = result {
+                // The completed delete is reported through the counter; the reason is this result.
                 if record.is_none() {
-                    memory
-                        .logout_issue
-                        .get_or_insert(LogoutIssue::RecordUnrecognized);
+                    memory.logout_issue = Some(LogoutIssue::RecordUnrecognized);
                 }
                 if let Some(startup) = startup {
                     let client_id = startup.client_id.as_deref();
@@ -768,9 +772,7 @@ impl<S: SecretStore> TwitcastingAuth<S> {
                     return Ok(());
                 }
                 if record.is_some() {
-                    memory
-                        .logout_issue
-                        .get_or_insert(LogoutIssue::OtherLoginKept);
+                    memory.logout_issue = Some(LogoutIssue::OtherLoginKept);
                 }
                 auth.session.notify(&memory, None, 0);
                 return Ok(());
@@ -868,7 +870,9 @@ impl<S: SecretStore> TwitcastingAuth<S> {
                         (None, MarkerTarget::Envelope(value_id(&value)))
                     }
                 };
-                if may_select_current && targets.is_empty() {
+                // The first explicit logout also targets the readable current value, even when
+                // another session's marker already lists older records.
+                if may_select_current && !targets.contains(&id) {
                     targets.insert(id.clone());
                     self.remember_logout_targets(&targets);
                     let append = targets.clone();
@@ -1289,9 +1293,13 @@ impl Session {
 
     async fn check_startup_marker(&self) -> Result<MarkerTargets, LogoutIssue> {
         let lock = self.credential_lock_path()?.map(Path::to_owned);
+        let wait = self.lock_wait;
         self.marker_io(move |path| {
             // This task owns the lock even if the startup caller stops waiting.
-            let _lock = lock.as_deref().map(lock_credential_file).transpose()?;
+            let _lock = lock
+                .as_deref()
+                .map(|lock| lock_credential_file(lock, wait))
+                .transpose()?;
             cleanup_marker_temps(path);
             read_marker(path)
         })
@@ -1305,7 +1313,7 @@ impl Session {
             LogoutMarker::File { lock, .. } => lock
                 .as_deref()
                 .map(Some)
-                .ok_or(LogoutIssue::MarkerInaccessible),
+                .ok_or(LogoutIssue::MarkerUnavailable),
         }
     }
 
@@ -1313,7 +1321,8 @@ impl Session {
         let Some(path) = self.credential_lock_path()?.map(Path::to_owned) else {
             return Ok(None);
         };
-        tokio::task::spawn_blocking(move || lock_credential_file(&path))
+        let wait = self.lock_wait;
+        tokio::task::spawn_blocking(move || lock_credential_file(&path, wait))
             .await
             .unwrap_or(Err(LogoutIssue::MarkerInaccessible))
             .map(Some)
@@ -1344,7 +1353,9 @@ impl Session {
     }
 }
 
-fn lock_credential_file(path: &Path) -> Result<fs::File, LogoutIssue> {
+const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(20);
+
+fn lock_credential_file(path: &Path, wait: Duration) -> Result<fs::File, LogoutIssue> {
     let parent = path.parent().ok_or(LogoutIssue::MarkerInaccessible)?;
     fs::create_dir_all(parent).map_err(|_| LogoutIssue::MarkerInaccessible)?;
     let mut options = fs::OpenOptions::new();
@@ -1358,8 +1369,18 @@ fn lock_credential_file(path: &Path) -> Result<fs::File, LogoutIssue> {
     let file = options
         .open(path)
         .map_err(|_| LogoutIssue::MarkerInaccessible)?;
-    file.lock().map_err(|_| LogoutIssue::MarkerInaccessible)?;
-    Ok(file)
+    // Another session may hold the lock indefinitely; give up instead of blocking the queue.
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(LOCK_RETRY_INTERVAL);
+            }
+            Err(fs::TryLockError::WouldBlock) => return Err(LogoutIssue::LockTimedOut),
+            Err(fs::TryLockError::Error(_)) => return Err(LogoutIssue::MarkerInaccessible),
+        }
+    }
 }
 
 fn inspect_marker(path: &Path) -> Result<Option<fs::Metadata>, LogoutIssue> {
@@ -1426,18 +1447,27 @@ fn record_id(record: &Record) -> String {
     value_id(&serde_json::to_string(record).unwrap_or_default())
 }
 
+// A marker larger than this is not ours; it is treated as corrupt without reading it.
+const MAX_MARKER_BYTES: u64 = 64 * 1024;
+
 fn read_marker(path: &Path) -> Result<MarkerTargets, LogoutIssue> {
     let Some(metadata) = inspect_marker(path)? else {
         return Ok(MarkerTargets::new());
     };
-    if !metadata.is_file() {
+    if !metadata.is_file() || metadata.len() > MAX_MARKER_BYTES {
         return Err(LogoutIssue::MarkerCorrupt);
     }
-    let content = match fs::read(path) {
-        Ok(content) => content,
+    let mut content = Vec::new();
+    let read = fs::File::open(path).and_then(|file| {
+        use io::Read;
+        file.take(MAX_MARKER_BYTES + 1).read_to_end(&mut content)
+    });
+    match read {
+        Ok(_) if content.len() as u64 > MAX_MARKER_BYTES => return Err(LogoutIssue::MarkerCorrupt),
+        Ok(_) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(MarkerTargets::new()),
         Err(_) => return Err(LogoutIssue::MarkerInaccessible),
-    };
+    }
     if content.is_empty() {
         return Ok(MarkerTargets::from([MarkerTarget::Any]));
     }
@@ -3859,7 +3889,7 @@ const fetch = (_path, { body }) => {
 
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join(CREDENTIAL_LOCK_FILE);
-            let _lock = lock_credential_file(&path).unwrap();
+            let _lock = lock_credential_file(&path, Duration::ZERO).unwrap();
             let child = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
@@ -3901,6 +3931,143 @@ const fetch = (_path, { body }) => {
             assert_eq!(auth.status(Some("client"), 0).state, "ready");
             assert!(!abandoned.exists());
             assert!(unrelated.exists());
+        }
+
+        // 修正13-1: 初回の明示ログアウトは、別セッションのマーカーがあっても読めた現在値を消す。
+        #[tokio::test]
+        async fn revision13_first_explicit_logout_deletes_current_despite_other_marker() {
+            let dir = tempfile::tempdir().unwrap();
+            let marker = dir.path().join(LOGOUT_MARKER_FILE);
+            let store = MemorySecretStore::new();
+            seed_record(&store, None).await;
+            store.fail_next_get();
+            let auth = auth_with_marker(store.clone(), marker.clone());
+            auth.initialize(Some("client"), 0).await;
+            assert_eq!(auth.status(Some("client"), 0).state, "loadFailed");
+            // Another session failed to reconcile an old record A and left it in the marker.
+            fs::write(&marker, id_of(&seeded("old-token"))).unwrap();
+
+            auth.disconnect().await.unwrap();
+            assert!(store.raw(TOKEN_KEY).is_none(), "現在の資格情報が残った");
+            auth.initialize(Some("client"), 0).await;
+            assert_ne!(auth.status(Some("client"), 0).state, "ready");
+        }
+
+        // 修正13-2: 削除済みの通知はカウンター、理由は今回の結果(別ログインを保持)。
+        #[tokio::test]
+        async fn revision13_retry_after_unreadable_delete_reports_kept_login() {
+            let root = tempfile::tempdir().unwrap();
+            let config = root.path().join("config");
+            fs::create_dir(&config).unwrap();
+            let marker = config.join(LOGOUT_MARKER_FILE);
+            let store = UnreadableStore::default();
+            store.put(TOKEN_KEY, "invalid envelope").await.unwrap();
+            let auth = TwitcastingAuth::with_logout_files(
+                store.clone(),
+                TwitcastingEndpoints::default(),
+                AuthOptions::default(),
+                Some(marker),
+                Some(root.path().join("credentials.lock")),
+            );
+            auth.initialize(Some("client"), 0).await;
+            assert_eq!(auth.status(Some("client"), 0).state, "loadFailed");
+            set_hook(&auth, {
+                let config = config.clone();
+                move |call| {
+                    // The delete succeeds, then removing the marker fails.
+                    if call == 1 {
+                        fs::remove_dir_all(&config).unwrap();
+                        fs::write(&config, []).unwrap();
+                    }
+                }
+            });
+            assert!(auth.disconnect().await.is_err());
+            assert!(store.0.raw(TOKEN_KEY).is_none());
+            fs::remove_file(&config).unwrap();
+            fs::create_dir(&config).unwrap();
+            // Another session logs in as B before the retry.
+            let other = serde_json::to_string(&seeded("other-token")).unwrap();
+            store.put(TOKEN_KEY, &other).await.unwrap();
+
+            auth.disconnect().await.unwrap();
+            assert_eq!(store.0.raw(TOKEN_KEY).as_deref(), Some(other.as_str()));
+            let status = auth.status(Some("client"), 0);
+            assert_eq!(status.logouts_completed, 1);
+            assert_eq!(
+                serde_json::to_value(status).unwrap()["logoutIssue"],
+                "otherLoginKept"
+            );
+        }
+
+        // 修正13-3: 別セッションがロックを握ったままでも、ログアウトの待ちは上限で終わる。
+        #[tokio::test]
+        async fn revision13_held_credential_lock_ends_the_wait() {
+            let dir = tempfile::tempdir().unwrap();
+            let marker = dir.path().join(LOGOUT_MARKER_FILE);
+            let store = MemorySecretStore::new();
+            seed_record(&store, None).await;
+            let auth = TwitcastingAuth::with_logout_marker(
+                store.clone(),
+                TwitcastingEndpoints::default(),
+                short_options(200),
+                Some(marker.clone()),
+            );
+            auth.initialize(Some("client"), 0).await;
+            assert_eq!(auth.status(Some("client"), 0).state, "ready");
+            let held = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(marker.with_extension("lock"))
+                .unwrap();
+            held.lock().unwrap();
+
+            assert!(auth.disconnect().await.is_err());
+            wait_until(|| !auth.session.memory.lock().unwrap().logout_running).await;
+            let status = auth.status(Some("client"), 0);
+            assert!(status.logout_pending);
+            assert_eq!(
+                serde_json::to_value(status).unwrap()["logoutIssue"],
+                "lockTimedOut"
+            );
+            assert!(store.raw(TOKEN_KEY).is_some());
+            drop(held);
+            auth.disconnect().await.unwrap();
+            assert!(store.raw(TOKEN_KEY).is_none());
+        }
+
+        // 修正13-4: 上限を超えるマーカーは読み込まず破損扱い。
+        #[test]
+        fn revision13_oversized_marker_is_corrupt() {
+            let dir = tempfile::tempdir().unwrap();
+            let marker = dir.path().join(LOGOUT_MARKER_FILE);
+            let lines = (0..1100)
+                .map(|i| value_id(&i.to_string()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(lines.len() > 64 * 1024);
+            fs::write(&marker, lines).unwrap();
+            assert!(matches!(
+                read_marker(&marker),
+                Err(LogoutIssue::MarkerCorrupt)
+            ));
+        }
+
+        // 修正13-5: ローカルデータフォルダーだけ取れない時は「利用できない」を返す。
+        #[tokio::test]
+        async fn revision13_missing_lock_path_is_reported_as_unavailable() {
+            let dir = tempfile::tempdir().unwrap();
+            let store = MemorySecretStore::new();
+            seed_record(&store, None).await;
+            let auth = TwitcastingAuth::with_logout_files(
+                store,
+                TwitcastingEndpoints::default(),
+                AuthOptions::default(),
+                Some(dir.path().join(LOGOUT_MARKER_FILE)),
+                None,
+            );
+            auth.initialize(Some("client"), 0).await;
+            let status = serde_json::to_value(auth.status(Some("client"), 0)).unwrap();
+            assert_eq!(status["logoutIssue"], "markerUnavailable");
         }
 
         #[tokio::test]
