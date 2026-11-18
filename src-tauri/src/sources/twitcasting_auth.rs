@@ -11,7 +11,7 @@ use hyper::{server::conn::http1, service::service_fn};
 use hyper_util::rt::TokioIo;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     convert::Infallible,
     fmt, io,
     sync::{Arc, Mutex},
@@ -32,6 +32,8 @@ pub const CALLBACK_PATH: &str = "/twitcasting/callback";
 pub const TOKEN_PATH: &str = "/twitcasting/token";
 pub const DEFAULT_CLIENT_ID: &str = "";
 const MAX_EXPIRY_SECONDS: u64 = 10 * 365 * 24 * 60 * 60;
+const ROLLBACK_ATTEMPTS: u32 = 3;
+const ROLLBACK_RETRY: Duration = Duration::from_millis(500);
 const WSAECONNRESET: i32 = 10054;
 
 pub fn effective_client_id(override_id: Option<&str>) -> Option<String> {
@@ -165,6 +167,8 @@ struct Memory {
     unauthorized: bool,
     expired: bool,
     expiry_task: Option<DropGuard>,
+    // Tokens whose late write could not be undone; never restore them from the store.
+    revoked: HashSet<String>,
 }
 pub struct TwitcastingAuth<S: SecretStore> {
     store: S,
@@ -193,6 +197,7 @@ impl<S: SecretStore> TwitcastingAuth<S> {
                 unauthorized: false,
                 expired: false,
                 expiry_task: None,
+                revoked: HashSet::new(),
             })),
             changes,
             operation: Arc::new(AsyncMutex::new(())),
@@ -209,8 +214,24 @@ impl<S: SecretStore> TwitcastingAuth<S> {
             .ok()
             .flatten()
             .and_then(|s| serde_json::from_str::<Record>(&s).ok())
-            .filter(|r| valid_token(&r.access_token));
-        self.replace_record(record, client_id, now_ms, observed_at);
+            .filter(|r| valid_token(&r.access_token))
+            // Out-of-range expiries are corrupt; the UI cannot render them as a date.
+            .filter(|r| {
+                r.expires_at_ms
+                    .is_none_or(|e| e <= now_ms.saturating_add(MAX_EXPIRY_SECONDS * 1000))
+            });
+        let revoked = record.as_ref().is_some_and(|r| {
+            self.memory
+                .lock()
+                .unwrap()
+                .revoked
+                .contains(&r.access_token)
+        });
+        if revoked {
+            let _ = tokio::time::timeout(self.options.read_timeout, self.store.delete(TOKEN_KEY))
+                .await;
+        }
+        self.replace_record(record.filter(|_| !revoked), client_id, now_ms, observed_at);
     }
     fn replace_record(
         &self,
@@ -505,7 +526,8 @@ impl<S: SecretStore> TwitcastingAuth<S> {
         let previous = tokio::select! {
             biased;
             stop = login_ended(&cancel, deadline) => return Err(stop),
-            previous = self.store.get(TOKEN_KEY) => previous.map_err(|_| error(Code::TokenStore))?,
+            // An unreadable old value must not block a fresh login; rollback then deletes.
+            previous = self.store.get(TOKEN_KEY) => previous.ok().flatten(),
         };
 
         let (reply, result) = oneshot::channel();
@@ -545,11 +567,25 @@ impl<S: SecretStore> TwitcastingAuth<S> {
                     let _ = reply.send(Err(stop));
                     // The OS write may still be running. Wait before restoring the old value.
                     let saved = match saved {
-                        Some(saved) => saved,
-                        None => write.await,
+                        Some(saved) => Some(saved),
+                        None => tokio::time::timeout(auth.options.read_timeout, &mut write)
+                            .await
+                            .ok(),
                     };
-                    if saved.is_ok() {
-                        auth.restore_previous(previous.as_deref()).await;
+                    let undone = match saved {
+                        Some(Err(_)) => true,
+                        Some(Ok(())) => auth.restore_previous(previous.as_deref()).await,
+                        None => false,
+                    };
+                    if !undone {
+                        // Give up so the operation lock is released; the store may keep the
+                        // cancelled token, so forget the login and refuse to reload that token.
+                        auth.memory
+                            .lock()
+                            .unwrap()
+                            .revoked
+                            .insert(record.access_token);
+                        auth.replace_record(None, None, 0, Instant::now());
                     }
                     return;
                 }
@@ -565,17 +601,22 @@ impl<S: SecretStore> TwitcastingAuth<S> {
         result.await.map_err(|_| error(Code::TokenStore))?
     }
 
-    async fn restore_previous(&self, previous: Option<&str>) {
-        loop {
-            let restored = match previous {
-                Some(value) => self.store.put(TOKEN_KEY, value).await,
-                None => self.store.delete(TOKEN_KEY).await,
-            };
-            if restored.is_ok() {
-                return;
+    async fn restore_previous(&self, previous: Option<&str>) -> bool {
+        for attempt in 0..ROLLBACK_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(ROLLBACK_RETRY).await;
             }
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            let restore = async {
+                match previous {
+                    Some(value) => self.store.put(TOKEN_KEY, value).await,
+                    None => self.store.delete(TOKEN_KEY).await,
+                }
+            };
+            if let Ok(Ok(())) = tokio::time::timeout(self.options.read_timeout, restore).await {
+                return true;
+            }
         }
+        false
     }
 }
 
@@ -654,7 +695,10 @@ history.replaceState(null, '', location.pathname);
 const params = new URLSearchParams(fragment.replaceAll('+', '%2B'));
 const query = new URLSearchParams(search);
 const denied = p => p.get('result') === 'denied' || p.has('error');
-const body = denied(params) || denied(query) ? 'result=denied' : params.toString();
+// Forward only the keys the app reads, so unrelated provider fields cannot grow the body.
+const grant = new URLSearchParams();
+for (const key of ['access_token', 'expires_in', 'state']) { if (params.has(key)) grant.set(key, params.get(key)); }
+const body = denied(params) || denied(query) ? 'result=denied' : grant.toString();
 const message = document.getElementById('message');
 if (!body) { message.textContent = '認証情報が見つかりません'; }
 else { fetch('/twitcasting/token', {method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body}).then(r => { message.textContent = r.ok ? 'アプリに戻ってください。この画面は閉じられます。' : '認証に失敗しました。アプリでやり直してください。'; }).catch(() => { message.textContent = 'アプリでログインをやり直してください。'; }); }
@@ -686,6 +730,16 @@ async fn handle_callback(context: &Loopback, req: Request) -> Response {
         return StatusCode::FORBIDDEN.into_response();
     }
     if req.method() == Method::GET && req.uri().path() == CALLBACK_PATH {
+        // An OAuth error in the query ends the login without waiting for the page script.
+        let denied = url::form_urlencoded::parse(req.uri().query().unwrap_or_default().as_bytes())
+            .any(|(k, v)| k == "error" || (k == "result" && v == "denied"));
+        if denied {
+            let mut accepted = context.accepted.lock().unwrap();
+            if !*accepted && !context.cancel.is_cancelled() {
+                *accepted = true;
+                let _ = context.tx.try_send(Err(error(Code::Denied)));
+            }
+        }
         return Html(PAGE).into_response();
     }
     if req.method() != Method::POST || req.uri().path() != TOKEN_PATH {
@@ -835,6 +889,25 @@ const fetch = (_path, { body }) => {
             format!("{base}#{oauth_error}"),
             format!("{base}?{oauth_error}#state=test-state"),
         ] {
+            let (tx, mut rx) = mpsc::channel(1);
+            let context = Loopback {
+                state: "test-state".into(),
+                port: CALLBACK_PORT,
+                read_timeout: Duration::from_secs(1),
+                tx,
+                accepted: Mutex::new(false),
+                cancel: CancellationToken::new(),
+            };
+            let uri = url.split_once('#').unwrap().0.trim_start_matches(&format!("http://localhost:{CALLBACK_PORT}"));
+            let request = Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .header("host", format!("localhost:{CALLBACK_PORT}"))
+                .body(Body::empty())
+                .unwrap();
+            assert_eq!(handle_callback(&context, request).await.status(), StatusCode::OK);
+            // Only a query error ends the login on the GET itself.
+            assert_eq!(rx.try_recv().is_ok(), url.contains('?'));
             let body = run_callback_script(PAGE, &url);
             assert_eq!(body, "result=denied");
             assert_fixed_denial(body).await;
@@ -884,6 +957,17 @@ const fetch = (_path, { body }) => {
         std::net::SocketAddr,
         tokio::task::JoinHandle<()>,
     ) {
+        login_fixture_with(store, AuthOptions::default().read_timeout).await
+    }
+
+    async fn login_fixture_with<S: SecretStore>(
+        store: S,
+        read_timeout: Duration,
+    ) -> (
+        Arc<TwitcastingAuth<S>>,
+        std::net::SocketAddr,
+        tokio::task::JoinHandle<()>,
+    ) {
         let verify = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let api_base = format!("http://{}", verify.local_addr().unwrap());
         let server = tokio::spawn(async move {
@@ -910,6 +994,7 @@ const fetch = (_path, { body }) => {
             AuthOptions {
                 port: addr.port(),
                 login_timeout: Duration::from_secs(3),
+                read_timeout,
                 ..AuthOptions::default()
             },
         );
@@ -1017,16 +1102,20 @@ const fetch = (_path, { body }) => {
         let store = MemorySecretStore::new();
         let (auth, addr, server) = login_fixture(store.clone()).await;
         let delay = Duration::from_millis(1100);
-        let login = post_grant(auth, addr, delay, "&expires_in=1").await;
-        let status = timeout(Duration::from_secs(2), login)
+        let start = Instant::now();
+        let login = post_grant(auth, addr, delay, "&expires_in=60").await;
+        let status = timeout(Duration::from_secs(5), login)
             .await
             .unwrap()
             .unwrap()
             .unwrap();
+        let elapsed = start.elapsed().as_millis() as u64;
         assert_eq!(status.state, "ready");
         let record: Record = serde_json::from_str(&store.raw(TOKEN_KEY).unwrap()).unwrap();
+        // connect() started after `start` with now_ms = 0, so the receipt time lies in between.
         assert!(record.obtained_at_ms >= delay.as_millis() as u64);
-        assert_eq!(status.expires_at_ms, Some(record.obtained_at_ms + 1000));
+        assert!(record.obtained_at_ms <= elapsed, "{} > {elapsed}", record.obtained_at_ms);
+        assert_eq!(status.expires_at_ms, Some(record.obtained_at_ms + 60_000));
         server.abort();
     }
 
@@ -1132,6 +1221,157 @@ const fetch = (_path, { body }) => {
         assert!(auth.user_id().is_none());
         assert!(auth.bearer(Some("client"), 0).is_none());
         assert!(store.raw(TOKEN_KEY).is_some());
+    }
+
+    #[tokio::test]
+    async fn callback_page_forwards_only_grant_keys() {
+        let base = format!("http://localhost:{CALLBACK_PORT}{CALLBACK_PATH}");
+        let cases = [
+            // Unrelated provider fields must not push a short grant over the limit.
+            (format!("#access_token=short&scope={}&state=test-state", "@".repeat(1365)), "short".to_string()),
+            // A full-length plain token with every forwarded key.
+            (format!("#access_token={}&token_type=bearer&state=test-state&expires_in=315360000", "a".repeat(2048)), "a".repeat(2048)),
+        ];
+        for (fragment, token) in cases {
+            let body = run_callback_script(PAGE, &format!("{base}{fragment}"));
+            assert!(!body.contains("scope"), "unrelated key was forwarded");
+            let (status, grant) = receive_callback_body(body).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(grant.unwrap().token, token);
+        }
+    }
+
+    #[tokio::test]
+    async fn load_treats_out_of_range_expiry_as_corrupt() {
+        let store = MemorySecretStore::new();
+        seed_record(&store, Some(9_001_731_600_000_000)).await;
+        let auth = TwitcastingAuth::new(
+            store,
+            TwitcastingEndpoints::default(),
+            AuthOptions::default(),
+        );
+        let now_ms = 1_763_000_000_000;
+        auth.load(Some("client"), now_ms).await;
+        let status = auth.status(Some("client"), now_ms);
+        assert_eq!(status.state, "loggedOut");
+        assert_eq!(status.expires_at_ms, None);
+    }
+
+    #[derive(Clone, Default)]
+    struct UnreadableStore(MemorySecretStore);
+
+    impl SecretStore for UnreadableStore {
+        async fn get(&self, _key: &str) -> Result<Option<String>, String> {
+            Err("broken".into())
+        }
+        async fn put(&self, key: &str, value: &str) -> Result<(), String> {
+            self.0.put(key, value).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), String> {
+            self.0.delete(key).await
+        }
+    }
+
+    #[tokio::test]
+    async fn unreadable_previous_value_does_not_block_login() {
+        let store = UnreadableStore::default();
+        let (auth, addr, server) = login_fixture(store.clone()).await;
+        auth.load(Some("client"), 0).await;
+        let login = post_grant(auth.clone(), addr, Duration::ZERO, "").await;
+        let status = timeout(Duration::from_secs(5), login)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.state, "ready");
+        assert!(store.0.raw(TOKEN_KEY).is_some());
+        server.abort();
+    }
+
+    /// The first put pauses until resumed (or forever); every later write fails.
+    #[derive(Clone, Default)]
+    struct FailingRollbackStore {
+        inner: MemorySecretStore,
+        writing: Arc<Notify>,
+        resume: Arc<Notify>,
+        hang: bool,
+        puts: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl SecretStore for FailingRollbackStore {
+        async fn get(&self, key: &str) -> Result<Option<String>, String> {
+            self.inner.get(key).await
+        }
+        async fn put(&self, key: &str, value: &str) -> Result<(), String> {
+            if self.puts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
+                return Err("rollback failed".into());
+            }
+            self.writing.notify_one();
+            if self.hang {
+                std::future::pending::<()>().await;
+            }
+            self.resume.notified().await;
+            self.inner.put(key, value).await
+        }
+        async fn delete(&self, _key: &str) -> Result<(), String> {
+            Err("rollback failed".into())
+        }
+    }
+
+    async fn abort_with_failing_rollback(seeded: bool, hang: bool) {
+        let store = FailingRollbackStore {
+            hang,
+            ..Default::default()
+        };
+        if seeded {
+            seed_record(&store.inner, None).await;
+        }
+        let (auth, addr, server) = login_fixture_with(store.clone(), Duration::from_millis(500)).await;
+        auth.load(Some("client"), 0).await;
+        assert_eq!(auth.user_id().as_deref(), seeded.then_some("user"));
+        let login = post_grant(auth.clone(), addr, Duration::ZERO, "").await;
+        timeout(Duration::from_secs(2), store.writing.notified())
+            .await
+            .unwrap();
+        auth.cancel_login();
+        let result = timeout(Duration::from_secs(1), login).await.unwrap().unwrap();
+        assert!(matches!(result.unwrap_err().code, Code::Cancelled));
+        store.resume.notify_one();
+
+        // The rollback gives up instead of holding the operation lock forever.
+        let guard = timeout(Duration::from_secs(5), auth.operation.lock())
+            .await
+            .expect("rollback kept the operation lock");
+        drop(guard);
+        assert_eq!(auth.status(Some("client"), 0).state, "loggedOut");
+        assert!(auth.user_id().is_none());
+        if !hang {
+            assert!(store.inner.raw(TOKEN_KEY).unwrap().contains("new-token"));
+        }
+        // The cancelled token left in the store is not restored.
+        auth.load(Some("client"), 0).await;
+        assert_eq!(auth.status(Some("client"), 0).state, "loggedOut");
+        assert!(auth.bearer(Some("client"), 0).is_none());
+        timeout(Duration::from_secs(5), auth.disconnect())
+            .await
+            .expect("disconnect waited on the abandoned rollback")
+            .unwrap_err();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn failing_delete_after_cancel_releases_lock_and_forgets_token() {
+        abort_with_failing_rollback(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn failing_restore_after_cancel_releases_lock_and_forgets_token() {
+        abort_with_failing_rollback(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn hanging_write_after_cancel_releases_lock() {
+        abort_with_failing_rollback(false, true).await;
     }
 
     #[tokio::test]

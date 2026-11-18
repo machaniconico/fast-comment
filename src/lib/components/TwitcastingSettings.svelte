@@ -13,7 +13,13 @@
   let message = $state('');
   let failed = $state(false);
   let now = $state(Date.now());
-  const expiring = $derived(status?.expiresAtMs != null && status.expiresAtMs - now <= 14 * 86400000);
+  // 範囲外の値は Invalid Date になるので、表示できる日時だけを期限として扱う。
+  const expiry = $derived.by(() => {
+    if (status?.expiresAtMs == null) return null;
+    const date = new Date(status.expiresAtMs);
+    return Number.isNaN(date.getTime()) ? 'invalid' : date;
+  });
+  const expiring = $derived(expiry instanceof Date && expiry.getTime() - now <= 14 * 86400000);
 
   async function refresh() {
     try { status = await getTwitcastingStatus(); }
@@ -65,8 +71,10 @@
       <span>未ログイン</span>
     {/if}
   </div>
-  {#if status?.expiresAtMs != null}
-    <p class:warn={expiring}>有効期限: {new Date(status.expiresAtMs).toLocaleString()}{expiring ? ' (期限が近いか、期限切れです。再ログインしてください)' : ''}</p>
+  {#if expiry === 'invalid'}
+    <p class="warn">有効期限を読み取れません。再ログインしてください。</p>
+  {:else if expiry}
+    <p class:warn={expiring}>有効期限: {expiry.toLocaleString()}{expiring ? ' (期限が近いか、期限切れです。再ログインしてください)' : ''}</p>
   {:else if status?.state === 'ready'}
     <p>有効期限は不明です。認証が切れたら再ログインしてください。</p>
   {/if}

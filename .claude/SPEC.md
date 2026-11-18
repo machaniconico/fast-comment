@@ -22,13 +22,13 @@
 
 - 公式 API v2 の Implicit (`response_type=token`) のみ。ClientSecret は扱わない。公開 ClientID は `DEFAULT_CLIENT_ID` (未登録のため空文字) + 任意の上書き `credentials.twitcastingClientId`。空白だけの上書きは既定へ戻す。
 - ログイン中だけ `127.0.0.1:47822` と `[::1]:47822` を bind。IPv6 無効(アドレス使用不可)のみ IPv4 だけに劣化し、いずれかが使用中なら開始しない。コールバックは `http://localhost:47822/twitcasting/callback`。180 秒・取消・次のログインで終了し、コマンドが返るまでにポートを解放する。
-- 固定 HTML がフラグメントとクエリを読み、直ちに `history.replaceState` で URL を整理する。フラグメントの値はリテラルの `+` を保持してフォームエンコードし、同一オリジンの `POST /twitcasting/token` 本文へ渡す。フラグメントまたはクエリに `result=denied` や OAuth の `error` があれば、固定の `result=denied` を送る。Host / Origin を 3 種のループバックだけに限定、本文 4096 バイト、32 バイト乱数の state を定数時間比較、トークンは 1〜2048 バイトの可視 ASCII。POST の拒否 (`result=denied` または `error`) は Host / Origin 検査後に固定文言で終了し、`error` や `error_description` の値はログ、エラー文、emit に出さない。不正 state / トークンでは待受を継続し、成功は一回限り。全応答に no-store / no-referrer / nosniff / 外部リソース禁止 CSP を付ける。
+- 固定 HTML がフラグメントとクエリを読み、直ちに `history.replaceState` で URL を整理する。フラグメントの `access_token` / `expires_in` / `state` だけをリテラルの `+` を保持してフォームエンコードし、同一オリジンの `POST /twitcasting/token` 本文へ渡す。フラグメントまたはクエリに `result=denied` や OAuth の `error` があれば、固定の `result=denied` を送る。クエリの `error` / `result=denied` はサーバーが `GET` の時点で拒否として終了する。Host / Origin を 3 種のループバックだけに限定、本文 4096 バイト、32 バイト乱数の state を定数時間比較、トークンは 1〜2048 バイトの可視 ASCII。POST の拒否 (`result=denied` または `error`) は Host / Origin 検査後に固定文言で終了し、`error` や `error_description` の値はログ、エラー文、emit に出さない。不正 state / トークンでは待受を継続し、成功は一回限り。全応答に no-store / no-referrer / nosniff / 外部リソース禁止 CSP を付ける。
 - 保存前に `/verify_credentials` を Bearer、`X-Api-Version: 2.0`、JSON Accept で呼び、`app.client_id` を照合する。トークン・state はログ、エラー文、Debug、emit、状態 JSON に出さない。
-- 資格情報ストア (`integrations::SecretStore`、service `fast-comment`、キー `twitcasting-oauth-token`) に `{clientId, accessToken, userId, screenId, name, expiresAtMs, obtainedAtMs}` を保存する。`obtainedAtMs` はコールバックの grant 受領時刻。`expires_in` は省略時のみ期限不明とし、指定時は 1 秒から 315360000 秒 (365 日 × 10 年) までの整数を受け付ける。期限切れや不正な期限ではログインを失敗させる。起動時に復元する。
-- 資格情報の保存待ちでも取消・時間切れから 1 秒以内にログインを終了する。保存済みのメモリ状態を維持し、遅れて成功した書き込みは後続の資格情報操作より先に取り消して元の値へ戻す。
+- 資格情報ストア (`integrations::SecretStore`、service `fast-comment`、キー `twitcasting-oauth-token`) に `{clientId, accessToken, userId, screenId, name, expiresAtMs, obtainedAtMs}` を保存する。`obtainedAtMs` はコールバックの grant 受領時刻。`expires_in` は省略時のみ期限不明とし、指定時は 1 秒から 315360000 秒 (365 日 × 10 年) までの整数を受け付ける。期限切れや不正な期限ではログインを失敗させる。起動時に復元する。保存値の読み取り失敗は旧値なしとして新規ログインを続行し、復元時に `expiresAtMs` が現在から 10 年を超える値は破損として扱う(UI も表示できない日時は「読み取れません」と出す)。
+- 資格情報の保存待ちでも取消・時間切れから 1 秒以内にログインを終了する。保存済みのメモリ状態を維持し、遅れて成功した書き込みは後続の資格情報操作より先に取り消して元の値へ戻す。書き込みの完了待ちと取り消し (削除 / 旧値の書き戻し) は各 `read_timeout` まで、取り消しは 3 回で諦め、メモリを未ログインにして操作ロックを放す。諦めたトークンはこのプロセス内では復元しない。
 - `LoggedOut` / `Ready` / `ReloginRequired` を watch 通知。期限切れ (`now >= expiresAtMs`)、ClientID 不一致、401 通知で再ログインが必要になる。既知の期限はタイマーでも通知する。Bearer は Ready かつ期限内かつ ClientID 一致時のみ取得でき、API リクエストの 401 は取得時の世代が一致する場合だけ現在のログインを失効させる。`user_id()` は Ready 時に返す。失効では保存値を残し、明示ログアウトで削除してメモリも消す(削除失敗時もメモリは消す)。
 - 設定の認証情報に状態、アカウント、期限(残り 14 日以下は警告)、ログイン / 取消 / ログアウト、ClientID 上書きとコールバック URL を表示。`get_twitcasting_status` / `connect_twitcasting` / `cancel_twitcasting_login` / `disconnect_twitcasting` を使い、接続時は ClientID だけ即時保存する。ツイキャス側の許可解除は連携アプリ設定で行う。
-- 残るリスク: Implicit のフラグメント付き URL が一瞬ブラウザ履歴に載る。待受終了後のコールバックでは接続拒否画面の URL 欄にトークンが残る場合がある。PR1 は認証のみで、コメント受信は後続 PR。
+- 残るリスク: Implicit のフラグメント付き URL が一瞬ブラウザ履歴に載る。遅れた書き込みが成功してから取り消すまでの間、または取り消しを諦めた後にアプリが終了すると、取り消したトークンが次の起動で復元されうる(取消済みの印はプロセス内のみ)。待受終了後のコールバックでは接続拒否画面の URL 欄にトークンが残る場合がある。PR1 は認証のみで、コメント受信は後続 PR。
 
 ## 2. 全体アーキテクチャ
 
