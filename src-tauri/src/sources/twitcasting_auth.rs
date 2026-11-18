@@ -732,7 +732,7 @@ else { fetch('/twitcasting/token', {method:'POST',headers:{'Content-Type':'appli
 async fn callback(context: &Loopback, req: Request) -> Response {
     let mut response = handle_callback(context, req).await;
     let headers = response.headers_mut();
-    for (k,v) in [("cache-control","no-store"), ("referrer-policy","no-referrer"), ("x-content-type-options","nosniff"), ("content-security-policy","default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'")] { headers.insert(k, v.parse().unwrap()); }
+    for (k,v) in [("cache-control","no-store"), ("referrer-policy","no-referrer"), ("x-content-type-options","nosniff"), ("content-security-policy","default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'")] { headers.insert(k, v.parse().unwrap()); }
     response
 }
 async fn handle_callback(context: &Loopback, req: Request) -> Response {
@@ -780,8 +780,8 @@ async fn handle_callback(context: &Loopback, req: Request) -> Response {
         };
     let params = parse_form(&body);
     let (grant, response) = if refused(&params) {
-        // A refusal carries no state per the provider flow; one that does must match.
-        if params.get("state").is_some_and(|s| !state_matches(context, s)) {
+        // Only this login's state may end it, so a stale page or a third party cannot.
+        if !params.get("state").is_some_and(|s| state_matches(context, s)) {
             return StatusCode::BAD_REQUEST.into_response();
         }
         (Err(error(Code::Denied)), StatusCode::OK)
@@ -936,15 +936,19 @@ const fetch = (_path, { body }) => {
     async fn oauth_error_completes_callback_with_fixed_denial() {
         let oauth_error = "error=access_denied&error_description=private%20provider%20details";
         let base = format!("http://localhost:{CALLBACK_PORT}{CALLBACK_PATH}");
-        for (url, expected) in [
-            (format!("{base}#{oauth_error}"), "result=denied"),
-            (format!("{base}#{oauth_error}&state=test-state"), "result=denied&state=test-state"),
-        ] {
-            let body = run_callback_script(PAGE, &url);
-            assert_eq!(body, expected);
-            assert_fixed_denial(body).await;
+        let body = run_callback_script(PAGE, &format!("{base}#{oauth_error}&state=test-state"));
+        assert_eq!(body, "result=denied&state=test-state");
+        assert_fixed_denial(body).await;
+        assert_fixed_denial(format!("{oauth_error}&state=test-state")).await;
+        // Without this login's state the refusal is ignored and the login keeps waiting.
+        let body = run_callback_script(PAGE, &format!("{base}#{oauth_error}"));
+        assert_eq!(body, "result=denied");
+        for body in [body, oauth_error.to_owned()] {
+            let (context, mut rx) = loopback();
+            let (status, _, _) = send(&context, Method::POST, TOKEN_PATH, &body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(rx.try_recv().is_err(), "stateless refusal ended the login");
         }
-        assert_fixed_denial(oauth_error.into()).await;
     }
 
     fn loopback() -> (Loopback, mpsc::Receiver<Result<Grant, TwitcastingAuthError>>) {
@@ -981,7 +985,7 @@ const fetch = (_path, { body }) => {
         let uri = format!("{CALLBACK_PATH}?error=access_denied&state=test-state");
         let (status, csp, page) = send(&context, Method::GET, &uri, "").await;
         assert_eq!(status, StatusCode::OK);
-        assert!(csp.contains("default-src 'none'"));
+        assert!(csp.ends_with("; frame-ancestors 'none'"));
         assert!(!page.contains("fetch"), "refusal page posts again");
         assert!(matches!(rx.try_recv(), Ok(Err(e)) if matches!(e.code, Code::Denied)));
 
