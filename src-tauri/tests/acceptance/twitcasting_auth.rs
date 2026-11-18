@@ -232,8 +232,11 @@ fn state_of(url: &str) -> String {
 
 /// `connect` を裏で走らせ、`open_browser` に渡った URL から `state` を取り出して返す。
 async fn begin(env: &Env, client: &str, now: u64) -> Login {
+    begin_auth(env.auth.clone(), client, now).await
+}
+
+async fn begin_auth<S: SecretStore>(auth: Arc<TwitcastingAuth<S>>, client: &str, now: u64) -> Login {
     let (tx, rx) = tokio::sync::oneshot::channel::<String>();
-    let auth = env.auth.clone();
     let client = client.to_string();
     let handle = tokio::spawn(async move {
         auth.connect(&client, now, move |url| {
@@ -280,6 +283,95 @@ async fn cancel_and_join(env: &Env, login: Login) {
 
 fn assert_port_free(port: u16) {
     std::net::TcpListener::bind(("127.0.0.1", port)).expect("ポートが解放されている");
+}
+
+// ---------------------------------------------------------------- 書き込みを止められるストア
+
+/// トークンキーへの `put` を、門が開くまで止める。`entered` は止まった `put` の数。
+#[derive(Clone)]
+struct GateStore {
+    inner: MemorySecretStore,
+    gate: Arc<tokio::sync::watch::Sender<bool>>,
+    entered: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl GateStore {
+    fn closed() -> Self {
+        Self {
+            inner: MemorySecretStore::new(),
+            gate: Arc::new(tokio::sync::watch::channel(false).0),
+            entered: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+    fn open(&self) {
+        self.gate.send_replace(true);
+    }
+    async fn wait_until_put_is_blocked(&self) {
+        for _ in 0..250 {
+            if self.entered.load(Ordering::SeqCst) > 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("保存(put)が呼ばれない");
+    }
+}
+
+impl SecretStore for GateStore {
+    async fn get(&self, key: &str) -> Result<Option<String>, String> {
+        self.inner.get(key).await
+    }
+    async fn put(&self, key: &str, value: &str) -> Result<(), String> {
+        if key == TOKEN_KEY {
+            let mut rx = self.gate.subscribe();
+            if !*rx.borrow() {
+                self.entered.fetch_add(1, Ordering::SeqCst);
+                while !*rx.borrow() {
+                    if rx.changed().await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+        self.inner.put(key, value).await
+    }
+    async fn delete(&self, key: &str) -> Result<(), String> {
+        self.inner.delete(key).await
+    }
+}
+
+struct GateEnv {
+    auth: Arc<TwitcastingAuth<GateStore>>,
+    store: GateStore,
+    port: u16,
+}
+
+fn gate_env(f: &Fake, login_timeout: Duration) -> GateEnv {
+    let port = free_port();
+    let store = GateStore::closed();
+    let endpoints = TwitcastingEndpoints { authorize: "http://127.0.0.1:9/oauth2/authorize".into(), api_base: f.base.clone() };
+    let options = AuthOptions { port, login_timeout, read_timeout: Duration::from_secs(2) };
+    GateEnv { auth: TwitcastingAuth::new(store.clone(), endpoints, options), store, port }
+}
+
+/// 許可(grant)を POST し、保存(put)が止まった所まで進める。POST の応答は待たない。
+async fn grant_and_block_store(env: &GateEnv, login: &Login) {
+    let port = env.port;
+    let body = success_body(&login.state);
+    tokio::spawn(async move {
+        let _ = post_token(port, &local_host(port), None, &body).await;
+    });
+    env.store.wait_until_put_is_blocked().await;
+}
+
+/// 止めた保存を再開し、遅れて書かれる分が落ち着くまで待つ。
+async fn release_and_settle(env: &GateEnv) {
+    env.store.open();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+}
+
+fn form_encode(s: &str) -> String {
+    url::form_urlencoded::byte_serialize(s.as_bytes()).collect()
 }
 
 // ================================================================ 認可 URL と ClientID
@@ -704,7 +796,7 @@ async fn expiry_counts_from_grant_receipt_not_connect_start() {
     let env = env_with(&f);
     let login = begin(&env, CLIENT, NOW).await;
     tokio::time::sleep(Duration::from_millis(1200)).await;
-    let body = format!("access_token={TOKEN}&token_type=bearer&expires_in=1&state={}", login.state);
+    let body = format!("access_token={TOKEN}&token_type=bearer&expires_in=60&state={}", login.state);
     let _ = post_token(env.port, &local_host(env.port), None, &body).await;
     let status = sj(&ok_of(wait(login.handle).await));
     assert_eq!(status["state"], "ready");
@@ -712,7 +804,7 @@ async fn expiry_counts_from_grant_receipt_not_connect_start() {
     let rec = stored(&env).unwrap();
     let obtained = rec["obtainedAtMs"].as_u64().expect("obtainedAtMs は数値");
     assert!(obtained >= NOW + 1200, "obtainedAtMs={obtained}");
-    assert_eq!(rec["expiresAtMs"].as_u64(), Some(obtained + 1000));
+    assert_eq!(rec["expiresAtMs"].as_u64(), Some(obtained + 60_000));
 }
 
 #[tokio::test]
@@ -927,4 +1019,159 @@ fn config_without_twitcasting_fields_loads() {
     let cfg = AppConfig::load(dir.path()).unwrap();
     assert_eq!(cfg.credentials.twitcasting_client_id, None);
     assert_eq!(cfg.credentials.twitch_username, "someone");
+}
+
+// ================================================================ 追加: 取消・拒否・エンコード・ストア異常
+
+const GATE_TIMEOUT_MS: u64 = 1000;
+
+#[tokio::test]
+async fn cancel_during_store_write_returns_within_1s_and_leaves_no_token() {
+    let f = fake(CLIENT, 200).await;
+    let env = gate_env(&f, Duration::from_secs(10));
+    let login = begin_auth(env.auth.clone(), CLIENT, NOW).await;
+    grant_and_block_store(&env, &login).await;
+    env.auth.cancel_login();
+    let r = tokio::time::timeout(Duration::from_secs(1), login.handle)
+        .await
+        .expect("保存が止まっていても取消から 1 秒以内に connect が返る")
+        .expect("タスクが落ちない");
+    assert_eq!(code_str(&err_of(r).code), "cancelled");
+    release_and_settle(&env).await;
+    assert!(env.store.inner.raw(TOKEN_KEY).is_none(), "取消後に新トークンが保存されている");
+    assert_eq!(sj(&env.auth.status(Some(CLIENT), NOW))["state"], "loggedOut");
+    assert!(env.auth.bearer(Some(CLIENT), NOW).is_none());
+}
+
+#[tokio::test]
+async fn cancel_during_store_write_keeps_previous_token() {
+    let f = fake(CLIENT, 200).await;
+    let env = gate_env(&f, Duration::from_secs(10));
+    env.store.inner.put(TOKEN_KEY, &record(CLIENT, "tc-old-token", Some(NOW + 1_000_000))).await.unwrap();
+    env.auth.load(Some(CLIENT), NOW).await;
+    let login = begin_auth(env.auth.clone(), CLIENT, NOW).await;
+    grant_and_block_store(&env, &login).await;
+    env.auth.cancel_login();
+    let r = tokio::time::timeout(Duration::from_secs(1), login.handle)
+        .await
+        .expect("保存が止まっていても取消から 1 秒以内に connect が返る")
+        .expect("タスクが落ちない");
+    assert_eq!(code_str(&err_of(r).code), "cancelled");
+    release_and_settle(&env).await;
+    let rec: Value = serde_json::from_str(&env.store.inner.raw(TOKEN_KEY).expect("前の記録が残る")).unwrap();
+    assert_eq!(rec["accessToken"], "tc-old-token");
+    assert_ne!(env.auth.bearer(Some(CLIENT), NOW).as_deref(), Some(TOKEN), "メモリが新トークンになっている");
+}
+
+#[tokio::test]
+async fn timeout_during_store_write_returns_and_leaves_no_token() {
+    let f = fake(CLIENT, 200).await;
+    let env = gate_env(&f, Duration::from_millis(GATE_TIMEOUT_MS));
+    let started = std::time::Instant::now();
+    let login = begin_auth(env.auth.clone(), CLIENT, NOW).await;
+    grant_and_block_store(&env, &login).await;
+    let r = tokio::time::timeout(Duration::from_secs(3), login.handle)
+        .await
+        .expect("保存が止まっていても時間切れで connect が返る")
+        .expect("タスクが落ちない");
+    assert_eq!(code_str(&err_of(r).code), "loginTimeout");
+    assert!(started.elapsed() < Duration::from_millis(GATE_TIMEOUT_MS + 1500), "時間切れが大きく遅れた");
+    release_and_settle(&env).await;
+    assert!(env.store.inner.raw(TOKEN_KEY).is_none(), "時間切れ後に新トークンが保存されている");
+    assert_eq!(sj(&env.auth.status(Some(CLIENT), NOW))["state"], "loggedOut");
+    assert!(env.auth.bearer(Some(CLIENT), NOW).is_none());
+}
+
+#[tokio::test]
+async fn oauth_error_param_denies_immediately() {
+    const DESC: &str = "secret_desc_marker_42 user said no";
+    let f = fake(CLIENT, 200).await;
+    for via_query in [false, true] {
+        let env = env_with(&f);
+        let login = begin(&env, CLIENT, NOW).await;
+        let params = format!(
+            "error=access_denied&error_description={}&state={}",
+            form_encode(DESC),
+            login.state
+        );
+        if via_query {
+            let req = http("GET", &format!("{CALLBACK_PATH}?{params}"), &local_host(env.port), None, "");
+            let _ = raw_request(env.port, req).await;
+        } else {
+            // フラグメント経由: ページの JS が `location.hash` をそのまま POST する形。
+            let _ = post_token(env.port, &local_host(env.port), None, &params).await;
+        }
+        let r = tokio::time::timeout(Duration::from_secs(5), login.handle)
+            .await
+            .unwrap_or_else(|_| panic!("error パラメータで 180 秒待たず拒否される(via_query={via_query})"))
+            .expect("タスクが落ちない");
+        let e = err_of(r);
+        assert_eq!(code_str(&e.code), "denied", "via_query={via_query}");
+        assert!(env.store.keys().is_empty(), "via_query={via_query}");
+        assert_port_free(env.port);
+        let texts = [
+            format!("{e:?}"),
+            format!("{e}"),
+            serde_json::to_string(&e).unwrap(),
+            sj(&env.auth.status(Some(CLIENT), NOW)).to_string(),
+        ];
+        for t in &texts {
+            assert!(!t.contains("secret_desc_marker_42"), "error_description が出ている: {t}");
+            assert!(!t.contains(&login.state), "state が出ている: {t}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn token_with_form_delimiters_round_trips() {
+    const SPECIAL: &str = "tk+plus%percent&amp=eq-0123456789abcdef";
+    let f = fake(CLIENT, 200).await;
+    let env = env_with(&f);
+    let (r, _) = run_login(&env, CLIENT, NOW, |s| {
+        format!("access_token={}&token_type=bearer&expires_in=15552000&state={s}", form_encode(SPECIAL))
+    })
+    .await;
+    assert_eq!(sj(&ok_of(r))["state"], "ready");
+    assert_eq!(stored(&env).expect("保存される")["accessToken"], SPECIAL);
+    let seen = f.seen.lock().unwrap();
+    assert_eq!(
+        seen.last().and_then(|h| h.get("authorization")).map(String::as_str),
+        Some(format!("Bearer {SPECIAL}").as_str()),
+        "検証にも元の値が使われる"
+    );
+}
+
+#[tokio::test]
+async fn long_scope_callback_is_accepted() {
+    let f = fake(CLIENT, 200).await;
+    let env = env_with(&f);
+    let scope = form_encode(&"@".repeat(1365));
+    let (r, _) = run_login(&env, CLIENT, NOW, |s| {
+        format!("access_token={TOKEN}&token_type=bearer&expires_in=15552000&scope={scope}&state={s}")
+    })
+    .await;
+    assert_eq!(sj(&ok_of(r))["state"], "ready", "長い scope の正当なコールバックが 4096 バイト上限で弾かれた");
+    assert_eq!(stored(&env).unwrap()["accessToken"], TOKEN);
+}
+
+#[tokio::test]
+async fn corrupt_stored_record_does_not_block_new_login() {
+    let f = fake(CLIENT, 200).await;
+    let env = env_with(&f);
+    // JSON としては読めるが TokenRecord としては読めない。
+    env.store.put(TOKEN_KEY, r#"{"unexpected":true,"accessToken":123}"#).await.unwrap();
+    let (r, _) = run_login(&env, CLIENT, NOW, |s| success_body(s)).await;
+    assert_eq!(sj(&ok_of(r))["state"], "ready");
+    let rec = stored(&env).expect("新レコードが保存される");
+    assert_eq!(rec["accessToken"], TOKEN);
+    assert_eq!(rec["clientId"], CLIENT);
+}
+
+#[tokio::test]
+async fn out_of_range_stored_expiry_loads_as_not_ready() {
+    let env = seeded(CLIENT, Some(9_001_731_600_000_000)).await;
+    env.auth.load(Some(CLIENT), NOW).await;
+    let state = status_json(&env, Some(CLIENT), NOW)["state"].as_str().unwrap().to_string();
+    assert!(state == "loggedOut" || state == "reloginRequired", "範囲外の期限で state={state}");
+    assert!(env.auth.bearer(Some(CLIENT), NOW).is_none());
 }
