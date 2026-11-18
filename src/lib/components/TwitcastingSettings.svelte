@@ -24,7 +24,7 @@
   const expiring = $derived(expiry instanceof Date && expiry.getTime() - now <= 14 * 86400000);
 
   const logoutIssueText: Record<NonNullable<TwitcastingStatus['logoutIssue']>, string> = {
-    markerUnavailable: '設定フォルダーを取得できないため、ツイキャスのログインは使えません。設定フォルダーを利用できる状態でアプリを起動し直してください。',
+    markerUnavailable: '設定フォルダーまたはローカルデータフォルダーを取得できないため、ツイキャスのログインは使えません。両方のフォルダーを利用できる状態でアプリを起動し直してください。',
     markerInaccessible: '設定フォルダーにアクセスできません。アクセス権を確認してアプリを再起動するか、ログアウトを再試行してください(再試行ではこの PC の認証情報を削除する場合があります)。',
     markerCorrupt: '設定フォルダー内の twitcasting-logout-pending を移動してから、ログアウトを再試行してください。',
     deleteFailed: '保存済みの認証情報を削除できません。ログアウトを再試行してください。',
@@ -34,7 +34,7 @@
     otherLoginKept: '別の場所でのログインは残しました',
     recordUnrecognized: '保存済みの認証情報を照合できなかったため、そのまま残しました。',
     unreadableRecordDeleted: '読み取れなかった認証情報を削除しました。',
-    lockTimedOut: '別の場所でツイキャスの認証情報を使用中のため、待ちきれませんでした。しばらく待ってからログアウトを再試行してください。',
+    lockTimedOut: '別の場所でツイキャスの認証情報を使用中のため、処理を完了できませんでした。しばらく待ってから、もう一度操作してください。',
   };
 
   async function refresh() {
