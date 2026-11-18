@@ -35,7 +35,8 @@
   async function refresh() {
     try {
       const next = await getTwitcastingStatus();
-      if (status?.logoutPending && next && !next.logoutPending) {
+      // 削除を伴うログアウトが完了した時だけ知らせる(再検査や別ログインの保持では出さない)。
+      if (status && next && (next.logoutsCompleted ?? 0) > (status.logoutsCompleted ?? 0)) {
         message = 'この PC の認証情報を削除しました';
         failed = false;
       }
@@ -63,7 +64,7 @@
     };
   });
   async function connect() {
-    if (connecting || disconnecting || reloading) return;
+    if (connecting || disconnecting || reloading || !status || status.state === 'loading') return;
     connecting = true;
     failed = false;
     message = 'ブラウザでツイキャスにログインし、アプリを許可してください…';
@@ -123,7 +124,7 @@
     {#if connecting}
       <button type="button" onclick={cancel}>取り消す</button>
     {:else}
-      <button type="button" class="primary" onclick={connect} disabled={disconnecting || reloading || status?.logoutPending}>ログイン</button>
+      <button type="button" class="primary" onclick={connect} disabled={disconnecting || reloading || !status || status.state === 'loading' || status.logoutPending}>ログイン</button>
     {/if}
     {#if status?.logoutPending}
       {#if status.logoutIssue === 'checkTimedOut'}

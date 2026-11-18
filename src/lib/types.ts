@@ -233,6 +233,8 @@ export interface TwitcastingStatus {
   state: 'loggedOut' | 'ready' | 'reloginRequired' | 'loading' | 'loadFailed';
   logoutPending?: boolean;
   logoutIssue?: 'markerUnavailable' | 'markerInaccessible' | 'markerCorrupt' | 'deleteFailed' | 'markerAndDeleteFailed' | 'timedOut' | 'checkTimedOut';
+  /** 削除を伴って完了したログアウトの回数(0 のときは省略)。 */
+  logoutsCompleted?: number;
   screenId: string | null;
   name: string | null;
   expiresAtMs: number | null;

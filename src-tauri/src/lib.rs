@@ -1369,6 +1369,37 @@ fn twitcasting_client_id(state: &AppState) -> Option<String> {
     )
 }
 
+/// tauri.conf.json の main ウィンドウ設定(label 省略時は "main")。
+fn main_window_config(
+    windows: &[tauri::utils::config::WindowConfig],
+) -> Option<&tauri::utils::config::WindowConfig> {
+    windows.iter().find(|w| w.label == "main")
+}
+
+/// 2 つ目の起動から呼ぶ。main が閉じられていれば設定から作り直し、表示・前面化する。
+#[cfg(desktop)]
+fn show_main_window(app: &AppHandle) {
+    let window = match app.get_webview_window("main") {
+        Some(window) => window,
+        None => {
+            let Some(config) = main_window_config(&app.config().app.windows).cloned() else {
+                tracing::warn!("main ウィンドウの設定がありません");
+                return;
+            };
+            match tauri::WebviewWindowBuilder::from_config(app, &config).and_then(|b| b.build()) {
+                Ok(window) => window,
+                Err(e) => {
+                    tracing::warn!("main ウィンドウを作り直せません: {e}");
+                    return;
+                }
+            }
+        }
+    };
+    let _ = window.unminimize();
+    let _ = window.show();
+    let _ = window.set_focus();
+}
+
 fn twitcasting_logout_marker(app_config_dir: Option<&std::path::Path>) -> Option<PathBuf> {
     app_config_dir
         .filter(|dir| dir.is_absolute())
@@ -2535,13 +2566,12 @@ pub fn run() {
     let builder = tauri::Builder::default();
     // 単一インスタンス(SPEC「単一インスタンス」)。最初に登録する。2 つ目の起動は
     // 既存のメインウィンドウを前面に出して終了する(資格情報・マーカーの競合を防ぐ)。
+    // 弾幕ウィンドウだけが残っていれば main を作り直す。ウィンドウ作成はイベントループの
+    // コールバック内で同期的に行わない(Windows で止まるため)。
     #[cfg(desktop)]
     let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-        if let Some(window) = app.get_webview_window("main") {
-            let _ = window.unminimize();
-            let _ = window.show();
-            let _ = window.set_focus();
-        }
+        let app = app.clone();
+        tauri::async_runtime::spawn(async move { show_main_window(&app) });
     }));
     builder
         .plugin(tauri_plugin_shell::init())
@@ -2606,11 +2636,8 @@ pub fn run() {
                 AuthOptions::default(),
                 twitcasting_logout_marker(app_config_dir.as_deref()),
             );
-            let client_id = effective_client_id(config.credentials.twitcasting_client_id.as_deref());
-            // 起動を待たせない。完了までは状態 loading を返す(read_timeout で打ち切り)。
-            tauri::async_runtime::spawn(
-                twitcasting_auth.initialize(client_id.as_deref(), timer_now_ms()),
-            );
+            let twitcasting_client_id =
+                effective_client_id(config.credentials.twitcasting_client_id.as_deref());
 
             // 下流 Bus(パイプライン → UI/OBS)。
             let bus = Bus::new(obs_port, stats_tx.clone(), timer_tx.clone());
@@ -2698,7 +2725,13 @@ pub fn run() {
                 ),
             };
             let listener_store = state.listeners.clone();
+            let twitcasting_auth = state.twitcasting_auth.clone();
             app.manage(state);
+            // 共通の資格情報ロックを取る読込は、setup の同期的な読込(Integrations::open)の後に
+            // 始める。起動を待たせず、完了までは状態 loading を返す(read_timeout で打ち切り)。
+            tauri::async_runtime::spawn(
+                twitcasting_auth.initialize(twitcasting_client_id.as_deref(), timer_now_ms()),
+            );
             // 配信開始/終了イベント → X 自動告知。状態は変化時だけ UI へ emit する。
             autopost::spawn_autopost(
                 live_rx,
@@ -2893,6 +2926,28 @@ pub fn run() {
 #[cfg(test)]
 mod followup_tests {
     use super::*;
+
+    // 修正10-2: 2 つ目の起動で main が無い時に作り直す設定を tauri.conf.json から取れる。
+    #[test]
+    fn revision10_main_window_config_comes_from_tauri_conf() {
+        let conf: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let windows: Vec<tauri::utils::config::WindowConfig> =
+            serde_json::from_value(conf["app"]["windows"].clone()).unwrap();
+        let main = main_window_config(&windows).expect("main の設定が無い");
+        assert_eq!(main.label, "main");
+        assert_eq!(main.title, "fast-comment");
+        assert!(main_window_config(&[]).is_none());
+    }
+
+    // 修正10-3: ツイキャスの起動時読込は、setup の同期的な資格情報読込(Integrations::open)の後に始める。
+    #[test]
+    fn revision10_twitcasting_initialize_starts_after_integrations_open() {
+        let source = include_str!("lib.rs");
+        let open = source.find("integrations::Integrations::open(").unwrap();
+        let init = source.find("twitcasting_auth.initialize(").unwrap();
+        assert!(open < init, "Integrations::open より先にツイキャスの読込を始めている");
+    }
 
     #[test]
     fn revision8_marker_requires_an_absolute_app_config_dir() {
