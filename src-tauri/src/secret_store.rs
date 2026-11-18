@@ -67,13 +67,19 @@ where
 
 /// 保存済みのエントリを削除する。存在しない場合は成功扱い。
 pub async fn delete(user: &str) -> Result<(), String> {
+    delete_if_present(user).await.map(|_| ())
+}
+
+/// エントリを削除し、実際に存在していたかを返す。
+pub(crate) async fn delete_if_present(user: &str) -> Result<bool, String> {
     let user = user.to_string();
     let _guard = keyring_lock().lock().await;
     tokio::task::spawn_blocking(move || {
         let entry = keyring::Entry::new(SERVICE, &user)
             .map_err(|e| format!("OS資格情報ストアを開けませんでした: {e}"))?;
         match entry.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Ok(()) => Ok(true),
+            Err(keyring::Error::NoEntry) => Ok(false),
             Err(e) => Err(format!("認証情報をOS資格情報ストアから削除できませんでした: {e}")),
         }
     })

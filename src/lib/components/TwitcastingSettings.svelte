@@ -11,6 +11,7 @@
   let connecting = $state(false);
   let disconnecting = $state(false);
   let reloading = $state(false);
+  let statusError = $state('');
   let message = $state('');
   let failed = $state(false);
   let now = $state(Date.now());
@@ -30,25 +31,35 @@
     markerAndDeleteFailed: 'ログアウトの記録と、保存済みの認証情報の削除に両方失敗しました。設定フォルダーのアクセス権と資格情報の保存先を確認し、ログアウトを再試行してください。',
     timedOut: 'ログアウトの処理が続いています。',
     checkTimedOut: '起動時の確認が時間切れになりました。「再読み込み」を押すか、アプリを再起動してください。ログアウトした覚えがなければ、ログアウトの再試行はしないでください(認証情報が削除されます)。',
+    otherLoginKept: '別の場所でのログインは残しました',
+    recordUnrecognized: '保存済みの認証情報を照合できなかったため、そのまま残しました。',
   };
 
   async function refresh() {
     try {
       const next = await getTwitcastingStatus();
+      if (!next) throw new Error('アプリからログイン状態を受け取れませんでした。');
       // 削除を伴うログアウトが完了した時だけ知らせる(再検査や別ログインの保持では出さない)。
-      if (status && next && (next.logoutsCompleted ?? 0) > (status.logoutsCompleted ?? 0)) {
+      if (status && (next.logoutsCompleted ?? 0) > (status.logoutsCompleted ?? 0)) {
         message = 'この PC の認証情報を削除しました';
         failed = false;
       }
       status = next;
+      statusError = '';
     }
-    catch (e) { message = errorText(e); failed = true; }
+    catch (e) { statusError = errorText(e); }
     now = Date.now();
+  }
+  async function retryStatus() {
+    reloading = true;
+    try { await refresh(); }
+    finally { reloading = false; }
   }
   async function reload() {
     reloading = true;
     try {
       status = await reloadTwitcastingStatus();
+      statusError = '';
       message = '';
       failed = false;
       now = Date.now();
@@ -73,6 +84,7 @@
     onClientIdSaved?.(id);
     try {
       status = await connectTwitcasting(id);
+      statusError = '';
       message = 'ツイキャスにログインしました';
     } catch (e) { message = errorText(e); failed = true; await refresh(); }
     finally { connecting = false; }
@@ -83,7 +95,13 @@
   }
   async function disconnect() {
     disconnecting = true;
-    try { status = await disconnectTwitcasting(); message = 'この PC の認証情報を削除しました'; failed = false; }
+    const completed = status?.logoutsCompleted ?? 0;
+    try {
+      status = await disconnectTwitcasting();
+      statusError = '';
+      message = (status?.logoutsCompleted ?? 0) > completed ? 'この PC の認証情報を削除しました' : '';
+      failed = false;
+    }
     catch (e) { message = errorText(e); failed = true; await refresh(); }
     finally { disconnecting = false; }
   }
@@ -92,7 +110,9 @@
 <fieldset>
   <legend>ツイキャス</legend>
   <div class="field-row">
-    {#if status?.logoutIssue === 'markerUnavailable'}
+    {#if !status && statusError}
+      <span class="warn">ログイン状態を取得できません</span>
+    {:else if status?.logoutIssue === 'markerUnavailable'}
       <span class="warn">ツイキャスのログインを利用できません</span>
     {:else if status?.logoutIssue === 'checkTimedOut'}
       <span class="warn">ログイン状態を確認できません</span>
@@ -110,6 +130,9 @@
       <span>未ログイン</span>
     {/if}
   </div>
+  {#if statusError}
+    <p class="warn" role="status">{statusError}</p>
+  {/if}
   {#if status?.logoutIssue}
     <p class="warn">{logoutIssueText[status.logoutIssue]}</p>
   {/if}
@@ -125,6 +148,9 @@
       <button type="button" onclick={cancel}>取り消す</button>
     {:else}
       <button type="button" class="primary" onclick={connect} disabled={disconnecting || reloading || !status || status.state === 'loading' || status.logoutPending}>ログイン</button>
+    {/if}
+    {#if statusError}
+      <button type="button" onclick={retryStatus} disabled={connecting || disconnecting || reloading}>{status ? 'ログイン状態を再取得' : '再読み込み'}</button>
     {/if}
     {#if status?.logoutPending}
       {#if status.logoutIssue === 'checkTimedOut'}

@@ -1406,6 +1406,19 @@ fn twitcasting_logout_marker(app_config_dir: Option<&std::path::Path>) -> Option
         .map(|dir| dir.join(LOGOUT_MARKER_FILE))
 }
 
+fn setup_twitcasting<S: integrations::SecretStore, R, Register: FnOnce() -> R>(
+    auth: &Arc<TwitcastingAuth<S>>,
+    client_id: Option<&str>,
+    prepare: impl FnOnce() -> Register,
+) -> (R, tauri::async_runtime::JoinHandle<()>) {
+    let register = prepare();
+    // Publish the Loading state before IPC can see it. Poll the future after Integrations::open
+    // and state registration, so its credential reads cannot block setup through the keyring lock.
+    let initialization = auth.initialize(client_id, timer_now_ms());
+    let managed = register();
+    (managed, tauri::async_runtime::spawn(initialization))
+}
+
 #[tauri::command]
 fn get_twitcasting_status(state: State<'_, AppState>) -> TwitcastingStatus {
     state
@@ -2668,69 +2681,72 @@ pub fn run() {
                 );
             }
 
-            let integrations = tauri::async_runtime::block_on(integrations::Integrations::open(
-                config_dir.clone(),
-                integrations::KeyringSecretStore,
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default().as_millis() as u64,
-            ));
-            let api_feed = api::ApiFeed::new(1000);
-            api_feed.bind(&bus, &integrations.gate(), app_cancel.clone());
-            let api_rate_limit = Arc::new(api::RateLimit::new());
-            let api_router = api::router(
-                api::ApiDeps::new(integrations.gate(), obs_cancel.clone())
-                    .with_feed(api_feed.clone())
-                    .with_ops(Arc::new(TauriAppOps(handle.clone())))
-                    .with_rate_limit(api_rate_limit.clone()),
-                obs_port,
-            );
-            let webhook = webhook::WebhookRuntime::new(integrations.clone(), webhook::ReqwestSender::new());
-            let state = AppState {
-                webhook,
-                integrations,
-                api_feed,
-                api_rate_limit,
-                listeners: Arc::new(listeners::ListenerStore::load(&config_dir)),
-                chatlog: chatlog::ChatLog::start(&config_dir, config.log.clone()),
-                config: Mutex::new(config.clone()),
-                config_tx,
-                timer_tx,
-                config_dir,
-                source_tx: source_tx.clone(),
-                bus: bus.clone(),
-                templates: templates.clone(),
-                goals_skin_dir: goals_skin_dir.clone(),
-                app_cancel: app_cancel.clone(),
-                obs_server: Mutex::new(ObsServerControl {
-                    port: obs_port,
-                    cancel: obs_cancel.clone(),
-                }),
-                channels: Mutex::new(HashMap::new()),
-                moderator: Mutex::new(moderator),
-                tts,
-                metadata_tx,
-                reaction_tx,
-                mod_tx,
-                live_tx,
-                autopost_user_tx,
-                autopost_status: autopost_status.clone(),
-                x_post_auth: x_post_auth.clone(),
-                twitcasting_auth,
-                participants: Mutex::new(Vec::new()),
-                youtube_auth: YoutubeAuth::new()
-                    .expect("YouTube投稿用HTTPクライアントの作成に失敗しました"),
-                twitch_auth: Arc::new(
-                    TwitchAuth::new().expect("Twitch認証用HTTPクライアントの作成に失敗しました"),
-                ),
-            };
-            let listener_store = state.listeners.clone();
-            let twitcasting_auth = state.twitcasting_auth.clone();
-            app.manage(state);
-            // 共通の資格情報ロックを取る読込は、setup の同期的な読込(Integrations::open)の後に
-            // 始める。起動を待たせず、完了までは状態 loading を返す(read_timeout で打ち切り)。
-            tauri::async_runtime::spawn(
-                twitcasting_auth.initialize(twitcasting_client_id.as_deref(), timer_now_ms()),
+            let ((api_router, listener_store), _) = setup_twitcasting(
+                &twitcasting_auth,
+                twitcasting_client_id.as_deref(),
+                || {
+                    let integrations = tauri::async_runtime::block_on(integrations::Integrations::open(
+                        config_dir.clone(),
+                        integrations::KeyringSecretStore,
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default().as_millis() as u64,
+                    ));
+                    let api_feed = api::ApiFeed::new(1000);
+                    api_feed.bind(&bus, &integrations.gate(), app_cancel.clone());
+                    let api_rate_limit = Arc::new(api::RateLimit::new());
+                    let api_router = api::router(
+                        api::ApiDeps::new(integrations.gate(), obs_cancel.clone())
+                            .with_feed(api_feed.clone())
+                            .with_ops(Arc::new(TauriAppOps(handle.clone())))
+                            .with_rate_limit(api_rate_limit.clone()),
+                        obs_port,
+                    );
+                    let webhook = webhook::WebhookRuntime::new(integrations.clone(), webhook::ReqwestSender::new());
+                    let state = AppState {
+                        webhook,
+                        integrations,
+                        api_feed,
+                        api_rate_limit,
+                        listeners: Arc::new(listeners::ListenerStore::load(&config_dir)),
+                        chatlog: chatlog::ChatLog::start(&config_dir, config.log.clone()),
+                        config: Mutex::new(config.clone()),
+                        config_tx,
+                        timer_tx,
+                        config_dir,
+                        source_tx: source_tx.clone(),
+                        bus: bus.clone(),
+                        templates: templates.clone(),
+                        goals_skin_dir: goals_skin_dir.clone(),
+                        app_cancel: app_cancel.clone(),
+                        obs_server: Mutex::new(ObsServerControl {
+                            port: obs_port,
+                            cancel: obs_cancel.clone(),
+                        }),
+                        channels: Mutex::new(HashMap::new()),
+                        moderator: Mutex::new(moderator),
+                        tts,
+                        metadata_tx,
+                        reaction_tx,
+                        mod_tx,
+                        live_tx,
+                        autopost_user_tx,
+                        autopost_status: autopost_status.clone(),
+                        x_post_auth: x_post_auth.clone(),
+                        twitcasting_auth: twitcasting_auth.clone(),
+                        participants: Mutex::new(Vec::new()),
+                        youtube_auth: YoutubeAuth::new()
+                            .expect("YouTube投稿用HTTPクライアントの作成に失敗しました"),
+                        twitch_auth: Arc::new(
+                            TwitchAuth::new().expect("Twitch認証用HTTPクライアントの作成に失敗しました"),
+                        ),
+                    };
+                    let listener_store = state.listeners.clone();
+                    move || {
+                        app.manage(state);
+                        (api_router, listener_store)
+                    }
+                },
             );
             // 配信開始/終了イベント → X 自動告知。状態は変化時だけ UI へ emit する。
             autopost::spawn_autopost(
@@ -2940,13 +2956,77 @@ mod followup_tests {
         assert!(main_window_config(&[]).is_none());
     }
 
-    // 修正10-3: ツイキャスの起動時読込は、setup の同期的な資格情報読込(Integrations::open)の後に始める。
+    fn observe_twitcasting_setup() -> (Vec<&'static str>, TwitcastingStatus) {
+        use crate::integrations::SecretStore;
+
+        #[derive(Clone)]
+        struct ObservedStore(Arc<Mutex<Vec<&'static str>>>);
+
+        impl SecretStore for ObservedStore {
+            async fn get(&self, key: &str) -> Result<Option<String>, String> {
+                self.0.lock().unwrap().push(match key {
+                    "local-api-token" => "integration read",
+                    "twitcasting-oauth-token" => "auth read",
+                    _ => panic!("unexpected credential read"),
+                });
+                Ok(None)
+            }
+
+            async fn put(&self, _: &str, _: &str) -> Result<(), String> {
+                panic!("unexpected credential write");
+            }
+
+            async fn delete(&self, _: &str) -> Result<(), String> {
+                panic!("unexpected credential deletion");
+            }
+        }
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let store = ObservedStore(events.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let auth = TwitcastingAuth::new(
+            store.clone(),
+            TwitcastingEndpoints::default(),
+            AuthOptions::default(),
+        );
+        let auth_at_manage = auth.clone();
+        let events_at_manage = events.clone();
+        let (at_manage, initialization) = setup_twitcasting(&auth, Some("client"), || {
+            tauri::async_runtime::block_on(integrations::Integrations::open(
+                dir.path().to_path_buf(),
+                store,
+                0,
+            ));
+            events.lock().unwrap().push("integrations opened");
+            move || {
+                let status = auth_at_manage.status(Some("client"), 0);
+                events_at_manage.lock().unwrap().push("managed");
+                status
+            }
+        });
+        tauri::async_runtime::block_on(initialization).unwrap();
+        let events = events.lock().unwrap().clone();
+        (events, at_manage)
+    }
+
     #[test]
-    fn revision10_twitcasting_initialize_starts_after_integrations_open() {
-        let source = include_str!("lib.rs");
-        let open = source.find("integrations::Integrations::open(").unwrap();
-        let init = source.find("twitcasting_auth.initialize(").unwrap();
-        assert!(open < init, "Integrations::open より先にツイキャスの読込を始めている");
+    fn revision11_twitcasting_is_loading_when_managed() {
+        let (_, at_manage) = observe_twitcasting_setup();
+        assert_eq!(at_manage.state, "loading");
+    }
+
+    #[test]
+    fn revision11_twitcasting_reads_after_integrations_open_and_state_registration() {
+        let (events, _) = observe_twitcasting_setup();
+        assert_eq!(
+            events,
+            [
+                "integration read",
+                "integrations opened",
+                "managed",
+                "auth read"
+            ]
+        );
     }
 
     #[test]

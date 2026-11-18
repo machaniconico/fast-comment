@@ -7,6 +7,10 @@ pub trait SecretStore: Clone + Send + Sync + 'static {
     fn get(&self, key: &str) -> impl Future<Output = Result<Option<String>, String>> + Send;
     fn put(&self, key: &str, value: &str) -> impl Future<Output = Result<(), String>> + Send;
     fn delete(&self, key: &str) -> impl Future<Output = Result<(), String>> + Send;
+    /// Reports whether a previously observed entry was removed when the backend can distinguish it.
+    fn delete_if_present(&self, key: &str) -> impl Future<Output = Result<bool, String>> + Send {
+        async move { self.delete(key).await.map(|()| true) }
+    }
 }
 #[derive(Clone)]
 pub struct KeyringSecretStore;
@@ -80,6 +84,11 @@ impl SecretStore for KeyringSecretStore {
             .await
             .map_err(|_| "資格情報を削除できません".into())
     }
+    async fn delete_if_present(&self, key: &str) -> Result<bool, String> {
+        crate::secret_store::delete_if_present(key)
+            .await
+            .map_err(|_| "資格情報を削除できません".to_string())
+    }
 }
 #[derive(Default)]
 struct Memory {
@@ -125,11 +134,13 @@ impl SecretStore for MemorySecretStore {
         Ok(())
     }
     async fn delete(&self, key: &str) -> Result<(), String> {
+        self.delete_if_present(key).await.map(|_| ())
+    }
+    async fn delete_if_present(&self, key: &str) -> Result<bool, String> {
         let mut m = self.0.lock().unwrap();
         if std::mem::take(&mut m.fail[2]) {
             return Err("資格情報を削除できません".into());
         }
-        m.values.remove(key);
-        Ok(())
+        Ok(m.values.remove(key).is_some())
     }
 }
