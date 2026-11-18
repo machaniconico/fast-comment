@@ -23,11 +23,13 @@
   const expiring = $derived(expiry instanceof Date && expiry.getTime() - now <= 14 * 86400000);
 
   const logoutIssueText: Record<NonNullable<TwitcastingStatus['logoutIssue']>, string> = {
-    markerUnavailable: '設定フォルダーを取得できません。利用できる状態でアプリを起動し直してください。',
-    markerInaccessible: '設定フォルダーとアクセス権を確認し、ログアウトを再試行してください。',
+    markerUnavailable: '設定フォルダーを取得できないため、ツイキャスのログインは使えません。設定フォルダーを利用できる状態でアプリを起動し直してください。',
+    markerInaccessible: '設定フォルダーにアクセスできません。アクセス権を確認してアプリを再起動するか、ログアウトを再試行してください(再試行すると、この PC の認証情報は削除されます)。',
     markerCorrupt: '設定フォルダー内の twitcasting-logout-pending を移動してから、ログアウトを再試行してください。',
     deleteFailed: '保存済みの認証情報を削除できません。ログアウトを再試行してください。',
+    markerAndDeleteFailed: 'ログアウトの記録と、保存済みの認証情報の削除に両方失敗しました。設定フォルダーのアクセス権と資格情報の保存先を確認し、ログアウトを再試行してください。',
     timedOut: 'ログアウトの処理が続いています。',
+    checkTimedOut: '起動時の確認が時間切れになりました。「再読み込み」を押すか、アプリを再起動してください。ログアウトした覚えがなければ、ログアウトの再試行はしないでください(認証情報が削除されます)。',
   };
 
   async function refresh() {
@@ -89,7 +91,11 @@
 <fieldset>
   <legend>ツイキャス</legend>
   <div class="field-row">
-    {#if status?.logoutPending}
+    {#if status?.logoutIssue === 'markerUnavailable'}
+      <span class="warn">ツイキャスのログインを利用できません</span>
+    {:else if status?.logoutIssue === 'checkTimedOut'}
+      <span class="warn">ログイン状態を確認できません</span>
+    {:else if status?.logoutPending}
       <span class="warn">ログアウトが未完了です</span>
     {:else if status?.state === 'ready'}
       <span class="connected">@{status.screenId} ({status.name}) としてログイン中</span>
@@ -120,7 +126,10 @@
       <button type="button" class="primary" onclick={connect} disabled={disconnecting || reloading || status?.logoutPending}>ログイン</button>
     {/if}
     {#if status?.logoutPending}
-      <button type="button" onclick={disconnect} disabled={disconnecting}>ログアウトを再試行</button>
+      {#if status.logoutIssue === 'checkTimedOut'}
+        <button type="button" onclick={reload} disabled={connecting || disconnecting || reloading}>再読み込み</button>
+      {/if}
+      <button type="button" onclick={disconnect} disabled={connecting || disconnecting || reloading}>ログアウトを再試行</button>
     {:else if status?.state === 'ready' || status?.state === 'reloginRequired' || status?.state === 'loadFailed'}
       <button type="button" onclick={disconnect} disabled={connecting || disconnecting || reloading}>ログアウト</button>
       {#if status.state === 'loadFailed'}

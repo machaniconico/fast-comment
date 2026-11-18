@@ -192,13 +192,30 @@ enum LogoutIssue {
     MarkerInaccessible,
     MarkerCorrupt,
     DeleteFailed,
+    MarkerAndDeleteFailed,
     TimedOut,
+    // The startup marker check ran out of time; reloading checks again.
+    CheckTimedOut,
 }
 
 enum LogoutMarker {
     MemoryOnly,
     Unavailable,
     File(PathBuf),
+}
+
+#[derive(Clone, Copy)]
+enum Restore {
+    Load,
+    Retry,
+    // Startup shares one deadline with the marker check before it.
+    Startup(Instant),
+}
+
+enum Logout {
+    Done,
+    // Startup only: the marker had already gone, so nothing was deleted.
+    Abandoned,
 }
 
 #[derive(Default)]
@@ -212,6 +229,10 @@ struct Memory {
     logout_pending: bool,
     logout_issue: Option<LogoutIssue>,
     logout_running: bool,
+    // The startup marker check has not finished, so login waits for its answer.
+    initializing: bool,
+    // The startup check failed without reading the marker; reload may check again.
+    marker_unchecked: bool,
 }
 struct Session {
     memory: Mutex<Memory>,
@@ -239,6 +260,8 @@ impl<S: SecretStore> fmt::Debug for TwitcastingAuth<S> {
     }
 }
 impl<S: SecretStore> TwitcastingAuth<S> {
+    /// Keeps the logout intent in memory only (tests and embedders without a config dir policy).
+    /// The app uses `with_logout_marker`, where `None` means the config dir is missing.
     pub fn new(store: S, endpoints: TwitcastingEndpoints, options: AuthOptions) -> Arc<Self> {
         Self::with_marker(store, endpoints, options, LogoutMarker::MemoryOnly)
     }
@@ -307,16 +330,44 @@ impl<S: SecretStore> TwitcastingAuth<S> {
         Ok(rx)
     }
 
-    pub(crate) async fn initialize(self: &Arc<Self>, client_id: Option<&str>, now_ms: u64) {
-        let check = tokio::time::timeout(
-            self.options.read_timeout,
-            self.session.marker_io(inspect_marker),
-        )
-        .await
-        .unwrap_or(Err(LogoutIssue::MarkerInaccessible));
+    /// Shows `loading` at once; the returned future finishes the startup check within
+    /// one `read_timeout` and can be spawned without blocking app startup.
+    pub(crate) fn initialize(
+        self: &Arc<Self>,
+        client_id: Option<&str>,
+        now_ms: u64,
+    ) -> impl Future<Output = ()> + Send + 'static {
+        let started = Instant::now();
+        {
+            let mut memory = self.session.memory.lock().unwrap();
+            memory.initializing = true;
+            memory.restore = RestoreState::Loading;
+            self.session.notify(&memory, client_id, now_ms);
+        }
+        let auth = self.clone();
+        let client_id = client_id.map(str::to_owned);
+        async move {
+            auth.check_marker(client_id.as_deref(), now_ms, started)
+                .await
+        }
+    }
+
+    async fn check_marker(
+        self: &Arc<Self>,
+        client_id: Option<&str>,
+        now_ms: u64,
+        started: Instant,
+    ) {
+        let deadline = started + self.options.read_timeout;
+        let check = tokio::time::timeout_at(deadline, self.session.marker_io(inspect_marker))
+            .await
+            .unwrap_or(Err(LogoutIssue::CheckTimedOut));
+        // Judge expiry with the time the check took, not the time startup began.
+        let now = || now_ms.saturating_add(started.elapsed().as_millis() as u64);
         let (retry_logout, issue) = match check {
             Ok(None) => {
-                self.load(client_id, now_ms).await;
+                self.restore(client_id, now(), Restore::Startup(deadline))
+                    .await;
                 return;
             }
             Ok(Some(metadata)) => (
@@ -327,34 +378,73 @@ impl<S: SecretStore> TwitcastingAuth<S> {
         };
         {
             let mut memory = self.session.memory.lock().unwrap();
-            memory.logout_pending = true;
-            memory.logout_issue = issue;
+            memory.initializing = false;
+            if matches!(memory.restore, RestoreState::Loading) {
+                memory.restore = RestoreState::Idle;
+            }
+            if !memory.logout_running {
+                memory.logout_pending = true;
+                memory.logout_issue = issue;
+                memory.marker_unchecked = !retry_logout;
+            }
+            self.session.notify(&memory, client_id, now());
         }
-        if retry_logout {
-            let _ = self.disconnect().await;
+        if retry_logout && matches!(self.logout(true).await, Ok(Logout::Abandoned)) {
+            // Another instance finished this logout and may have logged in again.
+            self.load(client_id, now()).await;
         }
     }
 
-    pub(crate) async fn reload(&self, client_id: Option<&str>, now_ms: u64) {
-        self.restore(client_id, now_ms, true).await;
+    /// Retries a failed read, or a startup marker check that could not read the marker.
+    pub(crate) async fn reload(self: &Arc<Self>, client_id: Option<&str>, now_ms: u64) {
+        let recheck = {
+            let mut memory = self.session.memory.lock().unwrap();
+            let recheck = memory.marker_unchecked && !memory.logout_running && !memory.initializing;
+            if recheck {
+                memory.marker_unchecked = false;
+                memory.logout_pending = false;
+                memory.logout_issue = None;
+            }
+            recheck
+        };
+        if recheck {
+            self.initialize(client_id, now_ms).await;
+        } else {
+            self.restore(client_id, now_ms, Restore::Retry).await;
+        }
     }
 
     pub async fn load(&self, client_id: Option<&str>, now_ms: u64) {
-        self.restore(client_id, now_ms, false).await;
+        self.restore(client_id, now_ms, Restore::Load).await;
     }
 
-    async fn restore(&self, client_id: Option<&str>, now_ms: u64, retry_only: bool) {
+    async fn restore(&self, client_id: Option<&str>, now_ms: u64, mode: Restore) {
         let observed_at = Instant::now();
-        let deadline = observed_at + self.options.read_timeout;
+        let deadline = match mode {
+            Restore::Startup(deadline) => deadline,
+            _ => observed_at + self.options.read_timeout,
+        };
         let session = self.session.clone();
         let client_id = client_id.map(str::to_owned);
         let (generation, read) = {
             let mut memory = session.memory.lock().unwrap();
+            let startup = matches!(mode, Restore::Startup(_));
+            if startup {
+                memory.initializing = false;
+                if matches!(memory.restore, RestoreState::Loading) {
+                    memory.restore = RestoreState::Idle;
+                }
+            }
             if memory.logout_pending
                 || memory.unauthorized
+                || memory.initializing
                 || matches!(memory.restore, RestoreState::Loading)
-                || (retry_only && !matches!(memory.restore, RestoreState::Failed))
+                || (matches!(mode, Restore::Retry)
+                    && !matches!(memory.restore, RestoreState::Failed))
             {
+                if startup {
+                    session.notify(&memory, client_id.as_deref(), now_ms);
+                }
                 return;
             }
             let generation = memory.generation;
@@ -396,7 +486,7 @@ impl<S: SecretStore> TwitcastingAuth<S> {
             let mut memory = session.memory.lock().unwrap();
             if memory.generation == generation && matches!(memory.restore, RestoreState::Loading) {
                 memory.restore = RestoreState::Failed;
-                session.auth_state(&memory, client_id.as_deref(), now_ms);
+                session.notify(&memory, client_id.as_deref(), now_ms);
             }
         })
         .await;
@@ -479,6 +569,12 @@ impl<S: SecretStore> TwitcastingAuth<S> {
         }
     }
     pub async fn disconnect(self: &Arc<Self>) -> Result<(), TwitcastingAuthError> {
+        self.logout(false).await.map(|_| ())
+    }
+
+    /// `startup` retries a logout another run left behind: it keeps the marker it found
+    /// and deletes nothing if the marker has gone by the time the deletion would start.
+    async fn logout(self: &Arc<Self>, startup: bool) -> Result<Logout, TwitcastingAuthError> {
         let deadline = Instant::now() + self.options.read_timeout;
         let generation = {
             let login = self.login.lock().unwrap();
@@ -491,15 +587,32 @@ impl<S: SecretStore> TwitcastingAuth<S> {
             }
             memory.logout_pending = true;
             memory.logout_running = true;
+            memory.marker_unchecked = false;
             self.session
                 .replace_record(&mut memory, None, None, 0, Instant::now());
+            self.session.notify(&memory, None, 0);
             memory.generation
         };
         // Keep the intent and deletion running after a caller timeout. Write the
         // marker ahead of the store queue, which can be waiting on an OS call.
         let auth = self.clone();
         let deletion = tokio::spawn(async move {
-            let marked = auth.session.marker_io(mark_logout).await;
+            let marked = if startup {
+                match auth.session.marker_io(inspect_marker).await {
+                    Ok(Some(_)) => Ok(()),
+                    Ok(None) => {
+                        let mut memory = auth.session.memory.lock().unwrap();
+                        memory.logout_running = false;
+                        memory.logout_pending = false;
+                        memory.logout_issue = None;
+                        auth.session.notify(&memory, None, 0);
+                        return Ok(Logout::Abandoned);
+                    }
+                    Err(issue) => Err(issue),
+                }
+            } else {
+                auth.session.marker_io(mark_logout).await
+            };
             if let Err(issue) = marked {
                 auth.session.memory.lock().unwrap().logout_issue = Some(issue);
             }
@@ -510,22 +623,26 @@ impl<S: SecretStore> TwitcastingAuth<S> {
             };
             let result = if deleted {
                 auth.session.marker_io(clear_logout_marker).await
+            } else if marked.is_err() {
+                Err(LogoutIssue::MarkerAndDeleteFailed)
             } else {
-                Err(marked.err().unwrap_or(LogoutIssue::DeleteFailed))
+                Err(LogoutIssue::DeleteFailed)
             };
             let mut memory = auth.session.memory.lock().unwrap();
             memory.logout_running = false;
             memory.logout_pending = result.is_err();
             memory.logout_issue = result.err();
-            result
+            auth.session.notify(&memory, None, 0);
+            result.map(|()| Logout::Done)
         });
         match tokio::time::timeout_at(deadline, deletion).await {
-            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Ok(done))) => Ok(done),
             Ok(_) => Err(error(Code::TokenStore)),
             Err(_) => {
                 let mut memory = self.session.memory.lock().unwrap();
                 if memory.generation == generation && memory.logout_running {
                     memory.logout_issue.get_or_insert(LogoutIssue::TimedOut);
+                    self.session.notify(&memory, None, 0);
                 }
                 Err(error(Code::TokenStore))
             }
@@ -546,9 +663,12 @@ impl<S: SecretStore> TwitcastingAuth<S> {
         let _cancel_on_drop = cancel.clone().drop_guard();
         {
             let mut login = self.login.lock().unwrap();
-            if self.session.memory.lock().unwrap().logout_pending {
+            let memory = self.session.memory.lock().unwrap();
+            // Until the startup check answers, a stale logout could delete this login.
+            if memory.logout_pending || memory.initializing {
                 return Err(error(Code::TokenStore));
             }
+            drop(memory);
             if let Some(old) = login.replace(cancel.clone()) {
                 old.cancel();
             }
@@ -815,6 +935,11 @@ impl Session {
                 }
             });
         }
+    }
+    /// Notifies subscribers even when only the logout or load progress changed.
+    fn notify(&self, memory: &Memory, client_id: Option<&str>, now_ms: u64) {
+        self.auth_state(memory, client_id, now_ms);
+        self.changes.send_modify(|_| {});
     }
     fn auth_state(&self, memory: &Memory, client_id: Option<&str>, now_ms: u64) -> AuthState {
         let state = match &memory.record {
@@ -2533,6 +2658,261 @@ const fetch = (_path, { body }) => {
                 assert!(!page.contains("許可されませんでした"));
                 assert!(!page.contains("fetch"));
             }
+        }
+
+        #[derive(Clone, Default)]
+        struct GatedDeleteStore {
+            inner: MemorySecretStore,
+            resume: Arc<Notify>,
+        }
+
+        impl SecretStore for GatedDeleteStore {
+            async fn get(&self, key: &str) -> Result<Option<String>, String> {
+                self.inner.get(key).await
+            }
+            async fn put(&self, key: &str, value: &str) -> Result<(), String> {
+                self.inner.put(key, value).await
+            }
+            async fn delete(&self, key: &str) -> Result<(), String> {
+                self.resume.notified().await;
+                self.inner.delete(key).await
+            }
+        }
+
+        fn short_options(read_timeout_ms: u64) -> AuthOptions {
+            AuthOptions {
+                read_timeout: Duration::from_millis(read_timeout_ms),
+                ..AuthOptions::default()
+            }
+        }
+
+        fn set_hook(
+            auth: &TwitcastingAuth<impl SecretStore>,
+            hook: impl Fn(usize) + Send + Sync + 'static,
+        ) {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            let calls = AtomicUsize::new(0);
+            *auth.session.marker_io_hook.lock().unwrap() =
+                Some(Arc::new(move || hook(calls.fetch_add(1, Ordering::SeqCst))));
+        }
+
+        async fn wait_until(mut done: impl FnMut() -> bool) {
+            timeout(Duration::from_secs(3), async {
+                while !done() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+
+        // 修正9-1: 別プロセスが削除・再ログインした後で、古い起動時再試行がそれを消さない。
+        #[tokio::test]
+        async fn revision9_startup_retry_rechecks_marker_before_deleting() {
+            let dir = tempfile::tempdir().unwrap();
+            let marker = dir.path().join(LOGOUT_MARKER_FILE);
+            fs::write(&marker, []).unwrap();
+            let store = MemorySecretStore::new();
+            // 別プロセスが再ログインして保存した値の代わり。
+            seed_record(&store, None).await;
+            let auth = auth_with_marker(store.clone(), marker.clone());
+            let removed = marker.clone();
+            set_hook(&auth, move |call| {
+                if call == 1 {
+                    // 起動時の検出後、削除前に別プロセスがログアウトを終えた。
+                    let _ = fs::remove_file(&removed);
+                }
+            });
+            auth.initialize(Some("client"), 0).await;
+            assert!(
+                store.raw(TOKEN_KEY).is_some(),
+                "別プロセスの新しいログインを消した"
+            );
+            assert!(!marker.exists(), "マーカーを作り直した");
+            wait_until(|| auth.status(Some("client"), 0).state == "ready").await;
+            assert!(!auth.status(Some("client"), 0).logout_pending);
+        }
+
+        // 修正9-2: マーカー検査にかかった時間を期限判定に含める。
+        #[tokio::test]
+        async fn revision9_marker_check_time_counts_toward_expiry() {
+            let dir = tempfile::tempdir().unwrap();
+            let store = MemorySecretStore::new();
+            seed_record(&store, Some(150)).await;
+            let auth = auth_with_marker(store, dir.path().join(LOGOUT_MARKER_FILE));
+            set_hook(&auth, |_| std::thread::sleep(Duration::from_millis(250)));
+            auth.initialize(Some("client"), 0).await;
+            assert_eq!(auth.status(Some("client"), 0).state, "reloginRequired");
+        }
+
+        // 修正9-3: 起動処理は呼び出し時点で loading になり、待ちは合計 read_timeout 以内。
+        #[tokio::test]
+        async fn revision9_initialize_is_loading_at_once_and_bounded_by_one_read_timeout() {
+            let dir = tempfile::tempdir().unwrap();
+            let store = PausedReadStore::default();
+            seed_record(&store.inner, None).await;
+            let auth = TwitcastingAuth::with_logout_marker(
+                store.clone(),
+                TwitcastingEndpoints::default(),
+                short_options(300),
+                Some(dir.path().join(LOGOUT_MARKER_FILE)),
+            );
+            set_hook(&auth, |_| std::thread::sleep(Duration::from_millis(200)));
+            let start = Instant::now();
+            let init = auth.initialize(Some("client"), 0);
+            assert_eq!(auth.status(Some("client"), 0).state, "loading");
+            init.await;
+            assert!(
+                start.elapsed() < Duration::from_millis(450),
+                "{:?}",
+                start.elapsed()
+            );
+            assert_eq!(auth.status(Some("client"), 0).state, "loadFailed");
+            store.resume.notify_one();
+        }
+
+        // 修正9-4: 起動時検査の時間切れは権限エラーと区別し、再読み込みで検査し直せる。
+        #[tokio::test]
+        async fn revision9_startup_check_timeout_is_distinct_and_reload_rechecks() {
+            let dir = tempfile::tempdir().unwrap();
+            let store = MemorySecretStore::new();
+            seed_record(&store, None).await;
+            let auth = TwitcastingAuth::with_logout_marker(
+                store.clone(),
+                TwitcastingEndpoints::default(),
+                short_options(100),
+                Some(dir.path().join(LOGOUT_MARKER_FILE)),
+            );
+            set_hook(&auth, |call| {
+                if call == 0 {
+                    std::thread::sleep(Duration::from_millis(300));
+                }
+            });
+            auth.initialize(Some("client"), 0).await;
+            let status = serde_json::to_value(auth.status(Some("client"), 0)).unwrap();
+            assert_eq!(status["logoutIssue"], "checkTimedOut");
+            assert_eq!(status["logoutPending"], true);
+            auth.reload(Some("client"), 0).await;
+            let status = auth.status(Some("client"), 0);
+            assert_eq!(status.state, "ready");
+            assert!(!status.logout_pending);
+            assert!(store.raw(TOKEN_KEY).is_some());
+        }
+
+        // 修正9-5: 状態が同じでもログアウト保留の変化は購読者に通知する。
+        #[tokio::test]
+        async fn revision9_logout_pending_changes_notify_subscribers() {
+            let store = MemorySecretStore::new();
+            let auth = TwitcastingAuth::new(
+                store.clone(),
+                TwitcastingEndpoints::default(),
+                AuthOptions::default(),
+            );
+            let mut rx = auth.subscribe();
+            rx.mark_unchanged();
+            auth.disconnect().await.unwrap();
+            assert!(rx.has_changed().unwrap(), "ログアウト完了が通知されない");
+            store.fail_next_get();
+            rx.mark_unchanged();
+            auth.load(Some("client"), 0).await;
+            assert!(rx.has_changed().unwrap());
+            assert_eq!(*rx.borrow_and_update(), AuthState::LoadFailed);
+        }
+
+        // 修正9-9: マーカーの記録と資格情報の削除が両方失敗したら、両方が分かる理由にする。
+        #[tokio::test]
+        async fn revision9_marker_and_delete_failures_are_both_reported() {
+            let dir = tempfile::tempdir().unwrap();
+            let parent = dir.path().join("config");
+            fs::write(&parent, []).unwrap();
+            let store = MemorySecretStore::new();
+            seed_record(&store, None).await;
+            let auth = auth_with_marker(store.clone(), parent.join(LOGOUT_MARKER_FILE));
+            store.fail_next_delete();
+            assert!(auth.disconnect().await.is_err());
+            let status = serde_json::to_value(auth.status(Some("client"), 0)).unwrap();
+            assert_eq!(status["logoutIssue"], "markerAndDeleteFailed");
+            assert_eq!(status["logoutPending"], true);
+        }
+
+        // 修正9-10a: 時間切れした起動時再試行が続く間の手動再試行は拒否し、重複登録しない。
+        #[tokio::test]
+        async fn revision9_manual_retry_during_timed_out_startup_retry_is_rejected() {
+            let dir = tempfile::tempdir().unwrap();
+            let marker = dir.path().join(LOGOUT_MARKER_FILE);
+            fs::write(&marker, []).unwrap();
+            let store = GatedDeleteStore::default();
+            seed_record(&store.inner, None).await;
+            let auth = TwitcastingAuth::with_logout_marker(
+                store.clone(),
+                TwitcastingEndpoints::default(),
+                short_options(100),
+                Some(marker.clone()),
+            );
+            auth.initialize(Some("client"), 0).await;
+            let status = serde_json::to_value(auth.status(Some("client"), 0)).unwrap();
+            assert_eq!(status["logoutPending"], true);
+            assert_eq!(status["logoutIssue"], "timedOut");
+            let start = Instant::now();
+            assert!(matches!(
+                auth.disconnect().await.unwrap_err().code,
+                Code::TokenStore
+            ));
+            assert!(start.elapsed() < Duration::from_millis(50));
+            assert!(auth.status(Some("client"), 0).logout_pending);
+            store.resume.notify_one();
+        }
+
+        // 修正9-10b: 背景のログアウト完了後は、通知が届き、手動再試行も通る。
+        #[tokio::test]
+        async fn revision9_manual_retry_after_background_completion_succeeds() {
+            let dir = tempfile::tempdir().unwrap();
+            let marker = dir.path().join(LOGOUT_MARKER_FILE);
+            fs::write(&marker, []).unwrap();
+            let store = GatedDeleteStore::default();
+            seed_record(&store.inner, None).await;
+            let auth = TwitcastingAuth::with_logout_marker(
+                store.clone(),
+                TwitcastingEndpoints::default(),
+                short_options(100),
+                Some(marker.clone()),
+            );
+            auth.initialize(Some("client"), 0).await;
+            assert!(auth.status(Some("client"), 0).logout_pending);
+            let mut rx = auth.subscribe();
+            rx.mark_unchanged();
+            store.resume.notify_one();
+            timeout(Duration::from_secs(3), rx.changed())
+                .await
+                .expect("背景のログアウト完了が通知されない")
+                .unwrap();
+            wait_until(|| !auth.status(Some("client"), 0).logout_pending).await;
+            assert!(!marker.exists());
+            assert!(store.inner.raw(TOKEN_KEY).is_none());
+            store.resume.notify_one();
+            auth.disconnect().await.unwrap();
+            assert!(!auth.status(Some("client"), 0).logout_pending);
+        }
+
+        // 修正9-10c: 設定フォルダーが無い時は、起動 → 再試行の後も保留のまま。
+        #[tokio::test]
+        async fn revision9_unavailable_marker_stays_pending_after_retry() {
+            let store = MemorySecretStore::new();
+            seed_record(&store, None).await;
+            let auth = TwitcastingAuth::with_logout_marker(
+                store.clone(),
+                TwitcastingEndpoints::default(),
+                AuthOptions::default(),
+                None,
+            );
+            auth.initialize(Some("client"), 0).await;
+            let status = serde_json::to_value(auth.status(Some("client"), 0)).unwrap();
+            assert_eq!(status["logoutIssue"], "markerUnavailable");
+            assert!(auth.bearer(Some("client"), 0).is_none());
+            assert!(auth.disconnect().await.is_err());
+            let status = serde_json::to_value(auth.status(Some("client"), 0)).unwrap();
+            assert_eq!(status["logoutPending"], true);
+            assert_eq!(status["logoutIssue"], "markerUnavailable");
         }
     }
 }

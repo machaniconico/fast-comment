@@ -232,7 +232,7 @@ export interface TwitcastingStatus {
   configured: boolean;
   state: 'loggedOut' | 'ready' | 'reloginRequired' | 'loading' | 'loadFailed';
   logoutPending?: boolean;
-  logoutIssue?: 'markerUnavailable' | 'markerInaccessible' | 'markerCorrupt' | 'deleteFailed' | 'timedOut';
+  logoutIssue?: 'markerUnavailable' | 'markerInaccessible' | 'markerCorrupt' | 'deleteFailed' | 'markerAndDeleteFailed' | 'timedOut' | 'checkTimedOut';
   screenId: string | null;
   name: string | null;
   expiresAtMs: number | null;

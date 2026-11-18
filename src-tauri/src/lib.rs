@@ -2532,7 +2532,18 @@ pub fn run() {
         )
         .init();
 
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    // 単一インスタンス(SPEC「単一インスタンス」)。最初に登録する。2 つ目の起動は
+    // 既存のメインウィンドウを前面に出して終了する(資格情報・マーカーの競合を防ぐ)。
+    #[cfg(desktop)]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.unminimize();
+            let _ = window.show();
+            let _ = window.set_focus();
+        }
+    }));
+    builder
         .plugin(tauri_plugin_shell::init())
         // 自動更新後の relaunch() 用。
         .plugin(tauri_plugin_process::init())
@@ -2596,7 +2607,8 @@ pub fn run() {
                 twitcasting_logout_marker(app_config_dir.as_deref()),
             );
             let client_id = effective_client_id(config.credentials.twitcasting_client_id.as_deref());
-            tauri::async_runtime::block_on(
+            // 起動を待たせない。完了までは状態 loading を返す(read_timeout で打ち切り)。
+            tauri::async_runtime::spawn(
                 twitcasting_auth.initialize(client_id.as_deref(), timer_now_ms()),
             );
 

@@ -78,6 +78,8 @@ keyring = { version = "3.6", default-features = false, features = ["linux-native
 # 自動更新(GitHub Releases の latest.json を見る)。デスクトップのみ。
 [target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
 tauri-plugin-updater = "2"
+# 二重起動を防ぐ(2 つ目は既存ウィンドウを前面に出して終了)。最初に登録する。
+tauri-plugin-single-instance = "2"
 
 # API / integrations の受け入れテスト(tests/acceptance)用。
 [dev-dependencies]
