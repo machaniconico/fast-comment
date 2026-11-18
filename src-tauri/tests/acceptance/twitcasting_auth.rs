@@ -324,8 +324,8 @@ impl SecretStore for GateStore {
     async fn put(&self, key: &str, value: &str) -> Result<(), String> {
         if key == TOKEN_KEY {
             let mut rx = self.gate.subscribe();
-            if !*rx.borrow() {
-                self.entered.fetch_add(1, Ordering::SeqCst);
+            // 止めるのは最初の 1 回だけ。2 回目以降(次のログイン等)は素通しする。
+            if self.entered.fetch_add(1, Ordering::SeqCst) == 0 && !*rx.borrow() {
                 while !*rx.borrow() {
                     if rx.changed().await.is_err() {
                         break;
@@ -513,24 +513,49 @@ async fn denied_result_fails_connect_with_denied_code() {
 }
 
 #[tokio::test]
-async fn denial_without_or_with_wrong_state_is_ignored() {
+async fn post_denial_without_state_is_accepted() {
+    // ツイキャスが拒否時に state を返すか未確認。Origin 検査済みの POST なら state 無しの拒否も拒否として扱う(実機確認 3 で確定)。
+    let f = fake(CLIENT, 200).await;
+    for body in ["result=denied", "error=access_denied"] {
+        let env = env_with(&f);
+        let (r, _) = run_login(&env, CLIENT, NOW, |_| body.to_string()).await;
+        assert_eq!(code_str(&err_of(r).code), "denied", "body={body}");
+        assert!(env.store.keys().is_empty(), "body={body}");
+        assert_port_free(env.port);
+    }
+}
+
+#[tokio::test]
+async fn denial_with_wrong_state_is_ignored() {
     let f = fake(CLIENT, 200).await;
     let env = env_with(&f);
     let login = begin(&env, CLIENT, NOW).await;
     let host = local_host(env.port);
-    let bodies = [
-        "result=denied".to_string(),
-        "result=denied&state=not-the-state".to_string(),
-        "error=access_denied".to_string(),
-        "error=access_denied&state=not-the-state".to_string(),
-    ];
-    for b in &bodies {
+    for b in ["result=denied&state=not-the-state", "error=access_denied&state=not-the-state"] {
         let _ = post_token(env.port, &host, None, b).await;
         let req = http("GET", &format!("{CALLBACK_PATH}?{b}"), &host, None, "");
         let _ = raw_request(env.port, req).await;
     }
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(!login.handle.is_finished(), "state 無し・不一致の拒否でログインが終わってはいけない");
+    assert!(!login.handle.is_finished(), "state 不一致の拒否でログインが終わってはいけない");
+    finish_ok(&env, login).await;
+}
+
+#[tokio::test]
+async fn get_denial_without_state_is_ignored() {
+    // 他サイトの <img> などで GET を踏ませてログインを潰されないよう、GET は state 一致の時だけ拒否にする。
+    let f = fake(CLIENT, 200).await;
+    let env = env_with(&f);
+    let login = begin(&env, CLIENT, NOW).await;
+    let host = local_host(env.port);
+    for b in ["result=denied", "error=access_denied"] {
+        for path in [CALLBACK_PATH, TOKEN_PATH] {
+            let req = http("GET", &format!("{path}?{b}"), &host, None, "");
+            let _ = raw_request(env.port, req).await;
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!login.handle.is_finished(), "state 無しの GET 拒否でログインが終わってはいけない");
     finish_ok(&env, login).await;
 }
 
@@ -1183,4 +1208,100 @@ async fn out_of_range_stored_expiry_loads_as_not_ready() {
     let state = status_json(&env, Some(CLIENT), NOW)["state"].as_str().unwrap().to_string();
     assert!(state == "loggedOut" || state == "reloginRequired", "範囲外の期限で state={state}");
     assert!(env.auth.bearer(Some(CLIENT), NOW).is_none());
+}
+
+#[tokio::test]
+async fn token_too_long_for_store_fails_before_saving() {
+    // 資格情報ストアの上限(Windows は 2560 バイト、UTF-16)を超える記録は受け付けない。
+    // 2048 文字のトークンは字種として正当だが、記録(JSON)にすると上限を超える。
+    let f = fake(CLIENT, 200).await;
+    let env = env_with(&f);
+    let long = "a".repeat(2048);
+    let (r, _) = run_login(&env, CLIENT, NOW, |st| {
+        format!("access_token={long}&token_type=bearer&expires_in=15552000&state={st}")
+    })
+    .await;
+    let code = code_str(&err_of(r).code);
+    assert!(code == "tokenStore" || code == "other", "code={code}");
+    assert!(env.store.keys().is_empty(), "上限超えの記録が保存された");
+    assert_port_free(env.port);
+    assert_eq!(sj(&env.auth.status(Some(CLIENT), NOW))["state"], "loggedOut");
+}
+
+#[tokio::test]
+async fn duplicate_state_uses_last_value_for_denial_and_grant() {
+    let f = fake(CLIENT, 200).await;
+    // 拒否: 後ろの state が正しければ Denied。
+    let env = env_with(&f);
+    let (r, _) = run_login(&env, CLIENT, NOW, |s| format!("result=denied&state=wrong&state={s}")).await;
+    assert_eq!(code_str(&err_of(r).code), "denied", "後ろが正しい拒否");
+    // 拒否: 後ろが誤りなら無視して待ち続ける。
+    let env = env_with(&f);
+    let login = begin(&env, CLIENT, NOW).await;
+    let b = format!("result=denied&state={}&state=wrong", login.state);
+    let _ = post_token(env.port, &local_host(env.port), None, &b).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!login.handle.is_finished(), "後ろが誤りの拒否は無視される");
+    finish_ok(&env, login).await;
+    // grant: 後ろの state が正しければ成功。
+    let env = env_with(&f);
+    let (r, _) = run_login(&env, CLIENT, NOW, |s| format!("{}&state={s}", success_body("wrong"))).await;
+    assert_eq!(sj(&ok_of(r))["state"], "ready", "後ろが正しい grant");
+    // grant: 後ろが誤りなら 400 で待ち続ける。
+    let env = env_with(&f);
+    let login = begin(&env, CLIENT, NOW).await;
+    let b = format!("{}&state=wrong", success_body(&login.state));
+    let r = post_token(env.port, &local_host(env.port), None, &b).await.expect("応答");
+    assert_eq!(r.status, 400);
+    assert!(env.store.keys().is_empty());
+    finish_ok(&env, login).await;
+}
+
+#[tokio::test]
+async fn encoded_key_names_are_decoded_before_validation() {
+    // `expires%5Fin=0` は `expires_in=0` として扱い、期限検査を抜けて期限なしで保存してはいけない。
+    let f = fake(CLIENT, 200).await;
+    let env = env_with(&f);
+    let (r, _) = run_login(&env, CLIENT, NOW, |s| format!("access_token={TOKEN}&expires%5Fin=0&state={s}")).await;
+    assert!(r.is_err(), "expires_in=0 のログインが成功した");
+    assert!(env.store.keys().is_empty(), "期限なしの記録が保存された");
+    assert_eq!(sj(&env.auth.status(Some(CLIENT), NOW))["state"], "loggedOut");
+}
+
+#[tokio::test]
+async fn late_write_after_cancel_does_not_survive_logout() {
+    let f = fake(CLIENT, 200).await;
+    let env = gate_env(&f, Duration::from_secs(10));
+    let login = begin_auth(env.auth.clone(), CLIENT, NOW).await;
+    grant_and_block_store(&env, &login).await;
+    env.auth.cancel_login();
+    assert_eq!(code_str(&err_of(wait(login.handle).await).code), "cancelled");
+    ok_of(env.auth.disconnect().await);
+    release_and_settle(&env).await;
+    assert!(env.store.inner.raw(TOKEN_KEY).is_none(), "ログアウト後に遅れた書き込みが残った");
+    assert_eq!(sj(&env.auth.status(Some(CLIENT), NOW))["state"], "loggedOut");
+    assert!(env.auth.bearer(Some(CLIENT), NOW).is_none());
+}
+
+#[tokio::test]
+async fn late_write_after_cancel_does_not_overwrite_next_login() {
+    let f = fake(CLIENT, 200).await;
+    let env = gate_env(&f, Duration::from_secs(10));
+    // A: 保存が止まったまま取り消す(止まるのは最初の put だけ)。
+    let a = begin_auth(env.auth.clone(), CLIENT, NOW).await;
+    grant_and_block_store(&env, &a).await;
+    env.auth.cancel_login();
+    assert_eq!(code_str(&err_of(wait(a.handle).await).code), "cancelled");
+    // B: 別のトークンでログインを成功させる。
+    let b = begin_auth(env.auth.clone(), CLIENT, NOW).await;
+    let body = format!("access_token=tc-token-b&token_type=bearer&expires_in=15552000&state={}", b.state);
+    let r = post_token(env.port, &local_host(env.port), None, &body).await.expect("応答");
+    assert_eq!(r.status / 100, 2);
+    ok_of(wait(b.handle).await);
+    // A の遅れた書き込みを再開しても B が残る。
+    release_and_settle(&env).await;
+    let rec: Value = serde_json::from_str(&env.store.inner.raw(TOKEN_KEY).expect("B の記録がある")).unwrap();
+    assert_eq!(rec["accessToken"], "tc-token-b", "A の遅れた書き込みが B を上書きした");
+    assert_eq!(env.auth.bearer(Some(CLIENT), NOW).as_deref(), Some("tc-token-b"));
+    assert_eq!(sj(&env.auth.status(Some(CLIENT), NOW))["state"], "ready");
 }
