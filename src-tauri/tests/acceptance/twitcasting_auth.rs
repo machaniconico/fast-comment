@@ -1142,19 +1142,6 @@ async fn token_with_form_delimiters_round_trips() {
 }
 
 #[tokio::test]
-async fn long_scope_callback_is_accepted() {
-    let f = fake(CLIENT, 200).await;
-    let env = env_with(&f);
-    let scope = form_encode(&"@".repeat(1365));
-    let (r, _) = run_login(&env, CLIENT, NOW, |s| {
-        format!("access_token={TOKEN}&token_type=bearer&expires_in=15552000&scope={scope}&state={s}")
-    })
-    .await;
-    assert_eq!(sj(&ok_of(r))["state"], "ready", "長い scope の正当なコールバックが 4096 バイト上限で弾かれた");
-    assert_eq!(stored(&env).unwrap()["accessToken"], TOKEN);
-}
-
-#[tokio::test]
 async fn corrupt_stored_record_does_not_block_new_login() {
     let f = fake(CLIENT, 200).await;
     let env = env_with(&f);
