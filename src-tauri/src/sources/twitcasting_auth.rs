@@ -13,14 +13,14 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     convert::Infallible,
-    fmt,
+    fmt, io,
     sync::{Arc, Mutex},
     time::Duration,
 };
 use subtle::ConstantTimeEq;
 use tokio::{
     net::TcpListener,
-    sync::{mpsc, watch, Mutex as AsyncMutex},
+    sync::{mpsc, oneshot, watch, Mutex as AsyncMutex},
     task::JoinSet,
     time::Instant,
 };
@@ -31,6 +31,9 @@ pub const CALLBACK_PORT: u16 = 47822;
 pub const CALLBACK_PATH: &str = "/twitcasting/callback";
 pub const TOKEN_PATH: &str = "/twitcasting/token";
 pub const DEFAULT_CLIENT_ID: &str = "";
+const MAX_EXPIRY_SECONDS: u64 = 10 * 365 * 24 * 60 * 60;
+const WSAECONNRESET: i32 = 10054;
+
 pub fn effective_client_id(override_id: Option<&str>) -> Option<String> {
     override_id
         .map(str::trim)
@@ -169,7 +172,7 @@ pub struct TwitcastingAuth<S: SecretStore> {
     options: AuthOptions,
     memory: Arc<Mutex<Memory>>,
     changes: watch::Sender<AuthState>,
-    operation: AsyncMutex<()>,
+    operation: Arc<AsyncMutex<()>>,
     login: Mutex<Option<CancellationToken>>,
 }
 impl<S: SecretStore> fmt::Debug for TwitcastingAuth<S> {
@@ -192,7 +195,7 @@ impl<S: SecretStore> TwitcastingAuth<S> {
                 expiry_task: None,
             })),
             changes,
-            operation: AsyncMutex::new(()),
+            operation: Arc::new(AsyncMutex::new(())),
             login: Mutex::new(None),
         })
     }
@@ -361,23 +364,26 @@ impl<S: SecretStore> TwitcastingAuth<S> {
             .map_err(|_| error(Code::TokenStore))
     }
     pub async fn connect(
-        &self,
+        self: &Arc<Self>,
         client_id: &str,
         now_ms: u64,
         open_browser: impl FnOnce(String) -> Result<(), String>,
     ) -> Result<TwitcastingStatus, TwitcastingAuthError> {
         let observed_at = Instant::now();
+        let deadline = observed_at + self.options.login_timeout;
         if client_id.trim().is_empty() {
             return Err(error(Code::NotConfigured));
         }
         let cancel = CancellationToken::new();
+        let _cancel_on_drop = cancel.clone().drop_guard();
         if let Some(old) = self.login.lock().unwrap().replace(cancel.clone()) {
             old.cancel();
         }
-        let _guard = self.operation.lock().await;
-        if cancel.is_cancelled() {
-            return Err(error(Code::Cancelled));
-        }
+        let operation = tokio::select! {
+            biased;
+            stop = login_ended(&cancel, deadline) => return Err(stop),
+            lock = self.operation.clone().lock_owned() => lock,
+        };
         let mut connections = JoinSet::new();
         let flow = async {
             let ipv4 = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, self.options.port))
@@ -423,9 +429,19 @@ impl<S: SecretStore> TwitcastingAuth<S> {
             };
             drop((ipv4, ipv6));
             let grant = grant?;
-            if grant.expires == Some(0) {
-                return Err(error(Code::Other));
-            }
+            let received_at = grant.received_at;
+            let obtained_at_ms = now_ms
+                .checked_add(received_at.duration_since(observed_at).as_millis() as u64)
+                .ok_or_else(|| error(Code::Other))?;
+            let expires_at_ms = grant
+                .expires
+                .map(|duration| {
+                    obtained_at_ms
+                        .checked_add(duration.as_millis() as u64)
+                        .filter(|expiry| *expiry > obtained_at_ms)
+                        .ok_or_else(|| error(Code::Other))
+                })
+                .transpose()?;
             let response = reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .timeout(self.options.read_timeout)
@@ -460,18 +476,14 @@ impl<S: SecretStore> TwitcastingAuth<S> {
                 user_id: field("/user/id")?,
                 screen_id: field("/user/screen_id")?,
                 name: field("/user/name")?,
-                expires_at_ms: grant
-                    .expires
-                    .and_then(|s| s.checked_mul(1000))
-                    .and_then(|ms| now_ms.checked_add(ms)),
-                obtained_at_ms: now_ms,
+                expires_at_ms,
+                obtained_at_ms,
             };
-            Ok(record)
+            Ok((record, received_at))
         };
-        let result = tokio::select! {
+        let mut result = tokio::select! {
             biased;
-            _ = cancel.cancelled() => Err(error(Code::Cancelled)),
-            _ = tokio::time::sleep(self.options.login_timeout) => Err(error(Code::LoginTimeout)),
+            stop = login_ended(&cancel, deadline) => Err(stop),
             result = flow => result,
         };
         if !matches!(&result, Err(e) if matches!(e.code, Code::Cancelled | Code::LoginTimeout)) {
@@ -480,32 +492,118 @@ impl<S: SecretStore> TwitcastingAuth<S> {
                 while connections.join_next().await.is_some() {}
             });
             tokio::select! {
-                _ = cancel.cancelled() => {}
+                stop = login_ended(&cancel, deadline) => result = Err(stop),
                 _ = flush => {}
             }
         }
         connections.shutdown().await;
-        let record = result?;
-        if cancel.is_cancelled() {
-            return Err(error(Code::Cancelled));
-        }
-        // Commit is serialized with disconnect and subsequent logins. Do not drop a
-        // credential-store future: the OS write may continue after cancellation.
+        let (record, received_at) = result?;
+        let token_deadline = record
+            .expires_at_ms
+            .map(|expiry| received_at + Duration::from_millis(expiry - record.obtained_at_ms));
         let serialized = serde_json::to_string(&record).map_err(|_| error(Code::Other))?;
-        self.store
-            .put(TOKEN_KEY, &serialized)
-            .await
-            .map_err(|_| error(Code::TokenStore))?;
-        self.replace_record(Some(record), Some(client_id), now_ms, observed_at);
-        Ok(self.status(Some(client_id), now_ms))
+        let previous = tokio::select! {
+            biased;
+            stop = login_ended(&cancel, deadline) => return Err(stop),
+            previous = self.store.get(TOKEN_KEY) => previous.map_err(|_| error(Code::TokenStore))?,
+        };
+
+        let (reply, result) = oneshot::channel();
+        let auth = self.clone();
+        tokio::spawn(async move {
+            // Keep subsequent store operations behind the write and its rollback.
+            let _operation = operation;
+            let interrupted = || {
+                if cancel.is_cancelled() {
+                    Some(error(Code::Cancelled))
+                } else if Instant::now() >= deadline {
+                    Some(error(Code::LoginTimeout))
+                } else if token_deadline.is_some_and(|expiry| Instant::now() >= expiry) {
+                    Some(error(Code::Other))
+                } else {
+                    None
+                }
+            };
+            if let Some(stop) = interrupted() {
+                let _ = reply.send(Err(stop));
+                return;
+            }
+
+            let write = auth.store.put(TOKEN_KEY, &serialized);
+            tokio::pin!(write);
+            let saved = tokio::select! {
+                biased;
+                stop = login_ended(&cancel, deadline) => Err((stop, None)),
+                saved = &mut write => match interrupted() {
+                    Some(stop) => Err((stop, Some(saved))),
+                    None => Ok(saved),
+                },
+            };
+            let saved = match saved {
+                Ok(saved) => saved,
+                Err((stop, saved)) => {
+                    let _ = reply.send(Err(stop));
+                    // The OS write may still be running. Wait before restoring the old value.
+                    let saved = match saved {
+                        Some(saved) => saved,
+                        None => write.await,
+                    };
+                    if saved.is_ok() {
+                        auth.restore_previous(previous.as_deref()).await;
+                    }
+                    return;
+                }
+            };
+            let outcome = saved.map_err(|_| error(Code::TokenStore)).map(|_| {
+                let client_id = record.client_id.clone();
+                let obtained_at_ms = record.obtained_at_ms;
+                auth.replace_record(Some(record), Some(&client_id), obtained_at_ms, received_at);
+                auth.status(Some(&client_id), obtained_at_ms)
+            });
+            let _ = reply.send(outcome);
+        });
+        result.await.map_err(|_| error(Code::TokenStore))?
+    }
+
+    async fn restore_previous(&self, previous: Option<&str>) {
+        loop {
+            let restored = match previous {
+                Some(value) => self.store.put(TOKEN_KEY, value).await,
+                None => self.store.delete(TOKEN_KEY).await,
+            };
+            if restored.is_ok() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
     }
 }
+
+async fn login_ended(cancel: &CancellationToken, deadline: Instant) -> TwitcastingAuthError {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => error(Code::Cancelled),
+        _ = tokio::time::sleep_until(deadline) => error(Code::LoginTimeout),
+    }
+}
+
 fn valid_token(token: &str) -> bool {
     !token.is_empty() && token.len() <= 2048 && token.bytes().all(|b| (0x21..=0x7e).contains(&b))
 }
+fn parse_expiry(value: &str) -> Result<Duration, TwitcastingAuthError> {
+    let seconds = value
+        .bytes()
+        .all(|b| b.is_ascii_digit())
+        .then(|| value.parse::<u64>().ok())
+        .flatten()
+        .filter(|seconds| (1..=MAX_EXPIRY_SECONDS).contains(seconds))
+        .ok_or_else(|| error(Code::Other))?;
+    Ok(Duration::from_secs(seconds))
+}
 struct Grant {
     token: String,
-    expires: Option<u64>,
+    expires: Option<Duration>,
+    received_at: Instant,
 }
 struct Loopback {
     state: String,
@@ -518,10 +616,24 @@ struct Loopback {
 
 fn spawn_callback(
     connections: &mut JoinSet<()>,
-    accepted: std::io::Result<(tokio::net::TcpStream, std::net::SocketAddr)>,
+    accepted: io::Result<(tokio::net::TcpStream, std::net::SocketAddr)>,
     context: &Arc<Loopback>,
 ) -> Result<(), TwitcastingAuthError> {
-    let (stream, _) = accepted.map_err(|_| error(Code::Other))?;
+    let (stream, _) = match accepted {
+        Ok(accepted) => accepted,
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::Interrupted
+                    | io::ErrorKind::WouldBlock
+            ) || e.raw_os_error() == Some(WSAECONNRESET) =>
+        {
+            return Ok(());
+        }
+        Err(_) => return Err(error(Code::Other)),
+    };
     let context = context.clone();
     connections.spawn(async move {
         let service = service_fn(|request: hyper::Request<hyper::body::Incoming>| async {
@@ -580,8 +692,8 @@ async fn handle_callback(context: &Loopback, req: Request) -> Response {
             _ => return StatusCode::BAD_REQUEST.into_response(),
         };
     let params: HashMap<String, String> = url::form_urlencoded::parse(&body).into_owned().collect();
-    let grant = if params.get("result").is_some_and(|s| s == "denied") {
-        Err(error(Code::Denied))
+    let (grant, response) = if params.get("result").is_some_and(|s| s == "denied") {
+        (Err(error(Code::Denied)), StatusCode::OK)
     } else {
         let state = params
             .get("state")
@@ -593,10 +705,21 @@ async fn handle_callback(context: &Loopback, req: Request) -> Response {
         let Some(token) = params.get("access_token").filter(|t| valid_token(t)) else {
             return StatusCode::BAD_REQUEST.into_response();
         };
-        Ok(Grant {
-            token: token.clone(),
-            expires: params.get("expires_in").and_then(|s| s.parse().ok()),
-        })
+        match params
+            .get("expires_in")
+            .map(|s| parse_expiry(s))
+            .transpose()
+        {
+            Ok(expires) => (
+                Ok(Grant {
+                    token: token.clone(),
+                    expires,
+                    received_at: Instant::now(),
+                }),
+                StatusCode::OK,
+            ),
+            Err(err) => (Err(err), StatusCode::BAD_REQUEST),
+        }
     };
     let mut accepted = context.accepted.lock().unwrap();
     if *accepted || context.cancel.is_cancelled() {
@@ -604,7 +727,7 @@ async fn handle_callback(context: &Loopback, req: Request) -> Response {
     }
     *accepted = true;
     let _ = context.tx.try_send(grant);
-    StatusCode::OK.into_response()
+    response.into_response()
 }
 
 #[cfg(test)]
@@ -614,9 +737,221 @@ mod tests {
     use tokio::{
         io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
         net::TcpStream,
-        sync::oneshot,
+        sync::Notify,
         time::timeout,
     };
+
+    #[derive(Clone, Default)]
+    struct PausedWriteStore {
+        inner: MemorySecretStore,
+        writing: Arc<Notify>,
+        resume: Arc<Notify>,
+    }
+
+    impl SecretStore for PausedWriteStore {
+        async fn get(&self, key: &str) -> Result<Option<String>, String> {
+            self.inner.get(key).await
+        }
+
+        async fn put(&self, key: &str, value: &str) -> Result<(), String> {
+            self.writing.notify_one();
+            self.resume.notified().await;
+            self.inner.put(key, value).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), String> {
+            self.inner.delete(key).await
+        }
+    }
+
+    async fn login_fixture<S: SecretStore>(
+        store: S,
+    ) -> (
+        Arc<TwitcastingAuth<S>>,
+        std::net::SocketAddr,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let verify = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api_base = format!("http://{}", verify.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let route = axum::Router::new().route(
+                "/verify_credentials",
+                axum::routing::get(|| async {
+                    axum::Json(serde_json::json!({
+                        "app": {"client_id": "client"},
+                        "user": {"id": "new-user", "screen_id": "new-screen", "name": "new"}
+                    }))
+                }),
+            );
+            axum::serve(verify, route).await.unwrap();
+        });
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+        let auth = TwitcastingAuth::new(
+            store,
+            TwitcastingEndpoints {
+                api_base,
+                ..TwitcastingEndpoints::default()
+            },
+            AuthOptions {
+                port: addr.port(),
+                login_timeout: Duration::from_secs(3),
+                ..AuthOptions::default()
+            },
+        );
+        (auth, addr, server)
+    }
+
+    async fn post_grant<S: SecretStore>(
+        auth: Arc<TwitcastingAuth<S>>,
+        addr: std::net::SocketAddr,
+        delay: Duration,
+        extra: &str,
+    ) -> tokio::task::JoinHandle<Result<TwitcastingStatus, TwitcastingAuthError>> {
+        let (started, listening) = oneshot::channel();
+        let login = tokio::spawn(async move {
+            auth.connect("client", 0, |url| {
+                let state = url::Url::parse(&url)
+                    .unwrap()
+                    .query_pairs()
+                    .find(|(name, _)| name == "state")
+                    .unwrap()
+                    .1
+                    .into_owned();
+                started.send(state).ok();
+                Ok(())
+            })
+            .await
+        });
+        let state = timeout(Duration::from_secs(2), listening)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::sleep(delay).await;
+        let mut client = BufReader::new(TcpStream::connect(addr).await.unwrap());
+        let body = format!("access_token=new-token&state={state}{extra}");
+        let request = format!(
+            "POST {TOKEN_PATH} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        client.write_all(request.as_bytes()).await.unwrap();
+        let mut status = String::new();
+        timeout(Duration::from_secs(2), client.read_line(&mut status))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status, "HTTP/1.1 200 OK\r\n");
+        login
+    }
+
+    async fn abort_paused_write(timed_out: bool, seeded: bool) {
+        let store = PausedWriteStore::default();
+        if seeded {
+            seed_record(&store.inner, None).await;
+        }
+        let previous = store.inner.raw(TOKEN_KEY);
+        let (auth, addr, server) = login_fixture(store.clone()).await;
+        auth.load(Some("client"), 0).await;
+        let start = Instant::now();
+        let login = post_grant(auth.clone(), addr, Duration::ZERO, "").await;
+        timeout(Duration::from_secs(2), store.writing.notified())
+            .await
+            .unwrap();
+        let wait = Duration::from_secs(1);
+        let expected = if timed_out {
+            tokio::time::sleep_until(start + Duration::from_secs(3)).await;
+            Code::LoginTimeout
+        } else {
+            auth.cancel_login();
+            Code::Cancelled
+        };
+        let result = timeout(wait, login)
+            .await
+            .expect("login stayed blocked on the credential write")
+            .unwrap();
+        assert!(matches!(
+            (result.unwrap_err().code, expected),
+            (Code::Cancelled, Code::Cancelled) | (Code::LoginTimeout, Code::LoginTimeout)
+        ));
+        assert!(store.inner.raw(TOKEN_KEY) == previous);
+        assert_eq!(auth.user_id().as_deref(), seeded.then_some("user"));
+
+        store.resume.notify_one();
+        if seeded {
+            // The compensating write restores the previous value.
+            timeout(wait, store.writing.notified()).await.unwrap();
+            store.resume.notify_one();
+        }
+        let _guard = timeout(wait, auth.operation.lock()).await.unwrap();
+        assert!(store.inner.raw(TOKEN_KEY) == previous);
+        assert_eq!(auth.user_id().as_deref(), seeded.then_some("user"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn cancel_during_write_deletes_late_token() {
+        abort_paused_write(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn timeout_during_write_restores_previous_token() {
+        abort_paused_write(true, true).await;
+    }
+
+    #[tokio::test]
+    async fn short_expiry_starts_when_grant_is_received() {
+        let store = MemorySecretStore::new();
+        let (auth, addr, server) = login_fixture(store.clone()).await;
+        let delay = Duration::from_millis(1100);
+        let login = post_grant(auth, addr, delay, "&expires_in=1").await;
+        let status = timeout(Duration::from_secs(2), login)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.state, "ready");
+        let record: Record = serde_json::from_str(&store.raw(TOKEN_KEY).unwrap()).unwrap();
+        assert!(record.obtained_at_ms >= delay.as_millis() as u64);
+        assert_eq!(status.expires_at_ms, Some(record.obtained_at_ms + 1000));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn invalid_expiry_fails_grant_instead_of_becoming_unknown() {
+        for expiry in [
+            "",
+            "0",
+            "-1",
+            "3600.0",
+            "%203600",
+            "18446744073709551616",
+            "9000000000000",
+        ] {
+            let (tx, mut rx) = mpsc::channel(1);
+            let context = Loopback {
+                state: "test-state".into(),
+                port: CALLBACK_PORT,
+                read_timeout: Duration::from_secs(1),
+                tx,
+                accepted: Mutex::new(false),
+                cancel: CancellationToken::new(),
+            };
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri(TOKEN_PATH)
+                .header("host", format!("localhost:{CALLBACK_PORT}"))
+                .body(Body::from(format!(
+                    "access_token=test-token&state=test-state&expires_in={expiry}"
+                )))
+                .unwrap();
+            assert_eq!(
+                handle_callback(&context, request).await.status(),
+                StatusCode::BAD_REQUEST
+            );
+            assert!(matches!(rx.try_recv(), Ok(Err(_))));
+        }
+    }
 
     async fn seed_record(store: &MemorySecretStore, expiry: Option<u64>) {
         let record = Record {
