@@ -732,7 +732,7 @@ else { fetch('/twitcasting/token', {method:'POST',headers:{'Content-Type':'appli
 async fn callback(context: &Loopback, req: Request) -> Response {
     let mut response = handle_callback(context, req).await;
     let headers = response.headers_mut();
-    for (k,v) in [("cache-control","no-store"), ("referrer-policy","no-referrer"), ("x-content-type-options","nosniff"), ("content-security-policy","default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'")] { headers.insert(k, v.parse().unwrap()); }
+    for (k,v) in [("cache-control","no-store"), ("referrer-policy","no-referrer"), ("x-content-type-options","nosniff"), ("content-security-policy","default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'")] { headers.insert(k, v.parse().unwrap()); }
     response
 }
 async fn handle_callback(context: &Loopback, req: Request) -> Response {
@@ -981,7 +981,7 @@ const fetch = (_path, { body }) => {
         let uri = format!("{CALLBACK_PATH}?error=access_denied&state=test-state");
         let (status, csp, page) = send(&context, Method::GET, &uri, "").await;
         assert_eq!(status, StatusCode::OK);
-        assert!(csp.contains("frame-ancestors 'none'"));
+        assert!(csp.contains("default-src 'none'"));
         assert!(!page.contains("fetch"), "refusal page posts again");
         assert!(matches!(rx.try_recv(), Ok(Err(e)) if matches!(e.code, Code::Denied)));
 
