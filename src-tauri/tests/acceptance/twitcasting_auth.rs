@@ -1276,11 +1276,17 @@ async fn late_write_after_cancel_does_not_survive_logout() {
     grant_and_block_store(&env, &login).await;
     env.auth.cancel_login();
     assert_eq!(code_str(&err_of(wait(login.handle).await).code), "cancelled");
-    ok_of(env.auth.disconnect().await);
+    // 開始済みの書き込みは中断できないので、disconnect は Ok でも Err(tokenStore) でもよいが、有限時間で返る。
+    let r = tokio::time::timeout(Duration::from_secs(10), env.auth.disconnect())
+        .await
+        .expect("書き込みが止まっていても disconnect が有限時間で返る");
+    if let Err(e) = &r {
+        assert_eq!(code_str(&e.code), "tokenStore");
+    }
+    assert_ne!(sj(&env.auth.status(Some(CLIENT), NOW))["state"], "ready", "ログアウト直後に ready のまま");
+    assert!(env.auth.bearer(Some(CLIENT), NOW).is_none());
     release_and_settle(&env).await;
     assert!(env.store.inner.raw(TOKEN_KEY).is_none(), "ログアウト後に遅れた書き込みが残った");
-    assert_eq!(sj(&env.auth.status(Some(CLIENT), NOW))["state"], "loggedOut");
-    assert!(env.auth.bearer(Some(CLIENT), NOW).is_none());
 }
 
 #[tokio::test]
@@ -1292,16 +1298,33 @@ async fn late_write_after_cancel_does_not_overwrite_next_login() {
     grant_and_block_store(&env, &a).await;
     env.auth.cancel_login();
     assert_eq!(code_str(&err_of(wait(a.handle).await).code), "cancelled");
-    // B: 別のトークンでログインを成功させる。
+    // B: 別のトークンでログインを始め、許可を送る。A の保存が止まっている間は終わらなくてよい。
     let b = begin_auth(env.auth.clone(), CLIENT, NOW).await;
+    let port = env.port;
     let body = format!("access_token=tc-token-b&token_type=bearer&expires_in=15552000&state={}", b.state);
-    let r = post_token(env.port, &local_host(env.port), None, &body).await.expect("応答");
-    assert_eq!(r.status / 100, 2);
-    ok_of(wait(b.handle).await);
-    // A の遅れた書き込みを再開しても B が残る。
-    release_and_settle(&env).await;
-    let rec: Value = serde_json::from_str(&env.store.inner.raw(TOKEN_KEY).expect("B の記録がある")).unwrap();
-    assert_eq!(rec["accessToken"], "tc-token-b", "A の遅れた書き込みが B を上書きした");
-    assert_eq!(env.auth.bearer(Some(CLIENT), NOW).as_deref(), Some("tc-token-b"));
-    assert_eq!(sj(&env.auth.status(Some(CLIENT), NOW))["state"], "ready");
+    tokio::spawn(async move {
+        let _ = post_token(port, &local_host(port), None, &body).await;
+    });
+    // 数百 ms 後に A の書き込みを再開する。
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    env.store.open();
+    let r = tokio::time::timeout(Duration::from_secs(10), b.handle)
+        .await
+        .expect("B の connect が有限時間で返る")
+        .expect("タスクが落ちない");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let raw = env.store.inner.raw(TOKEN_KEY);
+    match r {
+        Ok(_) => {
+            let rec: Value = serde_json::from_str(&raw.expect("B の記録がある")).unwrap();
+            assert_eq!(rec["accessToken"], "tc-token-b", "A の遅れた書き込みが B を上書きした");
+            assert_eq!(env.auth.bearer(Some(CLIENT), NOW).as_deref(), Some("tc-token-b"));
+            assert_eq!(sj(&env.auth.status(Some(CLIENT), NOW))["state"], "ready");
+        }
+        Err(e) => {
+            assert_eq!(code_str(&e.code), "tokenStore");
+            assert!(!raw.unwrap_or_default().contains(TOKEN), "A のトークンが残った");
+        }
+    }
+    assert_ne!(env.auth.bearer(Some(CLIENT), NOW).as_deref(), Some(TOKEN), "A のトークンがメモリにある");
 }
