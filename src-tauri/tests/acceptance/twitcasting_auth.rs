@@ -37,7 +37,7 @@ const TOKEN: &str = "tc-secret-token-abcdef0123456789";
 const USER_ID: &str = "1234567";
 const SCREEN_ID: &str = "fake_screen";
 const NAME: &str = "Fake Name";
-const CSP: &str = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'";
+const CSP: &str = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'";
 
 // ---------------------------------------------------------------- 偽のツイキャス
 
@@ -506,10 +506,32 @@ async fn token_in_query_string_is_never_accepted() {
 async fn denied_result_fails_connect_with_denied_code() {
     let f = fake(CLIENT, 200).await;
     let env = env_with(&f);
-    // 設計書 §1.2 ④: 拒否には state が付かない。state 無しの `result=denied` で `Denied` になる。
-    let (r, _) = run_login(&env, CLIENT, NOW, |_| "result=denied".to_string()).await;
+    // 拒否も state 一致が必須(他ページがログインを潰せない)。
+    let (r, _) = run_login(&env, CLIENT, NOW, |st| format!("result=denied&state={st}")).await;
     assert_eq!(code_str(&err_of(r).code), "denied");
     assert!(env.store.keys().is_empty());
+}
+
+#[tokio::test]
+async fn denial_without_or_with_wrong_state_is_ignored() {
+    let f = fake(CLIENT, 200).await;
+    let env = env_with(&f);
+    let login = begin(&env, CLIENT, NOW).await;
+    let host = local_host(env.port);
+    let bodies = [
+        "result=denied".to_string(),
+        "result=denied&state=not-the-state".to_string(),
+        "error=access_denied".to_string(),
+        "error=access_denied&state=not-the-state".to_string(),
+    ];
+    for b in &bodies {
+        let _ = post_token(env.port, &host, None, b).await;
+        let req = http("GET", &format!("{CALLBACK_PATH}?{b}"), &host, None, "");
+        let _ = raw_request(env.port, req).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!login.handle.is_finished(), "state 無し・不一致の拒否でログインが終わってはいけない");
+    finish_ok(&env, login).await;
 }
 
 #[tokio::test]
@@ -950,7 +972,7 @@ async fn debug_and_error_text_never_contain_token_or_state() {
     add_err(&mut texts, &err_of(r));
     // 拒否
     let env = env_with(&f_ok);
-    let (r, s) = run_login(&env, CLIENT, NOW, |_| "result=denied".to_string()).await;
+    let (r, s) = run_login(&env, CLIENT, NOW, |st| format!("result=denied&state={st}")).await;
     states.push(s);
     add_err(&mut texts, &err_of(r));
     // 未設定・キャンセル・タイムアウト
