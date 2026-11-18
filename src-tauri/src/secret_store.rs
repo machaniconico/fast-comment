@@ -11,6 +11,12 @@ use serde::Serialize;
 use tokio::sync::Mutex;
 
 const SERVICE: &str = "fast-comment";
+// The Windows keyring adapter writes passwords as UTF-16 without a terminator.
+const WINDOWS_CREDENTIAL_UTF16_UNITS: usize = 2560 / 2;
+
+pub(crate) fn fits_windows_credential(password: &str) -> bool {
+    password.encode_utf16().count() <= WINDOWS_CREDENTIAL_UTF16_UNITS
+}
 
 pub(crate) fn keyring_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();

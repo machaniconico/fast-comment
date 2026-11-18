@@ -17,6 +17,17 @@ struct TokenRecord {
     token: String,
     created_at_ms: u64,
 }
+
+pub(crate) fn token_fits_windows_credential(value: &str) -> bool {
+    // Include the outer JSON escaping and reserve room for the timestamp at write time.
+    let record = TokenRecord {
+        token: value.into(),
+        created_at_ms: u64::MAX,
+    };
+    serde_json::to_string(&record)
+        .is_ok_and(|password| crate::secret_store::fits_windows_credential(&password))
+}
+
 impl SecretStore for KeyringSecretStore {
     async fn get(&self, key: &str) -> Result<Option<String>, String> {
         if key.starts_with("webhook:") {

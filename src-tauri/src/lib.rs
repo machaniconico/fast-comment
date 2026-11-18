@@ -58,7 +58,7 @@ use crate::moderation::{Moderator, Verdict};
 use crate::moderation_error::{ModerationError, ModerationErrorCode};
 use crate::sources::twitcasting_auth::{
     effective_client_id, AuthOptions, TwitcastingAuth, TwitcastingAuthError,
-    TwitcastingAuthErrorCode, TwitcastingEndpoints, TwitcastingStatus,
+    TwitcastingAuthErrorCode, TwitcastingEndpoints, TwitcastingStatus, LOGOUT_MARKER_FILE,
 };
 use crate::sources::twitch_auth::{TwitchAuth, TwitchDeviceLogin, TwitchOauthStatus};
 use crate::sources::youtube_send::{YoutubeAuth, YoutubeOauthStatus};
@@ -1377,6 +1377,13 @@ fn get_twitcasting_status(state: State<'_, AppState>) -> TwitcastingStatus {
 }
 
 #[tauri::command]
+async fn reload_twitcasting_status(state: State<'_, AppState>) -> Result<TwitcastingStatus, ()> {
+    let client_id = twitcasting_client_id(&state);
+    state.twitcasting_auth.load(client_id.as_deref(), timer_now_ms()).await;
+    Ok(get_twitcasting_status(state))
+}
+
+#[tauri::command]
 async fn connect_twitcasting(
     state: State<'_, AppState>,
     client_id: Option<String>,
@@ -2573,10 +2580,11 @@ pub fn run() {
                 .expect("X投稿用HTTPクライアントの作成に失敗しました"),
             );
 
-            let twitcasting_auth = TwitcastingAuth::new(
+            let twitcasting_auth = TwitcastingAuth::with_logout_marker(
                 integrations::KeyringSecretStore,
                 TwitcastingEndpoints::default(),
                 AuthOptions::default(),
+                Some(config_dir.join(LOGOUT_MARKER_FILE)),
             );
             let auth_load = twitcasting_auth.clone();
             let client_id = effective_client_id(config.credentials.twitcasting_client_id.as_deref());
@@ -2834,6 +2842,7 @@ pub fn run() {
             preview_x_post,
             set_channel_own_stream,
             get_twitcasting_status,
+            reload_twitcasting_status,
             connect_twitcasting,
             cancel_twitcasting_login,
             disconnect_twitcasting,

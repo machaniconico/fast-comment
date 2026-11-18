@@ -230,7 +230,8 @@ export interface WebhookTestResult {
 
 export interface TwitcastingStatus {
   configured: boolean;
-  state: 'loggedOut' | 'ready' | 'reloginRequired';
+  state: 'loggedOut' | 'ready' | 'reloginRequired' | 'loading' | 'loadFailed';
+  logoutPending?: boolean;
   screenId: string | null;
   name: string | null;
   expiresAtMs: number | null;

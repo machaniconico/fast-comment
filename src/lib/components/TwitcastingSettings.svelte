@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { getTwitcastingStatus, connectTwitcasting, cancelTwitcastingLogin, disconnectTwitcasting } from '../ipc';
+  import { getTwitcastingStatus, reloadTwitcastingStatus, connectTwitcasting, cancelTwitcastingLogin, disconnectTwitcasting } from '../ipc';
   import type { TwitcastingStatus } from '../types';
   import { errorText } from '../xAutopost';
 
@@ -10,6 +10,7 @@
   let status = $state<TwitcastingStatus | null>(null);
   let connecting = $state(false);
   let disconnecting = $state(false);
+  let reloading = $state(false);
   let message = $state('');
   let failed = $state(false);
   let now = $state(Date.now());
@@ -22,9 +23,26 @@
   const expiring = $derived(expiry instanceof Date && expiry.getTime() - now <= 14 * 86400000);
 
   async function refresh() {
-    try { status = await getTwitcastingStatus(); }
+    try {
+      const next = await getTwitcastingStatus();
+      if (status?.logoutPending && next && !next.logoutPending) {
+        message = 'この PC の認証情報を削除しました';
+        failed = false;
+      }
+      status = next;
+    }
     catch (e) { message = errorText(e); failed = true; }
     now = Date.now();
+  }
+  async function reload() {
+    reloading = true;
+    try {
+      status = await reloadTwitcastingStatus();
+      message = '';
+      failed = false;
+      now = Date.now();
+    } catch (e) { message = errorText(e); failed = true; }
+    finally { reloading = false; }
   }
   onMount(() => {
     void refresh();
@@ -63,10 +81,16 @@
 <fieldset>
   <legend>ツイキャス</legend>
   <div class="field-row">
-    {#if status?.state === 'ready'}
+    {#if status?.logoutPending}
+      <span class="warn">ログアウトが未完了です</span>
+    {:else if status?.state === 'ready'}
       <span class="connected">@{status.screenId} ({status.name}) としてログイン中</span>
     {:else if status?.state === 'reloginRequired'}
       <span class="warn">再ログインしてください</span>
+    {:else if status?.state === 'loadFailed'}
+      <span class="warn">保存済みの認証情報を読み込めません</span>
+    {:else if !status || status.state === 'loading'}
+      <span>保存済みの認証情報を読み込んでいます…</span>
     {:else}
       <span>未ログイン</span>
     {/if}
@@ -82,10 +106,14 @@
     {#if connecting}
       <button type="button" onclick={cancel}>取り消す</button>
     {:else}
-      <button type="button" class="primary" onclick={connect} disabled={disconnecting}>ログイン</button>
+      <button type="button" class="primary" onclick={connect} disabled={disconnecting || status?.logoutPending}>ログイン</button>
     {/if}
-    {#if status && status.state !== 'loggedOut'}
+    {#if status?.logoutPending}
+      <button type="button" onclick={disconnect} disabled={disconnecting}>ログアウトを再試行</button>
+    {:else if status?.state === 'ready' || status?.state === 'reloginRequired'}
       <button type="button" onclick={disconnect} disabled={connecting || disconnecting}>ログアウト</button>
+    {:else if status?.state === 'loadFailed'}
+      <button type="button" onclick={reload} disabled={connecting || reloading}>認証情報を再読み込み</button>
     {/if}
   </div>
   <div aria-live="polite">{#if message}<p class:warn={failed}>{message}</p>{/if}</div>

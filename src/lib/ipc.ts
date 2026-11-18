@@ -1129,6 +1129,9 @@ export async function setChannelOwnStream(key: string, own: boolean): Promise<vo
 export async function getTwitcastingStatus(): Promise<import('./types').TwitcastingStatus | null> {
   return invoke<import('./types').TwitcastingStatus>('get_twitcasting_status');
 }
+export async function reloadTwitcastingStatus(): Promise<import('./types').TwitcastingStatus | null> {
+  return invoke<import('./types').TwitcastingStatus>('reload_twitcasting_status');
+}
 export async function connectTwitcasting(clientId?: string): Promise<import('./types').TwitcastingStatus | null> {
   return invoke<import('./types').TwitcastingStatus>('connect_twitcasting', { clientId: clientId || null });
 }
