@@ -647,9 +647,14 @@ fn spawn_callback(
     Ok(())
 }
 const PAGE: &str = r#"<!doctype html><html lang="ja"><meta charset="utf-8"><title>ツイキャス認証</title><p id="message">認証しています…</p><script>
-const body = location.hash.slice(1) ||
-  (new URLSearchParams(location.search).get('result') === 'denied' ? 'result=denied' : '');
+const fragment = location.hash.slice(1);
+const search = location.search;
 history.replaceState(null, '', location.pathname);
+// Preserve literal plus signs in the fragment before form decoding.
+const params = new URLSearchParams(fragment.replaceAll('+', '%2B'));
+const query = new URLSearchParams(search);
+const denied = p => p.get('result') === 'denied' || p.has('error');
+const body = denied(params) || denied(query) ? 'result=denied' : params.toString();
 const message = document.getElementById('message');
 if (!body) { message.textContent = '認証情報が見つかりません'; }
 else { fetch('/twitcasting/token', {method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body}).then(r => { message.textContent = r.ok ? 'アプリに戻ってください。この画面は閉じられます。' : '認証に失敗しました。アプリでやり直してください。'; }).catch(() => { message.textContent = 'アプリでログインをやり直してください。'; }); }
@@ -692,7 +697,9 @@ async fn handle_callback(context: &Loopback, req: Request) -> Response {
             _ => return StatusCode::BAD_REQUEST.into_response(),
         };
     let params: HashMap<String, String> = url::form_urlencoded::parse(&body).into_owned().collect();
-    let (grant, response) = if params.get("result").is_some_and(|s| s == "denied") {
+    let denied =
+        params.get("result").is_some_and(|s| s == "denied") || params.contains_key("error");
+    let (grant, response) = if denied {
         (Err(error(Code::Denied)), StatusCode::OK)
     } else {
         let state = params
@@ -734,12 +741,118 @@ async fn handle_callback(context: &Loopback, req: Request) -> Response {
 mod tests {
     use super::*;
     use crate::integrations::MemorySecretStore;
+    use std::{
+        io::Write,
+        process::{Command, Stdio},
+    };
     use tokio::{
         io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
         net::TcpStream,
         sync::Notify,
         time::timeout,
     };
+
+    fn run_callback_script(page: &str, callback_url: &str) -> String {
+        let script = page.split_once("<script>").unwrap().1;
+        let script = script.split_once("</script>").unwrap().0;
+        let mut node = Command::new("node")
+            .args(["-", callback_url])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("Node.js is required to run the callback page tests");
+        let mut input = node.stdin.take().unwrap();
+        input
+            .write_all(
+                br#"
+const location = new URL(process.argv[2]);
+const history = { replaceState() {} };
+const document = { getElementById: () => ({}) };
+const fetch = (_path, { body }) => {
+    process.stdout.write(String(body));
+    return Promise.resolve({ ok: true });
+};
+"#,
+            )
+            .unwrap();
+        input.write_all(script.as_bytes()).unwrap();
+        drop(input);
+        let output = node.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    async fn receive_callback_body(
+        body: String,
+    ) -> (StatusCode, Result<Grant, TwitcastingAuthError>) {
+        let (tx, mut rx) = mpsc::channel(1);
+        let context = Loopback {
+            state: "test-state".into(),
+            port: CALLBACK_PORT,
+            read_timeout: Duration::from_secs(1),
+            tx,
+            accepted: Mutex::new(false),
+            cancel: CancellationToken::new(),
+        };
+        let host = format!("localhost:{CALLBACK_PORT}");
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(TOKEN_PATH)
+            .header("host", &host)
+            .header("origin", format!("http://{host}"))
+            .body(Body::from(body))
+            .unwrap();
+        let status = handle_callback(&context, request).await.status();
+        (
+            status,
+            rx.try_recv().expect("callback did not complete the login"),
+        )
+    }
+
+    #[tokio::test]
+    async fn callback_page_round_trips_token_with_form_delimiters() {
+        for encoded_token in ["token+%25%26=end", "token%2B%25%26%3Dend"] {
+            let body = run_callback_script(
+                PAGE,
+                &format!("http://localhost:{CALLBACK_PORT}{CALLBACK_PATH}#access_token={encoded_token}&state=test-state"),
+            );
+            let (status, grant) = receive_callback_body(body).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(grant.unwrap().token, "token+%&=end");
+        }
+    }
+
+    #[tokio::test]
+    async fn oauth_error_completes_callback_with_fixed_denial() {
+        let oauth_error = "error=access_denied&error_description=private%20provider%20details";
+        let base = format!("http://localhost:{CALLBACK_PORT}{CALLBACK_PATH}");
+        for url in [
+            format!("{base}#{oauth_error}"),
+            format!("{base}?{oauth_error}#state=test-state"),
+        ] {
+            let body = run_callback_script(PAGE, &url);
+            assert_eq!(body, "result=denied");
+            assert_fixed_denial(body).await;
+        }
+        assert_fixed_denial(oauth_error.into()).await;
+    }
+
+    async fn assert_fixed_denial(body: String) {
+        let (status, grant) = receive_callback_body(body).await;
+        assert_eq!(status, StatusCode::OK);
+        let Err(denied) = grant else {
+            panic!("callback granted login after an OAuth error");
+        };
+        assert_eq!(
+            serde_json::to_value(denied).unwrap(),
+            serde_json::json!({"code": "denied", "message": "許可されませんでした"})
+        );
+    }
 
     #[derive(Clone, Default)]
     struct PausedWriteStore {
