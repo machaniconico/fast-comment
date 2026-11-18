@@ -243,9 +243,8 @@ struct StartupRestore {
 #[derive(Default)]
 struct PendingLogout {
     targets: MarkerTargets,
-    // The targets were fixed before this explicit logout read the marker: this session's
-    // record, a selected current value, or a pending logout found by startup or reload.
-    // Identifiers the explicit logout itself reads from the marker do not count.
+    // A local record, a marker found by startup/reload, or a successful explicit store read
+    // (including an empty store) fixes the targets. The explicit marker read alone does not.
     known: bool,
     unidentified: bool,
     deleted: Option<DeletedCredential>,
@@ -278,7 +277,6 @@ struct Session {
     memory: Mutex<Memory>,
     changes: watch::Sender<AuthState>,
     logout_marker: LogoutMarker,
-    lock_wait: Duration,
     #[cfg(test)]
     marker_io_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
@@ -339,7 +337,6 @@ impl<S: SecretStore> TwitcastingAuth<S> {
         logout_marker: LogoutMarker,
     ) -> Arc<Self> {
         let (changes, _) = watch::channel(AuthState::LoggedOut);
-        let lock_wait = options.read_timeout;
         Arc::new(Self {
             store,
             endpoints,
@@ -348,7 +345,6 @@ impl<S: SecretStore> TwitcastingAuth<S> {
                 memory: Mutex::new(Memory::default()),
                 changes,
                 logout_marker,
-                lock_wait,
                 #[cfg(test)]
                 marker_io_hook: Mutex::new(None),
             }),
@@ -417,7 +413,7 @@ impl<S: SecretStore> TwitcastingAuth<S> {
         generation: u64,
     ) {
         let deadline = started + self.options.read_timeout;
-        let check = tokio::time::timeout_at(deadline, self.session.check_startup_marker())
+        let check = tokio::time::timeout_at(deadline, self.session.check_startup_marker(deadline))
             .await
             .unwrap_or(Err(LogoutIssue::CheckTimedOut));
         let now = || now_ms.saturating_add(started.elapsed().as_millis() as u64);
@@ -872,7 +868,11 @@ impl<S: SecretStore> TwitcastingAuth<S> {
             }
         };
 
-        let result = match self.store.get_for_logout(TOKEN_KEY).await {
+        let current = self.store.get_for_logout(TOKEN_KEY).await;
+        if may_select_current && current.is_ok() {
+            self.session.memory.lock().unwrap().pending_logout.known = true;
+        }
+        let result = match current {
             Ok(None) => Logout::Empty,
             Ok(Some(value)) => {
                 let (record, id) = match value {
@@ -890,7 +890,6 @@ impl<S: SecretStore> TwitcastingAuth<S> {
                 if may_select_current && !targets.contains(&id) {
                     targets.insert(id.clone());
                     self.remember_logout_targets(&targets);
-                    self.session.memory.lock().unwrap().pending_logout.known = true;
                     let append = targets.clone();
                     marker_issue = self
                         .session
@@ -1070,6 +1069,8 @@ impl<S: SecretStore> TwitcastingAuth<S> {
             .map(|expiry| received_at + Duration::from_millis(expiry - record.obtained_at_ms));
         let (written, write_result) = oneshot::channel();
         let (commit, decision) = oneshot::channel();
+        let store_deadline = Instant::now() + self.options.read_timeout;
+        let lock_deadline = store_deadline.min(deadline);
         {
             let memory = self.session.memory.lock().unwrap();
             if memory.logout_pending || cancel.is_cancelled() {
@@ -1081,7 +1082,7 @@ impl<S: SecretStore> TwitcastingAuth<S> {
                 if written.is_closed() {
                     return;
                 }
-                let Ok(_lock) = session.lock_credentials().await else {
+                let Ok(_lock) = session.lock_credentials_until(lock_deadline).await else {
                     let _ = written.send(false);
                     return;
                 };
@@ -1119,7 +1120,7 @@ impl<S: SecretStore> TwitcastingAuth<S> {
         let saved = tokio::select! {
             biased;
             stop = login_ended(&cancel, deadline) => return Err(stop),
-            _ = tokio::time::sleep(self.options.read_timeout) => return Err(error(Code::TokenStore)),
+            _ = tokio::time::sleep_until(store_deadline) => return Err(error(Code::TokenStore)),
             saved = write_result => saved.map_err(|_| error(Code::TokenStore))?,
         };
         {
@@ -1303,14 +1304,13 @@ impl Session {
         state
     }
 
-    async fn check_startup_marker(&self) -> Result<MarkerTargets, LogoutIssue> {
+    async fn check_startup_marker(&self, deadline: Instant) -> Result<MarkerTargets, LogoutIssue> {
         let lock = self.credential_lock_path()?.map(Path::to_owned);
-        let wait = self.lock_wait;
         self.marker_io(move |path| {
             // This task owns the lock even if the startup caller stops waiting.
             let _lock = lock
                 .as_deref()
-                .map(|lock| lock_credential_file(lock, wait))
+                .map(|lock| lock_credential_file(lock, deadline))
                 .transpose()?;
             cleanup_marker_temps(path);
             read_marker(path)
@@ -1329,11 +1329,6 @@ impl Session {
         }
     }
 
-    async fn lock_credentials(&self) -> Result<Option<fs::File>, LogoutIssue> {
-        self.lock_credentials_until(Instant::now() + self.lock_wait)
-            .await
-    }
-
     async fn lock_credentials_until(
         &self,
         deadline: Instant,
@@ -1341,8 +1336,7 @@ impl Session {
         let Some(path) = self.credential_lock_path()?.map(Path::to_owned) else {
             return Ok(None);
         };
-        let wait = deadline.saturating_duration_since(Instant::now());
-        tokio::task::spawn_blocking(move || lock_credential_file(&path, wait))
+        tokio::task::spawn_blocking(move || lock_credential_file(&path, deadline))
             .await
             .unwrap_or(Err(LogoutIssue::MarkerInaccessible))
             .map(Some)
@@ -1375,7 +1369,7 @@ impl Session {
 
 const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(20);
 
-fn lock_credential_file(path: &Path, wait: Duration) -> Result<fs::File, LogoutIssue> {
+fn lock_credential_file(path: &Path, deadline: Instant) -> Result<fs::File, LogoutIssue> {
     let parent = path.parent().ok_or(LogoutIssue::MarkerInaccessible)?;
     fs::create_dir_all(parent).map_err(|_| LogoutIssue::MarkerInaccessible)?;
     let mut options = fs::OpenOptions::new();
@@ -1390,14 +1384,17 @@ fn lock_credential_file(path: &Path, wait: Duration) -> Result<fs::File, LogoutI
         .open(path)
         .map_err(|_| LogoutIssue::MarkerInaccessible)?;
     // Another session may hold the lock indefinitely; give up instead of blocking the queue.
-    let deadline = std::time::Instant::now() + wait;
+    let deadline = deadline.into_std();
     loop {
         match file.try_lock() {
             Ok(()) => return Ok(file),
-            Err(fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(LOCK_RETRY_INTERVAL);
+            Err(fs::TryLockError::WouldBlock) => {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(LogoutIssue::LockTimedOut);
+                }
+                std::thread::sleep(LOCK_RETRY_INTERVAL.min(remaining));
             }
-            Err(fs::TryLockError::WouldBlock) => return Err(LogoutIssue::LockTimedOut),
             Err(fs::TryLockError::Error(_)) => return Err(LogoutIssue::MarkerInaccessible),
         }
     }
@@ -3909,7 +3906,7 @@ const fetch = (_path, { body }) => {
 
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join(CREDENTIAL_LOCK_FILE);
-            let _lock = lock_credential_file(&path, Duration::ZERO).unwrap();
+            let _lock = lock_credential_file(&path, Instant::now()).unwrap();
             let child = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
@@ -3953,10 +3950,9 @@ const fetch = (_path, { body }) => {
             assert!(unrelated.exists());
         }
 
-        // 修正14-1: 読めずに失敗した初回の明示ログアウトを再試行しても、ディスクのマーカーから
-        // 取り込んだ識別子は「対象が判明した」扱いにならず、現在値を消す。
+        // 修正14-1: 現在値を読めなくても、別の識別子だけのマーカーがある初回の明示操作で削除する。
         #[tokio::test]
-        async fn revision14_retry_after_failed_read_deletes_current_despite_other_marker() {
+        async fn revision14_first_logout_deletes_unreadable_value_despite_other_marker() {
             let dir = tempfile::tempdir().unwrap();
             let marker = dir.path().join(LOGOUT_MARKER_FILE);
             let store = MemorySecretStore::new();
@@ -3969,57 +3965,144 @@ const fetch = (_path, { body }) => {
 
             store.fail_next_get();
             let first = auth.disconnect().await;
-            let retry = auth.disconnect().await;
-            assert!(first.is_ok() || retry.is_ok());
+            assert!(first.is_ok());
             assert!(store.raw(TOKEN_KEY).is_none(), "現在の資格情報が残った");
             auth.initialize(Some("client"), 0).await;
             assert_ne!(auth.status(Some("client"), 0).state, "ready");
         }
 
-        // 修正14-2: キューで待たされたログアウトは、ロックを残り時間だけ待つ。
         #[tokio::test]
-        async fn revision14_queued_logout_waits_only_for_its_remaining_time() {
+        async fn revision15_retry_keeps_new_login_after_marked_credential_delete_fails() {
             let dir = tempfile::tempdir().unwrap();
             let marker = dir.path().join(LOGOUT_MARKER_FILE);
             let store = MemorySecretStore::new();
             seed_record(&store, None).await;
-            let auth = TwitcastingAuth::with_logout_marker(
-                store.clone(),
-                TwitcastingEndpoints::default(),
-                short_options(400),
-                Some(marker.clone()),
-            );
+            store.fail_next_get();
+            let auth = auth_with_marker(store.clone(), marker.clone());
             auth.initialize(Some("client"), 0).await;
-            assert_eq!(auth.status(Some("client"), 0).state, "ready");
-            let held = fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(marker.with_extension("lock"))
-                .unwrap();
-            held.lock().unwrap();
-            // A reload occupies the queue while it waits for the held lock.
-            let load = tokio::spawn({
-                let auth = auth.clone();
-                async move { auth.load(Some("client"), 0).await }
-            });
-            wait_until(|| {
-                matches!(
-                    auth.session.memory.lock().unwrap().restore,
-                    RestoreState::Loading
-                )
-            })
-            .await;
+            assert_eq!(auth.status(Some("client"), 0).state, "loadFailed");
 
+            fs::write(&marker, id_of(&seeded("test-token"))).unwrap();
+            store.fail_next_delete();
             assert!(auth.disconnect().await.is_err());
-            timeout(Duration::from_millis(200), async {
-                while auth.session.memory.lock().unwrap().logout_running {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            })
-            .await
-            .expect("ログアウトが期限を過ぎてもロックを待ち続けた");
+            assert_eq!(
+                auth.status(Some("client"), 0).logout_issue,
+                Some(LogoutIssue::DeleteFailed)
+            );
+            assert!(store.raw(TOKEN_KEY).is_some());
+
+            let newer = serde_json::to_string(&seeded("new-token")).unwrap();
+            store.put(TOKEN_KEY, &newer).await.unwrap();
+            auth.disconnect().await.unwrap();
+            assert!(
+                store.raw(TOKEN_KEY).as_deref() == Some(newer.as_str()),
+                "再ログイン後の資格情報が失われた"
+            );
+            assert!(!marker.exists());
+            let status = auth.status(Some("client"), 0);
+            assert_eq!(status.logout_issue, Some(LogoutIssue::OtherLoginKept));
+            assert_eq!(status.logouts_completed, 0);
+        }
+
+        #[cfg(windows)]
+        #[tokio::test]
+        async fn revision15_retry_keeps_new_login_after_empty_store_cleanup_fails() {
+            let dir = tempfile::tempdir().unwrap();
+            let marker = dir.path().join(LOGOUT_MARKER_FILE);
+            let store = MemorySecretStore::new();
+            store.fail_next_get();
+            let auth = auth_with_marker(store.clone(), marker.clone());
+            auth.initialize(Some("client"), 0).await;
+            assert_eq!(auth.status(Some("client"), 0).state, "loadFailed");
+
+            fs::write(&marker, id_of(&seeded("old-token"))).unwrap();
+            let held = deny_marker_replacement(&marker);
+            assert!(auth.disconnect().await.is_err());
+            assert_eq!(
+                auth.status(Some("client"), 0).logout_issue,
+                Some(LogoutIssue::MarkerInaccessible)
+            );
+            assert!(store.raw(TOKEN_KEY).is_none());
             drop(held);
-            load.await.unwrap();
+
+            let newer = serde_json::to_string(&seeded("new-token")).unwrap();
+            store.put(TOKEN_KEY, &newer).await.unwrap();
+            auth.disconnect().await.unwrap();
+            assert!(
+                store.raw(TOKEN_KEY).as_deref() == Some(newer.as_str()),
+                "再ログイン後の資格情報が失われた"
+            );
+            assert!(!marker.exists());
+            let status = auth.status(Some("client"), 0);
+            assert_eq!(status.logout_issue, Some(LogoutIssue::OtherLoginKept));
+            assert_eq!(status.logouts_completed, 0);
+        }
+
+        // 修正14-2: ストアとブロッキングタスクの両キューで待った分をロック期限に含める。
+        #[test]
+        fn revision14_queued_logout_waits_only_for_its_remaining_time() {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .max_blocking_threads(1)
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let dir = tempfile::tempdir().unwrap();
+                    let marker = dir.path().join(LOGOUT_MARKER_FILE);
+                    let store = MemorySecretStore::new();
+                    seed_record(&store, None).await;
+                    let auth = TwitcastingAuth::with_logout_marker(
+                        store,
+                        TwitcastingEndpoints::default(),
+                        short_options(1000),
+                        Some(marker.clone()),
+                    );
+                    auth.initialize(Some("client"), 0).await;
+                    assert_eq!(auth.status(Some("client"), 0).state, "ready");
+                    let held = fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(marker.with_extension("lock"))
+                        .unwrap();
+                    held.lock().unwrap();
+
+                    let (resume_blocking, blocking_gate) = oneshot::channel();
+                    let blocker = tokio::task::spawn_blocking(move || {
+                        let _ = blocking_gate.blocking_recv();
+                    });
+                    let (started, worker_started) = oneshot::channel();
+                    let (resume_worker, worker_gate) = oneshot::channel();
+                    auth.enqueue(async move {
+                        let _ = started.send(());
+                        let _ = worker_gate.await;
+                    })
+                    .unwrap();
+                    worker_started.await.unwrap();
+                    let queue = auth.store_queue.lock().unwrap().as_ref().unwrap().clone();
+
+                    let logout = tokio::spawn({
+                        let auth = auth.clone();
+                        async move { auth.disconnect().await }
+                    });
+                    wait_until(|| queue.capacity() < STORE_QUEUE_CAPACITY).await;
+                    resume_worker.send(()).unwrap();
+
+                    assert!(logout.await.unwrap().is_err());
+                    resume_blocking.send(()).unwrap();
+                    blocker.await.unwrap();
+                    timeout(Duration::from_millis(500), async {
+                        while auth.session.memory.lock().unwrap().logout_running {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    })
+                    .await
+                    .expect("ログアウトが期限を過ぎてもロックを待ち続けた");
+                    assert_eq!(
+                        auth.status(Some("client"), 0).logout_issue,
+                        Some(LogoutIssue::LockTimedOut)
+                    );
+                    drop(held);
+                });
         }
 
         // 修正14-5: ロック待ちの間の 2 回目のログアウトは二重に登録せず拒否する。
