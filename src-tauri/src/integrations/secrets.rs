@@ -5,6 +5,17 @@ use std::{
 };
 pub trait SecretStore: Clone + Send + Sync + 'static {
     fn get(&self, key: &str) -> impl Future<Output = Result<Option<String>, String>> + Send;
+    /// Logout may identify a malformed OS envelope without exposing it to normal callers.
+    fn get_for_logout(
+        &self,
+        key: &str,
+    ) -> impl Future<Output = Result<Option<LogoutValue>, String>> + Send {
+        async move {
+            self.get(key)
+                .await
+                .map(|value| value.map(LogoutValue::Decoded))
+        }
+    }
     fn put(&self, key: &str, value: &str) -> impl Future<Output = Result<(), String>> + Send;
     fn delete(&self, key: &str) -> impl Future<Output = Result<(), String>> + Send;
     /// Reports whether a previously observed entry was removed when the backend can distinguish it.
@@ -12,6 +23,11 @@ pub trait SecretStore: Clone + Send + Sync + 'static {
         async move { self.delete(key).await.map(|()| true) }
     }
 }
+pub enum LogoutValue {
+    Decoded(String),
+    MalformedEnvelope(String),
+}
+
 #[derive(Clone)]
 pub struct KeyringSecretStore;
 // The trait exchanges secret strings; only the OS adapter wraps the on-disk record.
@@ -32,29 +48,41 @@ pub(crate) fn token_fits_windows_credential(value: &str) -> bool {
         .is_ok_and(|password| crate::secret_store::fits_windows_credential(&password))
 }
 
+async fn read_password(key: &str) -> Result<Option<String>, String> {
+    let key = key.to_owned();
+    let _guard = crate::secret_store::keyring_lock().lock().await;
+    tokio::task::spawn_blocking(move || {
+        let entry = keyring::Entry::new("fast-comment", &key)
+            .map_err(|_| "資格情報を読めません".to_string())?;
+        match entry.get_password() {
+            Ok(raw) => Ok(Some(raw)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(_) => Err("資格情報を読めません".into()),
+        }
+    })
+    .await
+    .map_err(|_| "資格情報を読めません".to_string())?
+}
+
 impl SecretStore for KeyringSecretStore {
     async fn get(&self, key: &str) -> Result<Option<String>, String> {
         if key.starts_with("webhook:") {
             // 壊れた JSON もそのまま取得し、上書き・削除の失敗時に復元できるようにする。
             // 内容の検証は load_webhook_secrets で行う。
-            let key = key.to_owned();
-            let _guard = crate::secret_store::keyring_lock().lock().await;
-            return tokio::task::spawn_blocking(move || {
-                let entry = keyring::Entry::new("fast-comment", &key)
-                    .map_err(|_| "資格情報を読めません".to_string())?;
-                match entry.get_password() {
-                    Ok(raw) => Ok(Some(raw)),
-                    Err(keyring::Error::NoEntry) => Ok(None),
-                    Err(_) => Err("資格情報を読めません".into()),
-                }
-            })
-            .await
-            .map_err(|_| "資格情報を読めません".to_string())?;
+            return read_password(key).await;
         }
         crate::secret_store::load::<TokenRecord>(key)
             .await
             .map(|v| v.map(|r| r.token))
             .map_err(|_| "資格情報を読めません".into())
+    }
+    async fn get_for_logout(&self, key: &str) -> Result<Option<LogoutValue>, String> {
+        Ok(read_password(key)
+            .await?
+            .map(|raw| match serde_json::from_str::<TokenRecord>(&raw) {
+                Ok(record) => LogoutValue::Decoded(record.token),
+                Err(_) => LogoutValue::MalformedEnvelope(raw),
+            }))
     }
     async fn put(&self, key: &str, value: &str) -> Result<(), String> {
         if key.starts_with("webhook:") {

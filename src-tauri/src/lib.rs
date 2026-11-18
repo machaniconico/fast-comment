@@ -58,7 +58,8 @@ use crate::moderation::{Moderator, Verdict};
 use crate::moderation_error::{ModerationError, ModerationErrorCode};
 use crate::sources::twitcasting_auth::{
     effective_client_id, AuthOptions, TwitcastingAuth, TwitcastingAuthError,
-    TwitcastingAuthErrorCode, TwitcastingEndpoints, TwitcastingStatus, LOGOUT_MARKER_FILE,
+    TwitcastingAuthErrorCode, TwitcastingEndpoints, TwitcastingStatus, CREDENTIAL_LOCK_FILE,
+    LOGOUT_MARKER_FILE,
 };
 use crate::sources::twitch_auth::{TwitchAuth, TwitchDeviceLogin, TwitchOauthStatus};
 use crate::sources::youtube_send::{YoutubeAuth, YoutubeOauthStatus};
@@ -2643,11 +2644,17 @@ pub fn run() {
                 .expect("X投稿用HTTPクライアントの作成に失敗しました"),
             );
 
-            let twitcasting_auth = TwitcastingAuth::with_logout_marker(
+            let twitcasting_auth = TwitcastingAuth::with_logout_files(
                 integrations::KeyringSecretStore,
                 TwitcastingEndpoints::default(),
                 AuthOptions::default(),
                 twitcasting_logout_marker(app_config_dir.as_deref()),
+                handle
+                    .path()
+                    .app_local_data_dir()
+                    .ok()
+                    .filter(|dir| dir.is_absolute())
+                    .map(|dir| dir.join(CREDENTIAL_LOCK_FILE)),
             );
             let twitcasting_client_id =
                 effective_client_id(config.credentials.twitcasting_client_id.as_deref());
