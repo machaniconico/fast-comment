@@ -11,9 +11,11 @@ use hyper::{server::conn::http1, service::service_fn};
 use hyper_util::rt::TokioIo;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     convert::Infallible,
-    fmt, io,
+    fmt,
+    future::Future,
+    io,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -34,6 +36,8 @@ pub const DEFAULT_CLIENT_ID: &str = "";
 const MAX_EXPIRY_SECONDS: u64 = 10 * 365 * 24 * 60 * 60;
 const ROLLBACK_ATTEMPTS: u32 = 3;
 const ROLLBACK_RETRY: Duration = Duration::from_millis(500);
+// Largest instant JavaScript `Date` can represent.
+const MAX_JS_DATE_MS: u64 = 8_640_000_000_000_000;
 const WSAECONNRESET: i32 = 10054;
 
 pub fn effective_client_id(override_id: Option<&str>) -> Option<String> {
@@ -167,8 +171,6 @@ struct Memory {
     unauthorized: bool,
     expired: bool,
     expiry_task: Option<DropGuard>,
-    // Tokens whose late write could not be undone; never restore them from the store.
-    revoked: HashSet<String>,
 }
 pub struct TwitcastingAuth<S: SecretStore> {
     store: S,
@@ -178,6 +180,10 @@ pub struct TwitcastingAuth<S: SecretStore> {
     changes: watch::Sender<AuthState>,
     operation: Arc<AsyncMutex<()>>,
     login: Mutex<Option<CancellationToken>>,
+    // Tail of the serial store queue. A started OS write cannot be aborted, so every
+    // operation on the token key runs after the previous one finishes, even when its
+    // caller has already stopped waiting.
+    store_queue: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 impl<S: SecretStore> fmt::Debug for TwitcastingAuth<S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -197,41 +203,60 @@ impl<S: SecretStore> TwitcastingAuth<S> {
                 unauthorized: false,
                 expired: false,
                 expiry_task: None,
-                revoked: HashSet::new(),
             })),
             changes,
             operation: Arc::new(AsyncMutex::new(())),
             login: Mutex::new(None),
+            store_queue: Mutex::new(None),
         })
+    }
+    fn queued<T, F>(&self, op: impl FnOnce(S) -> F) -> oneshot::Receiver<T>
+    where
+        T: Send + 'static,
+        F: Future<Output = T> + Send + 'static,
+    {
+        let (tx, rx) = oneshot::channel();
+        let op = op(self.store.clone());
+        let mut tail = self.store_queue.lock().unwrap();
+        let previous = tail.take();
+        *tail = Some(tokio::spawn(async move {
+            if let Some(previous) = previous {
+                let _ = previous.await;
+            }
+            let _ = tx.send(op.await);
+        }));
+        rx
+    }
+    /// Queues `op` and waits up to `read_timeout`; the operation still runs after a timeout.
+    async fn queued_within<T, F>(&self, op: impl FnOnce(S) -> F) -> Option<T>
+    where
+        T: Send + 'static,
+        F: Future<Output = T> + Send + 'static,
+    {
+        tokio::time::timeout(self.options.read_timeout, self.queued(op))
+            .await
+            .ok()
+            .and_then(Result::ok)
     }
     pub async fn load(&self, client_id: Option<&str>, now_ms: u64) {
         let observed_at = Instant::now();
         let _guard = self.operation.lock().await;
         let record = self
-            .store
-            .get(TOKEN_KEY)
+            .queued_within(|s| async move { s.get(TOKEN_KEY).await })
             .await
-            .ok()
+            .and_then(Result::ok)
             .flatten()
             .and_then(|s| serde_json::from_str::<Record>(&s).ok())
             .filter(|r| valid_token(&r.access_token))
             // Out-of-range expiries are corrupt; the UI cannot render them as a date.
+            // Compare stored values only, so a moved wall clock does not matter.
             .filter(|r| {
-                r.expires_at_ms
-                    .is_none_or(|e| e <= now_ms.saturating_add(MAX_EXPIRY_SECONDS * 1000))
+                r.expires_at_ms.is_none_or(|e| {
+                    e <= MAX_JS_DATE_MS
+                        && e.saturating_sub(r.obtained_at_ms) <= MAX_EXPIRY_SECONDS * 1000
+                })
             });
-        let revoked = record.as_ref().is_some_and(|r| {
-            self.memory
-                .lock()
-                .unwrap()
-                .revoked
-                .contains(&r.access_token)
-        });
-        if revoked {
-            let _ = tokio::time::timeout(self.options.read_timeout, self.store.delete(TOKEN_KEY))
-                .await;
-        }
-        self.replace_record(record.filter(|_| !revoked), client_id, now_ms, observed_at);
+        self.replace_record(record, client_id, now_ms, observed_at);
     }
     fn replace_record(
         &self,
@@ -379,10 +404,14 @@ impl<S: SecretStore> TwitcastingAuth<S> {
         self.cancel_login();
         let _guard = self.operation.lock().await;
         self.replace_record(None, None, 0, Instant::now());
-        self.store
-            .delete(TOKEN_KEY)
+        // On timeout the delete stays queued and runs after any write still in progress.
+        match self
+            .queued_within(|s| async move { s.delete(TOKEN_KEY).await })
             .await
-            .map_err(|_| error(Code::TokenStore))
+        {
+            Some(Ok(())) => Ok(()),
+            _ => Err(error(Code::TokenStore)),
+        }
     }
     pub async fn connect(
         self: &Arc<Self>,
@@ -526,8 +555,10 @@ impl<S: SecretStore> TwitcastingAuth<S> {
         let previous = tokio::select! {
             biased;
             stop = login_ended(&cancel, deadline) => return Err(stop),
-            // An unreadable old value must not block a fresh login; rollback then deletes.
-            previous = self.store.get(TOKEN_KEY) => previous.ok().flatten(),
+            // An unreadable old value must not block a fresh login.
+            previous = self.queued_within(|s| async move { s.get(TOKEN_KEY).await }) => {
+                previous.and_then(Result::ok).flatten()
+            }
         };
 
         let (reply, result) = oneshot::channel();
@@ -551,46 +582,28 @@ impl<S: SecretStore> TwitcastingAuth<S> {
                 return;
             }
 
-            let write = auth.store.put(TOKEN_KEY, &serialized);
-            tokio::pin!(write);
+            let value = serialized.clone();
+            let mut write = auth.queued(|s| async move { s.put(TOKEN_KEY, &value).await });
             let saved = tokio::select! {
                 biased;
-                stop = login_ended(&cancel, deadline) => Err((stop, None)),
-                saved = &mut write => match interrupted() {
-                    Some(stop) => Err((stop, Some(saved))),
-                    None => Ok(saved),
-                },
+                stop = login_ended(&cancel, deadline) => Err(stop),
+                saved = &mut write => interrupted().map_or(Ok(saved), Err),
             };
             let saved = match saved {
                 Ok(saved) => saved,
-                Err((stop, saved)) => {
+                Err(stop) => {
                     let _ = reply.send(Err(stop));
-                    // The OS write may still be running. Wait before restoring the old value.
-                    let saved = match saved {
-                        Some(saved) => Some(saved),
-                        None => tokio::time::timeout(auth.options.read_timeout, &mut write)
-                            .await
-                            .ok(),
-                    };
-                    let undone = match saved {
-                        Some(Err(_)) => true,
-                        Some(Ok(())) => auth.restore_previous(previous.as_deref()).await,
-                        None => false,
-                    };
-                    if !undone {
-                        // Give up so the operation lock is released; the store may keep the
-                        // cancelled token, so forget the login and refuse to reload that token.
-                        auth.memory
-                            .lock()
-                            .unwrap()
-                            .revoked
-                            .insert(record.access_token);
+                    // The rollback is queued behind the write, so it sees the write's result.
+                    if !auth.rollback(previous, serialized).await {
+                        // Give up so the operation lock is released. The store may keep the
+                        // cancelled token until a queued rollback or a later logout removes it.
                         auth.replace_record(None, None, 0, Instant::now());
                     }
                     return;
                 }
             };
-            let outcome = saved.map_err(|_| error(Code::TokenStore)).map(|_| {
+            let outcome = saved.map_err(|_| ()).and_then(|r| r.map_err(|_| ()));
+            let outcome = outcome.map_err(|_| error(Code::TokenStore)).map(|_| {
                 let client_id = record.client_id.clone();
                 let obtained_at_ms = record.obtained_at_ms;
                 auth.replace_record(Some(record), Some(&client_id), obtained_at_ms, received_at);
@@ -601,19 +614,29 @@ impl<S: SecretStore> TwitcastingAuth<S> {
         result.await.map_err(|_| error(Code::TokenStore))?
     }
 
-    async fn restore_previous(&self, previous: Option<&str>) -> bool {
+    /// Undoes a cancelled write only if it landed; an unreadable old value is left alone
+    /// when the write did not land, and deleted when it did (it cannot be restored).
+    async fn rollback(&self, previous: Option<String>, written: String) -> bool {
         for attempt in 0..ROLLBACK_ATTEMPTS {
             if attempt > 0 {
                 tokio::time::sleep(ROLLBACK_RETRY).await;
             }
-            let restore = async {
-                match previous {
-                    Some(value) => self.store.put(TOKEN_KEY, value).await,
-                    None => self.store.delete(TOKEN_KEY).await,
-                }
-            };
-            if let Ok(Ok(())) = tokio::time::timeout(self.options.read_timeout, restore).await {
-                return true;
+            let (previous, written) = (previous.clone(), written.clone());
+            let undone = self
+                .queued_within(|s| async move {
+                    if s.get(TOKEN_KEY).await?.as_deref() != Some(written.as_str()) {
+                        return Ok(());
+                    }
+                    match previous {
+                        Some(value) => s.put(TOKEN_KEY, &value).await,
+                        None => s.delete(TOKEN_KEY).await,
+                    }
+                })
+                .await;
+            match undone {
+                Some(Ok(())) => return true,
+                Some(Err(_)) => {}
+                None => return false,
             }
         }
         false
@@ -687,6 +710,7 @@ fn spawn_callback(
     });
     Ok(())
 }
+const DENIED_PAGE: &str = r#"<!doctype html><html lang="ja"><meta charset="utf-8"><title>ツイキャス認証</title><p>許可されませんでした。アプリでやり直してください。</p><script>history.replaceState(null, '', location.pathname);</script></html>"#;
 const PAGE: &str = r#"<!doctype html><html lang="ja"><meta charset="utf-8"><title>ツイキャス認証</title><p id="message">認証しています…</p><script>
 const fragment = location.hash.slice(1);
 const search = location.search;
@@ -695,10 +719,12 @@ history.replaceState(null, '', location.pathname);
 const params = new URLSearchParams(fragment.replaceAll('+', '%2B'));
 const query = new URLSearchParams(search);
 const denied = p => p.get('result') === 'denied' || p.has('error');
-// Forward only the keys the app reads, so unrelated provider fields cannot grow the body.
-const grant = new URLSearchParams();
-for (const key of ['access_token', 'expires_in', 'state']) { if (params.has(key)) grant.set(key, params.get(key)); }
-const body = denied(params) || denied(query) ? 'result=denied' : grant.toString();
+// Forward the raw pairs the app reads without re-encoding, so the body never outgrows the URL.
+const keys = ['access_token', 'expires_in', 'state'];
+const grant = fragment.split('&').filter(pair => keys.includes(pair.split('=')[0])).join('&');
+const state = params.get('state') ?? query.get('state');
+const refusal = 'result=denied' + (state ? '&state=' + encodeURIComponent(state) : '');
+const body = denied(params) || denied(query) ? refusal : grant;
 const message = document.getElementById('message');
 if (!body) { message.textContent = '認証情報が見つかりません'; }
 else { fetch('/twitcasting/token', {method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body}).then(r => { message.textContent = r.ok ? 'アプリに戻ってください。この画面は閉じられます。' : '認証に失敗しました。アプリでやり直してください。'; }).catch(() => { message.textContent = 'アプリでログインをやり直してください。'; }); }
@@ -706,7 +732,7 @@ else { fetch('/twitcasting/token', {method:'POST',headers:{'Content-Type':'appli
 async fn callback(context: &Loopback, req: Request) -> Response {
     let mut response = handle_callback(context, req).await;
     let headers = response.headers_mut();
-    for (k,v) in [("cache-control","no-store"), ("referrer-policy","no-referrer"), ("x-content-type-options","nosniff"), ("content-security-policy","default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'")] { headers.insert(k, v.parse().unwrap()); }
+    for (k,v) in [("cache-control","no-store"), ("referrer-policy","no-referrer"), ("x-content-type-options","nosniff"), ("content-security-policy","default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'")] { headers.insert(k, v.parse().unwrap()); }
     response
 }
 async fn handle_callback(context: &Loopback, req: Request) -> Response {
@@ -730,14 +756,16 @@ async fn handle_callback(context: &Loopback, req: Request) -> Response {
         return StatusCode::FORBIDDEN.into_response();
     }
     if req.method() == Method::GET && req.uri().path() == CALLBACK_PATH {
-        // An OAuth error in the query ends the login without waiting for the page script.
-        let denied = url::form_urlencoded::parse(req.uri().query().unwrap_or_default().as_bytes())
-            .any(|(k, v)| k == "error" || (k == "result" && v == "denied"));
-        if denied {
-            let mut accepted = context.accepted.lock().unwrap();
-            if !*accepted && !context.cancel.is_cancelled() {
-                *accepted = true;
-                let _ = context.tx.try_send(Err(error(Code::Denied)));
+        // An OAuth error in the query with this login's state ends the login at once. The
+        // page served for any state-bearing query error never posts, so a stale page from an
+        // earlier login cannot end the next one.
+        let query = parse_form(req.uri().query().unwrap_or_default().as_bytes());
+        if refused(&query) {
+            if let Some(state) = query.get("state") {
+                if state_matches(context, state) {
+                    complete(context, Err(error(Code::Denied)));
+                }
+                return Html(DENIED_PAGE).into_response();
             }
         }
         return Html(PAGE).into_response();
@@ -750,17 +778,15 @@ async fn handle_callback(context: &Loopback, req: Request) -> Response {
             Ok(Ok(body)) => body,
             _ => return StatusCode::BAD_REQUEST.into_response(),
         };
-    let params: HashMap<String, String> = url::form_urlencoded::parse(&body).into_owned().collect();
-    let denied =
-        params.get("result").is_some_and(|s| s == "denied") || params.contains_key("error");
-    let (grant, response) = if denied {
+    let params = parse_form(&body);
+    let (grant, response) = if refused(&params) {
+        // A refusal carries no state per the provider flow; one that does must match.
+        if params.get("state").is_some_and(|s| !state_matches(context, s)) {
+            return StatusCode::BAD_REQUEST.into_response();
+        }
         (Err(error(Code::Denied)), StatusCode::OK)
     } else {
-        let state = params
-            .get("state")
-            .map(String::as_bytes)
-            .unwrap_or_default();
-        if !bool::from(context.state.as_bytes().ct_eq(state)) {
+        if !params.get("state").is_some_and(|s| state_matches(context, s)) {
             return StatusCode::BAD_REQUEST.into_response();
         }
         let Some(token) = params.get("access_token").filter(|t| valid_token(t)) else {
@@ -782,13 +808,38 @@ async fn handle_callback(context: &Loopback, req: Request) -> Response {
             Err(err) => (Err(err), StatusCode::BAD_REQUEST),
         }
     };
+    if !complete(context, grant) {
+        return StatusCode::CONFLICT.into_response();
+    }
+    response.into_response()
+}
+/// Ends the login once; later results are rejected.
+fn complete(context: &Loopback, grant: Result<Grant, TwitcastingAuthError>) -> bool {
     let mut accepted = context.accepted.lock().unwrap();
     if *accepted || context.cancel.is_cancelled() {
-        return StatusCode::CONFLICT.into_response();
+        return false;
     }
     *accepted = true;
     let _ = context.tx.try_send(grant);
-    response.into_response()
+    true
+}
+/// Percent-decodes only: a literal `+` stays `+`, matching the raw fragment the page posts.
+fn parse_form(raw: &[u8]) -> HashMap<String, String> {
+    let mut escaped = Vec::with_capacity(raw.len());
+    for &b in raw {
+        if b == b'+' {
+            escaped.extend_from_slice(b"%2B");
+        } else {
+            escaped.push(b);
+        }
+    }
+    url::form_urlencoded::parse(&escaped).into_owned().collect()
+}
+fn refused(params: &HashMap<String, String>) -> bool {
+    params.get("result").is_some_and(|s| s == "denied") || params.contains_key("error")
+}
+fn state_matches(context: &Loopback, state: &str) -> bool {
+    bool::from(context.state.as_bytes().ct_eq(state.as_bytes()))
 }
 
 #[cfg(test)]
@@ -885,34 +936,83 @@ const fetch = (_path, { body }) => {
     async fn oauth_error_completes_callback_with_fixed_denial() {
         let oauth_error = "error=access_denied&error_description=private%20provider%20details";
         let base = format!("http://localhost:{CALLBACK_PORT}{CALLBACK_PATH}");
-        for url in [
-            format!("{base}#{oauth_error}"),
-            format!("{base}?{oauth_error}#state=test-state"),
+        for (url, expected) in [
+            (format!("{base}#{oauth_error}"), "result=denied"),
+            (format!("{base}#{oauth_error}&state=test-state"), "result=denied&state=test-state"),
         ] {
-            let (tx, mut rx) = mpsc::channel(1);
-            let context = Loopback {
-                state: "test-state".into(),
-                port: CALLBACK_PORT,
-                read_timeout: Duration::from_secs(1),
-                tx,
-                accepted: Mutex::new(false),
-                cancel: CancellationToken::new(),
-            };
-            let uri = url.split_once('#').unwrap().0.trim_start_matches(&format!("http://localhost:{CALLBACK_PORT}"));
-            let request = Request::builder()
-                .method(Method::GET)
-                .uri(uri)
-                .header("host", format!("localhost:{CALLBACK_PORT}"))
-                .body(Body::empty())
-                .unwrap();
-            assert_eq!(handle_callback(&context, request).await.status(), StatusCode::OK);
-            // Only a query error ends the login on the GET itself.
-            assert_eq!(rx.try_recv().is_ok(), url.contains('?'));
             let body = run_callback_script(PAGE, &url);
-            assert_eq!(body, "result=denied");
+            assert_eq!(body, expected);
             assert_fixed_denial(body).await;
         }
         assert_fixed_denial(oauth_error.into()).await;
+    }
+
+    fn loopback() -> (Loopback, mpsc::Receiver<Result<Grant, TwitcastingAuthError>>) {
+        let (tx, rx) = mpsc::channel(1);
+        let context = Loopback {
+            state: "test-state".into(),
+            port: CALLBACK_PORT,
+            read_timeout: Duration::from_secs(1),
+            tx,
+            accepted: Mutex::new(false),
+            cancel: CancellationToken::new(),
+        };
+        (context, rx)
+    }
+
+    async fn send(context: &Loopback, method: Method, uri: &str, body: &str) -> (StatusCode, String, String) {
+        let request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("host", format!("localhost:{CALLBACK_PORT}"))
+            .body(Body::from(body.to_owned()))
+            .unwrap();
+        let response = callback(context, request).await;
+        let status = response.status();
+        let csp = response.headers()["content-security-policy"].to_str().unwrap().to_owned();
+        let body = to_bytes(response.into_body(), 1 << 16).await.unwrap();
+        (status, csp, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn refusals_need_this_logins_state_and_never_repost() {
+        // A query refusal with the right state ends the login, and its page does not post.
+        let (context, mut rx) = loopback();
+        let uri = format!("{CALLBACK_PATH}?error=access_denied&state=test-state");
+        let (status, csp, page) = send(&context, Method::GET, &uri, "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(csp.contains("frame-ancestors 'none'"));
+        assert!(!page.contains("fetch"), "refusal page posts again");
+        assert!(matches!(rx.try_recv(), Ok(Err(e)) if matches!(e.code, Code::Denied)));
+
+        // Refusals without this login's state are ignored (stale page, cross-site <img>).
+        for uri in [
+            format!("{CALLBACK_PATH}?error=access_denied&state=other-state"),
+            format!("{CALLBACK_PATH}?error=access_denied"),
+        ] {
+            let (context, mut rx) = loopback();
+            send(&context, Method::GET, &uri, "").await;
+            assert!(rx.try_recv().is_err(), "{uri} ended the login");
+        }
+        let (context, mut rx) = loopback();
+        let (status, _, _) = send(&context, Method::POST, TOKEN_PATH, "result=denied&state=other-state").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(rx.try_recv().is_err(), "refusal for another state ended the login");
+    }
+
+    #[tokio::test]
+    async fn callback_page_posts_raw_fragment_within_limit() {
+        // Re-encoding would turn every `+` into `%2B` and exceed the 4096-byte limit.
+        let token = "+".repeat(2048);
+        let state = "s".repeat(43);
+        let (context, mut rx) = loopback();
+        let context = Loopback { state: state.clone(), ..context };
+        let url = format!("http://localhost:{CALLBACK_PORT}{CALLBACK_PATH}#access_token={token}&token_type=bearer&state={state}&expires_in=60");
+        let body = run_callback_script(PAGE, &url);
+        assert!(body.len() <= 4096, "{}", body.len());
+        let (status, _, _) = send(&context, Method::POST, TOKEN_PATH, &body).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(rx.try_recv().unwrap().unwrap().token, token);
     }
 
     async fn assert_fixed_denial(body: String) {
@@ -1007,6 +1107,16 @@ const fetch = (_path, { body }) => {
         delay: Duration,
         extra: &str,
     ) -> tokio::task::JoinHandle<Result<TwitcastingStatus, TwitcastingAuthError>> {
+        post_grant_as(auth, addr, delay, "new-token", extra).await
+    }
+
+    async fn post_grant_as<S: SecretStore>(
+        auth: Arc<TwitcastingAuth<S>>,
+        addr: std::net::SocketAddr,
+        delay: Duration,
+        token: &str,
+        extra: &str,
+    ) -> tokio::task::JoinHandle<Result<TwitcastingStatus, TwitcastingAuthError>> {
         let (started, listening) = oneshot::channel();
         let login = tokio::spawn(async move {
             auth.connect("client", 0, |url| {
@@ -1028,7 +1138,7 @@ const fetch = (_path, { body }) => {
             .unwrap();
         tokio::time::sleep(delay).await;
         let mut client = BufReader::new(TcpStream::connect(addr).await.unwrap());
-        let body = format!("access_token=new-token&state={state}{extra}");
+        let body = format!("access_token={token}&state={state}{extra}");
         let request = format!(
             "POST {TOKEN_PATH} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
@@ -1348,10 +1458,6 @@ const fetch = (_path, { body }) => {
         if !hang {
             assert!(store.inner.raw(TOKEN_KEY).unwrap().contains("new-token"));
         }
-        // The cancelled token left in the store is not restored.
-        auth.load(Some("client"), 0).await;
-        assert_eq!(auth.status(Some("client"), 0).state, "loggedOut");
-        assert!(auth.bearer(Some("client"), 0).is_none());
         timeout(Duration::from_secs(5), auth.disconnect())
             .await
             .expect("disconnect waited on the abandoned rollback")
@@ -1360,18 +1466,117 @@ const fetch = (_path, { body }) => {
     }
 
     #[tokio::test]
-    async fn failing_delete_after_cancel_releases_lock_and_forgets_token() {
+    async fn failing_delete_after_cancel_releases_lock() {
         abort_with_failing_rollback(false, false).await;
     }
 
     #[tokio::test]
-    async fn failing_restore_after_cancel_releases_lock_and_forgets_token() {
+    async fn failing_restore_after_cancel_releases_lock() {
         abort_with_failing_rollback(true, false).await;
     }
 
     #[tokio::test]
     async fn hanging_write_after_cancel_releases_lock() {
         abort_with_failing_rollback(false, true).await;
+    }
+
+    /// Like the OS store: the first put keeps writing in another task even if its caller
+    /// stops waiting, and lands after `delay`.
+    #[derive(Clone, Default)]
+    struct DetachedWriteStore {
+        inner: MemorySecretStore,
+        writing: Arc<Notify>,
+        puts: Arc<std::sync::atomic::AtomicUsize>,
+        never_delete: bool,
+    }
+
+    impl SecretStore for DetachedWriteStore {
+        async fn get(&self, key: &str) -> Result<Option<String>, String> {
+            self.inner.get(key).await
+        }
+        async fn put(&self, key: &str, value: &str) -> Result<(), String> {
+            if self.puts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
+                return self.inner.put(key, value).await;
+            }
+            self.writing.notify_one();
+            let (inner, key, value) = (self.inner.clone(), key.to_owned(), value.to_owned());
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+                inner.put(&key, &value).await
+            })
+            .await
+            .unwrap()
+        }
+        async fn delete(&self, key: &str) -> Result<(), String> {
+            if self.never_delete {
+                std::future::pending::<()>().await;
+            }
+            self.inner.delete(key).await
+        }
+    }
+
+    async fn cancel_detached_write(
+        store: &DetachedWriteStore,
+    ) -> (Arc<TwitcastingAuth<DetachedWriteStore>>, std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let (auth, addr, server) = login_fixture_with(store.clone(), Duration::from_millis(500)).await;
+        let login = post_grant(auth.clone(), addr, Duration::ZERO, "").await;
+        timeout(Duration::from_secs(2), store.writing.notified())
+            .await
+            .unwrap();
+        auth.cancel_login();
+        let result = timeout(Duration::from_secs(1), login).await.unwrap().unwrap();
+        assert!(matches!(result.unwrap_err().code, Code::Cancelled));
+        (auth, addr, server)
+    }
+
+    #[tokio::test]
+    async fn late_cancelled_write_does_not_overwrite_next_login() {
+        let store = DetachedWriteStore::default();
+        let (auth, addr, server) = cancel_detached_write(&store).await;
+        let next = post_grant_as(auth.clone(), addr, Duration::ZERO, "token-b", "").await;
+        let status = timeout(Duration::from_secs(5), next).await.unwrap().unwrap().unwrap();
+        assert_eq!(status.state, "ready");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let record: Record = serde_json::from_str(&store.inner.raw(TOKEN_KEY).unwrap()).unwrap();
+        assert_eq!(record.access_token, "token-b");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn late_cancelled_write_does_not_survive_disconnect() {
+        let store = DetachedWriteStore::default();
+        let (auth, _, server) = cancel_detached_write(&store).await;
+        let _ = timeout(Duration::from_secs(3), auth.disconnect())
+            .await
+            .expect("disconnect did not return");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(store.inner.raw(TOKEN_KEY).is_none());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn disconnect_returns_when_delete_never_completes() {
+        let store = DetachedWriteStore {
+            never_delete: true,
+            ..Default::default()
+        };
+        seed_record(&store.inner, None).await;
+        let auth = TwitcastingAuth::new(
+            store,
+            TwitcastingEndpoints::default(),
+            AuthOptions {
+                read_timeout: Duration::from_millis(500),
+                ..AuthOptions::default()
+            },
+        );
+        auth.load(Some("client"), 0).await;
+        assert_eq!(auth.status(Some("client"), 0).state, "ready");
+        let result = timeout(Duration::from_secs(2), auth.disconnect())
+            .await
+            .expect("disconnect waited on a delete that never completes");
+        assert!(matches!(result.unwrap_err().code, Code::TokenStore));
+        assert_eq!(auth.status(Some("client"), 0).state, "loggedOut");
+        drop(timeout(Duration::from_secs(1), auth.operation.lock()).await.unwrap());
     }
 
     #[tokio::test]
