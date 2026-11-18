@@ -22,6 +22,14 @@
   });
   const expiring = $derived(expiry instanceof Date && expiry.getTime() - now <= 14 * 86400000);
 
+  const logoutIssueText: Record<NonNullable<TwitcastingStatus['logoutIssue']>, string> = {
+    markerUnavailable: '設定フォルダーを取得できません。利用できる状態でアプリを起動し直してください。',
+    markerInaccessible: '設定フォルダーとアクセス権を確認し、ログアウトを再試行してください。',
+    markerCorrupt: '設定フォルダー内の twitcasting-logout-pending を移動してから、ログアウトを再試行してください。',
+    deleteFailed: '保存済みの認証情報を削除できません。ログアウトを再試行してください。',
+    timedOut: 'ログアウトの処理が続いています。',
+  };
+
   async function refresh() {
     try {
       const next = await getTwitcastingStatus();
@@ -53,7 +61,7 @@
     };
   });
   async function connect() {
-    if (connecting || disconnecting) return;
+    if (connecting || disconnecting || reloading) return;
     connecting = true;
     failed = false;
     message = 'ブラウザでツイキャスにログインし、アプリを許可してください…';
@@ -95,6 +103,9 @@
       <span>未ログイン</span>
     {/if}
   </div>
+  {#if status?.logoutIssue}
+    <p class="warn">{logoutIssueText[status.logoutIssue]}</p>
+  {/if}
   {#if expiry === 'invalid'}
     <p class="warn">有効期限を読み取れません。再ログインしてください。</p>
   {:else if expiry}
@@ -106,14 +117,15 @@
     {#if connecting}
       <button type="button" onclick={cancel}>取り消す</button>
     {:else}
-      <button type="button" class="primary" onclick={connect} disabled={disconnecting || status?.logoutPending}>ログイン</button>
+      <button type="button" class="primary" onclick={connect} disabled={disconnecting || reloading || status?.logoutPending}>ログイン</button>
     {/if}
     {#if status?.logoutPending}
       <button type="button" onclick={disconnect} disabled={disconnecting}>ログアウトを再試行</button>
-    {:else if status?.state === 'ready' || status?.state === 'reloginRequired'}
-      <button type="button" onclick={disconnect} disabled={connecting || disconnecting}>ログアウト</button>
-    {:else if status?.state === 'loadFailed'}
-      <button type="button" onclick={reload} disabled={connecting || reloading}>認証情報を再読み込み</button>
+    {:else if status?.state === 'ready' || status?.state === 'reloginRequired' || status?.state === 'loadFailed'}
+      <button type="button" onclick={disconnect} disabled={connecting || disconnecting || reloading}>ログアウト</button>
+      {#if status.state === 'loadFailed'}
+        <button type="button" onclick={reload} disabled={connecting || disconnecting || reloading}>認証情報を再読み込み</button>
+      {/if}
     {/if}
   </div>
   <div aria-live="polite">{#if message}<p class:warn={failed}>{message}</p>{/if}</div>

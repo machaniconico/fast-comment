@@ -1369,6 +1369,12 @@ fn twitcasting_client_id(state: &AppState) -> Option<String> {
     )
 }
 
+fn twitcasting_logout_marker(app_config_dir: Option<&std::path::Path>) -> Option<PathBuf> {
+    app_config_dir
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(LOGOUT_MARKER_FILE))
+}
+
 #[tauri::command]
 fn get_twitcasting_status(state: State<'_, AppState>) -> TwitcastingStatus {
     state
@@ -1379,7 +1385,10 @@ fn get_twitcasting_status(state: State<'_, AppState>) -> TwitcastingStatus {
 #[tauri::command]
 async fn reload_twitcasting_status(state: State<'_, AppState>) -> Result<TwitcastingStatus, ()> {
     let client_id = twitcasting_client_id(&state);
-    state.twitcasting_auth.load(client_id.as_deref(), timer_now_ms()).await;
+    state
+        .twitcasting_auth
+        .reload(client_id.as_deref(), timer_now_ms())
+        .await;
     Ok(get_twitcasting_status(state))
 }
 
@@ -2541,10 +2550,10 @@ pub fn run() {
             let handle = app.handle().clone();
 
             // 設定ディレクトリ。
-            let config_dir = handle
-                .path()
-                .app_config_dir()
-                .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+            let app_config_dir = handle.path().app_config_dir().ok();
+            let config_dir = app_config_dir
+                .clone()
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
             // 設定ロード(失敗時は既定値で続行)。
             let config = AppConfig::load(&config_dir).unwrap_or_else(|e| {
@@ -2584,11 +2593,12 @@ pub fn run() {
                 integrations::KeyringSecretStore,
                 TwitcastingEndpoints::default(),
                 AuthOptions::default(),
-                Some(config_dir.join(LOGOUT_MARKER_FILE)),
+                twitcasting_logout_marker(app_config_dir.as_deref()),
             );
-            let auth_load = twitcasting_auth.clone();
             let client_id = effective_client_id(config.credentials.twitcasting_client_id.as_deref());
-            tauri::async_runtime::block_on(auth_load.load(client_id.as_deref(), timer_now_ms()));
+            tauri::async_runtime::block_on(
+                twitcasting_auth.initialize(client_id.as_deref(), timer_now_ms()),
+            );
 
             // 下流 Bus(パイプライン → UI/OBS)。
             let bus = Bus::new(obs_port, stats_tx.clone(), timer_tx.clone());
@@ -2871,6 +2881,20 @@ pub fn run() {
 #[cfg(test)]
 mod followup_tests {
     use super::*;
+
+    #[test]
+    fn revision8_marker_requires_an_absolute_app_config_dir() {
+        assert_eq!(twitcasting_logout_marker(None), None);
+        assert_eq!(
+            twitcasting_logout_marker(Some(std::path::Path::new("."))),
+            None
+        );
+        let dir = std::env::temp_dir();
+        assert_eq!(
+            twitcasting_logout_marker(Some(&dir)),
+            Some(dir.join(LOGOUT_MARKER_FILE))
+        );
+    }
 
     #[test]
     fn integrations_commands_allow_only_main_window() {

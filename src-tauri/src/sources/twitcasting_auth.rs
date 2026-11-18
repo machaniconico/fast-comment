@@ -16,7 +16,7 @@ use std::{
     fmt, fs,
     future::Future,
     io,
-    path::PathBuf,
+    path::{Path, PathBuf},
     pin::Pin,
     sync::{Arc, Mutex},
     time::Duration,
@@ -114,6 +114,8 @@ pub struct TwitcastingStatus {
     pub custom_client_id: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub logout_pending: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    logout_issue: Option<LogoutIssue>,
 }
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -183,6 +185,22 @@ enum RestoreState {
     Loading,
     Failed,
 }
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum LogoutIssue {
+    MarkerUnavailable,
+    MarkerInaccessible,
+    MarkerCorrupt,
+    DeleteFailed,
+    TimedOut,
+}
+
+enum LogoutMarker {
+    MemoryOnly,
+    Unavailable,
+    File(PathBuf),
+}
+
 #[derive(Default)]
 struct Memory {
     record: Option<Record>,
@@ -192,12 +210,15 @@ struct Memory {
     expiry_task: Option<DropGuard>,
     restore: RestoreState,
     logout_pending: bool,
-    delete_queued: bool,
+    logout_issue: Option<LogoutIssue>,
+    logout_running: bool,
 }
 struct Session {
     memory: Mutex<Memory>,
     changes: watch::Sender<AuthState>,
-    logout_marker: Option<PathBuf>,
+    logout_marker: LogoutMarker,
+    #[cfg(test)]
+    marker_io_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 type StoreJob = Pin<Box<dyn Future<Output = ()> + Send>>;
 
@@ -219,7 +240,7 @@ impl<S: SecretStore> fmt::Debug for TwitcastingAuth<S> {
 }
 impl<S: SecretStore> TwitcastingAuth<S> {
     pub fn new(store: S, endpoints: TwitcastingEndpoints, options: AuthOptions) -> Arc<Self> {
-        Self::with_logout_marker(store, endpoints, options, None)
+        Self::with_marker(store, endpoints, options, LogoutMarker::MemoryOnly)
     }
 
     pub(crate) fn with_logout_marker(
@@ -228,21 +249,27 @@ impl<S: SecretStore> TwitcastingAuth<S> {
         options: AuthOptions,
         logout_marker: Option<PathBuf>,
     ) -> Arc<Self> {
+        let marker = logout_marker.map_or(LogoutMarker::Unavailable, LogoutMarker::File);
+        Self::with_marker(store, endpoints, options, marker)
+    }
+
+    fn with_marker(
+        store: S,
+        endpoints: TwitcastingEndpoints,
+        options: AuthOptions,
+        logout_marker: LogoutMarker,
+    ) -> Arc<Self> {
         let (changes, _) = watch::channel(AuthState::LoggedOut);
-        let logout_pending = logout_marker
-            .as_ref()
-            .is_some_and(|path| path.try_exists().unwrap_or(true));
         Arc::new(Self {
             store,
             endpoints,
             options,
             session: Arc::new(Session {
-                memory: Mutex::new(Memory {
-                    logout_pending,
-                    ..Memory::default()
-                }),
+                memory: Mutex::new(Memory::default()),
                 changes,
                 logout_marker,
+                #[cfg(test)]
+                marker_io_hook: Mutex::new(None),
             }),
             operation: AsyncMutex::new(()),
             login: Mutex::new(None),
@@ -280,61 +307,99 @@ impl<S: SecretStore> TwitcastingAuth<S> {
         Ok(rx)
     }
 
-    pub async fn load(&self, client_id: Option<&str>, now_ms: u64) {
-        let observed_at = Instant::now();
-        let queued = {
+    pub(crate) async fn initialize(self: &Arc<Self>, client_id: Option<&str>, now_ms: u64) {
+        let check = tokio::time::timeout(
+            self.options.read_timeout,
+            self.session.marker_io(inspect_marker),
+        )
+        .await
+        .unwrap_or(Err(LogoutIssue::MarkerInaccessible));
+        let (retry_logout, issue) = match check {
+            Ok(None) => {
+                self.load(client_id, now_ms).await;
+                return;
+            }
+            Ok(Some(metadata)) => (
+                true,
+                (!metadata.is_file()).then_some(LogoutIssue::MarkerCorrupt),
+            ),
+            Err(issue) => (false, Some(issue)),
+        };
+        {
             let mut memory = self.session.memory.lock().unwrap();
-            if memory.logout_pending || matches!(memory.restore, RestoreState::Loading) {
+            memory.logout_pending = true;
+            memory.logout_issue = issue;
+        }
+        if retry_logout {
+            let _ = self.disconnect().await;
+        }
+    }
+
+    pub(crate) async fn reload(&self, client_id: Option<&str>, now_ms: u64) {
+        self.restore(client_id, now_ms, true).await;
+    }
+
+    pub async fn load(&self, client_id: Option<&str>, now_ms: u64) {
+        self.restore(client_id, now_ms, false).await;
+    }
+
+    async fn restore(&self, client_id: Option<&str>, now_ms: u64, retry_only: bool) {
+        let observed_at = Instant::now();
+        let deadline = observed_at + self.options.read_timeout;
+        let session = self.session.clone();
+        let client_id = client_id.map(str::to_owned);
+        let (generation, read) = {
+            let mut memory = session.memory.lock().unwrap();
+            if memory.logout_pending
+                || memory.unauthorized
+                || matches!(memory.restore, RestoreState::Loading)
+                || (retry_only && !matches!(memory.restore, RestoreState::Failed))
+            {
                 return;
             }
             let generation = memory.generation;
-            let session = self.session.clone();
-            let stored_client_id = client_id.map(str::to_owned);
             memory.restore = RestoreState::Loading;
+            session.auth_state(&memory, client_id.as_deref(), now_ms);
+
             let store = self.store.clone();
-            let queued = self.store_request(async move {
-                let result = store.get(TOKEN_KEY).await;
-                let mut memory = session.memory.lock().unwrap();
-                if memory.generation != generation {
+            let session = session.clone();
+            let client_id = client_id.clone();
+            let read = self.store_request(async move {
+                if Instant::now() >= deadline {
                     return;
                 }
-                match result {
-                    Ok(value) => {
-                        let record = value
-                            .and_then(|s| serde_json::from_str::<Record>(&s).ok())
-                            .filter(|r| valid_token(&r.access_token))
-                            // Invalid dates cannot be rendered. Compare only stored timestamps.
-                            .filter(|r| {
-                                r.expires_at_ms.is_none_or(|e| {
-                                    e <= MAX_JS_DATE_MS
-                                        && e.saturating_sub(r.obtained_at_ms)
-                                            <= MAX_EXPIRY_SECONDS * 1000
-                                })
-                            });
-                        session.replace_record(
-                            &mut memory,
-                            record,
-                            stored_client_id.as_deref(),
-                            now_ms,
-                            observed_at,
-                        );
-                    }
-                    Err(_) => {
-                        memory.restore = RestoreState::Failed;
-                        session.auth_state(&memory, stored_client_id.as_deref(), now_ms);
-                    }
+                let Ok(value) = store.get(TOKEN_KEY).await else {
+                    return;
+                };
+                let record = value.and_then(|s| parse_stored_record(&s));
+                let mut memory = session.memory.lock().unwrap();
+                if Instant::now() < deadline
+                    && memory.generation == generation
+                    && !memory.unauthorized
+                {
+                    session.replace_record(
+                        &mut memory,
+                        record,
+                        client_id.as_deref(),
+                        now_ms,
+                        observed_at,
+                    );
                 }
             });
-            if queued.is_err() {
-                memory.restore = RestoreState::Failed;
-            }
-            self.session.auth_state(&memory, client_id, now_ms);
-            queued
+            (generation, read)
         };
-        if let Ok(queued) = queued {
-            // The worker can still publish the result if the caller has stopped waiting.
-            let _ = tokio::time::timeout(self.options.read_timeout, queued).await;
-        }
+        // End Loading even if the IPC caller stops waiting or the read never returns.
+        let _ = tokio::spawn(async move {
+            if let Ok(read) = read {
+                let _ = tokio::time::timeout_at(deadline, read).await;
+            }
+            let mut memory = session.memory.lock().unwrap();
+            if memory.generation == generation && matches!(memory.restore, RestoreState::Loading) {
+                memory.restore = RestoreState::Failed;
+                session.auth_state(&memory, client_id.as_deref(), now_ms);
+            }
+        })
+        .await;
     }
     pub fn status(&self, client_id: Option<&str>, now_ms: u64) -> TwitcastingStatus {
         let memory = self.session.memory.lock().unwrap();
@@ -355,6 +420,7 @@ impl<S: SecretStore> TwitcastingAuth<S> {
             expires_at_ms: r.and_then(|r| r.expires_at_ms),
             callback_url: format!("http://localhost:{}{CALLBACK_PATH}", self.options.port),
             logout_pending: memory.logout_pending,
+            logout_issue: memory.logout_issue,
             custom_client_id: client_id
                 .is_some_and(|c| !c.trim().is_empty() && c != DEFAULT_CLIENT_ID),
         }
@@ -412,41 +478,57 @@ impl<S: SecretStore> TwitcastingAuth<S> {
             cancel.cancel();
         }
     }
-    pub async fn disconnect(&self) -> Result<(), TwitcastingAuthError> {
-        let reply = {
+    pub async fn disconnect(self: &Arc<Self>) -> Result<(), TwitcastingAuthError> {
+        let deadline = Instant::now() + self.options.read_timeout;
+        let generation = {
             let login = self.login.lock().unwrap();
             if let Some(cancel) = login.as_ref() {
                 cancel.cancel();
             }
             let mut memory = self.session.memory.lock().unwrap();
-            if memory.delete_queued {
+            if memory.logout_running {
                 return Err(error(Code::TokenStore));
             }
             memory.logout_pending = true;
+            memory.logout_running = true;
             self.session
                 .replace_record(&mut memory, None, None, 0, Instant::now());
-            // Persist the intent before queuing deletion. If the marker cannot be written,
-            // still try to remove the credential itself.
-            self.session.mark_logout();
-            let session = self.session.clone();
-            let store = self.store.clone();
-            let reply = self.store_request(async move {
-                let deleted = store.delete(TOKEN_KEY).await.is_ok();
-                let mut memory = session.memory.lock().unwrap();
-                memory.delete_queued = false;
-                if deleted && session.clear_logout_marker() {
-                    memory.logout_pending = false;
-                    true
-                } else {
-                    false
-                }
-            })?;
-            memory.delete_queued = true;
-            reply
+            memory.generation
         };
-        match tokio::time::timeout(self.options.read_timeout, reply).await {
-            Ok(Ok(true)) => Ok(()),
-            _ => Err(error(Code::TokenStore)),
+        // Keep the intent and deletion running after a caller timeout. Write the
+        // marker ahead of the store queue, which can be waiting on an OS call.
+        let auth = self.clone();
+        let deletion = tokio::spawn(async move {
+            let marked = auth.session.marker_io(mark_logout).await;
+            if let Err(issue) = marked {
+                auth.session.memory.lock().unwrap().logout_issue = Some(issue);
+            }
+            let store = auth.store.clone();
+            let deleted = match auth.store_request(async move { store.delete(TOKEN_KEY).await }) {
+                Ok(reply) => matches!(reply.await, Ok(Ok(()))),
+                Err(_) => false,
+            };
+            let result = if deleted {
+                auth.session.marker_io(clear_logout_marker).await
+            } else {
+                Err(marked.err().unwrap_or(LogoutIssue::DeleteFailed))
+            };
+            let mut memory = auth.session.memory.lock().unwrap();
+            memory.logout_running = false;
+            memory.logout_pending = result.is_err();
+            memory.logout_issue = result.err();
+            result
+        });
+        match tokio::time::timeout_at(deadline, deletion).await {
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(_) => Err(error(Code::TokenStore)),
+            Err(_) => {
+                let mut memory = self.session.memory.lock().unwrap();
+                if memory.generation == generation && memory.logout_running {
+                    memory.logout_issue.get_or_insert(LogoutIssue::TimedOut);
+                }
+                Err(error(Code::TokenStore))
+            }
         }
     }
     pub async fn connect(
@@ -520,58 +602,19 @@ impl<S: SecretStore> TwitcastingAuth<S> {
                 }
             };
             drop((ipv4, ipv6));
-            let grant = grant?;
+            let PendingGrant { grant, browser } = grant?;
             let received_at = grant.received_at;
-            let obtained_at_ms = now_ms
-                .checked_add(received_at.duration_since(observed_at).as_millis() as u64)
-                .ok_or_else(|| error(Code::Other))?;
-            let expires_at_ms = grant
-                .expires
-                .map(|duration| {
-                    obtained_at_ms
-                        .checked_add(duration.as_millis() as u64)
-                        .filter(|expiry| *expiry > obtained_at_ms && *expiry <= MAX_JS_DATE_MS)
-                        .ok_or_else(|| error(Code::Other))
-                })
-                .transpose()?;
-            let response = reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .timeout(self.options.read_timeout)
-                .build()
-                .map_err(|_| error(Code::Other))?
-                .get(format!(
-                    "{}/verify_credentials",
-                    self.endpoints.api_base.trim_end_matches('/')
-                ))
-                .bearer_auth(&grant.token)
-                .header("X-Api-Version", "2.0")
-                .header("Accept", "application/json")
-                .send()
-                .await
-                .map_err(|_| error(Code::Network))?;
-            if !response.status().is_success() {
-                return Err(error(Code::Other));
-            }
-            let v: serde_json::Value = response.json().await.map_err(|_| error(Code::Other))?;
-            if v.pointer("/app/client_id").and_then(|v| v.as_str()) != Some(client_id) {
-                return Err(error(Code::ClientMismatch));
-            }
-            let field = |path| {
-                v.pointer(path)
-                    .and_then(|v| v.as_str())
-                    .map(str::to_owned)
-                    .ok_or_else(|| error(Code::Other))
+            let verified = self
+                .verify_grant(grant, client_id, now_ms, observed_at)
+                .await;
+            let status = if verified.is_ok() {
+                StatusCode::OK
+            } else {
+                StatusCode::BAD_REQUEST
             };
-            let record = Record {
-                client_id: client_id.into(),
-                access_token: grant.token,
-                user_id: field("/user/id")?,
-                screen_id: field("/user/screen_id")?,
-                name: field("/user/name")?,
-                expires_at_ms,
-                obtained_at_ms,
-            };
-            Ok((record, received_at))
+            let _ = browser.send(status);
+            let (record, serialized) = verified?;
+            Ok((record, serialized, received_at))
         };
         let mut result = tokio::select! {
             biased;
@@ -589,15 +632,11 @@ impl<S: SecretStore> TwitcastingAuth<S> {
             }
         }
         connections.shutdown().await;
-        let (record, received_at) = result?;
+        let (record, serialized, received_at) = result?;
         let obtained_at_ms = record.obtained_at_ms;
         let token_deadline = record
             .expires_at_ms
             .map(|expiry| received_at + Duration::from_millis(expiry - record.obtained_at_ms));
-        let serialized = serde_json::to_string(&record).map_err(|_| error(Code::Other))?;
-        if !crate::integrations::token_fits_windows_credential(&serialized) {
-            return Err(error(Code::TokenStore));
-        }
         let (written, write_result) = oneshot::channel();
         let (commit, decision) = oneshot::channel();
         {
@@ -661,6 +700,70 @@ impl<S: SecretStore> TwitcastingAuth<S> {
             let _ = commit.send(());
         }
         Ok(self.status(Some(client_id), obtained_at_ms))
+    }
+
+    async fn verify_grant(
+        &self,
+        grant: Grant,
+        client_id: &str,
+        now_ms: u64,
+        observed_at: Instant,
+    ) -> Result<(Record, String), TwitcastingAuthError> {
+        let received_at = grant.received_at;
+        let obtained_at_ms = now_ms
+            .checked_add(received_at.duration_since(observed_at).as_millis() as u64)
+            .ok_or_else(|| error(Code::Other))?;
+        let expires_at_ms = grant
+            .expires
+            .map(|duration| {
+                obtained_at_ms
+                    .checked_add(duration.as_millis() as u64)
+                    .filter(|expiry| *expiry > obtained_at_ms && *expiry <= MAX_JS_DATE_MS)
+                    .ok_or_else(|| error(Code::Other))
+            })
+            .transpose()?;
+        let response = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(self.options.read_timeout)
+            .build()
+            .map_err(|_| error(Code::Other))?
+            .get(format!(
+                "{}/verify_credentials",
+                self.endpoints.api_base.trim_end_matches('/')
+            ))
+            .bearer_auth(&grant.token)
+            .header("X-Api-Version", "2.0")
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .map_err(|_| error(Code::Network))?;
+        if !response.status().is_success() {
+            return Err(error(Code::Other));
+        }
+        let v: serde_json::Value = response.json().await.map_err(|_| error(Code::Other))?;
+        if v.pointer("/app/client_id").and_then(|v| v.as_str()) != Some(client_id) {
+            return Err(error(Code::ClientMismatch));
+        }
+        let field = |path| {
+            v.pointer(path)
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+                .ok_or_else(|| error(Code::Other))
+        };
+        let record = Record {
+            client_id: client_id.into(),
+            access_token: grant.token,
+            user_id: field("/user/id")?,
+            screen_id: field("/user/screen_id")?,
+            name: field("/user/name")?,
+            expires_at_ms,
+            obtained_at_ms,
+        };
+        let serialized = serde_json::to_string(&record).map_err(|_| error(Code::Other))?;
+        if !crate::integrations::token_fits_windows_credential(&serialized) {
+            return Err(error(Code::TokenStore));
+        }
+        Ok((record, serialized))
     }
 }
 
@@ -741,30 +844,105 @@ impl Session {
         state
     }
 
-    fn mark_logout(&self) {
-        if let Some(path) = &self.logout_marker {
-            if let Some(dir) = path.parent() {
-                let _ = fs::create_dir_all(dir);
-            }
-            if let Ok(file) = fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(false)
-                .open(path)
-            {
-                let _ = file.sync_all();
+    async fn marker_io<T: Default + Send + 'static>(
+        &self,
+        operation: fn(&Path) -> Result<T, LogoutIssue>,
+    ) -> Result<T, LogoutIssue> {
+        match &self.logout_marker {
+            LogoutMarker::MemoryOnly => Ok(T::default()),
+            LogoutMarker::Unavailable => Err(LogoutIssue::MarkerUnavailable),
+            LogoutMarker::File(path) => {
+                let path = path.clone();
+                #[cfg(test)]
+                let hook = self.marker_io_hook.lock().unwrap().clone();
+                tokio::task::spawn_blocking(move || {
+                    #[cfg(test)]
+                    if let Some(hook) = hook {
+                        hook();
+                    }
+                    operation(&path)
+                })
+                .await
+                .unwrap_or(Err(LogoutIssue::MarkerInaccessible))
             }
         }
     }
+}
 
-    fn clear_logout_marker(&self) -> bool {
-        self.logout_marker
-            .as_ref()
-            .is_none_or(|path| match fs::remove_file(path) {
-                Ok(()) => true,
-                Err(e) => e.kind() == io::ErrorKind::NotFound,
-            })
+fn inspect_marker(path: &Path) -> Result<Option<fs::Metadata>, LogoutIssue> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            // On Windows a file in place of the parent can also report NotFound.
+            let Some(parent) = path.parent() else {
+                return Err(LogoutIssue::MarkerInaccessible);
+            };
+            match fs::metadata(parent) {
+                Ok(metadata) if metadata.is_dir() => Ok(None),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+                _ => Err(LogoutIssue::MarkerInaccessible),
+            }
+        }
+        Err(_) => Err(LogoutIssue::MarkerInaccessible),
     }
+}
+
+fn mark_logout(path: &Path) -> Result<(), LogoutIssue> {
+    if let Some(metadata) = inspect_marker(path)? {
+        return if metadata.is_file() {
+            Ok(())
+        } else {
+            Err(LogoutIssue::MarkerCorrupt)
+        };
+    }
+    let parent = path.parent().ok_or(LogoutIssue::MarkerInaccessible)?;
+    fs::create_dir_all(parent).map_err(|_| LogoutIssue::MarkerInaccessible)?;
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(|_| LogoutIssue::MarkerInaccessible)
+}
+
+fn clear_logout_marker(path: &Path) -> Result<(), LogoutIssue> {
+    let Some(metadata) = inspect_marker(path)? else {
+        return Ok(());
+    };
+    let file_type = metadata.file_type();
+    let directory = file_type.is_dir();
+    #[cfg(windows)]
+    let directory = {
+        use std::os::windows::fs::FileTypeExt;
+        directory || file_type.is_symlink_dir()
+    };
+    let removed = if directory {
+        // Remove an empty directory or a Windows directory link without traversing it.
+        fs::remove_dir(path)
+    } else {
+        fs::remove_file(path)
+    };
+    match removed {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => inspect_marker(path)?
+            .is_none()
+            .then_some(())
+            .ok_or(LogoutIssue::MarkerInaccessible),
+        Err(_) if file_type.is_file() => Err(LogoutIssue::MarkerInaccessible),
+        Err(_) => Err(LogoutIssue::MarkerCorrupt),
+    }
+}
+
+fn parse_stored_record(value: &str) -> Option<Record> {
+    serde_json::from_str::<Record>(value)
+        .ok()
+        .filter(|r| valid_token(&r.access_token))
+        .filter(|r| {
+            r.expires_at_ms.is_none_or(|expiry| {
+                expiry <= MAX_JS_DATE_MS
+                    && expiry.saturating_sub(r.obtained_at_ms) <= MAX_EXPIRY_SECONDS * 1000
+            })
+        })
 }
 
 /// Runs on the store worker before the next job. Undo only a write that actually landed.
@@ -818,11 +996,15 @@ struct Grant {
     expires: Option<Duration>,
     received_at: Instant,
 }
+struct PendingGrant {
+    grant: Grant,
+    browser: oneshot::Sender<StatusCode>,
+}
 struct Loopback {
     state: String,
     port: u16,
     read_timeout: Duration,
-    tx: mpsc::Sender<Result<Grant, TwitcastingAuthError>>,
+    tx: mpsc::Sender<Result<PendingGrant, TwitcastingAuthError>>,
     accepted: Mutex<bool>,
     cancel: CancellationToken,
 }
@@ -863,18 +1045,25 @@ const DENIED_PAGE: &str = r#"<!doctype html><html lang="ja"><meta charset="utf-8
 const IGNORED_PAGE: &str = r#"<!doctype html><html lang="ja"><meta charset="utf-8"><title>ツイキャス認証</title><p>このページは閉じてください。</p><script>history.replaceState(null, '', location.pathname);</script></html>"#;
 const PAGE: &str = r#"<!doctype html><html lang="ja"><meta charset="utf-8"><title>ツイキャス認証</title><p id="message">認証しています…</p><script>
 const fragment = location.hash.slice(1);
+const query = location.search.slice(1);
 history.replaceState(null, '', location.pathname);
-const params = new Map();
-for (const pair of fragment.split('&')) {
-    // Decode the key and value, preserving literal plus signs and the original pair.
-    const entry = new URLSearchParams('?' + pair.replaceAll('+', '%2B')).entries().next().value;
-    if (entry) params.set(entry[0], {value: entry[1], pair});
+function parse(raw) {
+    const params = new Map();
+    for (const pair of raw.split('&')) {
+        // Decode the key and value, preserving literal plus signs and the original pair.
+        const entry = new URLSearchParams('?' + pair.replaceAll('+', '%2B')).entries().next().value;
+        if (entry) params.set(entry[0], {value: entry[1], pair});
+    }
+    return params;
 }
-const denied = params.get('result')?.value === 'denied' || params.has('error');
-const state = params.get('state');
+const refused = params => params.get('result')?.value === 'denied' || params.has('error');
+const queryParams = parse(query);
+const fragmentParams = parse(fragment);
+const denial = refused(queryParams) ? queryParams : refused(fragmentParams) ? fragmentParams : null;
+const state = denial?.get('state');
 const keys = ['access_token', 'expires_in', 'state'];
-const grant = keys.map(key => params.get(key)?.pair).filter(pair => pair !== undefined).join('&');
-const body = denied ? 'result=denied' + (state ? '&' + state.pair : '') : grant;
+const grant = keys.map(key => fragmentParams.get(key)?.pair).filter(pair => pair !== undefined).join('&');
+const body = denial ? 'result=denied' + (state ? '&' + state.pair : '') : grant;
 const message = document.getElementById('message');
 if (!body) { message.textContent = '認証情報が見つかりません'; }
 else { fetch('/twitcasting/token', {method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body}).then(r => { message.textContent = r.ok ? 'アプリに戻ってください。この画面は閉じられます。' : '認証に失敗しました。アプリでやり直してください。'; }).catch(() => { message.textContent = 'アプリでログインをやり直してください。'; }); }
@@ -908,11 +1097,12 @@ async fn handle_callback(context: &Loopback, req: Request) -> Response {
     if req.method() == Method::GET && req.uri().path() == CALLBACK_PATH {
         let query = parse_form(req.uri().query().unwrap_or_default().as_bytes());
         if refused(&query) {
-            let accepted = query
-                .get("state")
-                .is_some_and(|state| state_matches(context, state))
-                && complete(context, Err(error(Code::Denied)));
-            return Html(if accepted { DENIED_PAGE } else { IGNORED_PAGE }).into_response();
+            if let Some(state) = query.get("state") {
+                let accepted =
+                    state_matches(context, state) && complete(context, Err(error(Code::Denied)));
+                return Html(if accepted { DENIED_PAGE } else { IGNORED_PAGE }).into_response();
+            }
+            // The browser posts a stateless refusal through the Origin-checked path.
         }
         return Html(PAGE).into_response();
     }
@@ -925,7 +1115,7 @@ async fn handle_callback(context: &Loopback, req: Request) -> Response {
             _ => return StatusCode::BAD_REQUEST.into_response(),
         };
     let params = parse_form(&body);
-    let (grant, response) = if refused(&params) {
+    if refused(&params) {
         // Providers may omit state on refusal. A supplied state still belongs to one login.
         if params
             .get("state")
@@ -933,53 +1123,61 @@ async fn handle_callback(context: &Loopback, req: Request) -> Response {
         {
             return StatusCode::BAD_REQUEST.into_response();
         }
-        (Err(error(Code::Denied)), StatusCode::OK)
-    } else {
-        if !params
-            .get("state")
-            .is_some_and(|s| state_matches(context, s))
-        {
-            return StatusCode::BAD_REQUEST.into_response();
-        }
-        let Some(token) = params.get("access_token").filter(|t| valid_token(t)) else {
-            return StatusCode::BAD_REQUEST.into_response();
-        };
-        if token.len() > MAX_NEW_TOKEN_BYTES {
-            if !complete(context, Err(error(Code::TokenStore))) {
-                return StatusCode::CONFLICT.into_response();
-            }
-            return StatusCode::BAD_REQUEST.into_response();
-        }
-        match params
-            .get("expires_in")
-            .map(|s| parse_expiry(s))
-            .transpose()
-        {
-            Ok(expires) => (
-                Ok(Grant {
-                    token: token.clone(),
-                    expires,
-                    received_at: Instant::now(),
-                }),
-                StatusCode::OK,
-            ),
-            Err(err) => (Err(err), StatusCode::BAD_REQUEST),
-        }
+        return complete_error(context, error(Code::Denied), StatusCode::OK);
+    }
+    if !params
+        .get("state")
+        .is_some_and(|s| state_matches(context, s))
+    {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let Some(token) = params.get("access_token").filter(|t| valid_token(t)) else {
+        return StatusCode::BAD_REQUEST.into_response();
     };
-    if !complete(context, grant) {
+    if token.len() > MAX_NEW_TOKEN_BYTES {
+        return complete_error(context, error(Code::TokenStore), StatusCode::BAD_REQUEST);
+    }
+    let expires = match params
+        .get("expires_in")
+        .map(|s| parse_expiry(s))
+        .transpose()
+    {
+        Ok(expires) => expires,
+        Err(err) => return complete_error(context, err, StatusCode::BAD_REQUEST),
+    };
+    let (browser, verdict) = oneshot::channel();
+    let pending = PendingGrant {
+        grant: Grant {
+            token: token.clone(),
+            expires,
+            received_at: Instant::now(),
+        },
+        browser,
+    };
+    if !complete(context, Ok(pending)) {
         return StatusCode::CONFLICT.into_response();
     }
-    response.into_response()
+    verdict
+        .await
+        .unwrap_or(StatusCode::BAD_REQUEST)
+        .into_response()
+}
+
+fn complete_error(context: &Loopback, err: TwitcastingAuthError, status: StatusCode) -> Response {
+    if complete(context, Err(err)) {
+        status.into_response()
+    } else {
+        StatusCode::CONFLICT.into_response()
+    }
 }
 /// Ends the login once; later results are rejected.
-fn complete(context: &Loopback, grant: Result<Grant, TwitcastingAuthError>) -> bool {
+fn complete(context: &Loopback, grant: Result<PendingGrant, TwitcastingAuthError>) -> bool {
     let mut accepted = context.accepted.lock().unwrap();
     if *accepted || context.cancel.is_cancelled() {
         return false;
     }
     *accepted = true;
-    let _ = context.tx.try_send(grant);
-    true
+    context.tx.try_send(grant).is_ok()
 }
 /// Percent-decodes only: a literal `+` stays `+`, matching the raw fragment the page posts.
 fn parse_form(raw: &[u8]) -> HashMap<String, String> {
@@ -1053,14 +1251,17 @@ const fetch = (_path, { body }) => {
     async fn receive_callback_body(
         body: String,
     ) -> (StatusCode, Result<Grant, TwitcastingAuthError>) {
-        let (tx, mut rx) = mpsc::channel(1);
+        receive_callback_body_with_state(body, "test-state").await
+    }
+
+    async fn receive_callback_body_with_state(
+        body: String,
+        state: &str,
+    ) -> (StatusCode, Result<Grant, TwitcastingAuthError>) {
+        let (context, mut rx) = loopback();
         let context = Loopback {
-            state: "test-state".into(),
-            port: CALLBACK_PORT,
-            read_timeout: Duration::from_secs(1),
-            tx,
-            accepted: Mutex::new(false),
-            cancel: CancellationToken::new(),
+            state: state.into(),
+            ..context
         };
         let host = format!("localhost:{CALLBACK_PORT}");
         let request = Request::builder()
@@ -1070,11 +1271,17 @@ const fetch = (_path, { body }) => {
             .header("origin", format!("http://{host}"))
             .body(Body::from(body))
             .unwrap();
-        let status = handle_callback(&context, request).await.status();
-        (
-            status,
-            rx.try_recv().expect("callback did not complete the login"),
-        )
+        let (response, grant) = tokio::join!(handle_callback(&context, request), async {
+            timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .unwrap()
+                .expect("callback did not complete the login")
+                .map(|pending| {
+                    pending.browser.send(StatusCode::OK).unwrap();
+                    pending.grant
+                })
+        });
+        (response.status(), grant)
     }
 
     #[tokio::test]
@@ -1106,7 +1313,7 @@ const fetch = (_path, { body }) => {
 
     fn loopback() -> (
         Loopback,
-        mpsc::Receiver<Result<Grant, TwitcastingAuthError>>,
+        mpsc::Receiver<Result<PendingGrant, TwitcastingAuthError>>,
     ) {
         let (tx, rx) = mpsc::channel(1);
         let context = Loopback {
@@ -1143,7 +1350,7 @@ const fetch = (_path, { body }) => {
     }
 
     #[tokio::test]
-    async fn refusals_need_this_logins_state_and_never_repost() {
+    async fn get_alone_needs_matching_state_to_complete_refusal() {
         // A query refusal with the right state ends the login, and its page does not post.
         let (context, mut rx) = loopback();
         let uri = format!("{CALLBACK_PATH}?error=access_denied&state=test-state");
@@ -1182,18 +1389,13 @@ const fetch = (_path, { body }) => {
         // Re-encoding would expand each literal plus sign.
         let token = "+".repeat(MAX_NEW_TOKEN_BYTES);
         let state = "s".repeat(43);
-        let (context, mut rx) = loopback();
-        let context = Loopback {
-            state: state.clone(),
-            ..context
-        };
         let url = format!("http://localhost:{CALLBACK_PORT}{CALLBACK_PATH}#access_token={token}&token_type=bearer&state={state}&expires_in=60");
         let body = run_callback_script(PAGE, &url);
         assert!(body.contains(&token), "the token was re-encoded");
         assert!(body.len() <= 4096, "{}", body.len());
-        let (status, _, _) = send(&context, Method::POST, TOKEN_PATH, &body).await;
+        let (status, grant) = receive_callback_body_with_state(body, &state).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(rx.try_recv().unwrap().unwrap().token, token);
+        assert_eq!(grant.unwrap().token, token);
     }
 
     async fn assert_fixed_denial(body: String) {
@@ -1298,6 +1500,21 @@ const fetch = (_path, { body }) => {
         token: &str,
         extra: &str,
     ) -> tokio::task::JoinHandle<Result<TwitcastingStatus, TwitcastingAuthError>> {
+        let (login, status) = post_grant_response(auth, addr, delay, token, extra).await;
+        assert_eq!(status, "HTTP/1.1 200 OK\r\n");
+        login
+    }
+
+    async fn post_grant_response<S: SecretStore>(
+        auth: Arc<TwitcastingAuth<S>>,
+        addr: std::net::SocketAddr,
+        delay: Duration,
+        token: &str,
+        extra: &str,
+    ) -> (
+        tokio::task::JoinHandle<Result<TwitcastingStatus, TwitcastingAuthError>>,
+        String,
+    ) {
         let (started, listening) = oneshot::channel();
         let login = tokio::spawn(async move {
             auth.connect("client", 0, |url| {
@@ -1330,8 +1547,7 @@ const fetch = (_path, { body }) => {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(status, "HTTP/1.1 200 OK\r\n");
-        login
+        (login, status)
     }
 
     async fn abort_paused_write(timed_out: bool, seeded: bool) {
@@ -1877,6 +2093,183 @@ const fetch = (_path, { body }) => {
         use super::*;
 
         #[tokio::test]
+        async fn revision8_reload_preserves_unauthorized() {
+            let store = MemorySecretStore::new();
+            seed_record(&store, None).await;
+            let auth = TwitcastingAuth::new(
+                store,
+                TwitcastingEndpoints::default(),
+                AuthOptions::default(),
+            );
+            auth.load(Some("client"), 0).await;
+            auth.report_unauthorized();
+            auth.reload(Some("client"), 0).await;
+            assert_eq!(auth.status(Some("client"), 0).state, "reloginRequired");
+            assert!(auth.bearer(Some("client"), 0).is_none());
+        }
+
+        #[tokio::test]
+        async fn revision8_directory_marker_can_be_cleared() {
+            let dir = tempfile::tempdir().unwrap();
+            let marker = dir.path().join(LOGOUT_MARKER_FILE);
+            fs::create_dir(&marker).unwrap();
+            let store = MemorySecretStore::new();
+            seed_record(&store, None).await;
+            let auth = auth_with_marker(store.clone(), marker.clone());
+            auth.disconnect().await.unwrap();
+            assert!(!marker.exists());
+            assert!(store.raw(TOKEN_KEY).is_none());
+            assert!(!auth.status(Some("client"), 0).logout_pending);
+        }
+
+        #[tokio::test]
+        async fn revision8_marker_io_is_bounded_by_logout_deadline() {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+
+            for stalled_call in [0, 1] {
+                let dir = tempfile::tempdir().unwrap();
+                let auth = TwitcastingAuth::with_logout_marker(
+                    MemorySecretStore::new(),
+                    TwitcastingEndpoints::default(),
+                    AuthOptions {
+                        read_timeout: Duration::from_millis(50),
+                        ..AuthOptions::default()
+                    },
+                    Some(dir.path().join(LOGOUT_MARKER_FILE)),
+                );
+                let calls = AtomicUsize::new(0);
+                *auth.session.marker_io_hook.lock().unwrap() = Some(Arc::new(move || {
+                    if calls.fetch_add(1, Ordering::Relaxed) == stalled_call {
+                        std::thread::sleep(Duration::from_millis(400));
+                    }
+                }));
+                let start = Instant::now();
+                let result = auth.disconnect().await;
+                assert!(start.elapsed() < Duration::from_millis(350));
+                assert!(matches!(result.unwrap_err().code, Code::TokenStore));
+                assert!(auth.status(Some("client"), 0).logout_pending);
+                timeout(Duration::from_secs(3), async {
+                    while auth.status(Some("client"), 0).logout_pending {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .unwrap();
+            }
+        }
+
+        #[tokio::test]
+        async fn revision8_marker_io_leaves_memory_and_login_locks_available() {
+            let dir = tempfile::tempdir().unwrap();
+            let auth = auth_with_marker(
+                MemorySecretStore::new(),
+                dir.path().join(LOGOUT_MARKER_FILE),
+            );
+            let results = Arc::new(Mutex::new(Vec::new()));
+            let weak = Arc::downgrade(&auth);
+            *auth.session.marker_io_hook.lock().unwrap() = Some(Arc::new({
+                let results = Arc::clone(&results);
+                move || {
+                    let auth = weak.upgrade().unwrap();
+                    results.lock().unwrap().push((
+                        auth.session.memory.try_lock().is_ok(),
+                        auth.login.try_lock().is_ok(),
+                    ));
+                }
+            }));
+            auth.disconnect().await.unwrap();
+            assert_eq!(*results.lock().unwrap(), [(true, true), (true, true)]);
+        }
+
+        #[tokio::test]
+        async fn revision8_oversize_record_returns_browser_error() {
+            let store = MemorySecretStore::new();
+            let (auth, addr, server) = login_fixture(store.clone()).await;
+            let token = "%22".repeat(400);
+            let (login, status) = post_grant_response(auth, addr, Duration::ZERO, &token, "").await;
+            assert!(matches!(
+                login.await.unwrap().unwrap_err().code,
+                Code::TokenStore
+            ));
+            assert!(store.raw(TOKEN_KEY).is_none());
+            assert_eq!(status, "HTTP/1.1 400 Bad Request\r\n");
+            server.abort();
+        }
+
+        #[tokio::test]
+        async fn revision8_query_denial_requires_the_pages_post() {
+            for query in ["result=denied", "error=&error_description=private"] {
+                let (context, mut rx) = loopback();
+                let uri = format!("{CALLBACK_PATH}?{query}");
+                let (_, _, page) = send(&context, Method::GET, &uri, "").await;
+                assert!(rx.try_recv().is_err());
+                let body =
+                    run_callback_script(&page, &format!("http://localhost:{CALLBACK_PORT}{uri}"));
+                assert_eq!(body, "result=denied");
+                assert_fixed_denial(body).await;
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn revision8_hung_read_leaves_loading_at_deadline() {
+            let store = PausedReadStore::default();
+            seed_record(&store.inner, None).await;
+            let auth = TwitcastingAuth::new(
+                store.clone(),
+                TwitcastingEndpoints::default(),
+                AuthOptions::default(),
+            );
+            auth.load(Some("client"), 0).await;
+            assert_eq!(auth.status(Some("client"), 0).state, "loadFailed");
+            store.resume.notify_one();
+            timeout(
+                Duration::from_secs(1),
+                auth.store_request(async {}).unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(auth.bearer(Some("client"), 0).is_none());
+            auth.disconnect().await.unwrap();
+            assert!(store.inner.raw(TOKEN_KEY).is_none());
+        }
+
+        #[tokio::test]
+        async fn revision8_inaccessible_marker_has_safe_reason_and_can_be_retried() {
+            let dir = tempfile::tempdir().unwrap();
+            let parent = dir.path().join("config");
+            fs::write(&parent, []).unwrap();
+            let store = MemorySecretStore::new();
+            seed_record(&store, None).await;
+            let auth = auth_with_marker(store.clone(), parent.join(LOGOUT_MARKER_FILE));
+            auth.initialize(Some("client"), 0).await;
+            let status = serde_json::to_value(auth.status(Some("client"), 0)).unwrap();
+            assert_eq!(status["logoutIssue"], "markerInaccessible");
+            assert!(!status
+                .to_string()
+                .contains(&parent.to_string_lossy().to_string()));
+            assert!(auth.bearer(Some("client"), 0).is_none());
+            fs::remove_file(parent).unwrap();
+            auth.disconnect().await.unwrap();
+            assert!(store.raw(TOKEN_KEY).is_none());
+            assert!(!auth.status(Some("client"), 0).logout_pending);
+        }
+
+        #[tokio::test]
+        async fn revision8_startup_retries_pending_logout() {
+            let dir = tempfile::tempdir().unwrap();
+            let marker = dir.path().join(LOGOUT_MARKER_FILE);
+            fs::write(&marker, []).unwrap();
+            let store = MemorySecretStore::new();
+            seed_record(&store, None).await;
+            let auth = auth_with_marker(store.clone(), marker.clone());
+            auth.initialize(Some("client"), 0).await;
+            assert!(store.raw(TOKEN_KEY).is_none());
+            assert!(!marker.exists());
+            assert!(!auth.status(Some("client"), 0).logout_pending);
+        }
+
+        #[tokio::test]
         async fn unpersistable_token_fails_at_callback() {
             let (context, mut rx) = loopback();
             let body = format!("access_token={}&state=test-state", "+".repeat(2048));
@@ -1896,7 +2289,9 @@ const fetch = (_path, { body }) => {
             // The token and inner JSON fit. Escaping those quotes again in the OS
             // adapter's outer JSON makes the saved record too large.
             let token = "%22".repeat(400);
-            let login = post_grant_as(auth.clone(), addr, Duration::ZERO, &token, "").await;
+            let (login, status) =
+                post_grant_response(auth.clone(), addr, Duration::ZERO, &token, "").await;
+            assert_eq!(status, "HTTP/1.1 400 Bad Request\r\n");
             assert!(matches!(
                 login.await.unwrap().unwrap_err().code,
                 Code::TokenStore
@@ -2073,26 +2468,6 @@ const fetch = (_path, { body }) => {
             }
         }
 
-        #[tokio::test(start_paused = true)]
-        async fn slow_startup_read_keeps_loading_and_can_restore_late() {
-            let store = PausedReadStore::default();
-            seed_record(&store.inner, None).await;
-            let auth = TwitcastingAuth::new(
-                store.clone(),
-                TwitcastingEndpoints::default(),
-                AuthOptions::default(),
-            );
-            auth.load(Some("client"), 0).await;
-            assert_eq!(auth.status(Some("client"), 0).state, "loading");
-            let mut changes = auth.subscribe();
-            store.resume.notify_one();
-            timeout(Duration::from_secs(1), changes.changed())
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(auth.status(Some("client"), 0).state, "ready");
-        }
-
         #[tokio::test]
         async fn failed_read_can_be_retried() {
             let store = MemorySecretStore::new();
@@ -2105,7 +2480,7 @@ const fetch = (_path, { body }) => {
             store.fail_next_get();
             auth.load(Some("client"), 0).await;
             assert_eq!(auth.status(Some("client"), 0).state, "loadFailed");
-            auth.load(Some("client"), 0).await;
+            auth.reload(Some("client"), 0).await;
             assert_eq!(auth.status(Some("client"), 0).state, "ready");
         }
 
@@ -2129,12 +2504,13 @@ const fetch = (_path, { body }) => {
             seed_record(&store, None).await;
             {
                 let auth = auth_with_marker(store.clone(), marker.clone());
-                auth.load(Some("client"), 0).await;
+                auth.initialize(Some("client"), 0).await;
                 store.fail_next_delete();
                 assert!(auth.disconnect().await.is_err());
             }
+            store.fail_next_delete();
             let auth = auth_with_marker(store.clone(), marker.clone());
-            auth.load(Some("client"), 0).await;
+            auth.initialize(Some("client"), 0).await;
             assert!(auth.bearer(Some("client"), 0).is_none());
             assert!(marker.exists());
             assert_eq!(
@@ -2148,7 +2524,7 @@ const fetch = (_path, { body }) => {
 
         #[tokio::test]
         async fn ignored_get_refusals_show_neutral_page() {
-            for suffix in ["&state=stale", "&state=", ""] {
+            for suffix in ["&state=stale", "&state="] {
                 let (context, mut rx) = loopback();
                 let uri = format!("{CALLBACK_PATH}?error=access_denied{suffix}");
                 let (_, _, page) = send(&context, Method::GET, &uri, "").await;
