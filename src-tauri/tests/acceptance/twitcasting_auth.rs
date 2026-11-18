@@ -357,12 +357,17 @@ async fn valid_token_post_completes_login_and_stores_token() {
     let status = sj(&ok_of(r));
     assert_eq!(status["state"], "ready");
     assert_eq!(status["screenId"], SCREEN_ID);
-    assert_eq!(status["expiresAtMs"], NOW + EXPIRES_IN_MS);
+    // 期限の基準は grant 受領時刻(`obtainedAtMs`)。connect に渡した now 以上で、受領までの実時間ぶん後ろにずれうる。
+    let expires = status["expiresAtMs"].as_u64().expect("expiresAtMs は数値");
+    assert!((NOW + EXPIRES_IN_MS..=NOW + EXPIRES_IN_MS + 10_000).contains(&expires), "expiresAtMs={expires}");
     let rec = stored(&env).expect("ストアに保存済み");
     assert_eq!(rec["accessToken"], TOKEN);
     assert_eq!(rec["clientId"], CLIENT);
     assert_eq!(rec["screenId"], SCREEN_ID);
-    assert_eq!(rec["expiresAtMs"], NOW + EXPIRES_IN_MS);
+    assert_eq!(rec["expiresAtMs"].as_u64(), Some(expires));
+    let obtained = rec["obtainedAtMs"].as_u64().expect("obtainedAtMs は数値");
+    assert!(obtained >= NOW, "obtainedAtMs={obtained}");
+    assert_eq!(obtained + EXPIRES_IN_MS, expires);
     assert_eq!(env.auth.user_id(), Some(USER_ID.to_string()));
 }
 
@@ -637,17 +642,77 @@ async fn store_put_failure_fails_connect_with_token_store_and_stays_logged_out()
 }
 
 #[tokio::test]
-async fn missing_or_non_numeric_expires_in_stores_no_expiry() {
+async fn missing_expires_in_stores_no_expiry() {
     let f = fake(CLIENT, 200).await;
-    for query in ["token_type=bearer", "token_type=bearer&expires_in=abc"] {
+    let env = env_with(&f);
+    let (r, _) = run_login(&env, CLIENT, NOW, |s| format!("access_token={TOKEN}&token_type=bearer&state={s}")).await;
+    let status = sj(&ok_of(r));
+    assert_eq!(status["state"], "ready");
+    assert!(status["expiresAtMs"].is_null());
+    let rec = stored(&env).unwrap();
+    assert!(rec.get("expiresAtMs").map_or(true, |v| v.is_null()));
+}
+
+#[tokio::test]
+async fn unreadable_expires_in_fails_login_and_stores_nothing() {
+    let f = fake(CLIENT, 200).await;
+    // 値があるのに 1〜315360000 の 10 進整数(ASCII 数字のみ)として読めない物。
+    for value in ["abc", "-1", "3600.0", "%203600", "0", "", "315360001", "99999999999999999999999"] {
         let env = env_with(&f);
-        let (r, _) = run_login(&env, CLIENT, NOW, |s| format!("access_token={TOKEN}&{query}&state={s}")).await;
-        let status = sj(&ok_of(r));
-        assert_eq!(status["state"], "ready", "{query}");
-        assert!(status["expiresAtMs"].is_null(), "{query}");
-        let rec = stored(&env).unwrap();
-        assert!(rec.get("expiresAtMs").map_or(true, |v| v.is_null()), "{query}");
+        let (r, _) = run_login(&env, CLIENT, NOW, |s| {
+            format!("access_token={TOKEN}&token_type=bearer&expires_in={value}&state={s}")
+        })
+        .await;
+        assert_eq!(code_str(&err_of(r).code), "other", "expires_in={value:?}");
+        assert!(env.store.raw(TOKEN_KEY).is_none(), "expires_in={value:?}");
+        assert_eq!(status_json(&env, Some(CLIENT), NOW)["state"], "loggedOut", "expires_in={value:?}");
+        assert_port_free(env.port);
     }
+}
+
+#[tokio::test]
+async fn expires_in_ten_years_is_accepted() {
+    let f = fake(CLIENT, 200).await;
+    let env = env_with(&f);
+    let (r, _) = run_login(&env, CLIENT, NOW, |s| {
+        format!("access_token={TOKEN}&token_type=bearer&expires_in=315360000&state={s}")
+    })
+    .await;
+    assert_eq!(sj(&ok_of(r))["state"], "ready");
+    let rec = stored(&env).unwrap();
+    let obtained = rec["obtainedAtMs"].as_u64().expect("obtainedAtMs は数値");
+    assert_eq!(rec["expiresAtMs"].as_u64(), Some(obtained + 315_360_000_000));
+}
+
+#[tokio::test]
+async fn unreadable_expires_in_keeps_previous_token() {
+    let f = fake(CLIENT, 200).await;
+    let env = env_with(&f);
+    env.store.put(TOKEN_KEY, &record(CLIENT, "tc-old-token", Some(NOW + 1_000_000))).await.unwrap();
+    env.auth.load(Some(CLIENT), NOW).await;
+    let (r, _) = run_login(&env, CLIENT, NOW, |s| {
+        format!("access_token={TOKEN}&token_type=bearer&expires_in=abc&state={s}")
+    })
+    .await;
+    assert_eq!(code_str(&err_of(r).code), "other");
+    assert_eq!(stored(&env).expect("旧レコードが残る")["accessToken"], "tc-old-token");
+}
+
+#[tokio::test]
+async fn expiry_counts_from_grant_receipt_not_connect_start() {
+    let f = fake(CLIENT, 200).await;
+    let env = env_with(&f);
+    let login = begin(&env, CLIENT, NOW).await;
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let body = format!("access_token={TOKEN}&token_type=bearer&expires_in=1&state={}", login.state);
+    let _ = post_token(env.port, &local_host(env.port), None, &body).await;
+    let status = sj(&ok_of(wait(login.handle).await));
+    assert_eq!(status["state"], "ready");
+    // 実時間の期限フラグで不安定になるので、このあとの status(now) は見ない。
+    let rec = stored(&env).unwrap();
+    let obtained = rec["obtainedAtMs"].as_u64().expect("obtainedAtMs は数値");
+    assert!(obtained >= NOW + 1200, "obtainedAtMs={obtained}");
+    assert_eq!(rec["expiresAtMs"].as_u64(), Some(obtained + 1000));
 }
 
 #[tokio::test]
