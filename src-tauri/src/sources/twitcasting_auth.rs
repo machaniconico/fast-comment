@@ -1,16 +1,18 @@
 //! Twitcasting Implicit OAuth. Secrets never cross the status / error boundary.
 use crate::integrations::SecretStore;
 use axum::{
-    body::to_bytes,
-    extract::{Request, State},
+    body::{to_bytes, Body},
+    extract::Request,
     http::{Method, StatusCode},
     response::{Html, IntoResponse, Response},
-    Router,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use hyper::{server::conn::http1, service::service_fn};
+use hyper_util::rt::TokioIo;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
+    convert::Infallible,
     fmt,
     sync::{Arc, Mutex},
     time::Duration,
@@ -20,8 +22,9 @@ use tokio::{
     net::TcpListener,
     sync::{mpsc, watch, Mutex as AsyncMutex},
     task::JoinSet,
+    time::Instant,
 };
-use tokio_util::sync::CancellationToken;
+use tokio_util::sync::{CancellationToken, DropGuard};
 
 pub const TOKEN_KEY: &str = "twitcasting-oauth-token";
 pub const CALLBACK_PORT: u16 = 47822;
@@ -155,13 +158,16 @@ struct Record {
 }
 struct Memory {
     record: Option<Record>,
+    generation: u64,
     unauthorized: bool,
+    expired: bool,
+    expiry_task: Option<DropGuard>,
 }
 pub struct TwitcastingAuth<S: SecretStore> {
     store: S,
     endpoints: TwitcastingEndpoints,
     options: AuthOptions,
-    memory: Mutex<Memory>,
+    memory: Arc<Mutex<Memory>>,
     changes: watch::Sender<AuthState>,
     operation: AsyncMutex<()>,
     login: Mutex<Option<CancellationToken>>,
@@ -178,16 +184,20 @@ impl<S: SecretStore> TwitcastingAuth<S> {
             store,
             endpoints,
             options,
-            memory: Mutex::new(Memory {
+            memory: Arc::new(Mutex::new(Memory {
                 record: None,
+                generation: 0,
                 unauthorized: false,
-            }),
+                expired: false,
+                expiry_task: None,
+            })),
             changes,
             operation: AsyncMutex::new(()),
             login: Mutex::new(None),
         })
     }
     pub async fn load(&self, client_id: Option<&str>, now_ms: u64) {
+        let observed_at = Instant::now();
         let _guard = self.operation.lock().await;
         let record = self
             .store
@@ -197,17 +207,62 @@ impl<S: SecretStore> TwitcastingAuth<S> {
             .flatten()
             .and_then(|s| serde_json::from_str::<Record>(&s).ok())
             .filter(|r| valid_token(&r.access_token));
-        *self.memory.lock().unwrap() = Memory {
-            record,
-            unauthorized: false,
-        };
-        self.status(client_id, now_ms);
+        self.replace_record(record, client_id, now_ms, observed_at);
+    }
+    fn replace_record(
+        &self,
+        record: Option<Record>,
+        client_id: Option<&str>,
+        now_ms: u64,
+        observed_at: Instant,
+    ) {
+        let deadline = record
+            .as_ref()
+            .and_then(|r| r.expires_at_ms)
+            .and_then(|expiry| {
+                observed_at.checked_add(Duration::from_millis(expiry.saturating_sub(now_ms)))
+            });
+        let mut memory = self.memory.lock().unwrap();
+        memory.generation = memory.generation.wrapping_add(1);
+        memory.record = record;
+        memory.unauthorized = false;
+        memory.expired = deadline.is_some_and(|d| d <= Instant::now());
+        memory.expiry_task = None;
+        self.auth_state(&memory, client_id, now_ms);
+        if let Some(deadline) = deadline.filter(|_| !memory.expired) {
+            let generation = memory.generation;
+            let current = Arc::downgrade(&self.memory);
+            let changes = self.changes.clone();
+            let stop = CancellationToken::new();
+            memory.expiry_task = Some(stop.clone().drop_guard());
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = stop.cancelled() => return,
+                    _ = tokio::time::sleep_until(deadline) => {}
+                }
+                if let Some(current) = current.upgrade() {
+                    let mut memory = current.lock().unwrap();
+                    if memory.generation == generation {
+                        memory.expired = true;
+                        changes.send_if_modified(|state| {
+                            if *state == AuthState::Ready {
+                                *state = AuthState::ReloginRequired;
+                                true
+                            } else {
+                                false
+                            }
+                        });
+                    }
+                }
+            });
+        }
     }
     fn auth_state(&self, memory: &Memory, client_id: Option<&str>, now_ms: u64) -> AuthState {
         let state = match &memory.record {
             None => AuthState::LoggedOut,
             Some(r)
                 if memory.unauthorized
+                    || memory.expired
                     || client_id != Some(r.client_id.as_str())
                     || r.expires_at_ms.is_some_and(|e| now_ms >= e) =>
             {
@@ -246,24 +301,47 @@ impl<S: SecretStore> TwitcastingAuth<S> {
         }
     }
     pub fn bearer(&self, client_id: Option<&str>, now_ms: u64) -> Option<String> {
-        let memory = self.memory.lock().unwrap();
-        (self.auth_state(&memory, client_id, now_ms) == AuthState::Ready)
-            .then(|| memory.record.as_ref().unwrap().access_token.clone())
+        self.bearer_with_generation(client_id, now_ms)
+            .map(|(token, _)| token)
     }
+    /// Retain the generation alongside the request and pass it to `report_unauthorized_for` on a 401.
+    pub fn bearer_with_generation(
+        &self,
+        client_id: Option<&str>,
+        now_ms: u64,
+    ) -> Option<(String, u64)> {
+        let memory = self.memory.lock().unwrap();
+        (self.auth_state(&memory, client_id, now_ms) == AuthState::Ready).then(|| {
+            let record = memory.record.as_ref().unwrap();
+            (record.access_token.clone(), memory.generation)
+        })
+    }
+    /// Returns the verified ID while auth is Ready. Check `status` or `bearer`
+    /// with the current ClientID before using this ID for a new request.
     pub fn user_id(&self) -> Option<String> {
-        self.memory
-            .lock()
-            .unwrap()
-            .record
-            .as_ref()
-            .map(|r| r.user_id.clone())
+        let memory = self.memory.lock().unwrap();
+        if *self.changes.borrow() != AuthState::Ready {
+            return None;
+        }
+        memory.record.as_ref().map(|r| r.user_id.clone())
     }
     pub fn subscribe(&self) -> watch::Receiver<AuthState> {
         self.changes.subscribe()
     }
+    /// Invalidates the current login. Use the generation-aware form for an in-flight request.
     pub fn report_unauthorized(&self) {
+        self.invalidate(None);
+    }
+    /// Only invalidates the login used by the request that returned 401.
+    pub fn report_unauthorized_for(&self, generation: u64) {
+        self.invalidate(Some(generation));
+    }
+    fn invalidate(&self, generation: Option<u64>) {
         let mut memory = self.memory.lock().unwrap();
-        if memory.record.is_some() {
+        if memory.record.is_some()
+            && !memory.unauthorized
+            && generation.is_none_or(|g| g == memory.generation)
+        {
             memory.unauthorized = true;
             self.changes.send_replace(AuthState::ReloginRequired);
         }
@@ -276,11 +354,7 @@ impl<S: SecretStore> TwitcastingAuth<S> {
     pub async fn disconnect(&self) -> Result<(), TwitcastingAuthError> {
         self.cancel_login();
         let _guard = self.operation.lock().await;
-        *self.memory.lock().unwrap() = Memory {
-            record: None,
-            unauthorized: false,
-        };
-        self.changes.send_replace(AuthState::LoggedOut);
+        self.replace_record(None, None, 0, Instant::now());
         self.store
             .delete(TOKEN_KEY)
             .await
@@ -292,6 +366,7 @@ impl<S: SecretStore> TwitcastingAuth<S> {
         now_ms: u64,
         open_browser: impl FnOnce(String) -> Result<(), String>,
     ) -> Result<TwitcastingStatus, TwitcastingAuthError> {
+        let observed_at = Instant::now();
         if client_id.trim().is_empty() {
             return Err(error(Code::NotConfigured));
         }
@@ -303,9 +378,7 @@ impl<S: SecretStore> TwitcastingAuth<S> {
         if cancel.is_cancelled() {
             return Err(error(Code::Cancelled));
         }
-        let mut servers = JoinSet::new();
-        let shutdown = CancellationToken::new();
-        let _shutdown_guard = shutdown.clone().drop_guard();
+        let mut connections = JoinSet::new();
         let flow = async {
             let ipv4 = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, self.options.port))
                 .await
@@ -331,24 +404,28 @@ impl<S: SecretStore> TwitcastingAuth<S> {
                 read_timeout: self.options.read_timeout,
                 tx,
                 accepted: Mutex::new(false),
-                shutdown: shutdown.clone(),
                 cancel: cancel.clone(),
             });
-            let app = Router::new().fallback(callback).with_state(context);
-            for listener in std::iter::once(ipv4).chain(ipv6) {
-                let stop = shutdown.clone();
-                let app = app.clone();
-                servers.spawn(async move {
-                    let _ = axum::serve(listener, app)
-                        .with_graceful_shutdown(stop.cancelled_owned())
-                        .await;
-                });
-            }
             open_browser(build_authorize_url(&self.endpoints, client_id, &state))
                 .map_err(|_| error(Code::Other))?;
-            let grant = rx.recv().await.ok_or_else(|| error(Code::Other))??;
-            // Stop accepting callbacks before verification; graceful shutdown flushes the response.
-            shutdown.cancel();
+            let grant = loop {
+                tokio::select! {
+                    grant = rx.recv() => break grant.ok_or_else(|| error(Code::Other))?,
+                    stream = ipv4.accept() => spawn_callback(&mut connections, stream, &context)?,
+                    stream = async {
+                        match &ipv6 {
+                            Some(listener) => listener.accept().await,
+                            None => std::future::pending().await,
+                        }
+                    } => spawn_callback(&mut connections, stream, &context)?,
+                    _ = connections.join_next(), if !connections.is_empty() => {}
+                }
+            };
+            drop((ipv4, ipv6));
+            let grant = grant?;
+            if grant.expires == Some(0) {
+                return Err(error(Code::Other));
+            }
             let response = reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .timeout(self.options.read_timeout)
@@ -397,17 +474,17 @@ impl<S: SecretStore> TwitcastingAuth<S> {
             _ = tokio::time::sleep(self.options.login_timeout) => Err(error(Code::LoginTimeout)),
             result = flow => result,
         };
-        shutdown.cancel();
-        // Do not let a partial HTTP request keep a callback port alive indefinitely.
-        if tokio::time::timeout(Duration::from_millis(250), async {
-            while servers.join_next().await.is_some() {}
-        })
-        .await
-        .is_err()
-        {
-            servers.abort_all();
-            while servers.join_next().await.is_some() {}
+        if !matches!(&result, Err(e) if matches!(e.code, Code::Cancelled | Code::LoginTimeout)) {
+            // Let the browser receive its response before dropping other in-flight callbacks.
+            let flush = tokio::time::timeout(Duration::from_millis(250), async {
+                while connections.join_next().await.is_some() {}
+            });
+            tokio::select! {
+                _ = cancel.cancelled() => {}
+                _ = flush => {}
+            }
         }
+        connections.shutdown().await;
         let record = result?;
         if cancel.is_cancelled() {
             return Err(error(Code::Cancelled));
@@ -419,10 +496,7 @@ impl<S: SecretStore> TwitcastingAuth<S> {
             .put(TOKEN_KEY, &serialized)
             .await
             .map_err(|_| error(Code::TokenStore))?;
-        *self.memory.lock().unwrap() = Memory {
-            record: Some(record),
-            unauthorized: false,
-        };
+        self.replace_record(Some(record), Some(client_id), now_ms, observed_at);
         Ok(self.status(Some(client_id), now_ms))
     }
 }
@@ -439,18 +513,37 @@ struct Loopback {
     read_timeout: Duration,
     tx: mpsc::Sender<Result<Grant, TwitcastingAuthError>>,
     accepted: Mutex<bool>,
-    shutdown: CancellationToken,
     cancel: CancellationToken,
 }
+
+fn spawn_callback(
+    connections: &mut JoinSet<()>,
+    accepted: std::io::Result<(tokio::net::TcpStream, std::net::SocketAddr)>,
+    context: &Arc<Loopback>,
+) -> Result<(), TwitcastingAuthError> {
+    let (stream, _) = accepted.map_err(|_| error(Code::Other))?;
+    let context = context.clone();
+    connections.spawn(async move {
+        let service = service_fn(|request: hyper::Request<hyper::body::Incoming>| async {
+            Ok::<_, Infallible>(callback(&context, request.map(Body::new)).await)
+        });
+        let _ = http1::Builder::new()
+            .keep_alive(false)
+            .serve_connection(TokioIo::new(stream), service)
+            .await;
+    });
+    Ok(())
+}
 const PAGE: &str = r#"<!doctype html><html lang="ja"><meta charset="utf-8"><title>ツイキャス認証</title><p id="message">認証しています…</p><script>
-const hash = location.hash;
+const body = location.hash.slice(1) ||
+  (new URLSearchParams(location.search).get('result') === 'denied' ? 'result=denied' : '');
 history.replaceState(null, '', location.pathname);
 const message = document.getElementById('message');
-if (!hash || hash.length < 2) { message.textContent = '認証情報が見つかりません'; }
-else { fetch('/twitcasting/token', {method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:hash.slice(1)}).then(r => { message.textContent = r.ok ? 'アプリに戻ってください。この画面は閉じられます。' : '認証に失敗しました。アプリでやり直してください。'; }).catch(() => { message.textContent = 'アプリでログインをやり直してください。'; }); }
+if (!body) { message.textContent = '認証情報が見つかりません'; }
+else { fetch('/twitcasting/token', {method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body}).then(r => { message.textContent = r.ok ? 'アプリに戻ってください。この画面は閉じられます。' : '認証に失敗しました。アプリでやり直してください。'; }).catch(() => { message.textContent = 'アプリでログインをやり直してください。'; }); }
 </script></html>"#;
-async fn callback(State(context): State<Arc<Loopback>>, req: Request) -> Response {
-    let mut response = handle_callback(&context, req).await;
+async fn callback(context: &Loopback, req: Request) -> Response {
+    let mut response = handle_callback(context, req).await;
     let headers = response.headers_mut();
     for (k,v) in [("cache-control","no-store"), ("referrer-policy","no-referrer"), ("x-content-type-options","nosniff"), ("content-security-policy","default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'")] { headers.insert(k, v.parse().unwrap()); }
     response
@@ -506,10 +599,155 @@ async fn handle_callback(context: &Loopback, req: Request) -> Response {
         })
     };
     let mut accepted = context.accepted.lock().unwrap();
-    if *accepted || context.shutdown.is_cancelled() || context.cancel.is_cancelled() {
+    if *accepted || context.cancel.is_cancelled() {
         return StatusCode::CONFLICT.into_response();
     }
     *accepted = true;
     let _ = context.tx.try_send(grant);
     StatusCode::OK.into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::integrations::MemorySecretStore;
+    use tokio::{
+        io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+        net::TcpStream,
+        sync::oneshot,
+        time::timeout,
+    };
+
+    async fn seed_record(store: &MemorySecretStore, expiry: Option<u64>) {
+        let record = Record {
+            client_id: "client".into(),
+            access_token: "test-token".into(),
+            user_id: "user".into(),
+            screen_id: "screen".into(),
+            name: "name".into(),
+            expires_at_ms: expiry,
+            obtained_at_ms: 0,
+        };
+        store
+            .put(TOKEN_KEY, &serde_json::to_string(&record).unwrap())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_unauthorized_response_does_not_invalidate_new_session() {
+        let store = MemorySecretStore::new();
+        seed_record(&store, None).await;
+        let auth = TwitcastingAuth::new(
+            store,
+            TwitcastingEndpoints::default(),
+            AuthOptions::default(),
+        );
+        auth.load(Some("client"), 0).await;
+        let (_, old_generation) = auth.bearer_with_generation(Some("client"), 0).unwrap();
+        auth.load(Some("client"), 0).await;
+        let (_, generation) = auth.bearer_with_generation(Some("client"), 0).unwrap();
+        let mut changes = auth.subscribe();
+        assert_eq!(*changes.borrow_and_update(), AuthState::Ready);
+
+        auth.report_unauthorized_for(old_generation);
+        assert!(!changes.has_changed().unwrap());
+        assert_eq!(auth.user_id().as_deref(), Some("user"));
+
+        auth.report_unauthorized_for(generation);
+        assert_eq!(*changes.borrow_and_update(), AuthState::ReloginRequired);
+        assert!(auth.user_id().is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expiry_notifies_idle_subscribers_for_the_current_record_only() {
+        let store = MemorySecretStore::new();
+        seed_record(&store, Some(1000)).await;
+        let auth = TwitcastingAuth::new(
+            store.clone(),
+            TwitcastingEndpoints::default(),
+            AuthOptions::default(),
+        );
+        auth.load(Some("client"), 0).await;
+        let mut changes = auth.subscribe();
+        assert_eq!(*changes.borrow_and_update(), AuthState::Ready);
+        seed_record(&store, Some(3000)).await;
+        auth.load(Some("client"), 0).await;
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(!changes.has_changed().unwrap());
+        timeout(Duration::from_secs(2), changes.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(*changes.borrow_and_update(), AuthState::ReloginRequired);
+        assert!(auth.user_id().is_none());
+        assert!(auth.bearer(Some("client"), 0).is_none());
+        assert!(store.raw(TOKEN_KEY).is_some());
+    }
+
+    #[tokio::test]
+    async fn cancel_closes_inflight_callback_and_releases_port() {
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+        let auth = TwitcastingAuth::new(
+            MemorySecretStore::new(),
+            TwitcastingEndpoints::default(),
+            AuthOptions {
+                port: addr.port(),
+                read_timeout: Duration::from_secs(15),
+                ..AuthOptions::default()
+            },
+        );
+        let (started, listening) = oneshot::channel();
+        let login = tokio::spawn({
+            let auth = auth.clone();
+            async move {
+                auth.connect("client", 0, |_| {
+                    started.send(()).unwrap();
+                    Ok(())
+                })
+                .await
+            }
+        });
+        let wait = Duration::from_secs(2);
+        timeout(wait, listening).await.unwrap().unwrap();
+
+        let mut client = BufReader::new(TcpStream::connect(addr).await.unwrap());
+        client
+            .write_all(
+                format!(
+                    "POST {TOKEN_PATH} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: 100\r\nExpect: 100-continue\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut response = String::new();
+        timeout(wait, client.read_line(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response, "HTTP/1.1 100 Continue\r\n");
+        response.clear();
+        timeout(wait, client.read_line(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response, "\r\n");
+
+        auth.cancel_login();
+        let result = timeout(wait, login).await.unwrap().unwrap();
+        assert!(matches!(result.unwrap_err().code, Code::Cancelled));
+        let rebound = TcpListener::bind(addr).await;
+        let closed = timeout(wait, client.read_u8())
+            .await
+            .expect("callback connection stayed open after cancellation");
+        assert!(matches!(
+            closed.unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
+        ));
+        rebound.expect("callback port could not be rebound after cancellation");
+    }
 }

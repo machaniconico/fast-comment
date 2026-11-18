@@ -56,7 +56,7 @@
 
 <fieldset>
   <legend>ツイキャス</legend>
-  <div class="field-row" aria-live="polite">
+  <div class="field-row">
     {#if status?.state === 'ready'}
       <span class="connected">@{status.screenId} ({status.name}) としてログイン中</span>
     {:else if status?.state === 'reloginRequired'}
@@ -80,7 +80,7 @@
       <button type="button" onclick={disconnect} disabled={connecting || disconnecting}>ログアウト</button>
     {/if}
   </div>
-  {#if message}<p class:warn={failed} aria-live="polite">{message}</p>{/if}
+  <div aria-live="polite">{#if message}<p class:warn={failed}>{message}</p>{/if}</div>
   <details>
     <summary>詳細: 自分の ClientID を使う</summary>
     <div class="field-row">

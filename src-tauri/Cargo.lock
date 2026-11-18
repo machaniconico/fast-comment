@@ -1197,6 +1197,8 @@ dependencies = [
  "hex",
  "hmac",
  "http-body-util",
+ "hyper",
+ "hyper-util",
  "keyring",
  "oauth2",
  "prost",
