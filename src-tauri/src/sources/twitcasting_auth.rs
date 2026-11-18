@@ -243,10 +243,11 @@ struct StartupRestore {
 #[derive(Default)]
 struct PendingLogout {
     targets: MarkerTargets,
-    // A local record, a marker found by startup/reload, or a successful explicit store read
-    // (including an empty store) fixes the targets. The explicit marker read alone does not.
+    // A local record, a marker found by startup/reload, or a conclusive store operation
+    // fixes the targets. Reading a marker during explicit logout alone does not.
     known: bool,
-    unidentified: bool,
+    requested_at_ms: Option<u64>,
+    direct_delete_attempted: bool,
     deleted: Option<DeletedCredential>,
 }
 
@@ -718,6 +719,12 @@ impl<S: SecretStore> TwitcastingAuth<S> {
             if memory.logout_running {
                 return Err(error(Code::TokenStore));
             }
+            if startup.is_none() {
+                memory
+                    .pending_logout
+                    .requested_at_ms
+                    .get_or_insert_with(crate::timer_now_ms);
+            }
             if let Some(cancel) = login.as_ref() {
                 cancel.cancel();
             }
@@ -819,17 +826,21 @@ impl<S: SecretStore> TwitcastingAuth<S> {
     // The shared file lock covers the marker and the credential together, including any
     // login write and its rollback. A matching credential cannot be replaced before delete.
     async fn reconcile_logout(&self, startup: bool) -> Result<Logout, LogoutIssue> {
-        let (remembered, known, unidentified, deleted) = {
+        let (mut targets, selection_cutoff, direct_delete_attempted, deleted) = {
             let memory = self.session.memory.lock().unwrap();
+            let pending = &memory.pending_logout;
+            let deleted = pending.deleted.is_some();
+            let selection_cutoff = pending
+                .requested_at_ms
+                .filter(|_| !startup && !pending.known && !deleted);
             (
-                memory.pending_logout.targets.clone(),
-                memory.pending_logout.known,
-                memory.pending_logout.unidentified,
-                memory.pending_logout.deleted.is_some(),
+                pending.targets.clone(),
+                selection_cutoff,
+                pending.direct_delete_attempted,
+                deleted,
             )
         };
-        let may_select_current = !startup && !known && !deleted && !unidentified;
-        let mut targets = remembered;
+        let first_selection = selection_cutoff.is_some() && !direct_delete_attempted;
         // Only a wildcard still on disk can authorize a delete.
         targets.remove(&MarkerTarget::Any);
         let requested = targets.clone();
@@ -869,7 +880,7 @@ impl<S: SecretStore> TwitcastingAuth<S> {
         };
 
         let current = self.store.get_for_logout(TOKEN_KEY).await;
-        if may_select_current && current.is_ok() {
+        if selection_cutoff.is_some() && current.is_ok() {
             self.session.memory.lock().unwrap().pending_logout.known = true;
         }
         let result = match current {
@@ -885,9 +896,14 @@ impl<S: SecretStore> TwitcastingAuth<S> {
                         (None, MarkerTarget::Envelope(value_id(&value)))
                     }
                 };
-                // The first explicit logout also targets the readable current value, even when
-                // another session's marker already lists older records.
-                if may_select_current && !targets.contains(&id) {
+                // After a failed direct delete, only select a record obtained before the
+                // original request. A current value may have come from another session.
+                let select_current = first_selection
+                    || record
+                        .as_ref()
+                        .zip(selection_cutoff)
+                        .is_some_and(|(record, cutoff)| record.obtained_at_ms < cutoff);
+                if select_current && !targets.contains(&id) {
                     targets.insert(id.clone());
                     self.remember_logout_targets(&targets);
                     let append = targets.clone();
@@ -908,19 +924,18 @@ impl<S: SecretStore> TwitcastingAuth<S> {
                     Logout::Preserved(record)
                 }
             }
-            // An explicit operation without an identity may delete a value the OS cannot
-            // return, even when the marker lists other sessions' records. Retrying this path
-            // never adopts a subsequently readable credential.
-            Err(_) if !startup && (may_select_current || unidentified) && !deleted => {
+            // A direct delete is allowed only once before the current value is identified.
+            Err(_) if first_selection => {
                 self.session
                     .memory
                     .lock()
                     .unwrap()
                     .pending_logout
-                    .unidentified = true;
+                    .direct_delete_attempted = true;
                 self.delete_for_logout(true)
                     .await
                     .map_err(|()| store_issue(marker_issue))?;
+                self.session.memory.lock().unwrap().pending_logout.known = true;
                 Logout::Empty
             }
             Err(_) => return Err(store_issue(marker_issue)),
@@ -4004,26 +4019,45 @@ const fetch = (_path, { body }) => {
             assert_eq!(status.logouts_completed, 0);
         }
 
-        #[cfg(windows)]
         #[tokio::test]
         async fn revision15_retry_keeps_new_login_after_empty_store_cleanup_fails() {
             let dir = tempfile::tempdir().unwrap();
-            let marker = dir.path().join(LOGOUT_MARKER_FILE);
+            let config = dir.path().join("config");
+            fs::create_dir(&config).unwrap();
+            let marker = config.join(LOGOUT_MARKER_FILE);
             let store = MemorySecretStore::new();
             store.fail_next_get();
-            let auth = auth_with_marker(store.clone(), marker.clone());
+            let auth = TwitcastingAuth::with_logout_files(
+                store.clone(),
+                TwitcastingEndpoints::default(),
+                AuthOptions::default(),
+                Some(marker.clone()),
+                Some(dir.path().join("credentials.lock")),
+            );
             auth.initialize(Some("client"), 0).await;
             assert_eq!(auth.status(Some("client"), 0).state, "loadFailed");
 
             fs::write(&marker, id_of(&seeded("old-token"))).unwrap();
-            let held = deny_marker_replacement(&marker);
+            let backup = dir.path().join("config-backup");
+            set_hook(&auth, {
+                let config = config.clone();
+                let backup = backup.clone();
+                move |call| {
+                    if call == 1 {
+                        // The empty store was already read when marker cleanup starts.
+                        fs::rename(&config, &backup).unwrap();
+                        fs::write(&config, []).unwrap();
+                    }
+                }
+            });
             assert!(auth.disconnect().await.is_err());
             assert_eq!(
                 auth.status(Some("client"), 0).logout_issue,
                 Some(LogoutIssue::MarkerInaccessible)
             );
             assert!(store.raw(TOKEN_KEY).is_none());
-            drop(held);
+            fs::remove_file(&config).unwrap();
+            fs::rename(&backup, &config).unwrap();
 
             let newer = serde_json::to_string(&seeded("new-token")).unwrap();
             store.put(TOKEN_KEY, &newer).await.unwrap();
@@ -4036,6 +4070,75 @@ const fetch = (_path, { body }) => {
             let status = auth.status(Some("client"), 0);
             assert_eq!(status.logout_issue, Some(LogoutIssue::OtherLoginKept));
             assert_eq!(status.logouts_completed, 0);
+        }
+
+        #[tokio::test]
+        async fn revision16_unreadable_retry_does_not_delete_a_new_login() {
+            let dir = tempfile::tempdir().unwrap();
+            let marker = dir.path().join(LOGOUT_MARKER_FILE);
+            let store = MemorySecretStore::new();
+            seed_record(&store, None).await;
+            let auth = auth_with_marker(store.clone(), marker.clone());
+
+            store.fail_next_get();
+            store.fail_next_delete();
+            assert!(auth.disconnect().await.is_err());
+            assert!(store.raw(TOKEN_KEY).is_some());
+            assert!(!marker.exists());
+
+            let after_first_request = crate::timer_now_ms();
+            wait_until(|| crate::timer_now_ms() > after_first_request).await;
+            let mut newer = seeded("new-token");
+            newer.obtained_at_ms = crate::timer_now_ms();
+            let value = serde_json::to_string(&newer).unwrap();
+            store.put(TOKEN_KEY, &value).await.unwrap();
+
+            store.fail_next_get();
+            let retry = auth.disconnect().await;
+            assert!(
+                store.raw(TOKEN_KEY).as_deref() == Some(value.as_str()),
+                "読込に失敗した再試行で別のログインが失われた"
+            );
+            assert!(retry.is_err());
+            let status = auth.status(Some("client"), 0);
+            assert!(status.logout_pending);
+            assert_eq!(status.logout_issue, Some(LogoutIssue::DeleteFailed));
+            assert_eq!(status.logouts_completed, 0);
+
+            wait_until(|| crate::timer_now_ms() > newer.obtained_at_ms).await;
+            auth.disconnect().await.unwrap();
+            assert!(store.raw(TOKEN_KEY).as_deref() == Some(value.as_str()));
+            let status = auth.status(Some("client"), 0);
+            assert!(!status.logout_pending);
+            assert_eq!(status.logout_issue, Some(LogoutIssue::OtherLoginKept));
+            assert_eq!(status.logouts_completed, 0);
+        }
+
+        #[tokio::test]
+        async fn revision16_readable_retry_deletes_the_original_login() {
+            let dir = tempfile::tempdir().unwrap();
+            let marker = dir.path().join(LOGOUT_MARKER_FILE);
+            let store = MemorySecretStore::new();
+            seed_record(&store, None).await;
+            let auth = auth_with_marker(store.clone(), marker.clone());
+
+            store.fail_next_get();
+            store.fail_next_delete();
+            assert!(auth.disconnect().await.is_err());
+            assert!(store.raw(TOKEN_KEY).is_some());
+            assert!(!marker.exists());
+
+            auth.disconnect().await.unwrap();
+            drop(auth);
+            let restarted = auth_with_marker(store.clone(), marker.clone());
+            restarted.initialize(Some("client"), 0).await;
+            assert_ne!(
+                restarted.status(Some("client"), 0).state,
+                "ready",
+                "ログアウトの再試行後に元の資格情報が復元された"
+            );
+            assert!(store.raw(TOKEN_KEY).is_none());
+            assert!(!marker.exists());
         }
 
         // 修正14-2: ストアとブロッキングタスクの両キューで待った分をロック期限に含める。
