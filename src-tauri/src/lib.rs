@@ -1359,14 +1359,15 @@ fn notify_x_auth_changed(state: &AppState) {
 }
 
 fn twitcasting_client_id(state: &AppState) -> Option<String> {
-    effective_client_id(
-        state
-            .config
-            .lock()
-            .unwrap()
-            .credentials
-            .twitcasting_client_id
-            .as_deref(),
+    twitcasting_target(state).0
+}
+
+/// 実効 ClientID と、設定したログイン待受ポート(`x_post_target` と同じく設定から読む)。
+fn twitcasting_target(state: &AppState) -> (Option<String>, u16) {
+    let cfg = state.config.lock().unwrap();
+    (
+        effective_client_id(cfg.credentials.twitcasting_client_id.as_deref()),
+        cfg.twitcasting.callback_port,
     )
 }
 
@@ -1422,9 +1423,10 @@ fn setup_twitcasting<S: integrations::SecretStore, R, Register: FnOnce() -> R>(
 
 #[tauri::command]
 fn get_twitcasting_status(state: State<'_, AppState>) -> TwitcastingStatus {
+    let (client_id, port) = twitcasting_target(&state);
     state
         .twitcasting_auth
-        .status(twitcasting_client_id(&state).as_deref(), timer_now_ms())
+        .status_on(port, client_id.as_deref(), timer_now_ms())
 }
 
 #[tauri::command]
@@ -1441,16 +1443,22 @@ async fn reload_twitcasting_status(state: State<'_, AppState>) -> Result<Twitcas
 async fn connect_twitcasting(
     state: State<'_, AppState>,
     client_id: Option<String>,
+    callback_port: u16,
 ) -> Result<TwitcastingStatus, TwitcastingAuthError> {
     let override_id = client_id
         .map(|s| s.trim().to_owned())
         .filter(|s| !s.is_empty());
     let effective = effective_client_id(override_id.as_deref())
         .ok_or_else(|| TwitcastingAuthError::new(TwitcastingAuthErrorCode::NotConfigured))?;
+    // X の connect_x_post と同じく 0 は拒否する(bind すると任意ポートになりコールバック URL と食い違う)。
+    if callback_port == 0 {
+        return Err(TwitcastingAuthError::new(TwitcastingAuthErrorCode::Other));
+    }
     let next = {
         let mut cfg = state.config.lock().unwrap();
         let mut next = cfg.clone();
         next.credentials.twitcasting_client_id = override_id;
+        next.twitcasting.callback_port = callback_port;
         next.save(&state.config_dir)
             .map_err(|_| TwitcastingAuthError::new(TwitcastingAuthErrorCode::Other))?;
         *cfg = next.clone();
@@ -1459,7 +1467,7 @@ async fn connect_twitcasting(
     state.config_tx.send_replace(next);
     state
         .twitcasting_auth
-        .connect(&effective, timer_now_ms(), open_url)
+        .connect_on(callback_port, &effective, timer_now_ms(), open_url)
         .await
 }
 
@@ -1473,9 +1481,10 @@ async fn disconnect_twitcasting(
     state: State<'_, AppState>,
 ) -> Result<TwitcastingStatus, TwitcastingAuthError> {
     state.twitcasting_auth.disconnect().await?;
+    let (client_id, port) = twitcasting_target(&state);
     Ok(state
         .twitcasting_auth
-        .status(twitcasting_client_id(&state).as_deref(), timer_now_ms()))
+        .status_on(port, client_id.as_deref(), timer_now_ms()))
 }
 
 /// X 自動告知(API モード)の接続状態。

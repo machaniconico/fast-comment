@@ -823,6 +823,22 @@ impl Default for XPostConfig {
     }
 }
 
+/// ツイキャスのログイン設定。資格情報ではないので `credentials` には置かない。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct TwitcastingConfig {
+    /// ログイン待受(ループバック)のポート。X の `callbackPort` と同じく 0 はログイン時に拒否する。
+    pub callback_port: u16,
+}
+
+impl Default for TwitcastingConfig {
+    fn default() -> Self {
+        TwitcastingConfig {
+            callback_port: crate::sources::twitcasting_auth::CALLBACK_PORT,
+        }
+    }
+}
+
 impl XPostConfig {
     /// 範囲外の値を許容範囲へ丸める。
     pub fn normalize(&mut self) {
@@ -896,6 +912,8 @@ pub struct AppConfig {
     pub credentials: CredentialsConfig,
     #[serde(default)]
     pub x_post: XPostConfig,
+    #[serde(default)]
+    pub twitcasting: TwitcastingConfig,
 }
 
 impl Default for AppConfig {
@@ -917,6 +935,7 @@ impl Default for AppConfig {
             niconico_overrides: NiconicoOverrides::default(),
             credentials: CredentialsConfig::default(),
             x_post: XPostConfig::default(),
+            twitcasting: TwitcastingConfig::default(),
         }
     }
 }
@@ -1089,6 +1108,17 @@ mod tests {
         assert_eq!(cfg.x_post.cooldown_minutes, 60);
         assert_eq!(cfg.x_post.daily_limit, 5);
         assert_eq!(cfg.x_post.callback_port, 47821);
+        assert_eq!(cfg.twitcasting, TwitcastingConfig::default());
+        assert_eq!(cfg.twitcasting.callback_port, 39822);
+    }
+
+    #[test]
+    fn twitcasting_callback_port_reads_configured_value() {
+        let cfg: AppConfig =
+            serde_json::from_str(r#"{"twitcasting":{"callbackPort":40123}}"#).expect("twitcasting");
+        assert_eq!(cfg.twitcasting.callback_port, 40123);
+        let cfg: AppConfig = serde_json::from_str(r#"{"twitcasting":{}}"#).expect("empty twitcasting");
+        assert_eq!(cfg.twitcasting.callback_port, 39822);
     }
 
     #[test]
@@ -1284,6 +1314,7 @@ mod tests {
             },
             niconico_overrides: NiconicoOverrides::default(),
             x_post: XPostConfig::default(),
+            twitcasting: TwitcastingConfig::default(),
         };
 
         let text = serde_json::to_string(&cfg).expect("serialize AppConfig");
@@ -1292,6 +1323,7 @@ mod tests {
         assert_eq!(json["channels"][0]["ownStream"].as_bool(), Some(true));
         assert_eq!(json["credentials"]["xPostClientId"].as_str(), Some("x-post-client"));
         assert_eq!(json["xPost"]["callbackPort"].as_u64(), Some(47821));
+        assert_eq!(json["twitcasting"]["callbackPort"].as_u64(), Some(39822));
         assert_eq!(json["obs"]["template"].as_str(), Some("compact"));
         assert_eq!(json["obs"]["fontScalePct"].as_u64(), Some(125));
         assert_eq!(json["obs"]["danmakuFontSize"].as_u64(), Some(42));

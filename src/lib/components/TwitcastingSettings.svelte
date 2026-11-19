@@ -2,11 +2,19 @@
   import { onMount } from 'svelte';
   import { getTwitcastingStatus, reloadTwitcastingStatus, connectTwitcasting, cancelTwitcastingLogin, disconnectTwitcasting } from '../ipc';
   import type { TwitcastingStatus } from '../types';
-  import { errorText } from '../xAutopost';
+  import { errorText, parseCallbackPort } from '../xAutopost';
 
-  let { clientId = '', onClientIdSaved }: { clientId?: string; onClientIdSaved?: (id: string) => void } = $props();
+  let { clientId = '', callbackPort = 39822, onClientIdSaved, onCallbackPortSaved }: {
+    clientId?: string;
+    callbackPort?: number;
+    onClientIdSaved?: (id: string) => void;
+    onCallbackPortSaved?: (port: number) => void;
+  } = $props();
   // svelte-ignore state_referenced_locally
   let clientIdInput = $state(clientId);
+  // svelte-ignore state_referenced_locally
+  let portInput = $state(String(callbackPort));
+  const port = $derived(parseCallbackPort(portInput));
   let status = $state<TwitcastingStatus | null>(null);
   let connecting = $state(false);
   let disconnecting = $state(false);
@@ -78,14 +86,21 @@
   });
   async function connect() {
     if (connecting || disconnecting || reloading || !status || status.state === 'loading') return;
+    const callbackPort = port;
+    if (callbackPort === null) {
+      message = 'ポートは 1024〜65535 の整数にしてください';
+      failed = true;
+      return;
+    }
     connecting = true;
     failed = false;
     message = 'ブラウザでツイキャスにログインし、アプリを許可してください…';
     const id = clientIdInput.trim();
-    // コマンドはログインに先立って ClientID だけを保存する。親の未保存フォームにも反映する。
+    // コマンドはログインに先立って ClientID と待受ポートだけを保存する。親の未保存フォームにも反映する。
     onClientIdSaved?.(id);
+    onCallbackPortSaved?.(callbackPort);
     try {
-      status = await connectTwitcasting(id);
+      status = await connectTwitcasting(id, callbackPort);
       statusError = '';
       message = 'ツイキャスにログインしました';
     } catch (e) { message = errorText(e); failed = true; await refresh(); }
@@ -173,9 +188,16 @@
       <label for="twitcasting-client-id">ClientID</label>
       <input id="twitcasting-client-id" type="text" bind:value={clientIdInput} disabled={connecting || disconnecting} autocomplete="off" spellcheck="false" />
     </div>
-    <p>空欄ならアプリ既定値を使います。現在は既定値が未登録のため、自分の ClientID が必要です。ログイン時にこの項目だけ保存します。</p>
+    <div class="field-row">
+      <label for="twitcasting-port">待受ポート</label>
+      <input id="twitcasting-port" type="text" inputmode="numeric" bind:value={portInput} disabled={connecting || disconnecting} autocomplete="off" />
+    </div>
+    {#if port === null}
+      <p class="warn">ポートは 1024〜65535 の整数にしてください</p>
+    {/if}
+    <p>空欄ならアプリ既定値を使います。現在は既定値が未登録のため、自分の ClientID が必要です。ログイン時に ClientID と待受ポートだけ保存します。待受ポートの既定は 39822 です。変えたら開発者ページのコールバック URL も登録し直してください。</p>
     <p>ツイキャスの開発者ページでアプリを登録し、次のコールバック URL をそのまま設定してください。</p>
-    <code>{status?.callbackUrl ?? 'http://localhost:47822/twitcasting/callback'}</code>
+    <code>{status?.callbackUrl ?? 'http://localhost:39822/twitcasting/callback'}</code>
   </details>
   <p>認証の有効期間は通常約 180 日です。ログアウト後は、ツイキャスの連携アプリ設定から解除できます。</p>
 </fieldset>

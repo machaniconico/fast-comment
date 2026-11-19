@@ -31,7 +31,8 @@ use tokio::{
 use tokio_util::sync::{CancellationToken, DropGuard};
 
 pub const TOKEN_KEY: &str = "twitcasting-oauth-token";
-pub const CALLBACK_PORT: u16 = 47822;
+/// Outside the 44620-48715 range WSL mirrored networking reserves on the Windows side.
+pub const CALLBACK_PORT: u16 = 39822;
 pub const CALLBACK_PATH: &str = "/twitcasting/callback";
 pub const TOKEN_PATH: &str = "/twitcasting/token";
 pub(crate) const LOGOUT_MARKER_FILE: &str = "twitcasting-logout-pending";
@@ -147,7 +148,7 @@ impl TwitcastingAuthError {
         let message = match code {
             TwitcastingAuthErrorCode::NotConfigured => "ツイキャスの ClientID を設定してください",
             TwitcastingAuthErrorCode::PortInUse => {
-                "認証ポートを使用中です。他のログイン待受を閉じてください"
+                "認証ポートを使用中です。他のログイン待受を閉じてください。WSL の mirrored モードは 44620〜48715 を確保する場合があります。設定でポートを変え、開発者ページのコールバック URL も合わせて登録し直してください"
             }
             TwitcastingAuthErrorCode::LoginTimeout => "ログインが時間切れになりました",
             TwitcastingAuthErrorCode::Cancelled => "ログインを取り消しました",
@@ -617,6 +618,10 @@ impl<S: SecretStore> TwitcastingAuth<S> {
         .await;
     }
     pub fn status(&self, client_id: Option<&str>, now_ms: u64) -> TwitcastingStatus {
+        self.status_on(self.options.port, client_id, now_ms)
+    }
+    /// Like `status`, but reports the callback URL for `port` (the configured listener port).
+    pub fn status_on(&self, port: u16, client_id: Option<&str>, now_ms: u64) -> TwitcastingStatus {
         let memory = self.session.memory.lock().unwrap();
         let state = self.session.auth_state(&memory, client_id, now_ms);
         let r = memory.record.as_ref();
@@ -633,7 +638,7 @@ impl<S: SecretStore> TwitcastingAuth<S> {
             screen_id: r.map(|r| r.screen_id.clone()),
             name: r.map(|r| r.name.clone()),
             expires_at_ms: r.and_then(|r| r.expires_at_ms),
-            callback_url: format!("http://localhost:{}{CALLBACK_PATH}", self.options.port),
+            callback_url: format!("http://localhost:{port}{CALLBACK_PATH}"),
             logout_pending: memory.logout_pending,
             logout_issue: memory.logout_issue,
             logouts_completed: memory.logouts_completed,
@@ -986,6 +991,17 @@ impl<S: SecretStore> TwitcastingAuth<S> {
         now_ms: u64,
         open_browser: impl FnOnce(String) -> Result<(), String>,
     ) -> Result<TwitcastingStatus, TwitcastingAuthError> {
+        self.connect_on(self.options.port, client_id, now_ms, open_browser)
+            .await
+    }
+    /// Like `connect`, but listens on `port` (the configured listener port).
+    pub async fn connect_on(
+        self: &Arc<Self>,
+        port: u16,
+        client_id: &str,
+        now_ms: u64,
+        open_browser: impl FnOnce(String) -> Result<(), String>,
+    ) -> Result<TwitcastingStatus, TwitcastingAuthError> {
         let observed_at = Instant::now();
         let deadline = observed_at + self.options.login_timeout;
         if client_id.trim().is_empty() {
@@ -1012,11 +1028,11 @@ impl<S: SecretStore> TwitcastingAuth<S> {
         };
         let mut connections = JoinSet::new();
         let flow = async {
-            let ipv4 = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, self.options.port))
+            let ipv4 = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
                 .await
                 .map_err(|_| error(Code::PortInUse))?;
             let ipv6 =
-                match TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, self.options.port)).await {
+                match TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, port)).await {
                     Ok(l) => Some(l),
                     Err(e)
                         if e.kind() == std::io::ErrorKind::AddrNotAvailable
@@ -1032,7 +1048,7 @@ impl<S: SecretStore> TwitcastingAuth<S> {
             let (tx, mut rx) = mpsc::channel(1);
             let context = Arc::new(Loopback {
                 state: state.clone(),
-                port: self.options.port,
+                port,
                 read_timeout: self.options.read_timeout,
                 tx,
                 accepted: Mutex::new(false),
@@ -1170,7 +1186,7 @@ impl<S: SecretStore> TwitcastingAuth<S> {
             );
             let _ = commit.send(());
         }
-        Ok(self.status(Some(client_id), obtained_at_ms))
+        Ok(self.status_on(port, Some(client_id), obtained_at_ms))
     }
 
     async fn verify_grant(
@@ -2396,6 +2412,73 @@ const fetch = (_path, { body }) => {
             .unwrap();
     }
 
+    #[test]
+    fn default_callback_port_is_outside_wsl_mirrored_reservation() {
+        assert_eq!(CALLBACK_PORT, 39822);
+        assert!(!(44620..=48715).contains(&CALLBACK_PORT));
+        assert_eq!(AuthOptions::default().port, CALLBACK_PORT);
+        let auth = TwitcastingAuth::new(
+            MemorySecretStore::new(),
+            TwitcastingEndpoints::default(),
+            AuthOptions::default(),
+        );
+        assert_eq!(
+            auth.status(Some("client"), 0).callback_url,
+            format!("http://localhost:{CALLBACK_PORT}{CALLBACK_PATH}")
+        );
+        assert_eq!(
+            auth.status_on(40123, Some("client"), 0).callback_url,
+            format!("http://localhost:40123{CALLBACK_PATH}")
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_on_listens_on_the_configured_port() {
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        // The default port is not the one under test, so a pass proves `connect_on` bound `port`.
+        assert_ne!(port, CALLBACK_PORT);
+        let auth = TwitcastingAuth::new(
+            MemorySecretStore::new(),
+            TwitcastingEndpoints::default(),
+            AuthOptions::default(),
+        );
+        auth.load(Some("client"), 0).await;
+        let reached = Arc::new(Mutex::new(None));
+        let seen = reached.clone();
+        let result = auth
+            .connect_on(port, "client", 0, move |_| {
+                *seen.lock().unwrap() =
+                    Some(std::net::TcpStream::connect(("127.0.0.1", port)).is_ok());
+                Err("stop".into())
+            })
+            .await;
+        assert!(matches!(result, Err(e) if matches!(e.code, Code::Other)));
+        assert_eq!(*reached.lock().unwrap(), Some(true));
+        // The listener is released when the command returns.
+        TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn connect_on_reports_port_in_use_with_wsl_hint() {
+        let busy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = busy.local_addr().unwrap().port();
+        let auth = TwitcastingAuth::new(
+            MemorySecretStore::new(),
+            TwitcastingEndpoints::default(),
+            AuthOptions::default(),
+        );
+        auth.load(Some("client"), 0).await;
+        let err = auth
+            .connect_on(port, "client", 0, |_| Ok(()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err.code, Code::PortInUse));
+        assert!(err.message.contains("44620〜48715"), "{}", err.message);
+        drop(busy);
+    }
+
     #[tokio::test]
     async fn stale_unauthorized_response_does_not_invalidate_new_session() {
         let store = MemorySecretStore::new();
@@ -3028,7 +3111,7 @@ const fetch = (_path, { body }) => {
 
         #[tokio::test]
         async fn percent_encoded_expiry_key_is_validated_end_to_end() {
-            let body = run_callback_script(PAGE, "http://localhost:47822/twitcasting/callback#access%5Ftoken=t&expires%5Fin=%30&state=test-state");
+            let body = run_callback_script(PAGE, &format!("http://localhost:{CALLBACK_PORT}/twitcasting/callback#access%5Ftoken=t&expires%5Fin=%30&state=test-state"));
             let (status, result) = receive_callback_body(body).await;
             assert_eq!(status, StatusCode::BAD_REQUEST);
             assert!(matches!(result, Err(e) if matches!(e.code, Code::Other)));
@@ -3036,7 +3119,7 @@ const fetch = (_path, { body }) => {
 
         #[tokio::test]
         async fn duplicate_keys_use_the_last_decoded_value() {
-            let base = "http://localhost:47822/twitcasting/callback";
+            let base = format!("http://localhost:{CALLBACK_PORT}/twitcasting/callback");
             let body = run_callback_script(
                 PAGE,
                 &format!("{base}#result=denied&state=stale&st%61te=test-state"),
@@ -3112,7 +3195,7 @@ const fetch = (_path, { body }) => {
                 Request::builder()
                     .method(Method::POST)
                     .uri(TOKEN_PATH)
-                    .header("host", "localhost:47822")
+                    .header("host", format!("localhost:{CALLBACK_PORT}"))
                     .header("origin", origin)
                     .body(Body::from("result=denied"))
                     .unwrap()
@@ -3125,7 +3208,7 @@ const fetch = (_path, { body }) => {
             );
             assert!(rx.try_recv().is_err());
             assert_eq!(
-                handle_callback(&context, request("http://localhost:47822"))
+                handle_callback(&context, request(format!("http://localhost:{CALLBACK_PORT}").as_str()))
                     .await
                     .status(),
                 StatusCode::OK

@@ -1970,8 +1970,12 @@
     </p>
     <TwitcastingSettings
       clientId={config.credentials?.twitcastingClientId ?? ''}
+      callbackPort={config.twitcasting?.callbackPort ?? 39822}
       onClientIdSaved={(id) => {
         if (config) config.credentials = { ...(config.credentials ?? {}), twitcastingClientId: id || undefined };
+      }}
+      onCallbackPortSaved={(port) => {
+        if (config) config.twitcasting = { ...(config.twitcasting ?? {}), callbackPort: port };
       }}
     />
   </section>

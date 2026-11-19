@@ -1252,6 +1252,7 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.code, XPostErrorCode::PortInUse);
+        assert!(error.message.contains("44620〜48715"), "{}", error.message);
         drop(listener);
     }
 
