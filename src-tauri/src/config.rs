@@ -839,9 +839,22 @@ impl Default for TwitcastingConfig {
     }
 }
 
+impl TwitcastingConfig {
+    /// 1024 未満(0 を含む)の待受ポートは既定に戻す(UI の検証と同じ下限)。
+    pub fn normalize(&mut self) {
+        if self.callback_port < 1024 {
+            self.callback_port = TwitcastingConfig::default().callback_port;
+        }
+    }
+}
+
 impl XPostConfig {
     /// 範囲外の値を許容範囲へ丸める。
     pub fn normalize(&mut self) {
+        // 1024 未満(0 を含む)のポートは既定に戻す。1024 以上の既存設定は変えない。
+        if self.callback_port < 1024 {
+            self.callback_port = XPostConfig::default().callback_port;
+        }
         self.delay_secs = self.delay_secs.min(600);
         self.stale_minutes = self.stale_minutes.min(180);
         self.cooldown_minutes = self.cooldown_minutes.clamp(10, 1440);
@@ -956,8 +969,18 @@ impl AppConfig {
         }
         let text = std::fs::read_to_string(&path)
             .map_err(|e| anyhow::anyhow!("設定ファイル読込失敗 {}: {e}", path.display()))?;
-        let mut cfg: AppConfig = serde_json::from_str(&text)
-            .map_err(|e| anyhow::anyhow!("設定ファイル解析失敗 {}: {e}", path.display()))?;
+        // serde の文面は不正な値をそのまま含む(トークン等が紛れうる)ので、項目と位置だけ出す。
+        let mut cfg: AppConfig =
+            serde_path_to_error::deserialize(&mut serde_json::Deserializer::from_str(&text))
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "設定ファイル解析失敗 {}: 項目 {} ({} 行 {} 列)",
+                        path.display(),
+                        e.path(),
+                        e.inner().line(),
+                        e.inner().column()
+                    )
+                })?;
         cfg.normalize_all();
         Ok(cfg)
     }
@@ -968,6 +991,7 @@ impl AppConfig {
         self.log.normalize();
         self.tts.options.normalize();
         self.x_post.normalize();
+        self.twitcasting.normalize();
     }
 
     /// `config.json` へ保存する(ディレクトリは必要なら作成)。
@@ -1110,6 +1134,51 @@ mod tests {
         assert_eq!(cfg.x_post.callback_port, 47821);
         assert_eq!(cfg.twitcasting, TwitcastingConfig::default());
         assert_eq!(cfg.twitcasting.callback_port, 39822);
+    }
+
+    #[test]
+    fn callback_ports_below_1024_fall_back_to_defaults() {
+        for bad in [0u16, 80, 1023] {
+            let mut cfg: AppConfig = serde_json::from_str(&format!(
+                r#"{{"twitcasting":{{"callbackPort":{bad}}},"xPost":{{"callbackPort":{bad}}}}}"#
+            ))
+            .expect("ports");
+            cfg.normalize_all();
+            assert_eq!(cfg.twitcasting.callback_port, 39822, "{bad}");
+            assert_eq!(cfg.x_post.callback_port, 47821, "{bad}");
+        }
+        // Existing values of 1024 and above are kept as they are.
+        for kept in [1024u16, 40123, 47821, 65535] {
+            let mut cfg: AppConfig = serde_json::from_str(&format!(
+                r#"{{"twitcasting":{{"callbackPort":{kept}}},"xPost":{{"callbackPort":{kept}}}}}"#
+            ))
+            .expect("ports");
+            cfg.normalize_all();
+            assert_eq!(cfg.twitcasting.callback_port, kept);
+            assert_eq!(cfg.x_post.callback_port, kept);
+        }
+    }
+
+    #[test]
+    fn load_error_names_the_field_and_position_but_not_the_value() {
+        let dir = std::env::temp_dir().join(format!("fast-comment-config-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let secret = "http://localhost/#access_token=TEST";
+        std::fs::write(
+            dir.join("config.json"),
+            format!("{{\n  \"twitcasting\": {{\"callbackPort\": \"{secret}\"}}\n}}"),
+        )
+        .unwrap();
+        let message = AppConfig::load(&dir).unwrap_err().to_string();
+        assert!(!message.contains("access_token"), "{message}");
+        assert!(!message.contains("TEST"), "{message}");
+        assert!(message.contains("twitcasting.callbackPort"), "{message}");
+        assert!(message.contains("2 行"), "{message}");
+        // Syntax errors do not carry values either.
+        std::fs::write(dir.join("config.json"), format!("{{\"credentials\": \"{secret}")).unwrap();
+        let message = AppConfig::load(&dir).unwrap_err().to_string();
+        assert!(!message.contains("access_token"), "{message}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

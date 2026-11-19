@@ -38,6 +38,7 @@
   import TwitcastingSettings from './TwitcastingSettings.svelte';
   import IntegrationsSettings from './IntegrationsSettings.svelte';
   import { sanitizeXPostNumbers } from '../xAutopost';
+  import { DEFAULT_TWITCASTING_CALLBACK_PORT } from '../twitcasting';
   import { appUpdate } from '../appUpdate.svelte';
   import { progressLabel, statusText } from '../appUpdate';
 
@@ -1970,11 +1971,11 @@
     </p>
     <TwitcastingSettings
       clientId={config.credentials?.twitcastingClientId ?? ''}
-      callbackPort={config.twitcasting?.callbackPort ?? 39822}
+      callbackPort={config.twitcasting?.callbackPort ?? DEFAULT_TWITCASTING_CALLBACK_PORT}
       onClientIdSaved={(id) => {
         if (config) config.credentials = { ...(config.credentials ?? {}), twitcastingClientId: id || undefined };
       }}
-      onCallbackPortSaved={(port) => {
+      onCallbackPortChange={(port) => {
         if (config) config.twitcasting = { ...(config.twitcasting ?? {}), callbackPort: port };
       }}
     />

@@ -122,6 +122,15 @@ pub struct TwitcastingStatus {
     #[serde(skip_serializing_if = "is_zero")]
     pub logouts_completed: u64,
 }
+/// Clears `Memory::listening_port` when the login flow ends on any path.
+struct ListeningPort<'a>(&'a Session);
+impl Drop for ListeningPort<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut memory) = self.0.memory.lock() {
+            memory.listening_port = None;
+        }
+    }
+}
 fn is_zero(n: &u64) -> bool {
     *n == 0
 }
@@ -273,6 +282,8 @@ struct Memory {
     // The startup check failed without reading the marker; reload may check again.
     marker_unchecked: bool,
     logouts_completed: u64,
+    // The port a login is listening on, so status reports it even if the config changes meanwhile.
+    listening_port: Option<u16>,
 }
 struct Session {
     memory: Mutex<Memory>,
@@ -625,6 +636,7 @@ impl<S: SecretStore> TwitcastingAuth<S> {
         let memory = self.session.memory.lock().unwrap();
         let state = self.session.auth_state(&memory, client_id, now_ms);
         let r = memory.record.as_ref();
+        let port = memory.listening_port.unwrap_or(port);
         TwitcastingStatus {
             configured: client_id.is_some_and(|c| !c.trim().is_empty()),
             state: match state {
@@ -1042,6 +1054,9 @@ impl<S: SecretStore> TwitcastingAuth<S> {
                     }
                     Err(_) => return Err(error(Code::PortInUse)),
                 };
+            // Logins run one at a time under `operation`, so this login owns the field until it ends.
+            self.session.memory.lock().unwrap().listening_port = Some(port);
+            let _listening = ListeningPort(&self.session);
             let mut random = [0u8; 32];
             getrandom::getrandom(&mut random).map_err(|_| error(Code::Other))?;
             let state = URL_SAFE_NO_PAD.encode(random);
@@ -2432,32 +2447,87 @@ const fetch = (_path, { body }) => {
         );
     }
 
+    /// A free loopback port other than the default (so a pass proves the configured port was used).
+    async fn free_non_default_port() -> u16 {
+        loop {
+            let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = probe.local_addr().unwrap().port();
+            if port != CALLBACK_PORT {
+                return port;
+            }
+        }
+    }
+
     #[tokio::test]
     async fn connect_on_listens_on_the_configured_port() {
-        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = probe.local_addr().unwrap().port();
-        drop(probe);
-        // The default port is not the one under test, so a pass proves `connect_on` bound `port`.
-        assert_ne!(port, CALLBACK_PORT);
         let auth = TwitcastingAuth::new(
             MemorySecretStore::new(),
             TwitcastingEndpoints::default(),
             AuthOptions::default(),
         );
         auth.load(Some("client"), 0).await;
-        let reached = Arc::new(Mutex::new(None));
-        let seen = reached.clone();
-        let result = auth
-            .connect_on(port, "client", 0, move |_| {
-                *seen.lock().unwrap() =
-                    Some(std::net::TcpStream::connect(("127.0.0.1", port)).is_ok());
-                Err("stop".into())
-            })
-            .await;
-        assert!(matches!(result, Err(e) if matches!(e.code, Code::Other)));
-        assert_eq!(*reached.lock().unwrap(), Some(true));
-        // The listener is released when the command returns.
-        TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+        // The probe is released before `connect_on` binds, so another process may take the port
+        // in between; only that race (PortInUse) is retried.
+        for _ in 0..5 {
+            let port = free_non_default_port().await;
+            let reached = Arc::new(Mutex::new(None));
+            let seen = reached.clone();
+            let result = auth
+                .connect_on(port, "client", 0, move |_| {
+                    *seen.lock().unwrap() =
+                        Some(std::net::TcpStream::connect(("127.0.0.1", port)).is_ok());
+                    Err("stop".into())
+                })
+                .await;
+            if matches!(&result, Err(e) if matches!(e.code, Code::PortInUse)) {
+                continue;
+            }
+            assert!(matches!(result, Err(e) if matches!(e.code, Code::Other)));
+            assert_eq!(*reached.lock().unwrap(), Some(true));
+            // The listener is released when the command returns.
+            TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+            return;
+        }
+        panic!("no free port could be bound");
+    }
+
+    #[tokio::test]
+    async fn status_during_login_reports_the_listening_port() {
+        let auth = TwitcastingAuth::new(
+            MemorySecretStore::new(),
+            TwitcastingEndpoints::default(),
+            AuthOptions::default(),
+        );
+        auth.load(Some("client"), 0).await;
+        for _ in 0..5 {
+            let port = free_non_default_port().await;
+            let configured = if port == 40123 { 40124 } else { 40123 };
+            let during = Arc::new(Mutex::new(None));
+            let seen = during.clone();
+            let observer = auth.clone();
+            let result = auth
+                .connect_on(port, "client", 0, move |_| {
+                    // The config changed elsewhere while the login is listening.
+                    *seen.lock().unwrap() =
+                        Some(observer.status_on(configured, Some("client"), 0).callback_url);
+                    Err("stop".into())
+                })
+                .await;
+            if matches!(&result, Err(e) if matches!(e.code, Code::PortInUse)) {
+                continue;
+            }
+            assert_eq!(
+                during.lock().unwrap().as_deref(),
+                Some(format!("http://localhost:{port}{CALLBACK_PATH}").as_str())
+            );
+            // After the login ends, the configured port is reported again.
+            assert_eq!(
+                auth.status_on(configured, Some("client"), 0).callback_url,
+                format!("http://localhost:{configured}{CALLBACK_PATH}")
+            );
+            return;
+        }
+        panic!("no free port could be bound");
     }
 
     #[tokio::test]

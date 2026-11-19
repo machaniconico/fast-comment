@@ -360,7 +360,7 @@
   </div>
   <div class="field-row">
     <label for="xpost-port">コールバックポート</label>
-    <input id="xpost-port" type="text" inputmode="numeric" bind:value={portInput} class="num-input" />
+    <input id="xpost-port" type="text" inputmode="numeric" bind:value={portInput} oninput={(e) => { const next = parseCallbackPort(e.currentTarget.value); if (next !== null) xPost.callbackPort = next; }} class="num-input" />
     <span class="hint-inline">既定 47821。変えたら X の登録も直す</span>
   </div>
   <div class="field-row">
