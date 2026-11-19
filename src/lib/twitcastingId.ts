@@ -37,11 +37,7 @@ export function extractTwitcastingScreenId(input: string): string | null {
   if (!HOST_RE.test(parts[0])) return null;
   const segment = parts[1].replace(/^\//, '').split(/[/?#]/)[0];
   if (!segment) return null;
-  let id: string;
-  try {
-    id = decodeURIComponent(segment); // 1 回だけ。%253A は c%3Aabc になり下で弾かれる
-  } catch {
-    return null;
-  }
+  // §4: デコードするのは %3A(:)だけで 1 回だけ。%253A は %3A を含まないので残り、他のエスケープ(%41 等)も下で弾かれる。
+  const id = segment.replace(/%3A/gi, ':');
   return ID_RE.test(id) ? id : null;
 }

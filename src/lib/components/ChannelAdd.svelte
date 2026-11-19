@@ -587,7 +587,13 @@
     }
 
     const platform = det.kind === 'detected' ? det.platform : newPlatform;
-    const identifier = det.kind === 'detected' ? det.identifier : raw;
+    let identifier = det.kind === 'detected' ? det.identifier : raw;
+    if (platform === 'twitcasting' && det.kind !== 'detected') {
+      // 手動選択でも §4 の screen_id 規則を通す(不正な ID を IPC に渡さない)
+      const id = extractTwitcastingScreenId(raw);
+      if (!id) { addError = 'ツイキャスの配信者 ID(英数字と _、1〜32 文字。c: などの接頭辞可)か配信 URL を入力してください'; return; }
+      identifier = id;
+    }
 
     const ch: ChannelConfig = { platform, identifier, enabled: true };
     try {
