@@ -1031,7 +1031,7 @@ async fn debug_and_error_text_never_contain_token_or_state() {
 fn status_reports_callback_url_and_custom_client_flag() {
     let auth = TwitcastingAuth::new(MemorySecretStore::new(), TwitcastingEndpoints::default(), AuthOptions::default());
     let own = sj(&auth.status(Some("my-own-client"), NOW));
-    assert_eq!(own["callbackUrl"], "http://localhost:47822/twitcasting/callback");
+    assert_eq!(own["callbackUrl"], "http://localhost:39822/twitcasting/callback");
     assert_eq!(own["callbackUrl"], format!("http://localhost:{CALLBACK_PORT}{CALLBACK_PATH}"));
     assert_eq!(own["customClientId"], true);
     assert_eq!(own["configured"], true);
