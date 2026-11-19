@@ -1,5 +1,6 @@
 <script lang="ts">
   import { getConfig, setConfig, type AppConfig } from '../ipc';
+  import { configReloadMessage, configSync } from '../configSync.svelte';
   import { theme, type AppearanceSnapshot } from '../theme.svelte';
 
   const SCHEMA = 'fast-comment/settings';
@@ -14,15 +15,18 @@
 
   interface Props {
     onImported?: (config: AppConfig) => void;
+    onReload?: () => Promise<void>;
+    disabled?: boolean;
+    reloading?: boolean;
   }
 
-  let { onImported }: Props = $props();
+  let { onImported, onReload, disabled = false, reloading = false }: Props = $props();
 
   let exportedJson: string = $state('');
   let importText: string = $state('');
   let status: { kind: 'success' | 'error'; message: string } | null = $state(null);
   let exporting: boolean = $state(false);
-  let importing: boolean = $state(false);
+  const importDisabled = $derived(disabled || configSync.importing || configSync.reloadRequired);
   let exportTextarea: HTMLTextAreaElement | null = null;
   let importFileInput: HTMLInputElement | null = null;
 
@@ -146,7 +150,7 @@
   }
 
   async function applyRawImport(raw: string): Promise<void> {
-    if (importing) return;
+    if (importDisabled) return;
 
     const trimmed = raw.trim();
     if (!trimmed) {
@@ -172,22 +176,39 @@
       : window.confirm('現在の設定をバックアップJSONの内容で上書きします。続行しますか？');
     if (!ok) return;
 
-    importing = true;
+    configSync.importing = true;
+    configSync.importRevision += 1;
     status = null;
     try {
-      const warnings = await setConfig(parsed.config);
-      const saved = await getConfig();
-      if (!saved) throw new Error('保存後の設定を取得できませんでした。');
-      if (parsed.appearance !== undefined) {
-        theme.applySnapshot(parsed.appearance);
+      const result = await setConfig(parsed.config);
+      if (parsed.appearance !== undefined) theme.applySnapshot(parsed.appearance);
+      if (!result) {
+        showSuccess(parsed.appearance === undefined
+          ? '設定JSONを読み込みました。'
+          : '外観設定を反映しました。');
+        return;
+      }
+
+      const saved = await getConfig().catch(() => null);
+      if (!saved) {
+        configSync.reloadRequired = true;
+        return;
       }
       onImported?.(saved);
-      const base = '設定をインポートしました。外観設定も反映済みです。';
-      showSuccess(warnings.length > 0 ? `${base}(警告: ${warnings.join(' / ')})` : base);
+
+      const notices = [...result.warnings];
+      if (result.protectedOAuth.length > 0) {
+        const services = result.protectedOAuth.map(service => service === 'xPost' ? 'X' : 'ツイキャス');
+        notices.push(`ログイン中の ${services.join('、')} の Client ID と待受ポートを保持しました。`);
+      }
+      const base = parsed.appearance === undefined
+        ? '設定をインポートしました。'
+        : '設定をインポートし、外観設定を反映しました。';
+      showSuccess([base, ...notices].join(' '));
     } catch (e) {
       showError(`インポートに失敗しました: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
-      importing = false;
+      configSync.importing = false;
     }
   }
 
@@ -216,7 +237,14 @@
 </script>
 
 <div class="portability">
-  {#if status}
+  {#if configSync.reloadRequired}
+    <p class="portability-banner banner-error" role="status">{configReloadMessage}</p>
+    <div class="field-row">
+      <button type="button" class="export-btn" onclick={onReload} disabled={reloading}>
+        {reloading ? '読込中...' : '設定を再読み込み'}
+      </button>
+    </div>
+  {:else if status}
     <p
       class:banner-success={status.kind === 'success'}
       class:banner-error={status.kind === 'error'}
@@ -258,12 +286,13 @@
         bind:this={importFileInput}
         class="file-input"
         type="file"
+        disabled={importDisabled}
         accept=".json,application/json"
         onchange={onFileSelected}
         aria-label="インポートする設定JSONファイル"
       />
-      <button type="button" class="export-btn" onclick={onImportFromText} disabled={importing}>
-        {importing ? '読込中...' : 'テキストから読込'}
+      <button type="button" class="export-btn" onclick={onImportFromText} disabled={importDisabled}>
+        {configSync.importing ? '読込中...' : 'テキストから読込'}
       </button>
     </div>
     <label class="portability-label" for="settings-import-json">貼り付け用JSON</label>

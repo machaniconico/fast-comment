@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { getConfig, getTwitcastingStatus, reloadTwitcastingStatus, connectTwitcasting, cancelTwitcastingLogin, disconnectTwitcasting } from '../ipc';
+  import { getTwitcastingStatus, reloadTwitcastingStatus, connectTwitcasting, cancelTwitcastingLogin, disconnectTwitcasting } from '../ipc';
   import type { TwitcastingStatus } from '../types';
   import { errorText } from '../xAutopost';
   import { DEFAULT_TWITCASTING_CALLBACK_PORT, twitcastingDisplayCallbackUrl } from '../twitcasting';
@@ -8,15 +8,15 @@
 
   let {
     clientId = '', callbackPort = DEFAULT_TWITCASTING_CALLBACK_PORT, configRevision,
-    saving, onClientIdSaved, onCallbackPortChange, onConfigPendingChange,
+    saving, onCallbackPortChange, onConnectingChange, onConnectionSettled,
   }: {
     clientId?: string;
     callbackPort?: number;
     configRevision: number;
     saving: boolean;
-    onClientIdSaved?: (id: string) => void;
     onCallbackPortChange: (port: number | null) => void;
-    onConfigPendingChange: (pending: boolean) => void;
+    onConnectingChange: (connecting: boolean) => void;
+    onConnectionSettled: () => Promise<void>;
   } = $props();
   let clientIdInput = $state('');
   $effect.pre(() => {
@@ -29,12 +29,15 @@
   // 待受中はそのポート、それ以外は入力中の有効値から登録用 URL を出す。
   let listeningPort = $state<number | null>(null);
   const callbackUrl = $derived(twitcastingDisplayCallbackUrl(listeningPort, portInput.port));
-  let status = $state<TwitcastingStatus | null>(null);
+  let latestStatus = $state<TwitcastingStatus | null>(null);
+  let statusRequest = 0;
   let connecting = $state(false);
+  const status = $derived(!connecting && latestStatus?.clientId === clientId.trim() ? latestStatus : null);
   let disconnecting = $state(false);
   let reloading = $state(false);
   let statusError = $state('');
   let message = $state('');
+  let successClientId = $state<string | null>(null);
   let failed = $state(false);
   let now = $state(Date.now());
   // 範囲外の値は Invalid Date になるので、表示できる日時だけを期限として扱う。
@@ -60,18 +63,23 @@
   };
 
   async function refresh() {
+    const request = ++statusRequest;
     try {
       const next = await getTwitcastingStatus();
+      if (request !== statusRequest) return;
       if (!next) throw new Error('アプリからログイン状態を受け取れませんでした。');
       // 削除を伴うログアウトが完了した時だけ知らせる(再検査や別ログインの保持では出さない)。
-      if (status && (next.logoutsCompleted ?? 0) > (status.logoutsCompleted ?? 0)) {
+      if (latestStatus && (next.logoutsCompleted ?? 0) > (latestStatus.logoutsCompleted ?? 0)) {
+        successClientId = null;
         message = 'この PC の認証情報を削除しました';
         failed = false;
       }
-      status = next;
+      latestStatus = next;
       statusError = '';
     }
-    catch (e) { statusError = errorText(e); }
+    catch (e) {
+      if (request === statusRequest) statusError = errorText(e);
+    }
     now = Date.now();
   }
   async function retryStatus() {
@@ -82,7 +90,7 @@
   async function reload() {
     reloading = true;
     try {
-      status = await reloadTwitcastingStatus();
+      latestStatus = await reloadTwitcastingStatus();
       statusError = '';
       message = '';
       failed = false;
@@ -90,8 +98,11 @@
     } catch (e) { message = errorText(e); failed = true; }
     finally { reloading = false; }
   }
-  onMount(() => {
+  $effect(() => {
+    clientId;
     void refresh();
+  });
+  onMount(() => {
     const timer = setInterval(() => void refresh(), 30000);
     return () => {
       clearInterval(timer);
@@ -107,43 +118,30 @@
       return;
     }
     connecting = true;
-    onConfigPendingChange(true);
+    onConnectingChange(true);
     listeningPort = listenPort;
     failed = false;
+    successClientId = null;
     message = 'ブラウザでツイキャスにログインし、アプリを許可してください…';
-    const id = clientIdInput.trim();
-    const revision = configRevision;
-    let configSaved = false;
-    function acceptSavedConfig() {
-      if (configSaved) return;
-      configSaved = true;
-      if (configRevision === revision) {
-        clientIdInput = id;
-        onClientIdSaved?.(id);
-      }
-      onConfigPendingChange(false);
-    }
     try {
-      status = await connectTwitcasting(id, listenPort, acceptSavedConfig);
-      acceptSavedConfig();
-      // ポートは入力時に親へ渡し済み。待受中のインポートで置き換わった設定を保つ。
+      const next = await connectTwitcasting(clientIdInput.trim(), listenPort);
+      if (!next) throw new Error('アプリからログイン結果を受け取れませんでした。');
+      statusRequest += 1;
+      latestStatus = next;
+      successClientId = next.clientId;
       statusError = '';
       message = 'ツイキャスにログインしました';
     } catch (e) {
+      statusRequest += 1;
+      latestStatus = null;
       message = errorText(e);
       failed = true;
-      const saved = await getConfig().catch(() => null);
-      if (saved && configRevision === revision) {
-        clientIdInput = saved.credentials?.twitcastingClientId ?? '';
-        onClientIdSaved?.(clientIdInput);
-      }
-      await refresh();
-    }
-    finally {
-      configSaved = true;
-      onConfigPendingChange(false);
+    } finally {
       connecting = false;
       listeningPort = null;
+      onConnectingChange(false);
+      await onConnectionSettled();
+      if (failed) void refresh();
     }
   }
   async function cancel() {
@@ -153,10 +151,11 @@
   async function disconnect() {
     disconnecting = true;
     const completed = status?.logoutsCompleted ?? 0;
+    successClientId = null;
     try {
-      status = await disconnectTwitcasting();
+      latestStatus = await disconnectTwitcasting();
       statusError = '';
-      message = (status?.logoutsCompleted ?? 0) > completed ? 'この PC の認証情報を削除しました' : '';
+      message = (latestStatus?.logoutsCompleted ?? 0) > completed ? 'この PC の認証情報を削除しました' : '';
       failed = false;
     }
     catch (e) { message = errorText(e); failed = true; await refresh(); }
@@ -181,9 +180,9 @@
       <span class="warn">再ログインしてください</span>
     {:else if status?.state === 'loadFailed'}
       <span class="warn">保存済みの認証情報を読み込めません</span>
-    {:else if !status || status.state === 'loading'}
+    {:else if !connecting && (!status || status.state === 'loading')}
       <span>保存済みの認証情報を読み込んでいます…</span>
-    {:else}
+    {:else if status}
       <span>未ログイン</span>
     {/if}
   </div>
@@ -221,7 +220,7 @@
       {/if}
     {/if}
   </div>
-  <div aria-live="polite">{#if message}<p class:warn={failed}>{message}</p>{/if}</div>
+  <div aria-live="polite">{#if message && (successClientId === null || successClientId === clientId.trim())}<p class:warn={failed}>{message}</p>{/if}</div>
   <details>
     <summary>詳細: 自分の ClientID を使う</summary>
     <div class="field-row">

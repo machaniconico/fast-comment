@@ -2,7 +2,7 @@
   import { onMount, onDestroy, untrack } from 'svelte';
   import type {
     AppConfig, EffectRule, EffectsConfig, GoalsConfig, InjectTestCommentOptions, TtsDictEntry, TtsOptions,
-    TimerConfig, WelcomeConfig, YoutubeOauthStatus, ModerationAppended, TwitchOauthStatus, TwitchDeviceLogin
+    TimerConfig, WelcomeConfig, YoutubeOauthStatus, ModerationAppended, TwitchOauthStatus, TwitchDeviceLogin, OAuthService
   } from '../ipc';
   import {
     getConfig, setConfig, getObsUrl, getObsGoalsUrl, getObsTimerUrl, exportCommentsCsv, injectTestComment,
@@ -40,6 +40,7 @@
   import { sanitizeXPostNumbers } from '../xAutopost';
   import { DEFAULT_TWITCASTING_CALLBACK_PORT } from '../twitcasting';
   import { appUpdate } from '../appUpdate.svelte';
+  import { configReloadMessage, configSync } from '../configSync.svelte';
   import { progressLabel, statusText } from '../appUpdate';
 
   interface Props {
@@ -140,10 +141,17 @@
   let saving: boolean = $state(false);
   let twitcastingPortInvalid = $state(false);
   let xPostPortInvalid = $state(false);
-  let twitcastingConfigPending = $state(false);
-  let xPostConnecting = $state(false);
-  const invalidOAuthPort = $derived(twitcastingPortInvalid || xPostPortInvalid);
-  const saveBlocked = $derived(invalidOAuthPort || twitcastingConfigPending || xPostConnecting);
+  const oauthConnecting = $state({ twitcasting: false, xPost: false });
+  const oauthInputRevision = $state({ twitcasting: 0, xPost: 0 });
+  const oauthAttempts = { twitcasting: 0, xPost: 0 };
+  let reloadingConfig = $state(false);
+  const saveBlockedReason = $derived.by(() => {
+    if (configSync.reloadRequired) return configReloadMessage;
+    if (configSync.importing) return '設定をインポート中です';
+    if (twitcastingPortInvalid || xPostPortInvalid) return 'OAuth の待受ポートを確認してください';
+    if (oauthConnecting.twitcasting || oauthConnecting.xPost) return 'OAuth の接続処理中です';
+    return '';
+  });
   let saveMsg: string = $state('');
   let saveWarned: boolean = $state(false);
   let exportingCsv: boolean = $state(false);
@@ -401,6 +409,50 @@
     hydrateConfig(importedConfig);
     setNotify(importedConfig.ui.notifySound, importedConfig.ui.notifyVolume);
     onConfigSaved?.(importedConfig);
+  }
+
+  async function reloadImportedConfig() {
+    if (reloadingConfig) return;
+    reloadingConfig = true;
+    try {
+      const saved = await getConfig();
+      if (saved) {
+        onConfigImported(saved);
+        configSync.reloadRequired = false;
+      }
+    } catch {
+      // 再読込に成功してフォームを置き換えるまで保存を止める。
+    } finally {
+      reloadingConfig = false;
+    }
+  }
+
+  function applySavedOAuthConfig(saved: AppConfig, service: OAuthService) {
+    if (!config) return;
+    if (service === 'xPost' && config.xPost && saved.xPost) {
+      config.credentials = { ...config.credentials, xPostClientId: saved.credentials?.xPostClientId };
+      config.xPost.callbackPort = saved.xPost.callbackPort;
+      xPostPortInvalid = false;
+    } else if (service === 'twitcasting') {
+      config.credentials = { ...config.credentials, twitcastingClientId: saved.credentials?.twitcastingClientId };
+      config.twitcasting = saved.twitcasting;
+      twitcastingPortInvalid = false;
+    }
+    oauthInputRevision[service] += 1;
+  }
+
+  function onOAuthConnectingChange(service: OAuthService, connecting: boolean) {
+    oauthConnecting[service] = connecting;
+    if (connecting) oauthAttempts[service] += 1;
+  }
+
+  async function reloadOAuthConfig(service: OAuthService) {
+    const revision = configRevision;
+    const attempt = oauthAttempts[service];
+    const saved = await getConfig().catch(() => null);
+    if (saved && configRevision === revision && oauthAttempts[service] === attempt) {
+      applySavedOAuthConfig(saved, service);
+    }
   }
 
   async function onModerationImported() {
@@ -1167,7 +1219,7 @@
   }
 
   async function onSave() {
-    if (!config || saving || saveBlocked) return;
+    if (!config || saving || saveBlockedReason) return;
     saving = true;
     saveMsg = '';
     config.moderation.ngWords = [...ngWords];
@@ -1238,12 +1290,26 @@
       // 一覧で付けた「告知」印(ownStream)が、開きっぱなしの古い channels で戻らないよう保存直前に取り直す。
       try {
         const latest = await getConfig();
-        if (latest) config.channels = latest.channels;
+        if (latest) {
+          config.channels = latest.channels;
+          // Client ID の保存は接続コマンドとインポートに限る。
+          config.credentials.xPostClientId = latest.credentials?.xPostClientId;
+          config.credentials.twitcastingClientId = latest.credentials?.twitcastingClientId;
+        }
       } catch {
         // 取れなければ手元の channels で保存する。
       }
-      if (saveBlocked) return;
-      const warnings = await setConfig(config);
+      if (saveBlockedReason) return;
+      const result = await setConfig(config);
+      const warnings = result?.warnings ?? [];
+      if (result?.protectedOAuth.length) {
+        const saved = await getConfig().catch(() => null);
+        if (saved) {
+          for (const service of result.protectedOAuth) applySavedOAuthConfig(saved, service);
+        } else {
+          configSync.reloadRequired = true;
+        }
+      }
       void localApiSettings?.refreshStatus();
       saveWarned = warnings.length > 0;
       try {
@@ -1594,7 +1660,12 @@
 
   <section id="settings-portability">
     <h3>設定のバックアップ/移行</h3>
-    <ConfigPortability onImported={onConfigImported} />
+    <ConfigPortability
+      onImported={onConfigImported}
+      onReload={reloadImportedConfig}
+      disabled={saving}
+      reloading={reloadingConfig}
+    />
   </section>
 
   <section id="settings-danmaku">
@@ -1983,12 +2054,10 @@
     <TwitcastingSettings
       clientId={config.credentials?.twitcastingClientId ?? ''}
       callbackPort={config.twitcasting?.callbackPort ?? DEFAULT_TWITCASTING_CALLBACK_PORT}
-      {configRevision}
+      configRevision={configRevision + oauthInputRevision.twitcasting}
       {saving}
-      onConfigPendingChange={(pending) => { twitcastingConfigPending = pending; }}
-      onClientIdSaved={(id) => {
-        if (config) config.credentials = { ...(config.credentials ?? {}), twitcastingClientId: id || undefined };
-      }}
+      onConnectingChange={(connecting) => onOAuthConnectingChange('twitcasting', connecting)}
+      onConnectionSettled={() => reloadOAuthConfig('twitcasting')}
       onCallbackPortChange={(port) => {
         twitcastingPortInvalid = port === null;
         if (config && port !== null) config.twitcasting = { ...(config.twitcasting ?? {}), callbackPort: port };
@@ -2002,15 +2071,13 @@
       <XPostSettings
         xPost={config.xPost}
         clientId={config.credentials?.xPostClientId ?? ''}
-        {configRevision}
+        configRevision={configRevision + oauthInputRevision.xPost}
         {saving}
-        onConnectingChange={(connecting) => { xPostConnecting = connecting; }}
+        onConnectingChange={(connecting) => onOAuthConnectingChange('xPost', connecting)}
+        onConnectionSettled={() => reloadOAuthConfig('xPost')}
         onCallbackPortChange={(port) => {
           xPostPortInvalid = port === null;
           if (config?.xPost && port !== null) config.xPost.callbackPort = port;
-        }}
-        onClientIdSaved={(id) => {
-          if (config) config.credentials = { ...(config.credentials ?? {}), xPostClientId: id };
         }}
       />
     {/if}
@@ -3050,11 +3117,14 @@
 
   <!-- ── Save ── -->
   <div class="save-row">
-    <button class="save-btn" onclick={onSave} disabled={saving || saveBlocked}>
+    <button class="save-btn" onclick={onSave} disabled={saving || !!saveBlockedReason}>
       {saving ? '保存中...' : '設定を保存'}
     </button>
-    {#if invalidOAuthPort}
-      <span class="save-warn">OAuth の待受ポートを確認してください</span>
+    {#if saveBlockedReason}
+      <span class="save-warn" role="status">{saveBlockedReason}</span>
+      {#if configSync.reloadRequired && focus !== 'all'}
+        <button class="save-btn" onclick={reloadImportedConfig} disabled={reloadingConfig}>設定を再読み込み</button>
+      {/if}
     {:else if saveMsg}
       <span class={saveWarned ? 'save-warn' : 'save-ok'}>{saveMsg}</span>
     {/if}

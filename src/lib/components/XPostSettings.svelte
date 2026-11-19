@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onDestroy, onMount, tick } from 'svelte';
+  import { onDestroy, tick } from 'svelte';
   import {
     cancelXPostLogin,
     connectXPost,
@@ -21,7 +21,7 @@
     clientId = '',
     configRevision,
     saving,
-    onClientIdSaved,
+    onConnectionSettled,
     onCallbackPortChange,
     onConnectingChange,
   }: {
@@ -29,7 +29,7 @@
     clientId?: string;
     configRevision: number;
     saving: boolean;
-    onClientIdSaved?: (clientId: string) => void;
+    onConnectionSettled: () => Promise<void>;
     onCallbackPortChange: (port: number | null) => void;
     onConnectingChange: (connecting: boolean) => void;
   } = $props();
@@ -43,10 +43,13 @@
   const portInput = createCallbackPortInput(
     () => xPost.callbackPort, () => configRevision, (port) => onCallbackPortChange(port),
   );
-  let status = $state<XPostStatus | null>(null);
+  let latestStatus = $state<XPostStatus | null>(null);
+  let statusRequest = 0;
   let connecting = $state(false);
+  const status = $derived(!connecting && latestStatus?.clientId === clientId.trim() ? latestStatus : null);
   let disconnecting = $state(false);
   let authMsg = $state('');
+  let successClientId = $state<string | null>(null);
   let authOk = $state<boolean | null>(null);
   let copied = $state(false);
   let testConfirm = $state<string | null>(null);
@@ -62,16 +65,20 @@
   const connected = $derived(canSelectApiMode(status));
 
   async function refreshStatus() {
+    const request = ++statusRequest;
     try {
-      status = await getXPostStatus();
+      const next = await getXPostStatus();
+      if (request === statusRequest) latestStatus = next;
     } catch (e) {
-      status = null;
+      if (request !== statusRequest) return;
+      latestStatus = null;
       authMsg = errorText(e);
       authOk = false;
     }
   }
 
-  onMount(() => {
+  $effect(() => {
+    clientId;
     void refreshStatus();
   });
 
@@ -91,21 +98,27 @@
     }
     connecting = true;
     onConnectingChange(true);
-    const revision = configRevision;
+    successClientId = null;
     authMsg = 'ブラウザで X にログインし、アプリを許可してください…';
     authOk = null;
     try {
-      status = await connectXPost(id, listenPort);
-      if (configRevision === revision) onClientIdSaved?.(id);
-      authMsg = status?.username ? `@${status.username} として接続しました` : 'X に接続しました';
+      const next = await connectXPost(id, listenPort);
+      if (!next) throw new Error('アプリからログイン結果を受け取れませんでした。');
+      statusRequest += 1;
+      latestStatus = next;
+      successClientId = next.clientId;
+      authMsg = next.username ? `@${next.username} として接続しました` : 'X に接続しました';
       authOk = true;
     } catch (e) {
+      statusRequest += 1;
+      latestStatus = null;
       authMsg = errorText(e);
       authOk = false;
-      await refreshStatus();
     } finally {
-      onConnectingChange(false);
       connecting = false;
+      onConnectingChange(false);
+      await onConnectionSettled();
+      if (authOk === false) void refreshStatus();
     }
   }
 
@@ -121,8 +134,9 @@
   async function disconnect() {
     if (disconnecting) return;
     disconnecting = true;
+    successClientId = null;
     try {
-      status = await disconnectXPost();
+      latestStatus = await disconnectXPost();
       authMsg = 'X との接続を切りました(この PC の認証を消しました。X 側の許可は X の設定から外せます)';
       authOk = true;
     } catch (e) {
@@ -375,7 +389,7 @@
   </div>
   <div class="field-row">
     <label for="xpost-port">コールバックポート</label>
-    <input id="xpost-port" type="text" inputmode="numeric" value={portInput.text} oninput={portInput.onInput} class="num-input" />
+    <input id="xpost-port" type="text" inputmode="numeric" value={portInput.text} oninput={portInput.onInput} disabled={connecting} class="num-input" />
     <span class="hint-inline">既定 47821。変えたら X の登録も直す</span>
   </div>
   <div class="field-row">
@@ -392,7 +406,7 @@
     <span class="label-like">接続</span>
     {#if connected}
       <span class="xpost-connected">@{status?.username ?? '?'} として接続中</span>
-    {:else}
+    {:else if status}
       <span class="hint-inline">未接続</span>
     {/if}
   </div>
@@ -411,7 +425,7 @@
       <button type="button" class="btn-small" onclick={disconnect} disabled={connecting || disconnecting}>切断</button>
     {/if}
   </div>
-  {#if authMsg}
+  {#if authMsg && (successClientId === null || successClientId === clientId.trim())}
     <p class="xpost-msg" class:ok={authOk === true} class:ng={authOk === false} aria-live="polite">{authMsg}</p>
   {/if}
 

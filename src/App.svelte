@@ -52,6 +52,7 @@
   } from './lib/ipc';
   import type { AppConfig, TtsNotice } from './lib/ipc';
   import { appUpdate } from './lib/appUpdate.svelte';
+  import { configReloadMessage, configSync } from './lib/configSync.svelte';
   import { progressLabel, progressPercent } from './lib/appUpdate';
 
   let unlisten: (() => void) | null = null;
@@ -439,17 +440,28 @@
   }
 
   async function toggleGoalsInApp(event: Event) {
-    if (!config || goalsToggleSaving) return;
-    const previous = $state.snapshot(config);
-    const next = structuredClone(previous);
-    next.goals.showInApp = (event.currentTarget as HTMLInputElement).checked;
-    config = next;
+    const input = event.currentTarget as HTMLInputElement;
+    const checked = input.checked;
+    input.checked = showGoalsBar;
+    if (!config || goalsToggleSaving || configSync.importing || configSync.reloadRequired) return;
     goalsToggleSaving = true;
     goalsToggleError = '';
+    const revision = configSync.importRevision;
     try {
-      await setConfig(next);
+      const next = await getConfig();
+      if (configSync.importRevision !== revision || configSync.reloadRequired) return;
+      if (!next) throw new Error('設定を取得できませんでした');
+      next.goals.showInApp = checked;
+      const result = await setConfig(next);
+      if (configSync.importRevision !== revision) return;
+      if (result?.protectedOAuth.length) {
+        if (config) config.goals = next.goals;
+        const saved = await getConfig().catch(() => null);
+        if (saved && configSync.importRevision === revision) config = saved;
+      } else {
+        config = next;
+      }
     } catch (e) {
-      config = previous;
       goalsToggleError = e instanceof Error ? e.message : String(e);
     } finally {
       goalsToggleSaving = false;
@@ -862,12 +874,14 @@
           <input
             type="checkbox"
             checked={showGoalsBar}
-            disabled={goalsToggleSaving}
+            disabled={goalsToggleSaving || configSync.importing || configSync.reloadRequired}
             onchange={toggleGoalsInApp}
           />
           <span>{goalsToggleSaving ? '保存中' : 'コメビュに表示'}</span>
         </label>
-        {#if goalsToggleError}
+        {#if configSync.reloadRequired}
+          <span class="goals-toggle-error">{configReloadMessage}</span>
+        {:else if goalsToggleError}
           <span class="goals-toggle-error" title={goalsToggleError}>保存失敗</span>
         {/if}
       </div>

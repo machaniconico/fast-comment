@@ -35,6 +35,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::net::TcpStream;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -81,6 +82,10 @@ pub struct AppState {
     webhook: webhook::WebhookRuntime<integrations::KeyringSecretStore, webhook::ReqwestSender>,
     /// 現在の設定。
     config: Mutex<AppConfig>,
+    /// OAuth と全体保存で、検証から永続化までを直列化する。
+    config_write: tokio::sync::Mutex<()>,
+    x_post_logins: AtomicUsize,
+    twitcasting_logins: AtomicUsize,
     listeners: Arc<listeners::ListenerStore>,
     chatlog: chatlog::ChatLog,
     /// stats 集約などへ設定変更を伝える watch 送信端。
@@ -1073,11 +1078,78 @@ async fn configure_chatlog_nonfatal(
     }
 }
 
-/// `update_config` の結果。保存自体は成功しており、警告だけを UI に伝える。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum OAuthService {
+    XPost,
+    Twitcasting,
+}
+
+/// 同じサービスで次のログインが前のログインを取り消す場合も、最後の終了まで保護する。
+struct OAuthLogin<'a>(&'a AtomicUsize);
+
+impl<'a> OAuthLogin<'a> {
+    fn begin(count: &'a AtomicUsize) -> Self {
+        count.fetch_add(1, Ordering::SeqCst);
+        Self(count)
+    }
+}
+
+impl Drop for OAuthLogin<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn protect_oauth_config(
+    current: &AppConfig,
+    incoming: &mut AppConfig,
+    active: impl Fn(OAuthService) -> bool,
+) -> Vec<OAuthService> {
+    let mut protected = Vec::new();
+    if active(OAuthService::XPost)
+        && (current.credentials.x_post_client_id != incoming.credentials.x_post_client_id
+            || current.x_post.callback_port != incoming.x_post.callback_port)
+    {
+        incoming.credentials.x_post_client_id = current.credentials.x_post_client_id.clone();
+        incoming.x_post.callback_port = current.x_post.callback_port;
+        protected.push(OAuthService::XPost);
+    }
+    if active(OAuthService::Twitcasting)
+        && (current.credentials.twitcasting_client_id != incoming.credentials.twitcasting_client_id
+            || current.twitcasting.callback_port != incoming.twitcasting.callback_port)
+    {
+        incoming.credentials.twitcasting_client_id =
+            current.credentials.twitcasting_client_id.clone();
+        incoming.twitcasting.callback_port = current.twitcasting.callback_port;
+        protected.push(OAuthService::Twitcasting);
+    }
+    protected
+}
+
+fn parse_oauth_callback_port(value: serde_json::Value) -> Result<u16, &'static str> {
+    value
+        .as_u64()
+        .and_then(|port| u16::try_from(port).ok())
+        .filter(|&port| port >= config::MIN_OAUTH_CALLBACK_PORT)
+        .ok_or("待受ポートは 1024〜65535 の整数にしてください")
+}
+
+/// `update_config` で保存した時の警告と、既存値を維持した OAuth の項目。
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct UpdateConfigOutcome {
     warnings: Vec<String>,
+    protected_oauth: Vec<OAuthService>,
+}
+
+/// 状態を計算した時点での設定上の Client ID。公開クライアントの ID を UI の照合に使う。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OAuthStatus<T> {
+    client_id: String,
+    #[serde(flatten)]
+    status: T,
 }
 
 /// 設定全体を更新して保存する。moderation/tts/obs などの実行時状態も反映する。
@@ -1091,6 +1163,16 @@ async fn update_config(
 ) -> Result<UpdateConfigOutcome, String> {
     let mut new_config = AppConfig::from_config_update(new_config)?;
     validate_x_post_template(&new_config.x_post.template)?;
+    let write = state.config_write.lock().await;
+    let protected_oauth = protect_oauth_config(
+        &state.config.lock().unwrap(),
+        &mut new_config,
+        |service| match service {
+            OAuthService::XPost => state.x_post_logins.load(Ordering::SeqCst) != 0,
+            OAuthService::Twitcasting => state.twitcasting_logins.load(Ordering::SeqCst) != 0,
+        },
+    );
+    new_config.normalize_all();
     validate_x_post_mode(&state, &new_config).await?;
     let (
         youtube_source_config_changed,
@@ -1098,8 +1180,8 @@ async fn update_config(
         x_source_config_changed,
         twitch_viewer_auth_changed,
     ) = {
-        let current = state.config.lock().unwrap();
-        (
+        let mut current = state.config.lock().unwrap();
+        let changes = (
             current.youtube_overrides != new_config.youtube_overrides
                 || current.credentials.youtube_api_key.trim()
                     != new_config.credentials.youtube_api_key.trim(),
@@ -1117,14 +1199,16 @@ async fn update_config(
                     != new_config.credentials.twitch_client_id.trim()
                 || current.credentials.twitch_client_secret.trim()
                     != new_config.credentials.twitch_client_secret.trim(),
-        )
-    };
+        );
 
-    // 保存。
-    new_config.normalize_all();
-    new_config
-        .save(&state.config_dir)
-        .map_err(|e| e.to_string())?;
+        // ディスクとメモリの確定を揃え、その間に別の設定保存を挟まない。
+        new_config
+            .save(&state.config_dir)
+            .map_err(|e| e.to_string())?;
+        *current = new_config.clone();
+        state.config_tx.send_replace(new_config.clone());
+        changes
+    };
 
     // moderation 反映。
     state
@@ -1135,20 +1219,12 @@ async fn update_config(
 
     // OBS ポート反映。ポートが変わった場合は旧サーバを停止し、新ポートで再 bind する。
     restart_obs_server_if_needed(&app, &state, new_config.obs.port)?;
+    drop(write);
 
     let mut warnings = Vec::new();
     if let Some(w) = configure_chatlog_nonfatal(&state.chatlog, new_config.log.clone()).await {
         warnings.push(w);
     }
-
-    // 差分計算用にチャンネル一覧を退避しておく。
-    let desired_channels = new_config.channels.clone();
-
-    // 設定を先に確定する。これにより、続く差分適用で起動される新規 Source が
-    // 最新の youtube_overrides を読む(#8 / SPEC §4.2「再ビルド無しで overrides 反映」)。
-    let committed_config = new_config.clone();
-    *state.config.lock().unwrap() = new_config;
-    let _ = state.config_tx.send(committed_config.clone());
 
     if youtube_source_config_changed {
         stop_active_youtube_channels(&state);
@@ -1164,20 +1240,23 @@ async fn update_config(
     }
 
     // チャンネル差分適用(コミット済み設定を参照する)。
-    apply_channel_diff(&app, &state, &desired_channels);
+    apply_channel_diff(&app, &state, &new_config.channels);
 
     // 棒読みちゃん自動起動: 設定保存時にも(起動時だけでなく)未起動なら立ち上げる。
     // パスを設定した直後に効くようにする。ensure_launched 側で TCP 接続を確認し、
     // 既起動なら何もしないため、保存のたびに呼んでも無害。
-    if committed_config.tts.backend == config::TtsBackendKind::Bouyomi {
-        let path = committed_config.tts.options.bouyomi_path.trim().to_string();
-        let host = committed_config.tts.options.bouyomi_host.clone();
-        let port = committed_config.tts.options.bouyomi_port;
-        let elevated = committed_config.tts.options.bouyomi_launch_elevated;
+    if new_config.tts.backend == config::TtsBackendKind::Bouyomi {
+        let path = new_config.tts.options.bouyomi_path.trim().to_string();
+        let host = new_config.tts.options.bouyomi_host.clone();
+        let port = new_config.tts.options.bouyomi_port;
+        let elevated = new_config.tts.options.bouyomi_launch_elevated;
         ensure_bouyomi_launched_and_emit_notice(app.clone(), path, host, port, elevated).await;
     }
 
-    Ok(UpdateConfigOutcome { warnings })
+    Ok(UpdateConfigOutcome {
+        warnings,
+        protected_oauth,
+    })
 }
 
 /// YouTubeの受信方式に関わる設定変更時だけ既存タスクを止め、差分適用で再起動させる。
@@ -1360,16 +1439,8 @@ fn notify_x_auth_changed(state: &AppState) {
 }
 
 fn twitcasting_client_id(state: &AppState) -> Option<String> {
-    twitcasting_target(state).0
-}
-
-/// 実効 ClientID と、設定したログイン待受ポート(`x_post_target` と同じく設定から読む)。
-fn twitcasting_target(state: &AppState) -> (Option<String>, u16) {
     let cfg = state.config.lock().unwrap();
-    (
-        effective_client_id(cfg.credentials.twitcasting_client_id.as_deref()),
-        cfg.twitcasting.callback_port,
-    )
+    effective_client_id(cfg.credentials.twitcasting_client_id.as_deref())
 }
 
 /// tauri.conf.json の main ウィンドウ設定(label 省略時は "main")。
@@ -1423,15 +1494,28 @@ fn setup_twitcasting<S: integrations::SecretStore, R, Register: FnOnce() -> R>(
 }
 
 #[tauri::command]
-fn get_twitcasting_status(state: State<'_, AppState>) -> TwitcastingStatus {
-    let (client_id, port) = twitcasting_target(&state);
-    state
-        .twitcasting_auth
-        .status_on(port, client_id.as_deref(), timer_now_ms())
+fn get_twitcasting_status(state: State<'_, AppState>) -> OAuthStatus<TwitcastingStatus> {
+    let (client_id, port) = {
+        let cfg = state.config.lock().unwrap();
+        (
+            cfg.credentials
+                .twitcasting_client_id
+                .as_deref()
+                .unwrap_or("")
+                .trim()
+                .to_owned(),
+            cfg.twitcasting.callback_port,
+        )
+    };
+    let effective = effective_client_id(Some(&client_id));
+    let status = state.twitcasting_auth.status_on(port, effective.as_deref(), timer_now_ms());
+    OAuthStatus { client_id, status }
 }
 
 #[tauri::command]
-async fn reload_twitcasting_status(state: State<'_, AppState>) -> Result<TwitcastingStatus, ()> {
+async fn reload_twitcasting_status(
+    state: State<'_, AppState>,
+) -> Result<OAuthStatus<TwitcastingStatus>, ()> {
     let client_id = twitcasting_client_id(&state);
     state
         .twitcasting_auth
@@ -1444,34 +1528,35 @@ async fn reload_twitcasting_status(state: State<'_, AppState>) -> Result<Twitcas
 async fn connect_twitcasting(
     state: State<'_, AppState>,
     client_id: Option<String>,
-    callback_port: u16,
-    on_config_saved: tauri::ipc::Channel<()>,
-) -> Result<TwitcastingStatus, TwitcastingAuthError> {
-    let override_id = client_id
-        .map(|s| s.trim().to_owned())
-        .filter(|s| !s.is_empty());
-    let effective = effective_client_id(override_id.as_deref())
+    callback_port: serde_json::Value,
+) -> Result<OAuthStatus<TwitcastingStatus>, TwitcastingAuthError> {
+    let callback_port = parse_oauth_callback_port(callback_port).map_err(|message| {
+        TwitcastingAuthError {
+            code: TwitcastingAuthErrorCode::Other,
+            message: message.into(),
+        }
+    })?;
+    let client_id = client_id.unwrap_or_default().trim().to_owned();
+    let effective = effective_client_id(Some(&client_id))
         .ok_or_else(|| TwitcastingAuthError::new(TwitcastingAuthErrorCode::NotConfigured))?;
-    if callback_port < config::MIN_OAUTH_CALLBACK_PORT {
-        return Err(TwitcastingAuthError::new(TwitcastingAuthErrorCode::Other));
-    }
-    let next = {
+    let _login = {
+        let _write = state.config_write.lock().await;
         let mut cfg = state.config.lock().unwrap();
+        let login = OAuthLogin::begin(&state.twitcasting_logins);
         let mut next = cfg.clone();
-        next.credentials.twitcasting_client_id = override_id;
+        next.credentials.twitcasting_client_id = (!client_id.is_empty()).then(|| client_id.clone());
         next.twitcasting.callback_port = callback_port;
         next.save(&state.config_dir)
             .map_err(|_| TwitcastingAuthError::new(TwitcastingAuthErrorCode::Other))?;
-        *cfg = next.clone();
-        next
+        state.config_tx.send_replace(next.clone());
+        *cfg = next;
+        login
     };
-    state.config_tx.send_replace(next);
-    // ブラウザでの認証を待つ間も、設定画面がこの ClientID を引き継いで保存できるようにする。
-    let _ = on_config_saved.send(());
-    state
+    let status = state
         .twitcasting_auth
         .connect_on(callback_port, &effective, timer_now_ms(), open_url)
-        .await
+        .await?;
+    Ok(OAuthStatus { client_id, status })
 }
 
 #[tauri::command]
@@ -1482,19 +1567,19 @@ fn cancel_twitcasting_login(state: State<'_, AppState>) {
 #[tauri::command]
 async fn disconnect_twitcasting(
     state: State<'_, AppState>,
-) -> Result<TwitcastingStatus, TwitcastingAuthError> {
+) -> Result<OAuthStatus<TwitcastingStatus>, TwitcastingAuthError> {
     state.twitcasting_auth.disconnect().await?;
-    let (client_id, port) = twitcasting_target(&state);
-    Ok(state
-        .twitcasting_auth
-        .status_on(port, client_id.as_deref(), timer_now_ms()))
+    Ok(get_twitcasting_status(state))
 }
 
 /// X 自動告知(API モード)の接続状態。
 #[tauri::command]
-async fn get_x_post_status(state: State<'_, AppState>) -> Result<XPostStatus, XPostError> {
+async fn get_x_post_status(
+    state: State<'_, AppState>,
+) -> Result<OAuthStatus<XPostStatus>, XPostError> {
     let (client_id, port) = x_post_target(&state);
-    Ok(state.x_post_auth.status(&client_id, port).await)
+    let status = state.x_post_auth.status(&client_id, port).await;
+    Ok(OAuthStatus { client_id, status })
 }
 
 /// Client ID とコールバックポートだけを保存し、ブラウザで X にログインする
@@ -1503,27 +1588,32 @@ async fn get_x_post_status(state: State<'_, AppState>) -> Result<XPostStatus, XP
 async fn connect_x_post(
     state: State<'_, AppState>,
     client_id: String,
-    callback_port: u16,
-) -> Result<XPostStatus, XPostError> {
-    let client_id = client_id.trim().to_string();
-    if client_id.is_empty() || callback_port < config::MIN_OAUTH_CALLBACK_PORT {
+    callback_port: serde_json::Value,
+) -> Result<OAuthStatus<XPostStatus>, XPostError> {
+    let callback_port = parse_oauth_callback_port(callback_port).map_err(|message| XPostError {
+        code: XPostErrorCode::Other,
+        message: message.into(),
+    })?;
+    let client_id = client_id.trim().to_owned();
+    if client_id.is_empty() {
         return Err(XPostError::new(XPostErrorCode::NotLoggedIn));
     }
-    let next_config = {
+    let _login = {
+        let _write = state.config_write.lock().await;
         let mut cfg = state.config.lock().unwrap();
-        cfg.credentials.x_post_client_id = Some(client_id.clone());
-        cfg.x_post.callback_port = callback_port;
-        cfg.save(&state.config_dir)
+        let login = OAuthLogin::begin(&state.x_post_logins);
+        let mut next = cfg.clone();
+        next.credentials.x_post_client_id = Some(client_id.clone());
+        next.x_post.callback_port = callback_port;
+        next.save(&state.config_dir)
             .map_err(|_| XPostError::new(XPostErrorCode::Other))?;
-        cfg.clone()
+        state.config_tx.send_replace(next.clone());
+        *cfg = next;
+        login
     };
-    let _ = state.config_tx.send(next_config);
-    let result = state
-        .x_post_auth
-        .connect(&client_id, callback_port, open_url)
-        .await;
+    let result = state.x_post_auth.connect(&client_id, callback_port, open_url).await;
     notify_x_auth_changed(&state);
-    result
+    Ok(OAuthStatus { client_id, status: result? })
 }
 
 /// 進行中の X ログインを取り消す(待受ポートを即座に解放する)。
@@ -1534,7 +1624,9 @@ fn cancel_x_post_login(state: State<'_, AppState>) {
 
 /// この PC の X 認証を消す(X 側の許可は取り消さない)。API モードなら Intent モードへ戻す。
 #[tauri::command]
-async fn disconnect_x_post(state: State<'_, AppState>) -> Result<XPostStatus, XPostError> {
+async fn disconnect_x_post(
+    state: State<'_, AppState>,
+) -> Result<OAuthStatus<XPostStatus>, XPostError> {
     let result = state.x_post_auth.disconnect().await;
     let next_config = {
         let mut cfg = state.config.lock().unwrap();
@@ -1553,8 +1645,7 @@ async fn disconnect_x_post(state: State<'_, AppState>) -> Result<XPostStatus, XP
     }
     notify_x_auth_changed(&state);
     result?;
-    let (client_id, port) = x_post_target(&state);
-    Ok(state.x_post_auth.status(&client_id, port).await)
+    get_x_post_status(state).await
 }
 
 /// テスト投稿の結果。`tweetId` は X が ID を返さなかった時だけ空。
@@ -2751,6 +2842,9 @@ pub fn run() {
                         live_tx,
                         autopost_user_tx,
                         autopost_status: autopost_status.clone(),
+                        config_write: tokio::sync::Mutex::new(()),
+                        x_post_logins: AtomicUsize::new(0),
+                        twitcasting_logins: AtomicUsize::new(0),
                         x_post_auth: x_post_auth.clone(),
                         twitcasting_auth: twitcasting_auth.clone(),
                         participants: Mutex::new(Vec::new()),
@@ -2961,6 +3055,81 @@ pub fn run() {
 #[cfg(test)]
 mod followup_tests {
     use super::*;
+
+    #[test]
+    fn oauth_review_config_update_preserves_only_active_services() {
+        let mut current = AppConfig::default();
+        current.credentials.x_post_client_id = Some("current-x".into());
+        current.credentials.twitcasting_client_id = Some("current-tc".into());
+        current.x_post.callback_port = 41321;
+        current.twitcasting.callback_port = 41322;
+        for active in [
+            &[][..],
+            &[OAuthService::XPost],
+            &[OAuthService::Twitcasting],
+            &[OAuthService::XPost, OAuthService::Twitcasting],
+        ] {
+            let mut incoming = AppConfig::default();
+            incoming.credentials.x_post_client_id = Some("backup-x".into());
+            incoming.credentials.twitcasting_client_id = Some("backup-tc".into());
+            incoming.x_post.callback_port = 42321;
+            incoming.twitcasting.callback_port = 42322;
+            incoming.x_post.enabled = !current.x_post.enabled;
+            incoming.goals.show_in_app = !current.goals.show_in_app;
+
+            let protected = protect_oauth_config(&current, &mut incoming, |service| {
+                active.contains(&service)
+            });
+            assert_eq!(protected, active);
+            let expected_x = if active.contains(&OAuthService::XPost) {
+                ("current-x", 41321)
+            } else {
+                ("backup-x", 42321)
+            };
+            let expected_tc = if active.contains(&OAuthService::Twitcasting) {
+                ("current-tc", 41322)
+            } else {
+                ("backup-tc", 42322)
+            };
+            assert_eq!(
+                incoming.credentials.x_post_client_id.as_deref(),
+                Some(expected_x.0)
+            );
+            assert_eq!(incoming.x_post.callback_port, expected_x.1);
+            assert_eq!(
+                incoming.credentials.twitcasting_client_id.as_deref(),
+                Some(expected_tc.0)
+            );
+            assert_eq!(incoming.twitcasting.callback_port, expected_tc.1);
+            assert_ne!(incoming.x_post.enabled, current.x_post.enabled);
+            assert_ne!(incoming.goals.show_in_app, current.goals.show_in_app);
+        }
+    }
+
+    #[test]
+    fn oauth_review_connect_callback_port_errors_omit_the_json_value() {
+        const PUBLIC_ERROR: &str = "待受ポートは 1024〜65535 の整数にしてください";
+        for value in [
+            serde_json::json!("https://example.test/?token=TEST"),
+            serde_json::json!({"sensitive": "TEST"}),
+            serde_json::json!(null),
+            serde_json::json!(-1),
+            serde_json::json!(65536),
+            serde_json::json!(1024.5),
+        ] {
+            assert_eq!(parse_oauth_callback_port(value).unwrap_err(), PUBLIC_ERROR);
+        }
+        for value in [1024, 65535] {
+            assert_eq!(parse_oauth_callback_port(serde_json::json!(value)), Ok(value));
+        }
+    }
+
+    #[test]
+    fn oauth_review_twitcasting_connect_rejects_callback_ports_below_1024() {
+        for value in [0, 1023] {
+            assert!(parse_oauth_callback_port(serde_json::json!(value)).is_err());
+        }
+    }
 
     // 修正10-2: 2 つ目の起動で main が無い時に作り直す設定を tauri.conf.json から取れる。
     #[test]

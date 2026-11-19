@@ -635,7 +635,10 @@ impl<S: SecretStore> TwitcastingAuth<S> {
     pub fn status_on(&self, port: u16, client_id: Option<&str>, now_ms: u64) -> TwitcastingStatus {
         let memory = self.session.memory.lock().unwrap();
         let state = self.session.auth_state(&memory, client_id, now_ms);
-        let r = memory.record.as_ref();
+        let r = memory
+            .record
+            .as_ref()
+            .filter(|record| client_id == Some(record.client_id.as_str()));
         let port = memory.listening_port.unwrap_or(port);
         TwitcastingStatus {
             configured: client_id.is_some_and(|c| !c.trim().is_empty()),
@@ -2425,6 +2428,25 @@ const fetch = (_path, { body }) => {
             .put(TOKEN_KEY, &serde_json::to_string(&record).unwrap())
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn oauth_review_status_omits_account_details_for_another_client_id() {
+        let store = MemorySecretStore::new();
+        seed_record(&store, Some(60_000)).await;
+        let auth = TwitcastingAuth::new(
+            store,
+            TwitcastingEndpoints::default(),
+            AuthOptions::default(),
+        );
+        auth.load(Some("client"), 0).await;
+        let matching = auth.status(Some("client"), 0);
+        assert_eq!(matching.screen_id.as_deref(), Some("screen"));
+        let mismatched = auth.status(Some("new-client"), 0);
+        assert_eq!(mismatched.state, "reloginRequired");
+        assert_eq!(mismatched.screen_id, None);
+        assert_eq!(mismatched.name, None);
+        assert_eq!(mismatched.expires_at_ms, None);
     }
 
     #[test]

@@ -8,7 +8,7 @@
  */
 
 import type { ChatMessage, ListenerRecord, ListenerUpdate, ModerationEvent, TtsVoiceOverride, YoutubeReaction } from './types';
-import { Channel, invoke as tauriInvoke } from '@tauri-apps/api/core';
+import { invoke as tauriInvoke } from '@tauri-apps/api/core';
 import { emit, listen } from '@tauri-apps/api/event';
 import { getCurrentWindow, primaryMonitor } from '@tauri-apps/api/window';
 import { createTtsAudioPlayer } from './ttsAudio';
@@ -613,12 +613,15 @@ export async function exportCommentsCsv(csv: string): Promise<string | null> {
   return invoke<string>('export_comments_csv', { csv });
 }
 
-/** Saves the config. Resolves with non-fatal warnings (e.g. chatlog could not be opened). */
-export async function setConfig(config: AppConfig): Promise<string[]> {
-  // Rust command is `update_config(new_config)`; Tauri maps the snake_case
-  // param `new_config` to the JS key `newConfig`.
-  const res = await invoke<{ warnings?: string[] } | undefined>('update_config', { newConfig: config });
-  return res?.warnings ?? [];
+export type OAuthService = 'xPost' | 'twitcasting';
+
+export interface UpdateConfigOutcome {
+  warnings: string[];
+  protectedOAuth: OAuthService[];
+}
+
+export async function setConfig(config: AppConfig): Promise<UpdateConfigOutcome | null> {
+  return invoke<UpdateConfigOutcome>('update_config', { newConfig: config });
 }
 
 export async function setTtsPaused(paused: boolean): Promise<void> {
@@ -1088,6 +1091,7 @@ export async function previewXPost(template: string): Promise<XPostPreview | nul
 
 /** Rust `XPostStatus`。API モードの接続状態。 */
 export interface XPostStatus {
+  clientId: string;
   configured: boolean;
   connected: boolean;
   username?: string | null;
@@ -1141,13 +1145,10 @@ export async function reloadTwitcastingStatus(): Promise<import('./types').Twitc
 export async function connectTwitcasting(
   clientId: string | undefined,
   callbackPort: number,
-  onConfigSaved: () => void,
 ): Promise<import('./types').TwitcastingStatus | null> {
-  if (!isTauri()) return null;
   return invoke<import('./types').TwitcastingStatus>('connect_twitcasting', {
     clientId: clientId || null,
     callbackPort,
-    onConfigSaved: new Channel<null>(onConfigSaved),
   });
 }
 export async function cancelTwitcastingLogin(): Promise<void> {

@@ -229,6 +229,7 @@ export interface WebhookTestResult {
 
 
 export interface TwitcastingStatus {
+  clientId: string;
   configured: boolean;
   state: 'loggedOut' | 'ready' | 'reloginRequired' | 'loading' | 'loadFailed';
   logoutPending?: boolean;
