@@ -247,7 +247,6 @@ struct PendingLogout {
     // fixes the targets. Reading a marker during explicit logout alone does not.
     known: bool,
     requested_at_ms: Option<u64>,
-    direct_delete_attempted: bool,
     deleted: Option<DeletedCredential>,
 }
 
@@ -837,19 +836,14 @@ impl<S: SecretStore> TwitcastingAuth<S> {
         startup: bool,
         first_request: bool,
     ) -> Result<Logout, LogoutIssue> {
-        let (mut targets, selection_cutoff, direct_delete_attempted, deleted) = {
+        let (mut targets, selection_cutoff, deleted) = {
             let memory = self.session.memory.lock().unwrap();
             let pending = &memory.pending_logout;
             let deleted = pending.deleted.is_some();
             let selection_cutoff = pending
                 .requested_at_ms
                 .filter(|_| !startup && !pending.known && !deleted);
-            (
-                pending.targets.clone(),
-                selection_cutoff,
-                pending.direct_delete_attempted,
-                deleted,
-            )
+            (pending.targets.clone(), selection_cutoff, deleted)
         };
         // A first request that ended before reading the store (lock wait, full queue) leaves
         // no direct delete behind, so its retry still relies on the request time.
@@ -911,12 +905,15 @@ impl<S: SecretStore> TwitcastingAuth<S> {
                 };
                 // On a retry, select a record obtained no later than the original request.
                 // A later value may have come from another session. Every session writes a
-                // parseable record, so an unparseable value is the one a failed direct delete
-                // of this request was aimed at.
+                // parseable record, so an unparseable value predates any such login.
+                // A request time of 0 means the wall clock read before 1970. Records then carry
+                // only the elapsed login time, so the times cannot separate sessions; delete
+                // rather than leave a logged-out credential to be restored.
                 let select_current = first_selection
-                    || selection_cutoff.is_some_and(|cutoff| match &record {
-                        Some(record) => record.obtained_at_ms <= cutoff,
-                        None => direct_delete_attempted,
+                    || selection_cutoff.is_some_and(|cutoff| {
+                        record
+                            .as_ref()
+                            .is_none_or(|record| cutoff == 0 || record.obtained_at_ms <= cutoff)
                     });
                 if select_current && !targets.contains(&id) {
                     targets.insert(id.clone());
@@ -939,14 +936,8 @@ impl<S: SecretStore> TwitcastingAuth<S> {
                     Logout::Preserved(record)
                 }
             }
-            // A direct delete is allowed only once before the current value is identified.
+            // Only the first request may delete before the current value is identified.
             Err(_) if first_selection => {
-                self.session
-                    .memory
-                    .lock()
-                    .unwrap()
-                    .pending_logout
-                    .direct_delete_attempted = true;
                 self.delete_for_logout(true)
                     .await
                     .map_err(|()| store_issue(marker_issue))?;
@@ -4259,6 +4250,96 @@ const fetch = (_path, { body }) => {
                 restarted.initialize(Some("client"), 0).await;
                 assert_ne!(restarted.status(Some("client"), 0).state, "ready");
             }
+        }
+
+        // 修正18: 時計が 0 を返す PC では取得時刻がログイン開始からの経過分だけ進む。
+        // 受付時刻 0 の再試行でも、その経路で保存した元の記録を残さない。
+        #[tokio::test]
+        async fn revision18_clock_zero_retry_deletes_a_login_saved_with_elapsed_time() {
+            let dir = tempfile::tempdir().unwrap();
+            let marker = dir.path().join(LOGOUT_MARKER_FILE);
+            let store = MemorySecretStore::new();
+            {
+                // connect() receives now_ms = 0, as timer_now_ms() does before 1970.
+                let (auth, addr, server) = super::login_fixture(store.clone()).await;
+                let login = super::post_grant(auth, addr, Duration::from_millis(300), "").await;
+                let status = timeout(Duration::from_secs(5), login)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(status.state, "ready");
+                server.abort();
+            }
+            let saved: Record = serde_json::from_str(&store.raw(TOKEN_KEY).unwrap()).unwrap();
+            assert!(saved.obtained_at_ms >= 300);
+
+            let auth = auth_with_marker(store.clone(), marker.clone());
+            store.fail_next_get();
+            store.fail_next_delete();
+            assert!(auth.disconnect().await.is_err());
+            assert!(store.raw(TOKEN_KEY).is_some());
+            // The request time comes from the same clock, which returns 0.
+            auth.session
+                .memory
+                .lock()
+                .unwrap()
+                .pending_logout
+                .requested_at_ms = Some(0);
+
+            auth.disconnect().await.unwrap();
+            assert!(
+                store.raw(TOKEN_KEY).is_none(),
+                "時計 0 の再試行で元の記録が残った"
+            );
+            let status = auth.status(Some("client"), 0);
+            assert!(!status.logout_pending);
+            assert_eq!(status.logouts_completed, 1);
+            drop(auth);
+            let restarted = auth_with_marker(store.clone(), marker.clone());
+            restarted.initialize(Some("client"), 0).await;
+            assert_ne!(restarted.status(Some("client"), 0).state, "ready");
+        }
+
+        // 修正18: 読込前に終わった初回の後の再試行でも、解析不能な値は取り残さない。
+        #[tokio::test]
+        async fn revision18_retry_after_lock_timeout_deletes_unrecognized_value() {
+            let dir = tempfile::tempdir().unwrap();
+            let marker = dir.path().join(LOGOUT_MARKER_FILE);
+            let store = MemorySecretStore::new();
+            store.put(TOKEN_KEY, "not a record").await.unwrap();
+            let auth = TwitcastingAuth::with_logout_marker(
+                store.clone(),
+                TwitcastingEndpoints::default(),
+                short_options(200),
+                Some(marker.clone()),
+            );
+            let held = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(marker.with_extension("lock"))
+                .unwrap();
+            held.lock().unwrap();
+            assert!(auth.disconnect().await.is_err());
+            wait_until(|| !auth.session.memory.lock().unwrap().logout_running).await;
+            assert_eq!(
+                auth.status(Some("client"), 0).logout_issue,
+                Some(LogoutIssue::LockTimedOut)
+            );
+            drop(held);
+
+            auth.disconnect().await.unwrap();
+            assert!(store.raw(TOKEN_KEY).is_none(), "解析できない値が残った");
+            let status = auth.status(Some("client"), 0);
+            assert!(!status.logout_pending);
+            assert_eq!(
+                status.logout_issue,
+                Some(LogoutIssue::UnreadableRecordDeleted)
+            );
+            assert_eq!(status.logouts_completed, 1);
+            assert!(!marker.exists());
         }
 
         // 修正17-3: 直接削除に失敗した後の再試行で読めた解析不能な値は、直接削除の対象として消す。
