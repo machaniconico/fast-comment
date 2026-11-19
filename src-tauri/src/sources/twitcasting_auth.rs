@@ -845,8 +845,9 @@ impl<S: SecretStore> TwitcastingAuth<S> {
                 .filter(|_| !startup && !pending.known && !deleted);
             (pending.targets.clone(), selection_cutoff, deleted)
         };
-        // A first request that ended before reading the store (lock wait, full queue) leaves
-        // no direct delete behind, so its retry still relies on the request time.
+        // Only the call that set the request time may select unconditionally. Every retry,
+        // including one after a first request that ended before reading the store, decides by
+        // the request time.
         let first_selection = first_request && selection_cutoff.is_some();
         // Only a wildcard still on disk can authorize a delete.
         targets.remove(&MarkerTarget::Any);
