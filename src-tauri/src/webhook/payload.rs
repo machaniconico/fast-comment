@@ -27,6 +27,7 @@ pub fn discord(matched: &Matched, msg: &ChatMessage) -> Value {
         Platform::Twitch => "Twitch",
         Platform::X => "X",
         Platform::Niconico => "ニコニコ生放送",
+        Platform::Twitcasting => "ツイキャス",
     };
     let title = match matched.trigger {
         Trigger::Donation => format!(

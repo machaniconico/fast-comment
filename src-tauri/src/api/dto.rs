@@ -81,6 +81,7 @@ pub fn api_comment_json(seq: u64, msg: &ChatMessage) -> Value {
             Platform::Youtube => "youtube",
             Platform::X => "x",
             Platform::Niconico => "niconico",
+            Platform::Twitcasting => "twitcasting",
         },
         author: ApiAuthor {
             id: &author.id,

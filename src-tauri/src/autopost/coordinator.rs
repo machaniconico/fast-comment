@@ -634,6 +634,7 @@ fn stream_key(stream: &LiveStream) -> String {
         Platform::Twitch => "twitch",
         Platform::Niconico => "niconico",
         Platform::X => "x",
+        Platform::Twitcasting => "twitcasting",
     };
     format!("{platform}:{}", stream.stream_id)
 }

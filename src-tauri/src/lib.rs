@@ -2508,6 +2508,7 @@ fn participant_platform(platform: Platform) -> &'static str {
         Platform::Youtube => "youtube",
         Platform::X => "x",
         Platform::Niconico => "niconico",
+        Platform::Twitcasting => "twitcasting",
     }
 }
 

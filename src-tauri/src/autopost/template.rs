@@ -135,6 +135,7 @@ pub fn render(
         Platform::Twitch => 1,
         Platform::Niconico => 2,
         Platform::X => 3,
+        Platform::Twitcasting => 4,
     });
     let title = sanitize_title(
         streams
@@ -154,6 +155,7 @@ pub fn render(
             Platform::Twitch => "Twitch",
             Platform::Niconico => "ニコ生",
             Platform::X => "X",
+            Platform::Twitcasting => "ツイキャス",
         };
         if !platforms.contains(&name) {
             platforms.push(name);
