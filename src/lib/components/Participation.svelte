@@ -94,7 +94,7 @@
       {:else}
         {#each waiting as p (p.platform + ':' + p.userId)}
           <div class="participant-row" role="listitem">
-            <span class="platform" class:twitch={p.platform === 'twitch'} class:youtube={p.platform === 'youtube'} class:x={p.platform === 'x'} class:niconico={p.platform === 'niconico'}>
+            <span class="platform" class:twitch={p.platform === 'twitch'} class:youtube={p.platform === 'youtube'} class:x={p.platform === 'x'} class:niconico={p.platform === 'niconico'} class:twitcasting={p.platform === 'twitcasting'}>
               {p.platform}
             </span>
             <span class="name">{p.name}</span>
@@ -114,7 +114,7 @@
       {:else}
         {#each picked as p (p.platform + ':' + p.userId)}
           <div class="participant-row picked" role="listitem">
-            <span class="platform" class:twitch={p.platform === 'twitch'} class:youtube={p.platform === 'youtube'} class:x={p.platform === 'x'} class:niconico={p.platform === 'niconico'}>
+            <span class="platform" class:twitch={p.platform === 'twitch'} class:youtube={p.platform === 'youtube'} class:x={p.platform === 'x'} class:niconico={p.platform === 'niconico'} class:twitcasting={p.platform === 'twitcasting'}>
               {p.platform}
             </span>
             <span class="name">{p.name}</span>
@@ -222,6 +222,7 @@
   .platform.youtube { color: #ff9999; }
   .platform.x { color: #1da1f2; }
   .platform.niconico { color: #fcc800; }
+  .platform.twitcasting { color: #1e78ff; }
 
   .name {
     min-width: 0;

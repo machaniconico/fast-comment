@@ -747,6 +747,11 @@
           class:active={store.filterPlatform === 'niconico'}
           onclick={() => onFilterClick('niconico')}
         >ニコ生</button>
+        <button
+          class="filter-btn twitcasting"
+          class:active={store.filterPlatform === 'twitcasting'}
+          onclick={() => onFilterClick('twitcasting')}
+        >ツイキャス</button>
       </div>
 
       <!-- View mode -->
@@ -1476,6 +1481,7 @@
   .filter-btn.youtube.active { background: rgba(255,0,0,0.2); border-color: #ff4444; color: #ff9999; }
   .filter-btn.x.active { background: rgba(29,161,242,0.22); border-color: #1da1f2; color: #1da1f2; }
   .filter-btn.niconico.active { background: rgba(252,200,0,0.22); border-color: #fcc800; color: #fcc800; }
+  .filter-btn.twitcasting.active { background: rgba(30,120,255,0.22); border-color: #1e78ff; color: #1e78ff; }
 
   .view-mode-btn {
     background: rgba(255,255,255,0.06);

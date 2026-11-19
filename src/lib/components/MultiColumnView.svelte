@@ -8,6 +8,7 @@
     { platform: 'twitch', label: 'Twitch', className: 'twitch' },
     { platform: 'youtube', label: 'YouTube', className: 'youtube' },
     { platform: 'x', label: 'X', className: 'x' },
+    { platform: 'twitcasting', label: 'ツイキャス', className: 'twitcasting' },
   ];
 
   function platformCount(platform: Platform): number {
@@ -37,7 +38,7 @@
     flex: 1;
     min-height: 0;
     display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-template-columns: repeat(4, minmax(0, 1fr));
     gap: 1px;
     background: rgba(255, 255, 255, 0.08);
     overflow: hidden;
@@ -86,6 +87,10 @@
     background: #fcc800;
   }
 
+  .platform-mark.twitcasting {
+    background: #1e78ff;
+  }
+
   .column-title {
     min-width: 0;
     overflow: hidden;
@@ -110,7 +115,7 @@
   @media (max-width: 720px) {
     .multi-column-view {
       grid-template-columns: 1fr;
-      grid-template-rows: repeat(3, minmax(0, 1fr));
+      grid-template-rows: repeat(4, minmax(0, 1fr));
     }
   }
 </style>

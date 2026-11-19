@@ -66,6 +66,15 @@ test('twitch / youtube / x keep their platform value', () => {
   }
 });
 
+test('twitcasting keeps its platform value in every template', () => {
+  for (const t of TEMPLATES) {
+    const apply = new Function(`${block(sources[t])}\nreturn fcApplyAttrs;`)();
+    const el = fakeEl();
+    apply(el, { ...full, platform: 'twitcasting' });
+    assert.equal(el.attrs.get('data-service'), 'twitcasting', t);
+  }
+});
+
 test('message without author or roles does not throw and degrades', () => {
   const el = fakeEl();
   fcApplyAttrs(el, { platform: 'twitch' });
