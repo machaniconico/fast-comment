@@ -3,7 +3,7 @@
   import type { ChannelConfig, ChannelStatus } from '../ipc';
   import { addChannel, removeChannel, getConfig, onStats, openUrl, setChannelOwnStream } from '../ipc';
   import { ownStreamBlockedReason } from '../xAutopost';
-  import { extractTwitcastingScreenId, isTwitcastingUrl } from '../twitcastingId';
+  import { extractTwitcastingScreenId, isPrefixedTwitcastingId, isTwitcastingUrl } from '../twitcastingId';
 
   // 追加成功時に親へ通知(任意)。
   let { onAdded }: { onAdded?: (ch: ChannelConfig) => void } = $props();
@@ -415,8 +415,11 @@
 
   function detectChannel(input: string): ChannelDetection {
     const raw = input.trim();
-    // ツイキャスは URL(twitcasting.tv を含む)の時だけ自動判定。素の ID は他と衝突するため、
-    // プラットフォーム選択が「ツイキャス」の時だけ受ける。
+    // ツイキャスは URL か接頭辞付きの裸 ID(c:xxx 等)の時だけ自動判定。接頭辞なしの裸 ID は
+    // 他と衝突するため、プラットフォーム選択が「ツイキャス」の時だけ受ける。
+    if (isPrefixedTwitcastingId(raw)) {
+      return { kind: 'detected', platform: 'twitcasting', identifier: raw };
+    }
     if (isTwitcastingUrl(raw)) {
       const id = extractTwitcastingScreenId(raw);
       if (id) return { kind: 'detected', platform: 'twitcasting', identifier: id };
