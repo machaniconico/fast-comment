@@ -176,10 +176,12 @@
     status = null;
     try {
       const warnings = await setConfig(parsed.config);
+      const saved = await getConfig();
+      if (!saved) throw new Error('保存後の設定を取得できませんでした。');
       if (parsed.appearance !== undefined) {
         theme.applySnapshot(parsed.appearance);
       }
-      onImported?.(parsed.config);
+      onImported?.(saved);
       const base = '設定をインポートしました。外観設定も反映済みです。';
       showSuccess(warnings.length > 0 ? `${base}(警告: ${warnings.join(' / ')})` : base);
     } catch (e) {

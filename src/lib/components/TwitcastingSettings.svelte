@@ -2,30 +2,33 @@
   import { onMount } from 'svelte';
   import { getConfig, getTwitcastingStatus, reloadTwitcastingStatus, connectTwitcasting, cancelTwitcastingLogin, disconnectTwitcasting } from '../ipc';
   import type { TwitcastingStatus } from '../types';
-  import { errorText, parseCallbackPort } from '../xAutopost';
+  import { errorText } from '../xAutopost';
   import { DEFAULT_TWITCASTING_CALLBACK_PORT, twitcastingDisplayCallbackUrl } from '../twitcasting';
+  import { createCallbackPortInput } from '../callbackPortInput.svelte';
 
-  let { clientId = '', callbackPort = DEFAULT_TWITCASTING_CALLBACK_PORT, onClientIdSaved, onCallbackPortChange }: {
+  let {
+    clientId = '', callbackPort = DEFAULT_TWITCASTING_CALLBACK_PORT, configRevision,
+    saving, onClientIdSaved, onCallbackPortChange, onConfigPendingChange,
+  }: {
     clientId?: string;
     callbackPort?: number;
-    /** Rust が保存した ClientID(ログイン成功後、または失敗後に再取得した保存値)。 */
+    configRevision: number;
+    saving: boolean;
     onClientIdSaved?: (id: string) => void;
-    /** 待受ポートの有効な入力値。親フォームに反映し、通常の「設定を保存」でも保存させる。 */
-    onCallbackPortChange?: (port: number) => void;
+    onCallbackPortChange: (port: number | null) => void;
+    onConfigPendingChange: (pending: boolean) => void;
   } = $props();
   let clientIdInput = $state('');
-  let portInput = $state('');
-  // 設定のインポート等で親の値が変わったら入力欄も追従させる。
-  $effect.pre(() => { clientIdInput = clientId; });
-  $effect.pre(() => { portInput = String(callbackPort); });
-  const port = $derived(parseCallbackPort(portInput));
+  $effect.pre(() => {
+    configRevision;
+    clientIdInput = clientId;
+  });
+  const portInput = createCallbackPortInput(
+    () => callbackPort, () => configRevision, (port) => onCallbackPortChange(port),
+  );
   // 待受中はそのポート、それ以外は入力中の有効値から登録用 URL を出す。
   let listeningPort = $state<number | null>(null);
-  const callbackUrl = $derived(twitcastingDisplayCallbackUrl(listeningPort, port));
-  function onPortInput(e: Event & { currentTarget: HTMLInputElement }) {
-    const next = parseCallbackPort(e.currentTarget.value);
-    if (next !== null) onCallbackPortChange?.(next);
-  }
+  const callbackUrl = $derived(twitcastingDisplayCallbackUrl(listeningPort, portInput.port));
   let status = $state<TwitcastingStatus | null>(null);
   let connecting = $state(false);
   let disconnecting = $state(false);
@@ -96,34 +99,52 @@
     };
   });
   async function connect() {
-    if (connecting || disconnecting || reloading || !status || status.state === 'loading') return;
-    const listenPort = port;
+    if (saving || connecting || disconnecting || reloading || !status || status.state === 'loading') return;
+    const listenPort = portInput.port;
     if (listenPort === null) {
       message = 'ポートは 1024〜65535 の整数にしてください';
       failed = true;
       return;
     }
     connecting = true;
+    onConfigPendingChange(true);
     listeningPort = listenPort;
     failed = false;
     message = 'ブラウザでツイキャスにログインし、アプリを許可してください…';
     const id = clientIdInput.trim();
-    // コマンドはログインに先立って ClientID と待受ポートだけを保存する。親の未保存フォームへは
-    // 保存が確かな時だけ反映する(失敗時は保存済みの値を読み直す。保存前に失敗することもあるため)。
+    const revision = configRevision;
+    let configSaved = false;
+    function acceptSavedConfig() {
+      if (configSaved) return;
+      configSaved = true;
+      if (configRevision === revision) {
+        clientIdInput = id;
+        onClientIdSaved?.(id);
+      }
+      onConfigPendingChange(false);
+    }
     try {
-      status = await connectTwitcasting(id, listenPort);
-      onClientIdSaved?.(id);
-      onCallbackPortChange?.(listenPort);
+      status = await connectTwitcasting(id, listenPort, acceptSavedConfig);
+      acceptSavedConfig();
+      // ポートは入力時に親へ渡し済み。待受中のインポートで置き換わった設定を保つ。
       statusError = '';
       message = 'ツイキャスにログインしました';
     } catch (e) {
       message = errorText(e);
       failed = true;
       const saved = await getConfig().catch(() => null);
-      if (saved) onClientIdSaved?.(saved.credentials?.twitcastingClientId ?? '');
+      if (saved && configRevision === revision) {
+        clientIdInput = saved.credentials?.twitcastingClientId ?? '';
+        onClientIdSaved?.(clientIdInput);
+      }
       await refresh();
     }
-    finally { connecting = false; listeningPort = null; }
+    finally {
+      configSaved = true;
+      onConfigPendingChange(false);
+      connecting = false;
+      listeningPort = null;
+    }
   }
   async function cancel() {
     try { await cancelTwitcastingLogin(); }
@@ -183,7 +204,7 @@
     {#if connecting}
       <button type="button" onclick={cancel}>取り消す</button>
     {:else}
-      <button type="button" class="primary" onclick={connect} disabled={disconnecting || reloading || !status || status.state === 'loading' || status.logoutPending}>ログイン</button>
+      <button type="button" class="primary" onclick={connect} disabled={saving || disconnecting || reloading || !status || status.state === 'loading' || status.logoutPending}>ログイン</button>
     {/if}
     {#if statusError}
       <button type="button" onclick={retryStatus} disabled={connecting || disconnecting || reloading}>{status ? 'ログイン状態を再取得' : '再読み込み'}</button>
@@ -209,9 +230,9 @@
     </div>
     <div class="field-row">
       <label for="twitcasting-port">待受ポート</label>
-      <input id="twitcasting-port" type="text" inputmode="numeric" bind:value={portInput} oninput={onPortInput} disabled={connecting || disconnecting} autocomplete="off" />
+      <input id="twitcasting-port" type="text" inputmode="numeric" value={portInput.text} oninput={portInput.onInput} disabled={connecting || disconnecting} autocomplete="off" />
     </div>
-    {#if port === null}
+    {#if portInput.port === null}
       <p class="warn">ポートは 1024〜65535 の整数にしてください</p>
     {/if}
     <p>空欄ならアプリ既定値を使います。現在は既定値が未登録のため、自分の ClientID が必要です。ClientID はログイン時に保存します。待受ポート(既定 {DEFAULT_TWITCASTING_CALLBACK_PORT})はログイン時と「設定を保存」の両方で保存します。変えたら開発者ページのコールバック URL も登録し直してください。</p>

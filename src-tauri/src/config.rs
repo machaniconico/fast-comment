@@ -786,6 +786,8 @@ pub struct CredentialsConfig {
     pub twitcasting_client_id: Option<String>,
 }
 
+pub(crate) const MIN_OAUTH_CALLBACK_PORT: u16 = 1024;
+
 /// X 自動告知の設定。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -842,7 +844,7 @@ impl Default for TwitcastingConfig {
 impl TwitcastingConfig {
     /// 1024 未満(0 を含む)の待受ポートは既定に戻す(UI の検証と同じ下限)。
     pub fn normalize(&mut self) {
-        if self.callback_port < 1024 {
+        if self.callback_port < MIN_OAUTH_CALLBACK_PORT {
             self.callback_port = TwitcastingConfig::default().callback_port;
         }
     }
@@ -852,7 +854,7 @@ impl XPostConfig {
     /// 範囲外の値を許容範囲へ丸める。
     pub fn normalize(&mut self) {
         // 1024 未満(0 を含む)のポートは既定に戻す。1024 以上の既存設定は変えない。
-        if self.callback_port < 1024 {
+        if self.callback_port < MIN_OAUTH_CALLBACK_PORT {
             self.callback_port = XPostConfig::default().callback_port;
         }
         self.delay_secs = self.delay_secs.min(600);
@@ -953,6 +955,40 @@ impl Default for AppConfig {
     }
 }
 
+fn config_error_path(path: &serde_path_to_error::Path) -> String {
+    use serde_path_to_error::Segment;
+
+    // 既定の設定に存在するフィールド名だけを採用し、配列やマップの要素には進まない。
+    let defaults = serde_json::to_value(AppConfig::default()).unwrap_or_default();
+    let mut schema = &defaults;
+    let mut names = Vec::new();
+    for segment in path {
+        let Segment::Map { key } = segment else {
+            break;
+        };
+        if let Some(next) = schema.get(key) {
+            names.push(key.as_str());
+            schema = next;
+            continue;
+        }
+        // 既定値の JSON で省略される固定フィールド。任意のマップキーは表示しない。
+        if matches!(
+            (names.as_slice(), key.as_str()),
+            (["youtubeOverrides"], "apiKey" | "clientVersion" | "paths")
+                | (["xOverrides"], "bearerToken" | "endpoints" | "livePollSecs")
+                | (["niconicoOverrides"], "endpoints")
+                | (["credentials"], "xPostClientId" | "twitcastingClientId")
+        ) {
+            names.push(key.as_str());
+        }
+        break;
+    }
+    if names.is_empty() {
+        return ".".to_owned();
+    }
+    names.join(".")
+}
+
 impl AppConfig {
     /// 指定ディレクトリ配下の `config.json` パスを返す。
     pub fn path_in(dir: &Path) -> PathBuf {
@@ -970,19 +1006,35 @@ impl AppConfig {
         let text = std::fs::read_to_string(&path)
             .map_err(|e| anyhow::anyhow!("設定ファイル読込失敗 {}: {e}", path.display()))?;
         // serde の文面は不正な値をそのまま含む(トークン等が紛れうる)ので、項目と位置だけ出す。
+        let mut deserializer = serde_json::Deserializer::from_str(&text);
         let mut cfg: AppConfig =
-            serde_path_to_error::deserialize(&mut serde_json::Deserializer::from_str(&text))
+            serde_path_to_error::deserialize(&mut deserializer)
                 .map_err(|e| {
                     anyhow::anyhow!(
                         "設定ファイル解析失敗 {}: 項目 {} ({} 行 {} 列)",
                         path.display(),
-                        e.path(),
+                        config_error_path(e.path()),
                         e.inner().line(),
                         e.inner().column()
                     )
                 })?;
+        deserializer.end().map_err(|e| {
+            anyhow::anyhow!(
+                "設定ファイル解析失敗 {}: JSON の末尾が不正です ({} 行 {} 列)",
+                path.display(),
+                e.line(),
+                e.column()
+            )
+        })?;
         cfg.normalize_all();
         Ok(cfg)
+    }
+
+    /// IPC の入力値はエラー文に含めない。
+    pub(crate) fn from_config_update(value: serde_json::Value) -> Result<Self, String> {
+        serde_path_to_error::deserialize(value).map_err(|e| {
+            format!("設定の形式が不正です (項目 {})", config_error_path(e.path()))
+        })
     }
 
     /// 範囲外値の丸め。ロード時と更新(保存前)の双方から呼ぶ。
@@ -1179,6 +1231,49 @@ mod tests {
         let message = AppConfig::load(&dir).unwrap_err().to_string();
         assert!(!message.contains("access_token"), "{message}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_error_hides_override_map_keys() {
+        let dir = std::env::temp_dir().join(format!("fast-comment-config-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            AppConfig::path_in(&dir),
+            r#"{"xOverrides":{"endpoints":{"https://example.test/?token=TEST":42}}}"#,
+        )
+        .unwrap();
+        let result = AppConfig::load(&dir);
+        std::fs::remove_dir_all(dir).unwrap();
+        let message = result.unwrap_err().to_string();
+        assert!(message.contains("xOverrides.endpoints"));
+        assert!(!message.contains("token=TEST"));
+    }
+
+    #[test]
+    fn load_rejects_a_second_json_value() {
+        let dir = std::env::temp_dir().join(format!("fast-comment-config-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(AppConfig::path_in(&dir), "{} {}").unwrap();
+        let result = AppConfig::load(&dir);
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn update_error_reports_callback_port_fields_without_input_values() {
+        for field in ["twitcasting", "xPost"] {
+            let result = AppConfig::from_config_update(serde_json::json!({
+                (field): { "callbackPort": "https://example.test/#access_token=TEST" },
+            }));
+            assert_eq!(
+                result.unwrap_err(),
+                format!("設定の形式が不正です (項目 {field}.callbackPort)")
+            );
+        }
+        assert_eq!(
+            AppConfig::from_config_update(serde_json::json!({})).unwrap(),
+            AppConfig::default()
+        );
     }
 
     #[test]

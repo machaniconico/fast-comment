@@ -2466,8 +2466,7 @@ const fetch = (_path, { body }) => {
             AuthOptions::default(),
         );
         auth.load(Some("client"), 0).await;
-        // The probe is released before `connect_on` binds, so another process may take the port
-        // in between; only that race (PortInUse) is retried.
+        // Another process may take the port after the probe or after the login releases it.
         for _ in 0..5 {
             let port = free_non_default_port().await;
             let reached = Arc::new(Mutex::new(None));
@@ -2485,10 +2484,11 @@ const fetch = (_path, { body }) => {
             assert!(matches!(result, Err(e) if matches!(e.code, Code::Other)));
             assert_eq!(*reached.lock().unwrap(), Some(true));
             // The listener is released when the command returns.
-            TcpListener::bind(("127.0.0.1", port)).await.unwrap();
-            return;
+            if TcpListener::bind(("127.0.0.1", port)).await.is_ok() {
+                return;
+            }
         }
-        panic!("no free port could be bound");
+        panic!("could not verify that the configured port was bound and released");
     }
 
     #[tokio::test]

@@ -1087,8 +1087,9 @@ struct UpdateConfigOutcome {
 async fn update_config(
     app: AppHandle,
     state: State<'_, AppState>,
-    mut new_config: AppConfig,
+    new_config: serde_json::Value,
 ) -> Result<UpdateConfigOutcome, String> {
+    let mut new_config = AppConfig::from_config_update(new_config)?;
     validate_x_post_template(&new_config.x_post.template)?;
     validate_x_post_mode(&state, &new_config).await?;
     let (
@@ -1444,14 +1445,14 @@ async fn connect_twitcasting(
     state: State<'_, AppState>,
     client_id: Option<String>,
     callback_port: u16,
+    on_config_saved: tauri::ipc::Channel<()>,
 ) -> Result<TwitcastingStatus, TwitcastingAuthError> {
     let override_id = client_id
         .map(|s| s.trim().to_owned())
         .filter(|s| !s.is_empty());
     let effective = effective_client_id(override_id.as_deref())
         .ok_or_else(|| TwitcastingAuthError::new(TwitcastingAuthErrorCode::NotConfigured))?;
-    // X の connect_x_post と同じく 0 は拒否する(bind すると任意ポートになりコールバック URL と食い違う)。
-    if callback_port == 0 {
+    if callback_port < config::MIN_OAUTH_CALLBACK_PORT {
         return Err(TwitcastingAuthError::new(TwitcastingAuthErrorCode::Other));
     }
     let next = {
@@ -1465,6 +1466,8 @@ async fn connect_twitcasting(
         next
     };
     state.config_tx.send_replace(next);
+    // ブラウザでの認証を待つ間も、設定画面がこの ClientID を引き継いで保存できるようにする。
+    let _ = on_config_saved.send(());
     state
         .twitcasting_auth
         .connect_on(callback_port, &effective, timer_now_ms(), open_url)
@@ -1503,7 +1506,7 @@ async fn connect_x_post(
     callback_port: u16,
 ) -> Result<XPostStatus, XPostError> {
     let client_id = client_id.trim().to_string();
-    if client_id.is_empty() || callback_port == 0 {
+    if client_id.is_empty() || callback_port < config::MIN_OAUTH_CALLBACK_PORT {
         return Err(XPostError::new(XPostErrorCode::NotLoggedIn));
     }
     let next_config = {

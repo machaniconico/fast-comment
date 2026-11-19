@@ -102,6 +102,7 @@
   }
 
   let config: AppConfig | null = $state(null);
+  let configRevision = $state(0);
   let obsBaseUrl: string = $state('');
   let obsGoalsBaseUrl: string = $state('');
   let obsTimerBaseUrl: string = $state('');
@@ -137,6 +138,12 @@
   }
 
   let saving: boolean = $state(false);
+  let twitcastingPortInvalid = $state(false);
+  let xPostPortInvalid = $state(false);
+  let twitcastingConfigPending = $state(false);
+  let xPostConnecting = $state(false);
+  const invalidOAuthPort = $derived(twitcastingPortInvalid || xPostPortInvalid);
+  const saveBlocked = $derived(invalidOAuthPort || twitcastingConfigPending || xPostConnecting);
   let saveMsg: string = $state('');
   let saveWarned: boolean = $state(false);
   let exportingCsv: boolean = $state(false);
@@ -325,6 +332,9 @@
 
   function hydrateConfig(nextConfig: AppConfig | null) {
     config = nextConfig;
+    configRevision += 1;
+    twitcastingPortInvalid = false;
+    xPostPortInvalid = false;
     if (config) {
       ngWords = normalizeModerationEntries(config.moderation.ngWords);
       ngUsers = normalizeModerationEntries(config.moderation.ngUsers);
@@ -1157,7 +1167,7 @@
   }
 
   async function onSave() {
-    if (!config) return;
+    if (!config || saving || saveBlocked) return;
     saving = true;
     saveMsg = '';
     config.moderation.ngWords = [...ngWords];
@@ -1232,6 +1242,7 @@
       } catch {
         // 取れなければ手元の channels で保存する。
       }
+      if (saveBlocked) return;
       const warnings = await setConfig(config);
       void localApiSettings?.refreshStatus();
       saveWarned = warnings.length > 0;
@@ -1972,11 +1983,15 @@
     <TwitcastingSettings
       clientId={config.credentials?.twitcastingClientId ?? ''}
       callbackPort={config.twitcasting?.callbackPort ?? DEFAULT_TWITCASTING_CALLBACK_PORT}
+      {configRevision}
+      {saving}
+      onConfigPendingChange={(pending) => { twitcastingConfigPending = pending; }}
       onClientIdSaved={(id) => {
         if (config) config.credentials = { ...(config.credentials ?? {}), twitcastingClientId: id || undefined };
       }}
       onCallbackPortChange={(port) => {
-        if (config) config.twitcasting = { ...(config.twitcasting ?? {}), callbackPort: port };
+        twitcastingPortInvalid = port === null;
+        if (config && port !== null) config.twitcasting = { ...(config.twitcasting ?? {}), callbackPort: port };
       }}
     />
   </section>
@@ -1987,6 +2002,13 @@
       <XPostSettings
         xPost={config.xPost}
         clientId={config.credentials?.xPostClientId ?? ''}
+        {configRevision}
+        {saving}
+        onConnectingChange={(connecting) => { xPostConnecting = connecting; }}
+        onCallbackPortChange={(port) => {
+          xPostPortInvalid = port === null;
+          if (config?.xPost && port !== null) config.xPost.callbackPort = port;
+        }}
         onClientIdSaved={(id) => {
           if (config) config.credentials = { ...(config.credentials ?? {}), xPostClientId: id };
         }}
@@ -3028,10 +3050,14 @@
 
   <!-- ── Save ── -->
   <div class="save-row">
-    <button class="save-btn" onclick={onSave} disabled={saving}>
+    <button class="save-btn" onclick={onSave} disabled={saving || saveBlocked}>
       {saving ? '保存中...' : '設定を保存'}
     </button>
-    {#if saveMsg}<span class={saveWarned ? 'save-warn' : 'save-ok'}>{saveMsg}</span>{/if}
+    {#if invalidOAuthPort}
+      <span class="save-warn">OAuth の待受ポートを確認してください</span>
+    {:else if saveMsg}
+      <span class={saveWarned ? 'save-warn' : 'save-ok'}>{saveMsg}</span>
+    {/if}
   </div>
   {/if}
 </div>

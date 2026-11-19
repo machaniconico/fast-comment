@@ -8,7 +8,7 @@
  */
 
 import type { ChatMessage, ListenerRecord, ListenerUpdate, ModerationEvent, TtsVoiceOverride, YoutubeReaction } from './types';
-import { invoke as tauriInvoke } from '@tauri-apps/api/core';
+import { Channel, invoke as tauriInvoke } from '@tauri-apps/api/core';
 import { emit, listen } from '@tauri-apps/api/event';
 import { getCurrentWindow, primaryMonitor } from '@tauri-apps/api/window';
 import { createTtsAudioPlayer } from './ttsAudio';
@@ -1138,8 +1138,17 @@ export async function getTwitcastingStatus(): Promise<import('./types').Twitcast
 export async function reloadTwitcastingStatus(): Promise<import('./types').TwitcastingStatus | null> {
   return invoke<import('./types').TwitcastingStatus>('reload_twitcasting_status');
 }
-export async function connectTwitcasting(clientId: string | undefined, callbackPort: number): Promise<import('./types').TwitcastingStatus | null> {
-  return invoke<import('./types').TwitcastingStatus>('connect_twitcasting', { clientId: clientId || null, callbackPort });
+export async function connectTwitcasting(
+  clientId: string | undefined,
+  callbackPort: number,
+  onConfigSaved: () => void,
+): Promise<import('./types').TwitcastingStatus | null> {
+  if (!isTauri()) return null;
+  return invoke<import('./types').TwitcastingStatus>('connect_twitcasting', {
+    clientId: clientId || null,
+    callbackPort,
+    onConfigSaved: new Channel<null>(onConfigSaved),
+  });
 }
 export async function cancelTwitcastingLogin(): Promise<void> {
   await invoke<void>('cancel_twitcasting_login');

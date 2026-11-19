@@ -10,7 +10,8 @@
     sendXTestPost,
   } from '../ipc';
   import type { XPostConfig, XPostErrorInfo, XPostPreview, XPostStatus } from '../ipc';
-  import { canSelectApiMode, errorText, parseCallbackPort, testPostPreview } from '../xAutopost';
+  import { canSelectApiMode, errorText, testPostPreview } from '../xAutopost';
+  import { createCallbackPortInput } from '../callbackPortInput.svelte';
 
   // X 自動告知の設定欄。値は親の config.xPost を直接編集し、保存は設定画面の保存ボタンで行う。
   // 文字数・警告は Rust の preview_x_post の結果をそのまま表示する(UI では数えない)。
@@ -18,18 +19,30 @@
   let {
     xPost,
     clientId = '',
+    configRevision,
+    saving,
     onClientIdSaved,
+    onCallbackPortChange,
+    onConnectingChange,
   }: {
     xPost: XPostConfig;
     clientId?: string;
+    configRevision: number;
+    saving: boolean;
     onClientIdSaved?: (clientId: string) => void;
+    onCallbackPortChange: (port: number | null) => void;
+    onConnectingChange: (connecting: boolean) => void;
   } = $props();
 
   // ── API モードの接続 ──
-  // svelte-ignore state_referenced_locally
-  let clientIdInput = $state(clientId);
-  // svelte-ignore state_referenced_locally
-  let portInput = $state(String(xPost.callbackPort));
+  let clientIdInput = $state('');
+  $effect.pre(() => {
+    configRevision;
+    clientIdInput = clientId;
+  });
+  const portInput = createCallbackPortInput(
+    () => xPost.callbackPort, () => configRevision, (port) => onCallbackPortChange(port),
+  );
   let status = $state<XPostStatus | null>(null);
   let connecting = $state(false);
   let disconnecting = $state(false);
@@ -44,7 +57,7 @@
   let confirmCancelEl: HTMLButtonElement | null = $state(null);
   let testButtonEl: HTMLButtonElement | null = $state(null);
 
-  const port = $derived(parseCallbackPort(portInput));
+  const port = $derived(portInput.port);
   const displayCallbackUrl = $derived(port !== null ? `http://127.0.0.1:${port}/callback` : '');
   const connected = $derived(canSelectApiMode(status));
 
@@ -63,26 +76,27 @@
   });
 
   async function connect() {
-    if (connecting) return;
+    if (saving || connecting) return;
     const id = clientIdInput.trim();
     if (!id) {
       authMsg = 'Client ID を入力してください';
       authOk = false;
       return;
     }
-    if (port === null) {
+    const listenPort = port;
+    if (listenPort === null) {
       authMsg = 'ポートは 1024〜65535 の整数にしてください';
       authOk = false;
       return;
     }
     connecting = true;
+    onConnectingChange(true);
+    const revision = configRevision;
     authMsg = 'ブラウザで X にログインし、アプリを許可してください…';
     authOk = null;
     try {
-      // Client ID とポートは Rust 側で保存済み。親の未保存フォームにも反映して、設定保存で戻らないようにする。
-      onClientIdSaved?.(id);
-      xPost.callbackPort = port;
-      status = await connectXPost(id, port);
+      status = await connectXPost(id, listenPort);
+      if (configRevision === revision) onClientIdSaved?.(id);
       authMsg = status?.username ? `@${status.username} として接続しました` : 'X に接続しました';
       authOk = true;
     } catch (e) {
@@ -90,6 +104,7 @@
       authOk = false;
       await refreshStatus();
     } finally {
+      onConnectingChange(false);
       connecting = false;
     }
   }
@@ -356,11 +371,11 @@
 
   <div class="field-row">
     <label for="xpost-client-id">Client ID</label>
-    <input id="xpost-client-id" type="text" bind:value={clientIdInput} class="text-input" autocomplete="off" spellcheck="false" />
+    <input id="xpost-client-id" type="text" bind:value={clientIdInput} disabled={connecting} class="text-input" autocomplete="off" spellcheck="false" />
   </div>
   <div class="field-row">
     <label for="xpost-port">コールバックポート</label>
-    <input id="xpost-port" type="text" inputmode="numeric" bind:value={portInput} oninput={(e) => { const next = parseCallbackPort(e.currentTarget.value); if (next !== null) xPost.callbackPort = next; }} class="num-input" />
+    <input id="xpost-port" type="text" inputmode="numeric" value={portInput.text} oninput={portInput.onInput} class="num-input" />
     <span class="hint-inline">既定 47821。変えたら X の登録も直す</span>
   </div>
   <div class="field-row">
@@ -388,7 +403,7 @@
     {#if connecting}
       <button type="button" class="btn-small" onclick={cancelLogin}>ログインを取り消す</button>
     {:else}
-      <button type="button" class="btn-small primary" onclick={connect} disabled={disconnecting}>
+      <button type="button" class="btn-small primary" onclick={connect} disabled={saving || disconnecting}>
         {connected ? '別のアカウントで接続し直す' : 'X に接続'}
       </button>
     {/if}

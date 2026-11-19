@@ -36,7 +36,7 @@
 - マーカーの更新ではロック内で読み直して集合の和を取り、一時ファイルを同期してから rename で公開する。起動時の再試行では削除直前にマーカーを再確認し、再確認に失敗しても判明済みの識別子はメモリに保持する。資格情報ストアの現在値が対象の集合に含まれる場合だけ削除し、ストアに無いと確認できた識別子だけをマーカーから外す。最後の識別子が消えたらマーカーを取り除く。明示操作では破損マーカーや空ディレクトリ、リンクを取り除ける。
 - `logoutPending` と理由はストアとの照合とマーカーの解除結果から決める。`logoutsCompleted` は、実際の削除とマーカーの解除が揃った時に増える。削除後に解除だけ失敗した時は削除済みをメモリに保持し、再試行で解除できた時に一度だけ画面へ削除完了を通知する。
 - 安定した設定ディレクトリを取得できない時は復元を保留し、ログアウトは失敗として返す。マーカー検査が時間切れなら理由 `checkTimedOut` で再検査でき、アクセスエラーなら `markerInaccessible` を返す。どちらもアプリ再起動の選択肢を出す。マーカーの記録と資格情報の削除が両方失敗した時は `markerAndDeleteFailed`、設定ディレクトリまたはロックを置くローカルデータフォルダーを取得できない時は `markerUnavailable` を返す。保留時は `logoutPending` と必要に応じて固定の `logoutIssue` を返す。設定画面から再試行できる。
-- 設定には状態、アカウント、期限（残り 14 日以下は警告）、ログイン / 取消 / ログアウトと再試行、ClientID 上書きとコールバック URL を表示する。状態の取得に失敗した時は理由と再読込ボタンを表示する。`get_twitcasting_status` / `reload_twitcasting_status` / `connect_twitcasting` / `cancel_twitcasting_login` / `disconnect_twitcasting` を使い、接続時は ClientID だけ即時保存する。ツイキャス側の許可解除は連携アプリ設定で行う。
+- 設定には状態、アカウント、期限（残り 14 日以下は警告）、ログイン / 取消 / ログアウトと再試行、ClientID 上書きとコールバック URL を表示する。状態の取得に失敗した時は理由と再読込ボタンを表示する。`get_twitcasting_status` / `reload_twitcasting_status` / `connect_twitcasting` / `cancel_twitcasting_login` / `disconnect_twitcasting` を使い、接続時は ClientID と待受ポートを即時保存する。設定画面は保存完了の通知を受けて ClientID を反映し、認証待ちの間も通常保存に引き継ぐ。ツイキャス側の許可解除は連携アプリ設定で行う。
 - 残るリスク。Implicit のフラグメント付き URL が一瞬ブラウザ履歴に載る。待受終了後のコールバックでは接続拒否画面の URL 欄にトークンが残る場合がある。遅れた書き込みの巻き戻し前にアプリが終了するか、巻き戻しが 3 回失敗すると、取り消したトークンが次の起動で復元されうる。旧版や資格情報マネージャーなど、同じファイルロックを使わない更新は、OS ストアの照合と削除の間に入りうる。旧形式の任意マーカーが残っている間は、現在値を対象にし、新しいログインの保存を保留する。明示ログアウトで削除とマーカーの永続化が両方失敗した場合や、生の値を読めず対象を記録できなかった場合は、削除が成功する前に終了すると旧値が次回起動で復元されうる。時刻による照合は壁時計の変更やミリ秒単位の丸め、受付前に取得され受付後に保存された grant により、実際の資格情報の保存順とずれる場合がある。PR1 は認証のみで、コメント受信は後続 PR。
 
 ## 2. 全体アーキテクチャ
@@ -361,13 +361,13 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
   - `obs`: ポートに加え `maxRows` / `fontScalePct` / `ttlMs` / `bgOpacityPct` / `position` 等の見た目設定。範囲外値が入らないよう **Rust 側でも `normalize()` で clamp**(`maxRows` 1..=1000, `fontScalePct` 50..=200, `bgOpacityPct` 0..=100, `ttlMs` 500..=600000, `position`∈{top,bottom})。`normalize()` は config ロード時と `update_config` 適用時の両方で呼ぶ。上限定数は Rust 側に1箇所(`MAX_OBS_ROWS`)を置き UI/テンプレと値を揃える。
   - `channels[].ownStream`(bool 既定false): 「自分の配信」の印(X 自動告知の対象)。旧 config は欠落で false。
   - `xPost{enabled=false, mode="intent"|"api"="intent", intentOpen="button"|"auto"="button", combine=false, template, delaySecs=60, staleMinutes=15, cooldownMinutes=60, dailyLimit=5, callbackPort=47821}`: X 自動告知。`template` 既定は `{title}\n{url}\n{date} {time}`。全項目 serde default。`normalize_all()` で clamp(`delaySecs` 0..=600, `staleMinutes` 0..=180, `cooldownMinutes` 10..=1440, `dailyLimit` 1..=20、`mode` / `intentOpen` は不正値なら既定)。
-  - `twitcasting{callbackPort=39822}`: ツイキャスのログイン待受ポート(§1.3)。serde default で旧 config.json も読める。検証は `xPost.callbackPort` と同じ(UI は 1024〜65535 の整数だけ通し、`connect_twitcasting` は 0 を拒否)。設定画面のログイン(`connect_twitcasting`)が `credentials.twitcastingClientId` と一緒にこの値だけを保存し、待受と status の `callbackUrl` に使う。
+  - `twitcasting{callbackPort=39822}`: ツイキャスのログイン待受ポート(§1.3)。serde default で旧 config.json も読める。`xPost.callbackPort` と同じく、設定画面と接続コマンドは 1024〜65535 の整数を受け付ける。設定ロードと `update_config` では 1024 未満を各サービスの既定値に戻す。設定画面のログイン(`connect_twitcasting`)が `credentials.twitcastingClientId` と一緒にこの値だけを保存し、待受と status の `callbackUrl` に使う。
   - `credentials.twitcastingClientId`(任意): ツイキャス公開 ClientID の上書き。未設定は JSON から省略し、空欄なら既定値を使用する。トークンは資格情報一覧の `twitcasting-oauth-token` にのみ保存する(§1.3)。
   - `credentials.xPostClientId`(任意): API モード用の X OAuth 2.0 Client ID。未設定なら JSON に出さない。設定画面の「X に接続」(`connect_x_post`)が `xPost.callbackPort` と一緒にこの 2 項目だけを保存する。
   - `xOverrides.endpoints` の `postAuthorizeUrl` / `postTokenUrl` / `postTweetsUrl` / `postUsersMeUrl`: API モードの X エンドポイントの上書き(起動時に読む。変えたらアプリを再起動)。
   - X 投稿の認証は `config.json` に置かない: OS 資格情報ストア(`secret_store`)のエントリ `x-post-oauth-token` に `{ clientId, refreshToken, userId, username }`。access token はメモリのみ。
   - 台帳 `<config_dir>/x-autopost-ledger.json`(§13)。
-- 起動時ロード、変更時保存。`config.json` をアプリ設定の正本とする。
+- 起動時ロード、変更時保存。`config.json` をアプリ設定の正本とする。読込時は JSON の末尾まで検証する。設定の型エラーは固定の項目名で示し、入力値や任意のマップキーをログ・画面に出さない。インポート後は Rust の正規化済み設定を取得してフォームに反映する。
 - **localStorage 併用**: 一部のUI/ウィンドウ局所設定は各ウィンドウの `localStorage` に保持する(`config.json` には載せない)。現状: 弾幕表示設定(`fc.danmaku`)、テーマ、最前面ピン状態、コマンドパレット履歴 等。これらはウィンドウローカルかつ低リスクなため意図的に localStorage 側に置いている。
 
 ## 11. フェーズ計画
