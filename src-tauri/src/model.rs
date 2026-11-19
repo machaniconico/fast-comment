@@ -14,6 +14,8 @@ pub enum Platform {
     X,
     /// ニコニコ生放送。
     Niconico,
+    /// ツイキャス。
+    Twitcasting,
 }
 
 /// 配信 1 回分の情報(X 自動告知の入力)。
@@ -397,6 +399,15 @@ mod tests {
             before_ms: Some(100),
         };
         assert!(!user.matches(&msg));
+    }
+
+    #[test]
+    fn twitcasting_platform_serializes_as_lowercase_name() {
+        use super::Platform;
+        let value = serde_json::to_value(Platform::Twitcasting).unwrap();
+        assert_eq!(value, serde_json::json!("twitcasting"));
+        let decoded: Platform = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, Platform::Twitcasting);
     }
 
     #[test]
