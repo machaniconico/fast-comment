@@ -56,6 +56,13 @@
       run: () => { store.setFilterPlatform('niconico'); ui.setTab('comments'); },
     },
     {
+      id: 'filter-twitcasting',
+      title: 'フィルタ: ツイキャス',
+      keywords: ['twitcasting', 'twitcas', 'filter', 'フィルタ', 'ツイキャス', 'ツイキャ'],
+      icon: '🔷',
+      run: () => { store.setFilterPlatform('twitcasting'); ui.setTab('comments'); },
+    },
+    {
       id: 'clear',
       title: '一覧をクリア',
       keywords: ['clear', 'クリア', 'delete', '削除', 'reset'],

@@ -86,6 +86,7 @@ html, body {
 .platform-dot.youtube { background: #ff2d2d; }
 .platform-dot.x { background: #1da1f2; }
 .platform-dot.niconico { background: #fcc800; }
+.platform-dot.twitcasting { background: #1e78ff; }
 .hide-platform .platform-dot { display: none; }
 
 .author {

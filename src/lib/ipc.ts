@@ -583,14 +583,14 @@ export interface Participant {
 }
 
 export interface ChannelConfig {
-  platform: 'twitch' | 'youtube' | 'x' | 'niconico';
-  identifier: string; // Twitch: channel name, YouTube: videoId, X: broadcast URL/ID, niconico: lv番組ID/URL
+  platform: 'twitch' | 'youtube' | 'x' | 'niconico' | 'twitcasting';
+  identifier: string; // Twitch: channel name, YouTube: videoId, X: broadcast URL/ID, niconico: lv番組ID/URL, twitcasting: 配信者ID/URL
   enabled: boolean; // Rust ChannelConfig.enabled (serde default true)
   ownStream?: boolean; // 「自分の配信」の印(X 自動告知の対象)。serde default false
 }
 
 export interface InjectTestCommentOptions {
-  platform: 'twitch' | 'youtube' | 'x' | 'niconico';
+  platform: 'twitch' | 'youtube' | 'x' | 'niconico' | 'twitcasting';
   name: string;
   text: string;
   kind?: 'normal' | 'superChat' | 'membership' | 'bits' | 'gift';

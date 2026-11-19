@@ -386,7 +386,7 @@
       {:else}
         {#each participants as p (participantKey(p))}
           <div class="participant-row" class:picked={p.picked} role="listitem">
-            <span class="platform" class:twitch={p.platform === 'twitch'} class:youtube={p.platform === 'youtube'} class:x={p.platform === 'x'} class:niconico={p.platform === 'niconico'}>
+            <span class="platform" class:twitch={p.platform === 'twitch'} class:youtube={p.platform === 'youtube'} class:x={p.platform === 'x'} class:niconico={p.platform === 'niconico'} class:twitcasting={p.platform === 'twitcasting'}>
               {p.platform}
             </span>
             <span class="name">{p.name}</span>
@@ -722,6 +722,10 @@
 
   .platform.niconico {
     color: #fcc800;
+  }
+
+  .platform.twitcasting {
+    color: #1e78ff;
   }
 
   .name,

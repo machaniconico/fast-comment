@@ -83,6 +83,7 @@ html, body {
 .platform-dot.youtube { background: #ff0000; }
 .platform-dot.x { background: #1da1f2; }
 .platform-dot.niconico { background: #fcc800; }
+.platform-dot.twitcasting { background: #1e78ff; }
 
 .author {
   min-width: 0;
