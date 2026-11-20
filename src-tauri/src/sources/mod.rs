@@ -116,6 +116,8 @@ pub struct SourceManager {
     x_auth: Option<x::XAuth>,
     /// ニコニコ生放送の overrides スナップショット。
     niconico_overrides: crate::config::NiconicoOverrides,
+    /// ツイキャス非公式経路の overrides スナップショット。
+    twitcasting_overrides: twitcasting::TwitcastingOverrides,
 }
 
 impl SourceManager {
@@ -127,6 +129,7 @@ impl SourceManager {
         x_overrides: crate::config::XOverrides,
         x_auth: Option<x::XAuth>,
         niconico_overrides: crate::config::NiconicoOverrides,
+        twitcasting_overrides: twitcasting::TwitcastingOverrides,
         metadata_tx: Option<mpsc::Sender<YoutubeMetadataUpdate>>,
         reaction_tx: Option<mpsc::Sender<Vec<YoutubeReaction>>>,
         mod_tx: Option<mpsc::Sender<ModerationEvent>>,
@@ -142,6 +145,7 @@ impl SourceManager {
             x_overrides,
             x_auth,
             niconico_overrides,
+            twitcasting_overrides,
         }
     }
 
@@ -211,6 +215,17 @@ impl SourceManager {
                     run_with_logging(&src, tx, child).await;
                 });
             }
+            ChannelPlatform::Twitcasting => {
+                let src = twitcasting::TwitcastingSource::new(
+                    identifier,
+                    self.twitcasting_overrides.clone(),
+                    metadata_tx,
+                )
+                .with_live_tx(self.live_tx.clone());
+                tauri::async_runtime::spawn(async move {
+                    run_with_logging(&src, tx, child).await;
+                });
+            }
         }
 
         cancel
@@ -259,5 +274,49 @@ mod tests {
         // 受信側が閉じていても戻る。
         drop(rx);
         send_live_event(&tx, ended());
+    }
+
+    fn manager(metadata_tx: mpsc::Sender<YoutubeMetadataUpdate>) -> SourceManager {
+        let (tx, _rx) = broadcast::channel(4);
+        SourceManager::new(
+            tx,
+            Default::default(),
+            String::new(),
+            Default::default(),
+            None,
+            Default::default(),
+            Default::default(),
+            Some(metadata_tx),
+            None,
+            None,
+        )
+    }
+
+    fn twitcasting_channel(enabled: bool) -> ChannelConfig {
+        ChannelConfig {
+            platform: ChannelPlatform::Twitcasting,
+            // 解釈できない識別子は起動直後に状態メッセージを出して待機する(通信しない)。
+            identifier: "!!".to_string(),
+            enabled,
+            own_stream: false,
+        }
+    }
+
+    /// 登録したツイキャスは TwitcastingSource が起動し、enabled=false は起動しない。
+    #[tokio::test]
+    async fn spawn_channel_starts_twitcasting_only_when_enabled() {
+        let (mtx, mut mrx) = mpsc::channel(8);
+        let m = manager(mtx);
+        let off = m.spawn_channel(&twitcasting_channel(false));
+        let quiet = tokio::time::timeout(Duration::from_millis(300), mrx.recv()).await;
+        assert!(quiet.is_err(), "enabled=false なのに Source が動いた");
+        let on = m.spawn_channel(&twitcasting_channel(true));
+        let update = tokio::time::timeout(Duration::from_secs(5), mrx.recv())
+            .await
+            .expect("Source が起動していない")
+            .expect("channel closed");
+        assert_eq!(update.platform, Platform::Twitcasting);
+        on.cancel();
+        off.cancel();
     }
 }

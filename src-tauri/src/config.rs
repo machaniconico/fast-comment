@@ -41,6 +41,8 @@ pub enum ChannelPlatform {
     X,
     /// ニコニコ生放送。identifier は番組URL または lv 番組ID。
     Niconico,
+    /// ツイキャス。identifier は配信者 ID(screen_id)または URL。
+    Twitcasting,
 }
 
 const MAX_OBS_ROWS: u16 = 1000;
@@ -692,6 +694,10 @@ impl Default for ParticipationConfig {
     }
 }
 
+fn twitcasting_overrides_is_default(o: &crate::sources::twitcasting::TwitcastingOverrides) -> bool {
+    *o == Default::default()
+}
+
 /// YouTube InnerTube の仕様変更を再ビルド無しで吸収するための上書き設定。
 ///
 /// いずれも `None`/空のときは parser/innertube 側の既定挙動を使う。
@@ -924,6 +930,9 @@ pub struct AppConfig {
     pub x_overrides: XOverrides,
     #[serde(default)]
     pub niconico_overrides: NiconicoOverrides,
+    /// ツイキャス非公式経路の上書き。空なら保存時に出力しない(旧 config と同形に保つ)。
+    #[serde(default, skip_serializing_if = "twitcasting_overrides_is_default")]
+    pub twitcasting_overrides: crate::sources::twitcasting::TwitcastingOverrides,
     #[serde(default)]
     pub credentials: CredentialsConfig,
     #[serde(default)]
@@ -949,6 +958,7 @@ impl Default for AppConfig {
             youtube_overrides: YoutubeOverrides::default(),
             x_overrides: XOverrides::default(),
             niconico_overrides: NiconicoOverrides::default(),
+            twitcasting_overrides: Default::default(),
             credentials: CredentialsConfig::default(),
             x_post: XPostConfig::default(),
             twitcasting: TwitcastingConfig::default(),
@@ -1322,6 +1332,21 @@ mod tests {
     }
 
     #[test]
+    fn twitcasting_overrides_absent_in_old_config_and_omitted_when_empty() {
+        let cfg: AppConfig = serde_json::from_str(r#"{"channels":[]}"#).expect("old config");
+        assert_eq!(cfg.twitcasting_overrides, Default::default());
+        let json: serde_json::Value = serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert!(json.get("twitcasting_overrides").is_none());
+        assert!(json.get("twitcastingOverrides").is_none());
+        let cfg: AppConfig = serde_json::from_str(
+            r#"{"twitcastingOverrides":{"endpoints":{"userPageBaseUrl":"https://x.test/"}}}"#,
+        )
+        .expect("with overrides");
+        let json: serde_json::Value = serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(json["twitcastingOverrides"]["endpoints"]["userPageBaseUrl"], "https://x.test/");
+    }
+
+    #[test]
     fn twitcasting_callback_port_reads_configured_value() {
         let cfg: AppConfig =
             serde_json::from_str(r#"{"twitcasting":{"callbackPort":40123}}"#).expect("twitcasting");
@@ -1522,6 +1547,7 @@ mod tests {
                 live_poll_secs: Some(45),
             },
             niconico_overrides: NiconicoOverrides::default(),
+            twitcasting_overrides: Default::default(),
             x_post: XPostConfig::default(),
             twitcasting: TwitcastingConfig::default(),
         };

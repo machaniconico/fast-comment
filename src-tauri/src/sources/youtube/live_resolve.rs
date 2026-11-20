@@ -148,6 +148,7 @@ pub fn spawn_live_resolve_poller(
             crate::config::XOverrides::default(),
             None,
             crate::config::NiconicoOverrides::default(),
+            crate::sources::twitcasting::TwitcastingOverrides::default(),
             Some(metadata_tx.clone()),
             Some(reaction_tx),
             Some(mod_tx),

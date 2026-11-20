@@ -83,3 +83,23 @@ pub fn generic(event_id: &str, matched: &Matched, msg: &ChatMessage, sent_at_ms:
     }
     v
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::webhook::Trigger;
+
+    #[test]
+    fn twitcasting_label_and_platform_key_are_used() {
+        let req: crate::api::TestCommentRequest =
+            serde_json::from_value(serde_json::json!({"platform": "twitcasting"})).unwrap();
+        let msg = crate::inject::build_test_messages(&req).unwrap().remove(0);
+        let matched = Matched {
+            trigger: Trigger::Test,
+            keyword: None,
+        };
+        assert!(discord(&matched, &msg).to_string().contains("ツイキャス"));
+        let v = generic("e", &matched, &msg, 0);
+        assert_eq!(v["comment"]["platform"], "twitcasting");
+    }
+}

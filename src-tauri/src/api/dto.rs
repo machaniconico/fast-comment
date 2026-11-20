@@ -134,3 +134,16 @@ pub fn api_comment_json(seq: u64, msg: &ChatMessage) -> Value {
     };
     serde_json::to_value(dto).expect("API comment serialization")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn twitcasting_platform_is_serialized_as_twitcasting() {
+        let req: crate::api::TestCommentRequest =
+            serde_json::from_value(serde_json::json!({"platform": "twitcasting"})).unwrap();
+        let msg = crate::inject::build_test_messages(&req).unwrap().remove(0);
+        assert_eq!(api_comment_json(1, &msg)["platform"], "twitcasting");
+    }
+}

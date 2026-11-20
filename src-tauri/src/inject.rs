@@ -13,6 +13,7 @@ pub fn build_test_messages(req: &TestCommentRequest) -> Result<Vec<ChatMessage>,
         "youtube" => Platform::Youtube,
         "x" => Platform::X,
         "niconico" => Platform::Niconico,
+        "twitcasting" => Platform::Twitcasting,
         other => return Err(format!("不正な platform です: {other}")),
     };
     let kind = match req.kind.as_str() {
@@ -103,5 +104,15 @@ mod tests {
             assert!(amount.value.is_sign_positive());
             assert_eq!(amount.raw_text, "¥0");
         }
+    }
+
+    #[test]
+    fn twitcasting_platform_is_accepted() {
+        let req: TestCommentRequest = serde_json::from_value(serde_json::json!({
+            "platform": "twitcasting",
+        }))
+        .unwrap();
+        let messages = build_test_messages(&req).unwrap();
+        assert_eq!(messages[0].platform, Platform::Twitcasting);
     }
 }
