@@ -410,17 +410,24 @@
     onConfigSaved?.(importedConfig);
   }
 
+  function readConfigWithTimeout(): Promise<AppConfig | null> {
+    let timeout: number | undefined;
+    const deadline = new Promise<null>(resolve => {
+      timeout = window.setTimeout(() => resolve(null), 10_000);
+    });
+    return Promise.race([getConfig().catch(() => null), deadline])
+      .finally(() => window.clearTimeout(timeout));
+  }
+
   async function reloadImportedConfig() {
-    if (reloadingConfig) return;
+    if (destroyed || reloadingConfig) return;
     reloadingConfig = true;
     try {
-      const saved = await getConfig();
-      if (saved) {
+      const saved = await readConfigWithTimeout();
+      if (!destroyed && saved) {
         onConfigImported(saved);
         configSync.reloadRequired = false;
       }
-    } catch {
-      // 再読込に成功してフォームを置き換えるまで保存を止める。
     } finally {
       reloadingConfig = false;
     }
@@ -445,12 +452,7 @@
   async function reloadOAuthConfig(service: OAuthService) {
     if (destroyed) return;
     const revision = oauthConfigRevision[service];
-    let timeout: number | undefined;
-    const deadline = new Promise<null>(resolve => {
-      timeout = window.setTimeout(() => resolve(null), 10_000);
-    });
-    const saved = await Promise.race([getConfig().catch(() => null), deadline])
-      .finally(() => window.clearTimeout(timeout));
+    const saved = await readConfigWithTimeout();
     // 読込中にインポートなどで設定を置き換えた場合は、その値を使う。
     if (destroyed || oauthConfigRevision[service] !== revision) return;
     if (!saved) {

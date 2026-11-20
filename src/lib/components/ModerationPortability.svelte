@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { getConfig, setConfig, type AppConfig } from '../ipc';
+  import { getConfig, setModeration, type AppConfig } from '../ipc';
 
   const SCHEMA = 'fast-comment-moderation';
 
@@ -178,16 +178,7 @@
     importing = true;
     status = null;
     try {
-      const currentConfig = await getConfig();
-      if (!currentConfig) {
-        showError('現在の設定を取得できませんでした。Tauri環境で開いてから再試行してください。');
-        return;
-      }
-
-      await setConfig({
-        ...currentConfig,
-        moderation,
-      });
+      await setModeration(moderation);
       await onImported();
       showSuccess('モデレーション規則をインポートしました。');
     } catch (e) {

@@ -208,6 +208,39 @@ for (const service of services) {
     assert.equal(next[service.key].callbackPort, 40321);
   }));
 
+  test(service.name + ' retries a timed-out manual reload and ignores its late reply', async t => withSettings(t, async page => {
+    await start(page);
+    await accept(page);
+    await page.evaluate(() => { window.mock.readsToFail = 1; });
+    await finish(page, 'cancelled');
+    const reload = page.getByRole('button', { name: '設定を再読み込み', exact: true });
+    await reload.waitFor();
+    await page.clock.install();
+    await page.evaluate(() => { window.mock.holdReads = true; });
+    await reload.click();
+    await page.waitForFunction(() => window.mock.heldReads.length === 1);
+    assert.equal(await page.getByRole('button', { name: '読込中...', exact: true }).isDisabled(), true);
+
+    await page.clock.fastForward(10_000);
+    await reload.waitFor();
+    assert.equal(await reload.isEnabled(), true);
+    assert.equal(await save(page).isDisabled(), true);
+    await page.evaluate(({ key, id }) => {
+      window.mock.saved.credentials[id] = 'retry-client';
+      window.mock.saved[key].callbackPort = 40322;
+      window.mock.holdReads = false;
+    }, service);
+    await reload.click();
+    await page.waitForFunction(prefix => document.getElementById(prefix + '-port').value === '40322', service.prefix);
+    await page.evaluate(() => {
+      window.mock.heldReads.shift()();
+      return new Promise(resolve => requestAnimationFrame(resolve));
+    });
+    assert.equal(await id(page).inputValue(), 'retry-client');
+    assert.equal(await port(page).inputValue(), '40322');
+    assert.equal(await save(page).isEnabled(), true);
+  }));
+
   test(service.name + ' cancels the login attempt it started', async t => withSettings(t, async page => {
     await start(page);
     const attempt = await page.evaluate(key => window.mock.login[key].attempt, service.key);
@@ -299,18 +332,11 @@ test('the main window preserves OAuth settings when saving the goals toggle', as
   assert.equal(config.twitcasting.callbackPort, 43421);
 }, 'app'));
 
-test('the goals toggle preserves both OAuth settings committed before its save', async t => withSettings(t, async page => {
-  const toggle = page.getByRole('checkbox', { name: 'コメビュに表示' });
-  await toggle.waitFor();
-  await page.evaluate(() => {
-    window.mock.holdReads = true;
-    window.mock.holdGoalsWrites = true;
-  });
-  await toggle.click();
-  // Pause the old path after it snapshots A, or the field-specific path before it writes.
-  await page.waitForFunction(() => window.mock.heldReads.length + window.mock.heldGoalsWrites.length === 1);
-  await page.evaluate(async ({ services }) => {
-    for (const [key, command] of services) {
+async function commitOAuthBeforeWrite(page, heldWrites, holdWrites) {
+  // The old path pauses after taking a snapshot. The field-specific path pauses before writing.
+  await page.waitForFunction(held => window.mock.heldReads.length + window.mock[held].length === 1, heldWrites);
+  await page.evaluate(async ({ heldWrites, holdWrites }) => {
+    for (const [key, command] of [['xPost', 'connect_x_post'], ['twitcasting', 'connect_twitcasting']]) {
       const login = window.__TAURI_INTERNALS__.invoke(command, {
         attempt: crypto.randomUUID(), clientId: 'new-' + key, callbackPort: 43421,
       });
@@ -319,15 +345,66 @@ test('the goals toggle preserves both OAuth settings committed before its save',
       await login;
     }
     window.mock.holdReads = false;
-    window.mock.holdGoalsWrites = false;
-    (window.mock.heldReads.shift() ?? window.mock.heldGoalsWrites.shift())();
-  }, { services: [['xPost', 'connect_x_post'], ['twitcasting', 'connect_twitcasting']] });
+    window.mock[holdWrites] = false;
+    (window.mock.heldReads.shift() ?? window.mock[heldWrites].shift())();
+  }, { heldWrites, holdWrites });
+}
 
-  await page.waitForFunction(() => window.mock.saved.goals.showInApp === true);
-  assert.equal(await toggle.isChecked(), true);
+async function assertOAuthPreserved(page) {
   const config = await saved(page);
   for (const { key, id } of services) {
     assert.equal(config.credentials[id], 'new-' + key);
     assert.equal(config[key].callbackPort, 43421);
   }
+}
+
+test('the goals toggle preserves both OAuth settings committed before its save', async t => withSettings(t, async page => {
+  const toggle = page.getByRole('checkbox', { name: 'コメビュに表示' });
+  await toggle.waitFor();
+  await page.evaluate(() => {
+    window.mock.holdReads = true;
+    window.mock.holdGoalsWrites = true;
+  });
+  await toggle.click();
+  await commitOAuthBeforeWrite(page, 'heldGoalsWrites', 'holdGoalsWrites');
+  await page.waitForFunction(() => window.mock.saved.goals.showInApp === true);
+  assert.equal(await toggle.isChecked(), true);
+  await assertOAuthPreserved(page);
 }, 'app'));
+
+test('comment NG append preserves both OAuth settings committed before its save', async t => withSettings(t, async page => {
+  await page.getByRole('checkbox', { name: 'コメビュに表示' }).waitFor();
+  await page.evaluate(() => window.mock.pushComment({
+    id: 'ng-comment', platform: 'twitch', channel: 'test-channel', kind: 'normal',
+    timestampMs: Date.now(),
+    author: { id: 'test-user', name: 'Test Author', badges: [], roles: {} },
+    fragments: [{ type: 'text', text: 'Test comment' }],
+  }));
+  await page.getByRole('button', { name: 'コメント操作メニューを開く' }).click();
+  await page.evaluate(() => {
+    window.mock.holdReads = true;
+    window.mock.holdModerationWrites = true;
+  });
+  await page.getByRole('menuitem', { name: 'この人をNGユーザーに追加' }).click();
+  await commitOAuthBeforeWrite(page, 'heldModerationWrites', 'holdModerationWrites');
+  await page.waitForFunction(() => window.mock.saved.moderation.ngUsers.includes('Test Author'));
+  await assertOAuthPreserved(page);
+  assert.deepEqual((await saved(page)).moderation, { ngWords: [], ngUsers: ['Test Author'], highlights: [] });
+  assert.equal(await page.evaluate(() => window.mock.writes.length), 0);
+}, 'app'));
+
+test('moderation import preserves both OAuth settings committed before its save', async t => withSettings(t, async page => {
+  const moderation = { ngWords: ['spam'], ngUsers: ['bot'], highlights: ['important'] };
+  const input = page.locator('#moderation-import-json');
+  await input.fill(JSON.stringify({ moderation }));
+  await page.evaluate(() => {
+    window.mock.holdReads = true;
+    window.mock.holdModerationWrites = true;
+  });
+  await page.locator('.portability').filter({ has: input }).getByRole('button', { name: 'テキストから読込' }).click();
+  await commitOAuthBeforeWrite(page, 'heldModerationWrites', 'holdModerationWrites');
+  await page.getByText('モデレーション規則をインポートしました。', { exact: true }).waitFor();
+  await assertOAuthPreserved(page);
+  assert.deepEqual((await saved(page)).moderation, moderation);
+  assert.equal(await page.evaluate(() => window.mock.writes.length), 0);
+}));

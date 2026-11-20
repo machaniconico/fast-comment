@@ -3,6 +3,7 @@ import App from '../../src/App.svelte';
 import Settings from '../../src/lib/components/Settings.svelte';
 import ConfigPortability from '../../src/lib/components/ConfigPortability.svelte';
 import { theme } from '../../src/lib/theme.svelte';
+import { store } from '../../src/lib/stores.svelte';
 
 const initial = {
   channels: [],
@@ -38,10 +39,13 @@ const mock = window.mock = {
   holdReads: false,
   heldGoalsWrites: [],
   holdGoalsWrites: false,
+  heldModerationWrites: [],
+  holdModerationWrites: false,
   login: {},
   cancels: [],
   callbacks: new Map(),
   appearance: () => theme.getSnapshot(),
+  pushComment: comment => store.pushBatch([comment]),
 };
 
 window.confirm = () => true;
@@ -93,6 +97,20 @@ if (location.search === '?browser') {
           }
           mock.saved.goals.showInApp = args.showInApp;
           return null;
+        case 'append_moderation_value':
+        case 'set_moderation': {
+          if (mock.holdModerationWrites) {
+            await new Promise(resolve => mock.heldModerationWrites.push(resolve));
+          }
+          if (command === 'set_moderation') {
+            mock.saved.moderation = structuredClone(args.moderation);
+            return null;
+          }
+          const value = args.value.trim();
+          const entries = mock.saved.moderation[args.kind];
+          if (value && !entries.includes(value)) entries.push(value);
+          return value || null;
+        }
         case 'cancel_twitcasting_login':
         case 'cancel_x_post_login':
           mock.cancels.push({ command, attempt: args.attempt });

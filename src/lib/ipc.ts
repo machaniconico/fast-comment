@@ -628,6 +628,11 @@ export async function setGoalsShowInApp(showInApp: boolean): Promise<void> {
   await invoke<void>('set_goals_show_in_app', { showInApp });
 }
 
+export async function setModeration(moderation: AppConfig['moderation']): Promise<void> {
+  if (!isTauri()) throw new Error('Tauri環境で開いてから再試行してください。');
+  await invoke<void>('set_moderation', { moderation });
+}
+
 export async function setTtsPaused(paused: boolean): Promise<void> {
   await invoke<void>('set_tts_paused', { paused });
 }
@@ -679,17 +684,9 @@ export async function startListenerUpdatedListener(handler: (u: ListenerUpdate) 
 
 /** Append a value to the moderation NG list (ngUsers / ngWords) in the config. */
 export async function appendModerationValue(kind: 'ngUsers' | 'ngWords', value: string): Promise<void> {
-  const normalized = value.trim();
+  const normalized = await invoke<string>('append_moderation_value', { kind, value });
   if (!normalized) return;
 
-  const config = await getConfig();
-  if (!config) return;
-
-  const current = config.moderation[kind] ?? [];
-  if (!current.includes(normalized)) {
-    config.moderation[kind] = [...current, normalized];
-    await setConfig(config);
-  }
   // Let an open Settings form merge it into its unsaved edit state, otherwise its next save
   // would overwrite the config with the stale list and drop this entry.
   window.dispatchEvent(new CustomEvent<ModerationAppended>(MODERATION_APPENDED_EVENT, { detail: { kind, value: normalized } }));

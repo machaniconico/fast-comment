@@ -31,7 +31,7 @@ mod templates;
 pub mod tts;
 mod update;
 
-use std::collections::{hash_map::Entry, HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::net::TcpStream;
 use std::path::PathBuf;
@@ -1089,13 +1089,25 @@ fn parse_oauth_attempt(attempt: &str) -> Result<Uuid, &'static str> {
     Uuid::parse_str(attempt).map_err(|_| "ログインの試行 ID が不正です")
 }
 
-const MAX_OAUTH_CANCELLED_BEFORE_BEGIN: usize = 32;
+const MAX_OAUTH_RETIRED_ATTEMPTS: usize = 32;
 
 #[derive(Default)]
 struct OAuthAttempts {
     running: HashMap<Uuid, CancellationToken>,
-    /// 試行が未登録だった時の取消を、受け付けた順に保持する。
-    cancelled_before_begin: VecDeque<Uuid>,
+    /// 開始前に取り消した試行と終了した試行を、確定順に保持する。
+    retired: VecDeque<Uuid>,
+}
+
+impl OAuthAttempts {
+    fn retire(&mut self, attempt: Uuid) {
+        if self.retired.contains(&attempt) {
+            return;
+        }
+        if self.retired.len() == MAX_OAUTH_RETIRED_ATTEMPTS {
+            self.retired.pop_front();
+        }
+        self.retired.push_back(attempt);
+    }
 }
 
 /// 1 サービスの OAuth ログインの開始順と、試行 ID ごとの取消を管理する。
@@ -1115,11 +1127,8 @@ impl OAuthLoginGate {
         let mut attempts = self.attempts.lock().unwrap();
         if let Some(cancel) = attempts.running.get(&attempt) {
             cancel.cancel();
-        } else if !attempts.cancelled_before_begin.contains(&attempt) {
-            if attempts.cancelled_before_begin.len() == MAX_OAUTH_CANCELLED_BEFORE_BEGIN {
-                attempts.cancelled_before_begin.pop_front();
-            }
-            attempts.cancelled_before_begin.push_back(attempt);
+        } else {
+            attempts.retire(attempt);
         }
     }
 
@@ -1127,15 +1136,10 @@ impl OAuthLoginGate {
         let cancel = CancellationToken::new();
         {
             let mut attempts = self.attempts.lock().unwrap();
-            let cancelled = &mut attempts.cancelled_before_begin;
-            if let Some(index) = cancelled.iter().position(|&id| id == attempt) {
-                cancelled.remove(index);
+            if attempts.running.contains_key(&attempt) || attempts.retired.contains(&attempt) {
                 return None;
             }
-            match attempts.running.entry(attempt) {
-                Entry::Occupied(_) => return None,
-                Entry::Vacant(entry) => entry.insert(cancel.clone()),
-            };
+            attempts.running.insert(attempt, cancel.clone());
         }
         let mut login = OAuthLogin {
             gate: self,
@@ -1182,7 +1186,9 @@ impl OAuthLogin<'_> {
 
 impl Drop for OAuthLogin<'_> {
     fn drop(&mut self) {
-        self.gate.attempts.lock().unwrap().running.remove(&self.attempt);
+        let mut attempts = self.gate.attempts.lock().unwrap();
+        attempts.running.remove(&self.attempt);
+        attempts.retire(self.attempt);
     }
 }
 
@@ -1403,6 +1409,65 @@ async fn set_goals_show_in_app(state: State<'_, AppState>, show_in_app: bool) ->
     *current = next.clone();
     state.config_tx.send_replace(next);
     Ok(())
+}
+
+/// 呼び出し側が config_write を保持した状態で、最新の moderation だけを保存・反映する。
+fn update_moderation(
+    state: &AppState,
+    edit: impl FnOnce(&mut config::ModerationConfig),
+) -> Result<(), String> {
+    let mut current = state.config.lock().unwrap();
+    let mut next = current.clone();
+    edit(&mut next.moderation);
+    if next.moderation == current.moderation {
+        return Ok(());
+    }
+    next.save(&state.config_dir)
+        .map_err(|_| "モデレーション規則を保存できませんでした".to_string())?;
+    state.moderator.lock().unwrap().update_config(&next.moderation);
+    *current = next.clone();
+    state.config_tx.send_replace(next);
+    Ok(())
+}
+
+#[tauri::command]
+async fn append_moderation_value(
+    state: State<'_, AppState>,
+    kind: serde_json::Value,
+    value: serde_json::Value,
+) -> Result<Option<String>, String> {
+    let select: fn(&mut config::ModerationConfig) -> &mut Vec<String> = match kind.as_str() {
+        Some("ngWords") => |rules: &mut config::ModerationConfig| &mut rules.ng_words,
+        Some("ngUsers") => |rules: &mut config::ModerationConfig| &mut rules.ng_users,
+        _ => return Err("NG リストの種類が不正です".into()),
+    };
+    let value = value
+        .as_str()
+        .ok_or("NG 規則は文字列で指定してください")?
+        .trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let _write = state.config_write.lock().await;
+    let value = value.to_owned();
+    update_moderation(&state, |rules| {
+        let entries = select(rules);
+        if !entries.contains(&value) {
+            entries.push(value.clone());
+        }
+    })?;
+    Ok(Some(value))
+}
+
+#[tauri::command]
+async fn set_moderation(
+    state: State<'_, AppState>,
+    moderation: serde_json::Value,
+) -> Result<(), String> {
+    let moderation = serde_json::from_value::<config::ModerationConfig>(moderation)
+        .map_err(|_| "モデレーション規則の形式が不正です".to_string())?;
+    let _write = state.config_write.lock().await;
+    update_moderation(&state, |rules| *rules = moderation)
 }
 
 /// チャンネルを1件追加して起動する。
@@ -3147,6 +3212,8 @@ pub fn run() {
             moderate_unban_user,
             update_config,
             set_goals_show_in_app,
+            append_moderation_value,
+            set_moderation,
             add_channel,
             remove_channel,
             hide_message,
@@ -3265,6 +3332,18 @@ mod followup_tests {
             gate.cancel(Uuid::new_v4());
         }
         assert!(begin.await.is_none());
+        assert!(gate.begin(attempt).await.is_none());
+        assert!(!gate.is_active());
+    }
+
+    #[tokio::test]
+    async fn oauth_review_finished_attempt_cannot_begin_again() {
+        let gate = OAuthLoginGate::default();
+        let attempt = Uuid::new_v4();
+        drop(gate.begin(attempt).await.unwrap());
+        assert!(gate.begin(attempt).await.is_none());
+        gate.cancel(attempt);
+        assert!(gate.begin(attempt).await.is_none());
         assert!(!gate.is_active());
     }
 
@@ -3284,16 +3363,17 @@ mod followup_tests {
             gate.cancel(attempt);
         }
 
-        // 終了済み試行への遅い取消が最古なので、新しい 32 件を残して捨てる。
-        drop(gate.begin(finished).await.unwrap());
+        // 終了済み試行は最古なので、新しい取消 32 件を残して捨てる。
         for attempt in pending {
             assert!(gate.begin(attempt).await.is_none());
         }
+        drop(gate.begin(finished).await.unwrap());
         assert!(gate.is_active());
         assert!(!login.cancelled());
         gate.cancel(running);
         assert!(login.cancelled());
         drop(login);
+        assert!(gate.begin(running).await.is_none());
         assert!(!gate.is_active());
     }
 

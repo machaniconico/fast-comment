@@ -130,8 +130,8 @@ fn compile_all(patterns: &[String], label: &str) -> Vec<Regex> {
         .filter(|p| !p.trim().is_empty())
         .filter_map(|p| match Regex::new(p) {
             Ok(re) => Some(re),
-            Err(e) => {
-                tracing::warn!("moderation {label} の正規表現が不正: {p:?}: {e}");
+            Err(_) => {
+                tracing::warn!("moderation {label} の正規表現が不正");
                 None
             }
         })
