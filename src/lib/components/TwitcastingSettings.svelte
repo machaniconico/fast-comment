@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { getTwitcastingStatus, reloadTwitcastingStatus, connectTwitcasting, cancelTwitcastingLogin, disconnectTwitcasting, newOAuthAttempt, type ConfigCommit, type OAuthClientSaved } from '../ipc';
+  import { getTwitcastingStatus, reloadTwitcastingStatus, connectTwitcasting, cancelTwitcastingLogin, disconnectTwitcasting, newOAuthAttempt, type ConfigSavedHandler, type OAuthClientSaved } from '../ipc';
   import type { TwitcastingStatus } from '../types';
   import { errorText } from '../xAutopost';
   import { DEFAULT_TWITCASTING_CALLBACK_PORT, twitcastingDisplayCallbackUrl } from '../twitcasting';
@@ -20,7 +20,7 @@
     onConnectingChange: (connecting: boolean) => void;
     onConnectionSettled: () => Promise<void>;
     /** 接続コマンドが ClientID と待受ポートを保存した。 */
-    onConfigSaved: (commit: ConfigCommit<OAuthClientSaved>) => void;
+    onConfigSaved: ConfigSavedHandler<OAuthClientSaved>;
   } = $props();
   let clientIdInput = $state('');
   $effect.pre(() => {
@@ -142,6 +142,8 @@
     } catch (e) {
       statusRequest += 1;
       latestStatus = null;
+      // 全体保存は ClientID を送らないので、欄を保存済みの値に戻して表示と揃える(待受ポートは全体保存で送る)。
+      clientIdInput = clientId;
       message = errorText(e);
       failed = true;
     } finally {

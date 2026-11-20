@@ -9,7 +9,7 @@
     openUrl,
     previewXPost,
     sendXTestPost,
-    type ConfigCommit,
+    type ConfigSavedHandler,
     type OAuthClientSaved,
   } from '../ipc';
   import type { XPostConfig, XPostErrorInfo, XPostPreview, XPostStatus } from '../ipc';
@@ -40,9 +40,9 @@
     onCallbackPortChange: (port: number | null) => void;
     onConnectingChange: (connecting: boolean) => void;
     /** 接続コマンドが ClientID と待受ポートを保存した。 */
-    onConfigSaved: (commit: ConfigCommit<OAuthClientSaved>) => void;
+    onConfigSaved: ConfigSavedHandler<OAuthClientSaved>;
     /** 切断が API モードを Intent モードへ戻して保存した。 */
-    onModeSaved: (commit: ConfigCommit<{ xPost: Pick<XPostConfig, 'mode'> }>) => void;
+    onModeSaved: ConfigSavedHandler<{ xPost: Pick<XPostConfig, 'mode'> }>;
   } = $props();
 
   // ── API モードの接続 ──
@@ -126,6 +126,8 @@
     } catch (e) {
       statusRequest += 1;
       latestStatus = null;
+      // 全体保存は ClientID を送らないので、欄を保存済みの値に戻して表示と揃える(待受ポートは全体保存で送る)。
+      clientIdInput = clientId;
       authMsg = errorText(e);
       authOk = false;
     } finally {

@@ -423,7 +423,9 @@
     configLoading = true;
     try {
       const loaded = await getConfigSnapshot();
-      if (loaded && loaded.revision > configRevision) {
+      // Tauri の外などで読めなかった時も失敗として扱い、再試行の上限に乗せる。
+      if (!loaded) throw new Error('config is unavailable');
+      if (loaded.revision > configRevision) {
         config = loaded.config;
         configRevision = loaded.revision;
         if (loaded.revision > configSync.revision) configSync.revision = loaded.revision;

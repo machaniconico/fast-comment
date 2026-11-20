@@ -75,6 +75,9 @@ window.confirm = () => true;
 
 if (location.search === '?browser') {
   mount(ConfigPortability, { target: document.body });
+} else if (location.search === '?browser-app') {
+  // Tauri なしでアプリ全体を開く(get_config は null になる)。
+  mount(App, { target: document.body });
 } else {
   window.__TAURI_INTERNALS__ = {
     metadata: { currentWindow: { label: 'main' } },

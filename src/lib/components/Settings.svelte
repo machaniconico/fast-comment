@@ -428,9 +428,10 @@
   }
 
   /** 自分が呼んだ書込の応答。基準 + 1 ちょうどなら書いた部分を反映して基準を進め、それより先なら読み直しを求める。 */
-  function applyCommit(revision: number | null, apply: () => void) {
+  function applyCommit(revision: number | null, apply: () => void, late = false) {
     if (revision === null || destroyed || !newerThanBase(revision)) return;
-    if (baseRevision !== undefined && revision === baseRevision + 1) {
+    // コマンドが settle した後に届いた接続系の通知は反映しない。基準より新しい保存なので読み直しを求める。
+    if (!late && baseRevision !== undefined && revision === baseRevision + 1) {
       apply();
       baseRevision = revision;
     } else {
@@ -516,8 +517,8 @@
     oauthConfigRevision[service] += 1;
   }
 
-  function onOAuthConfigSaved(service: OAuthService, commit: ConfigCommit<OAuthClientSaved>) {
-    applyCommit(commit.revision, () => applyOAuthClient(service, commit));
+  function onOAuthConfigSaved(service: OAuthService, commit: ConfigCommit<OAuthClientSaved>, late: boolean) {
+    applyCommit(commit.revision, () => applyOAuthClient(service, commit), late);
   }
 
   onMount(async () => {
@@ -1374,9 +1375,9 @@
     youtubeOauthMsg = 'ブラウザでGoogleアカウントを選び、許可してください…';
     youtubeOauthOk = null;
     try {
-      youtubeOauthStatus = await connectYoutubeOauth(clientId, commit => applyCommit(commit.revision, () => {
+      youtubeOauthStatus = await connectYoutubeOauth(clientId, (commit, late) => applyCommit(commit.revision, () => {
         if (config) config.credentials = { ...(config.credentials ?? {}), youtubeOauthClientId: commit.youtubeOauthClientId };
-      }));
+      }, late));
       moderation.setYoutubeConnected(youtubeOauthStatus?.connected === true);
       youtubeOauthMsg = 'Googleアカウントに接続しました';
       youtubeOauthOk = true;
@@ -2094,7 +2095,7 @@
       configReloading={reloading.twitcasting > 0}
       onConnectingChange={(connecting) => onOAuthConnectingChange('twitcasting', connecting)}
       onConnectionSettled={async () => { await reloadConfig(['twitcasting']); }}
-      onConfigSaved={(commit) => onOAuthConfigSaved('twitcasting', commit)}
+      onConfigSaved={(commit, late) => onOAuthConfigSaved('twitcasting', commit, late)}
       onCallbackPortChange={(port) => {
         twitcastingPortInvalid = port === null;
         if (config && port !== null) config.twitcasting = { ...(config.twitcasting ?? {}), callbackPort: port };
@@ -2114,10 +2115,10 @@
         configReloading={reloading.xPost > 0}
         onConnectingChange={(connecting) => onOAuthConnectingChange('xPost', connecting)}
         onConnectionSettled={async () => { await reloadConfig(['xPost']); }}
-        onConfigSaved={(commit) => onOAuthConfigSaved('xPost', commit)}
-        onModeSaved={(commit) => applyCommit(commit.revision, () => {
+        onConfigSaved={(commit, late) => onOAuthConfigSaved('xPost', commit, late)}
+        onModeSaved={(commit, late) => applyCommit(commit.revision, () => {
           if (config?.xPost) config.xPost.mode = commit.xPost.mode;
-        })}
+        }, late)}
         onCallbackPortChange={(port) => {
           xPostPortInvalid = port === null;
           if (config?.xPost && port !== null) config.xPost.callbackPort = port;

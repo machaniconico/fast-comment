@@ -616,25 +616,28 @@ export interface OAuthClientSaved {
   callbackPort: number;
 }
 
+/** 接続系コマンドの保存通知。`late` はコマンドが settle した後に届いた(反映してはいけない)時に true。 */
+export type ConfigSavedHandler<T> = (commit: ConfigCommit<T>, late: boolean) => void;
+
 /** 接続コマンドが設定を保存した時に呼ばれる Channel。 */
-function configSavedChannel<T>(handler?: (commit: ConfigCommit<T>) => void): Channel<ConfigCommit<T>> | undefined {
+function configSavedChannel<T>(handler: (commit: ConfigCommit<T>) => void): Channel<ConfigCommit<T>> | undefined {
   if (!isTauri()) return undefined;
   const channel = new Channel<ConfigCommit<T>>();
-  channel.onmessage = commit => handler?.(commit);
+  channel.onmessage = handler;
   return channel;
 }
 
 /**
- * 接続系コマンドを呼ぶ。`onConfigSaved` の通知はコマンドが settle する前に届いた物だけ渡す
- * (settle 後の状態はコマンドの応答と、その後の再読込で決める)。
+ * 接続系コマンドを呼ぶ。`onConfigSaved` の通知には、コマンドが settle した後に届いたかを添える
+ * (settle 後の通知は反映せず、状態はコマンドの応答と、その後の再読込で決める)。
  */
 async function invokeWithConfigSaved<T, C>(
   cmd: string,
   args: Record<string, unknown>,
-  handler?: (commit: ConfigCommit<C>) => void,
+  handler?: ConfigSavedHandler<C>,
 ): Promise<T | null> {
   let settled = false;
-  const onConfigSaved = configSavedChannel<C>(commit => { if (!settled) handler?.(commit); });
+  const onConfigSaved = configSavedChannel<C>(commit => handler?.(commit, settled));
   try {
     return await invoke<T>(cmd, { ...args, onConfigSaved });
   } finally {
@@ -913,7 +916,7 @@ export async function getYoutubeOauthStatus(): Promise<YoutubeOauthStatus | null
 
 export async function connectYoutubeOauth(
   clientId: string,
-  onConfigSaved?: (commit: ConfigCommit<{ youtubeOauthClientId: string }>) => void,
+  onConfigSaved?: ConfigSavedHandler<{ youtubeOauthClientId: string }>,
 ): Promise<YoutubeOauthStatus> {
   return (await invokeWithConfigSaved<YoutubeOauthStatus, { youtubeOauthClientId: string }>(
     'connect_youtube_oauth', { clientId }, onConfigSaved,
@@ -1177,7 +1180,7 @@ export async function connectXPost(
   clientId: string,
   callbackPort: number,
   attempt: string,
-  onConfigSaved?: (commit: ConfigCommit<OAuthClientSaved>) => void,
+  onConfigSaved?: ConfigSavedHandler<OAuthClientSaved>,
 ): Promise<XPostStatus | null> {
   return invokeWithConfigSaved<XPostStatus, OAuthClientSaved>(
     'connect_x_post', { clientId, callbackPort, attempt }, onConfigSaved,
@@ -1196,7 +1199,7 @@ export function newOAuthAttempt(): string {
 
 /** X の許可を取り消し、この PC の保存を消す。API モードだった時は Intent モードへ戻る。 */
 export async function disconnectXPost(
-  onConfigSaved?: (commit: ConfigCommit<{ xPost: Pick<XPostConfig, 'mode'> }>) => void,
+  onConfigSaved?: ConfigSavedHandler<{ xPost: Pick<XPostConfig, 'mode'> }>,
 ): Promise<XPostStatus | null> {
   return invokeWithConfigSaved<XPostStatus, { xPost: Pick<XPostConfig, 'mode'> }>('disconnect_x_post', {}, onConfigSaved);
 }
@@ -1222,7 +1225,7 @@ export async function connectTwitcasting(
   clientId: string | undefined,
   callbackPort: number,
   attempt: string,
-  onConfigSaved?: (commit: ConfigCommit<OAuthClientSaved>) => void,
+  onConfigSaved?: ConfigSavedHandler<OAuthClientSaved>,
 ): Promise<import('./types').TwitcastingStatus | null> {
   return invokeWithConfigSaved<import('./types').TwitcastingStatus, OAuthClientSaved>('connect_twitcasting', {
     clientId: clientId || null,

@@ -20,7 +20,7 @@ async function withSettings(t, run, mode = 'settings') {
   page.setDefaultTimeout(5000);
   t.after(() => page.close());
   await page.goto(new URL('?' + mode, fixture).href, { waitUntil: 'commit' });
-  if (mode !== 'app') await page.locator('#settings-import-json').waitFor();
+  if (!mode.endsWith('app')) await page.locator('#settings-import-json').waitFor();
   if (mode === 'settings') {
     await page.locator('details').filter({ hasText: '自分の ClientID を使う' }).locator('summary').click();
   }
@@ -119,9 +119,10 @@ for (const service of services) {
       await finish(page, result === 'success' ? { ...service.ready, clientId: 'typed-client' } : result);
       await page.waitForFunction(n => window.mock.reads > n, reads);
       if (result === 'failure before save') {
-        // Nothing was saved, so the read is not newer than the form and the typed values stay.
+        // Nothing was saved: the ClientID field shows the saved ID again (the full save does not send it),
+        // and the typed port stays because the full save sends it.
         await page.waitForFunction(() => window.mock.configSync.reloading === 0);
-        assert.equal(await id(page).inputValue(), 'typed-client');
+        assert.equal(await id(page).inputValue(), (await initial(page)).credentials[service.id]);
         assert.equal(await port(page).inputValue(), '040321');
         const next = await saveSettings(page);
         assert.equal(next.credentials[service.id], (await initial(page)).credentials[service.id]);
@@ -918,3 +919,30 @@ test('an own moderation import answered at base+2 asks for a reload', async t =>
   assert.deepEqual(next.moderation, spamRules);
   assert.equal(next.goals.showInApp, true);
 }));
+
+test('the whole app opens and switches tabs without Tauri', async t => withSettings(t, async page => {
+  await page.getByRole('tab', { name: '設定', exact: true }).click();
+  await page.locator('#settings-import-json').waitFor();
+  await page.getByRole('tab', { name: 'コメント', exact: true }).click();
+  await page.getByRole('tab', { name: '設定', exact: true }).waitFor();
+  // The main thread stays responsive (no synchronous reload loop).
+  await page.evaluate(() => new Promise(resolve => setTimeout(resolve, 0)));
+}, 'browser-app'));
+
+test('a late X disconnect notice newer than the base asks for a reload', async t => withSettings(t, async page => {
+  await page.getByRole('tab', { name: '設定', exact: true }).waitFor();
+  await page.evaluate(() => {
+    window.mock.saved.xPost.mode = 'api';
+    window.mock.status.xPost = { ...window.mock.status.xPost, connected: true, username: 'current-x' };
+    window.mock.holdConfigSaved = true;
+  });
+  await page.getByRole('tab', { name: '設定', exact: true }).click();
+  await save(page).waitFor();
+  await page.waitForFunction(() => window.mock.configSync.reloading === 0);
+  await page.getByRole('button', { name: '切断', exact: true }).click();
+  await page.getByText(/X との接続を切りました/).waitFor();
+  assert.equal(await page.evaluate(() => window.mock.configSync.reloadRequired), false);
+  await page.evaluate(() => window.mock.heldConfigSaved.shift()());
+  await page.waitForFunction(() => window.mock.configSync.reloadRequired === true);
+  assert.equal(await save(page).isDisabled(), true);
+}, 'app'));
