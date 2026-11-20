@@ -3032,13 +3032,21 @@ fn resolve_templates_dir(app: &AppHandle) -> PathBuf {
     cwd.join("templates")
 }
 
+/// ログフィルタを作る。`RUST_LOG`(`env`)が無い・不正なら既定 `info`。
+///
+/// WS ハンドシェイクのリクエスト行(`GET /events?token=...`)は tungstenite が TRACE で
+/// 平文に出すので、環境変数の後ろに info 固定の directive を足して上書きさせない。
+fn build_log_filter(env: Option<&str>) -> tracing_subscriber::EnvFilter {
+    env.and_then(|value| tracing_subscriber::EnvFilter::try_new(value).ok())
+        .unwrap_or_else(|| tracing_subscriber::EnvFilter::new("info"))
+        .add_directive("tungstenite=info".parse().expect("static directive"))
+        .add_directive("tokio_tungstenite=info".parse().expect("static directive"))
+}
+
 /// Tauri アプリを構築して実行する(desktop only)。
 pub fn run() {
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
+        .with_env_filter(build_log_filter(std::env::var("RUST_LOG").ok().as_deref()))
         .init();
 
     let builder = tauri::Builder::default();
@@ -4119,5 +4127,70 @@ mod followup_tests {
     fn build_injected_test_messages_rejects_bad_input() {
         assert!(build_injected_test_messages("bogus", "", "", None, None, None).is_err());
         assert!(build_injected_test_messages("x", "", "", Some("bogus"), None, None).is_err());
+    }
+}
+
+#[cfg(test)]
+mod log_filter_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct Sink(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+        type Writer = Sink;
+        fn make_writer(&'a self) -> Sink {
+            self.clone()
+        }
+    }
+
+    fn logged(env: Option<&str>) -> String {
+        let sink = Sink::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(build_log_filter(env))
+            .with_writer(sink.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::trace!(target: "tungstenite::handshake::client", "GET /events?token=SECRET");
+            tracing::trace!(target: "tokio_tungstenite", "GET /events?token=SECRET");
+            tracing::debug!(target: "tungstenite::handshake::client", "GET /events?token=SECRET");
+            tracing::info!(target: "fast_comment_lib", "kept");
+            tracing::debug!(target: "fast_comment_lib", "debug-line");
+        });
+        let bytes = sink.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    #[test]
+    fn ws_handshake_url_never_reaches_the_log_even_with_trace_env() {
+        for env in [
+            "tungstenite=trace",
+            "trace",
+            "tokio_tungstenite=trace,tungstenite=trace",
+            "debug",
+        ] {
+            assert!(!logged(Some(env)).contains("SECRET"), "RUST_LOG={env}");
+        }
+    }
+
+    #[test]
+    fn default_and_other_targets_keep_their_levels() {
+        let default = logged(None);
+        assert!(default.contains("kept"));
+        assert!(!default.contains("debug-line"));
+        assert!(logged(Some("debug")).contains("debug-line"));
+        // 不正な値は既定 info に戻る。
+        assert!(logged(Some("=[")).contains("kept"));
     }
 }

@@ -61,6 +61,8 @@ pub const DEFAULT_IS_ONLIVE_PATTERN: &str = r#"data-is-onlive="(true|false)""#;
 
 const NOT_FOUND_NOTICE: &str = "ツイキャスのユーザーが見つかりません";
 const UNAVAILABLE_NOTICE: &str = "この配信は非公開のため取得できません";
+const UNREADABLE_LOG: &str =
+    "視聴ページから配信状態を読み取れません(仕様変更の可能性)。30 秒後に再確認します";
 const INVALID_ID_NOTICE: &str = "ツイキャスの配信者 ID を解釈できません";
 
 /// ツイキャスの非公式経路で使うエンドポイント・正規表現の上書き。
@@ -311,17 +313,19 @@ impl UserPagePatterns {
             }
         } else {
             self.first_movie_id(html)
-        }?;
+        };
         let is_onlive = self
             .is_onlive
             .as_ref()
             .and_then(|regex| regex.captures(html))
             .and_then(|captures| captures.get(1))
             .map(|matched| matched.as_str().eq_ignore_ascii_case("true"));
-        Some(UserPage {
-            movie_id: Some(movie_id),
-            is_onlive,
-        })
+        // movie_id が無くても is-onlive=false が明示されていれば未配信(配信歴ゼロ)。
+        // それ以外で何も読めない HTML は None(呼び出し側で Unreadable)。
+        if movie_id.is_none() && is_onlive != Some(false) {
+            return None;
+        }
+        Some(UserPage { movie_id, is_onlive })
     }
 }
 
@@ -800,6 +804,10 @@ pub struct TwitcastingSource {
     metadata_tx: Option<mpsc::Sender<YoutubeMetadataUpdate>>,
     /// 配信開始/終了イベント(X 自動告知用)。
     live_tx: Option<mpsc::Sender<LiveEvent>>,
+    /// 最後に Started を送った movie_id。同じ枠の WS 再接続で告知を重ねない
+    /// (台帳は件数で切り詰められるので、台帳の重複判定に頼らない)。
+    /// 未配信を観測した時だけ消す。
+    last_started: std::sync::Mutex<Option<String>>,
 }
 
 impl TwitcastingSource {
@@ -815,6 +823,7 @@ impl TwitcastingSource {
             overrides,
             metadata_tx,
             live_tx: None,
+            last_started: std::sync::Mutex::new(None),
         }
     }
 
@@ -825,6 +834,13 @@ impl TwitcastingSource {
 
     fn send_live_started(&self, screen_id: &str, movie_id: &str) {
         let Some(tx) = &self.live_tx else { return };
+        {
+            let mut last = self.last_started.lock().unwrap_or_else(|e| e.into_inner());
+            if last.as_deref() == Some(movie_id) {
+                return;
+            }
+            *last = Some(movie_id.to_string());
+        }
         super::send_live_event(
             tx,
             LiveEvent::Started(LiveStream {
@@ -836,6 +852,10 @@ impl TwitcastingSource {
                 started_at_ms: None,
             }),
         );
+    }
+
+    fn forget_started(&self) {
+        *self.last_started.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     fn send_live_ended(&self) {
@@ -919,6 +939,9 @@ enum SessionOutcome {
     Unavailable,
     /// eventpubsuburl が 302/4xx。HTML から配信状態を確認し直す。
     Recheck,
+    /// HTTP 200 だが HTML から配信状態を読み取れない(仕様変更・一時的な崩れ)。
+    /// 配信終了とは限らないので Ended を送らず、live 状態も変えずに 30 秒後に再確認する。
+    Unreadable,
     /// WS 切断・通信失敗。Backoff で張り直す。
     Disconnected {
         stable: bool,
@@ -983,6 +1006,7 @@ impl Source for TwitcastingSource {
                     SessionOutcome::Offline => {
                         self.send_live_state(false).await;
                         self.send_live_ended();
+                        self.forget_started();
                     }
                     SessionOutcome::NotFound => {
                         tracing::warn!("twitcasting:{channel} {NOT_FOUND_NOTICE}");
@@ -1002,6 +1026,13 @@ impl Source for TwitcastingSource {
                             tracing::debug!("twitcasting:{channel} eventpubsuburl の応答から再確認");
                         } else {
                             tracing::warn!("twitcasting:{channel} eventpubsuburl の応答から再確認");
+                        }
+                    }
+                    SessionOutcome::Unreadable => {
+                        if repeated {
+                            tracing::debug!("twitcasting:{channel} {UNREADABLE_LOG}");
+                        } else {
+                            tracing::warn!("twitcasting:{channel} {UNREADABLE_LOG}");
                         }
                     }
                     SessionOutcome::Disconnected { .. } => {
@@ -1043,7 +1074,7 @@ impl TwitcastingSource {
         };
 
         let Some(movie_id) = page.movie_id else {
-            return SessionOutcome::Offline;
+            return SessionOutcome::Unreadable;
         };
 
         // 枠が変わった時だけ listall に入り直す。同じ枠の WS 再接続では
@@ -1106,13 +1137,7 @@ impl TwitcastingSource {
                 return Err(SessionOutcome::Disconnected { stable: false });
             }
         };
-        let page = patterns.parse_for(&html, Some(screen_id));
-        if page.is_none() {
-            tracing::warn!(
-                "twitcasting:{screen_id} HTML から movie_id を取得できません(配信歴ゼロ・限定配信・仕様変更の可能性)"
-            );
-        }
-        classify_fetched_page(page)
+        classify_fetched_page(patterns.parse_for(&html, Some(screen_id)))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1361,7 +1386,10 @@ impl TwitcastingSource {
 
 /// Unavailable / Recheck が同じ状態のまま続いているか。続く 2 回目以降は debug に落とす。
 fn is_quiet_outcome(outcome: SessionOutcome) -> bool {
-    matches!(outcome, SessionOutcome::Unavailable | SessionOutcome::Recheck)
+    matches!(
+        outcome,
+        SessionOutcome::Unavailable | SessionOutcome::Recheck | SessionOutcome::Unreadable
+    )
 }
 
 fn is_repeated_quiet(last: &mut Option<SessionOutcome>, outcome: SessionOutcome) -> bool {
@@ -1382,11 +1410,13 @@ fn classify_user_page_status(status: reqwest::StatusCode) -> Option<SessionOutco
     }
 }
 
-/// HTML が読めない(配信歴ゼロを含む)時はエラーではなく待機にする。
+/// 未配信(Offline)は HTML が明示した時だけ(is-onlive=false・配信歴ゼロ)。
+/// 何も読めない HTML は Unreadable にして、配信終了として扱わない。
 fn classify_fetched_page(page: Option<UserPage>) -> Result<UserPage, SessionOutcome> {
     match page {
         Some(page) if page.movie_id.is_some() && page.is_onlive != Some(false) => Ok(page),
-        _ => Err(SessionOutcome::Offline),
+        Some(_) => Err(SessionOutcome::Offline),
+        None => Err(SessionOutcome::Unreadable),
     }
 }
 
@@ -1413,7 +1443,7 @@ fn outcome_delay(
             backoff.reset();
             Some(jittered(OFFLINE_INTERVAL, 20, jitter_seed))
         }
-        SessionOutcome::Recheck => {
+        SessionOutcome::Recheck | SessionOutcome::Unreadable => {
             // 連続失敗でも 30 秒を下回らない。
             backoff.reset();
             Some(OFFLINE_INTERVAL)
@@ -1723,6 +1753,122 @@ mod tests {
         assert_eq!(extract_screen_id("\u{feff}abc").as_deref(), Some("abc"));
     }
 
+    /// 全リクエストへ同じ本文を返す最小の HTTP サーバー。リクエスト数を数える。
+    async fn serve_html(body: &'static str) -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(response.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        (port, hits)
+    }
+
+    fn source_for_page(port: u16) -> (TwitcastingSource, mpsc::Receiver<LiveEvent>) {
+        let overrides = TwitcastingOverrides {
+            endpoints: HashMap::from([(
+                "userPageBaseUrl".to_string(),
+                format!("http://127.0.0.1:{port}/"),
+            )]),
+            ..TwitcastingOverrides::default()
+        };
+        let (live_tx, live_rx) = mpsc::channel(8);
+        let source = TwitcastingSource::new("alice".to_string(), overrides, None)
+            .with_live_tx(Some(live_tx));
+        (source, live_rx)
+    }
+
+    #[tokio::test]
+    async fn unreadable_html_never_sends_ended() {
+        let (port, hits) = serve_html("<html></html>").await;
+        let (source, mut live_rx) = source_for_page(port);
+        let (tx, _rx) = broadcast::channel(8);
+        let cancel = CancellationToken::new();
+        let runner = {
+            let cancel = cancel.clone();
+            tokio::spawn(async move { source.run(tx, cancel).await })
+        };
+        while hits.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        cancel.cancel();
+        let _ = runner.await;
+        assert!(live_rx.try_recv().is_err(), "読めない HTML で Ended を送らない");
+    }
+
+    #[tokio::test]
+    async fn explicit_offline_html_sends_ended() {
+        let (port, _hits) = serve_html(r#"<body data-is-onlive="false"></body>"#).await;
+        let (source, mut live_rx) = source_for_page(port);
+        let (tx, _rx) = broadcast::channel(8);
+        let cancel = CancellationToken::new();
+        let runner = {
+            let cancel = cancel.clone();
+            tokio::spawn(async move { source.run(tx, cancel).await })
+        };
+        let event = tokio::time::timeout(Duration::from_secs(5), live_rx.recv())
+            .await
+            .expect("Ended が届く")
+            .expect("channel open");
+        cancel.cancel();
+        let _ = runner.await;
+        assert!(matches!(event, LiveEvent::Ended { .. }));
+    }
+
+    #[test]
+    fn unreadable_is_a_quiet_recheck_of_at_least_30s() {
+        let mut last = None;
+        assert!(!is_repeated_quiet(&mut last, SessionOutcome::Unreadable));
+        assert!(is_repeated_quiet(&mut last, SessionOutcome::Unreadable));
+        let mut backoff = Backoff::new();
+        let mut seed = 1;
+        let delay = outcome_delay(SessionOutcome::Unreadable, &mut backoff, &mut seed).unwrap();
+        assert!(delay >= OFFLINE_INTERVAL);
+    }
+
+    #[test]
+    fn live_started_is_sent_once_per_movie_until_offline_is_observed() {
+        let (live_tx, mut live_rx) = mpsc::channel(8);
+        let source = TwitcastingSource::new(
+            "alice".to_string(),
+            TwitcastingOverrides::default(),
+            None,
+        )
+        .with_live_tx(Some(live_tx));
+        let started = |rx: &mut mpsc::Receiver<LiveEvent>| matches!(rx.try_recv(), Ok(LiveEvent::Started(_)));
+
+        // 同じ movie_id での WS 再接続を繰り返しても告知は 1 回。
+        source.send_live_started("alice", "42");
+        source.send_live_started("alice", "42");
+        source.send_live_started("alice", "42");
+        assert!(started(&mut live_rx));
+        assert!(live_rx.try_recv().is_err(), "同じ movie_id は再送しない");
+
+        // 別の movie_id は新しい配信として 1 回送る。
+        source.send_live_started("alice", "43");
+        assert!(started(&mut live_rx));
+        assert!(live_rx.try_recv().is_err());
+
+        // 未配信を観測したら覚えた値を消し、同じ movie_id でも新しく送る。
+        source.forget_started();
+        source.send_live_started("alice", "43");
+        assert!(started(&mut live_rx));
+    }
+
     #[test]
     fn unavailable_notice_matches_design() {
         assert_eq!(UNAVAILABLE_NOTICE, "この配信は非公開のため取得できません");
@@ -1958,7 +2104,7 @@ mod tests {
 
     #[test]
     fn missing_movie_id_is_waiting_and_only_302_is_an_error() {
-        assert_eq!(classify_fetched_page(None), Err(SessionOutcome::Offline));
+        assert_eq!(classify_fetched_page(None), Err(SessionOutcome::Unreadable));
         let zero_history = UserPage {
             movie_id: None,
             is_onlive: Some(false),
