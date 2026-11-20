@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { getConfig, setModeration, type AppConfig } from '../ipc';
+  import { getConfig, setModeration, type AppConfig, type ModerationCommit } from '../ipc';
   import { configSync } from '../configSync.svelte';
 
   const SCHEMA = 'fast-comment-moderation';
@@ -14,7 +14,8 @@
   }
 
   interface Props {
-    onImported: () => Promise<boolean>;
+    /** 保存の応答を受け取り、設定を読み直せたら true。 */
+    onImported: (commit: ModerationCommit) => Promise<boolean>;
     disabled: boolean;
   }
 
@@ -181,8 +182,8 @@
     configSync.importing = 'moderation';
     status = null;
     try {
-      await setModeration(moderation);
-      if (await onImported()) {
+      const commit = await setModeration(moderation);
+      if (await onImported(commit)) {
         showSuccess('モデレーション規則をインポートしました。');
       } else {
         showError('モデレーション規則は保存されました。設定を読み直してください。');

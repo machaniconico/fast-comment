@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { getTwitcastingStatus, reloadTwitcastingStatus, connectTwitcasting, cancelTwitcastingLogin, disconnectTwitcasting, newOAuthAttempt } from '../ipc';
+  import { getTwitcastingStatus, reloadTwitcastingStatus, connectTwitcasting, cancelTwitcastingLogin, disconnectTwitcasting, newOAuthAttempt, type ConfigCommit, type OAuthClientSaved } from '../ipc';
   import type { TwitcastingStatus } from '../types';
   import { errorText } from '../xAutopost';
   import { DEFAULT_TWITCASTING_CALLBACK_PORT, twitcastingDisplayCallbackUrl } from '../twitcasting';
@@ -8,7 +8,7 @@
 
   let {
     clientId = '', callbackPort = DEFAULT_TWITCASTING_CALLBACK_PORT, configRevision,
-    saving, allFieldsLocked, configReloading, onCallbackPortChange, onConnectingChange, onConnectionSettled,
+    saving, allFieldsLocked, configReloading, onCallbackPortChange, onConnectingChange, onConnectionSettled, onConfigSaved,
   }: {
     clientId?: string;
     callbackPort?: number;
@@ -19,6 +19,8 @@
     onCallbackPortChange: (port: number | null) => void;
     onConnectingChange: (connecting: boolean) => void;
     onConnectionSettled: () => Promise<void>;
+    /** 接続コマンドが ClientID と待受ポートを保存した。 */
+    onConfigSaved: (commit: ConfigCommit<OAuthClientSaved>) => void;
   } = $props();
   let clientIdInput = $state('');
   $effect.pre(() => {
@@ -130,7 +132,7 @@
     successClientId = null;
     message = 'ブラウザでツイキャスにログインし、アプリを許可してください…';
     try {
-      const next = await connectTwitcasting(clientIdInput.trim(), listenPort, current);
+      const next = await connectTwitcasting(clientIdInput.trim(), listenPort, current, onConfigSaved);
       if (!next) throw new Error('アプリからログイン結果を受け取れませんでした。');
       statusRequest += 1;
       latestStatus = next;

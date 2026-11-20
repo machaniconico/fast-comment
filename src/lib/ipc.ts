@@ -8,11 +8,10 @@
  */
 
 import type { ChatMessage, ListenerRecord, ListenerUpdate, ModerationEvent, TtsVoiceOverride, YoutubeReaction } from './types';
-import { invoke as tauriInvoke } from '@tauri-apps/api/core';
+import { Channel, invoke as tauriInvoke } from '@tauri-apps/api/core';
 import { emit, listen } from '@tauri-apps/api/event';
 import { getCurrentWindow, primaryMonitor } from '@tauri-apps/api/window';
 import { createTtsAudioPlayer } from './ttsAudio';
-import { notifyModerationAppend } from './configSync.svelte';
 
 // ---- Tauri availability guard ----
 // @tauri-apps/api throws when window.__TAURI_INTERNALS__ is absent (browser dev).
@@ -606,6 +605,25 @@ export interface UpdateStatus {
   releaseUrl: string;
 }
 
+/**
+ * 書込 IPC の応答。`revision` は保存後の設定 revision(保存しなかった時は null)、残りは書いた部分の
+ * 正規化済みの値。画面は `revision` が自分の基準 + 1 ちょうどの時だけ反映して基準を進める。
+ */
+export type ConfigCommit<T> = T & { revision: number | null };
+
+export interface OAuthClientSaved {
+  clientId: string | null;
+  callbackPort: number;
+}
+
+/** 接続コマンドが設定を保存した時に呼ばれる Channel。 */
+function configSavedChannel<T>(handler?: (commit: ConfigCommit<T>) => void): Channel<ConfigCommit<T>> | undefined {
+  if (!isTauri()) return undefined;
+  const channel = new Channel<ConfigCommit<T>>();
+  channel.onmessage = commit => handler?.(commit);
+  return channel;
+}
+
 /** 設定と、その時点の revision(Rust 側で保存のたびに進む)。 */
 export interface ConfigSnapshot {
   config: AppConfig;
@@ -631,6 +649,8 @@ export interface UpdateConfigOutcome {
   protectedOAuth: OAuthService[];
   /** 保存後の設定 revision。 */
   revision: number;
+  /** 保存した正規化済みの設定全体。 */
+  config: AppConfig;
 }
 
 /** Rust の `CONFIG_CHANGED_ERROR` と同じ文言。`baseRevision` が古くて保存されなかった。 */
@@ -644,13 +664,17 @@ export async function setConfig(config: AppConfig, baseRevision?: number): Promi
   return invoke<UpdateConfigOutcome>('update_config', { newConfig: config, baseRevision: baseRevision ?? null });
 }
 
-export async function setGoalsShowInApp(showInApp: boolean): Promise<void> {
-  await invoke<void>('set_goals_show_in_app', { showInApp });
+export async function setGoalsShowInApp(showInApp: boolean): Promise<ConfigCommit<{ showInApp: boolean }> | null> {
+  return invoke<ConfigCommit<{ showInApp: boolean }>>('set_goals_show_in_app', { showInApp });
 }
 
-export async function setModeration(moderation: AppConfig['moderation']): Promise<void> {
+export type ModerationCommit = ConfigCommit<{ moderation: AppConfig['moderation'] }>;
+
+export async function setModeration(moderation: AppConfig['moderation']): Promise<ModerationCommit> {
   if (!isTauri()) throw new Error('Tauri環境で開いてから再試行してください。');
-  await invoke<void>('set_moderation', { moderation });
+  const commit = await invoke<ModerationCommit>('set_moderation', { moderation });
+  if (!commit) throw new Error('Tauri環境で開いてから再試行してください。');
+  return commit;
 }
 
 export async function setTtsPaused(paused: boolean): Promise<void> {
@@ -703,13 +727,9 @@ export async function startListenerUpdatedListener(handler: (u: ListenerUpdate) 
 }
 
 /** Append a value to the moderation NG list (ngUsers / ngWords) in the config. */
+/** 開いている設定画面には知らせない。古いフォームの全体保存は Rust が revision で拒否する。 */
 export async function appendModerationValue(kind: 'ngUsers' | 'ngWords', value: string): Promise<void> {
-  const normalized = await invoke<string>('append_moderation_value', { kind, value });
-  if (!normalized) return;
-
-  // Let an open Settings form merge it into its unsaved edit state, otherwise its next save
-  // would overwrite the config with the stale list and drop this entry.
-  notifyModerationAppend(kind, normalized);
+  await invoke('append_moderation_value', { kind, value });
 }
 
 export async function getTtsQueueState(): Promise<TtsQueueState | null> {
@@ -873,8 +893,12 @@ export async function getYoutubeOauthStatus(): Promise<YoutubeOauthStatus | null
   return invoke<YoutubeOauthStatus>('get_youtube_oauth_status');
 }
 
-export async function connectYoutubeOauth(clientId: string): Promise<YoutubeOauthStatus> {
-  return (await invoke<YoutubeOauthStatus>('connect_youtube_oauth', { clientId })) ?? {
+export async function connectYoutubeOauth(
+  clientId: string,
+  onConfigSaved?: (commit: ConfigCommit<{ youtubeOauthClientId: string }>) => void,
+): Promise<YoutubeOauthStatus> {
+  const args = { clientId, onConfigSaved: configSavedChannel(onConfigSaved) };
+  return (await invoke<YoutubeOauthStatus>('connect_youtube_oauth', args)) ?? {
     configured: false,
     connected: false,
     channelTitle: null,
@@ -1130,8 +1154,15 @@ export async function getXPostStatus(): Promise<XPostStatus | null> {
 }
 
 /** Client ID とポートだけを保存し、ブラウザで X にログインする。失敗は `XPostErrorInfo` で reject。 */
-export async function connectXPost(clientId: string, callbackPort: number, attempt: string): Promise<XPostStatus | null> {
-  return invoke<XPostStatus>('connect_x_post', { clientId, callbackPort, attempt });
+export async function connectXPost(
+  clientId: string,
+  callbackPort: number,
+  attempt: string,
+  onConfigSaved?: (commit: ConfigCommit<OAuthClientSaved>) => void,
+): Promise<XPostStatus | null> {
+  return invoke<XPostStatus>('connect_x_post', {
+    clientId, callbackPort, attempt, onConfigSaved: configSavedChannel(onConfigSaved),
+  });
 }
 
 /** `attempt` の X ログインだけを取り消す(接続コマンドより先に届いても効く)。 */
@@ -1145,8 +1176,10 @@ export function newOAuthAttempt(): string {
 }
 
 /** X の許可を取り消し、この PC の保存を消す。API モードだった時は Intent モードへ戻る。 */
-export async function disconnectXPost(): Promise<XPostStatus | null> {
-  return invoke<XPostStatus>('disconnect_x_post');
+export async function disconnectXPost(
+  onConfigSaved?: (commit: ConfigCommit<{ xPost: Pick<XPostConfig, 'mode'> }>) => void,
+): Promise<XPostStatus | null> {
+  return invoke<XPostStatus>('disconnect_x_post', { onConfigSaved: configSavedChannel(onConfigSaved) });
 }
 
 /** テスト投稿(実際に公開され、課金される)。呼ぶ前に必ず確認を取る。 */
@@ -1170,11 +1203,13 @@ export async function connectTwitcasting(
   clientId: string | undefined,
   callbackPort: number,
   attempt: string,
+  onConfigSaved?: (commit: ConfigCommit<OAuthClientSaved>) => void,
 ): Promise<import('./types').TwitcastingStatus | null> {
   return invoke<import('./types').TwitcastingStatus>('connect_twitcasting', {
     clientId: clientId || null,
     callbackPort,
     attempt,
+    onConfigSaved: configSavedChannel(onConfigSaved),
   });
 }
 /** `attempt` のツイキャスログインだけを取り消す(接続コマンドより先に届いても効く)。 */

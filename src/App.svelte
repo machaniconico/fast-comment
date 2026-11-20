@@ -119,6 +119,10 @@
   // config を読んだ時の revision。インポートなど別の画面の保存で古くなったら読み直す。
   let configRevision = $state(0);
   let configLoading = $state(false);
+  // 読込に失敗したら間を空けて再試行し、続けて失敗したら止める(get_config を連打しない)。
+  let configRetryWait = $state(false);
+  let configFailures = 0;
+  const CONFIG_RETRY_LIMIT = 3;
   const configStale = $derived(configRevision < configSync.revision);
   let goalsToggleError = $state('');
   let ttsPaused = $state(false);
@@ -423,15 +427,21 @@
         configRevision = loaded.revision;
         if (loaded.revision > configSync.revision) configSync.revision = loaded.revision;
       }
+      configFailures = 0;
     } catch (e) {
       console.warn('[config] load failed', e);
+      configFailures += 1;
+      configRetryWait = true;
+      if (configFailures <= CONFIG_RETRY_LIMIT) {
+        setTimeout(() => { configRetryWait = false; }, 1000 * 2 ** (configFailures - 1));
+      }
     } finally {
       configLoading = false;
     }
   }
 
   $effect(() => {
-    if (configStale && !configLoading) void loadConfig();
+    if (configStale && !configLoading && !configRetryWait) void loadConfig();
   });
 
   function showTtsNotice(notice: TtsNotice) {
@@ -464,11 +474,16 @@
     if (!config || goalsToggleSaving || !!configSync.importing || configStale) return;
     goalsToggleSaving = true;
     goalsToggleError = '';
-    const revision = configRevision;
     try {
-      await setGoalsShowInApp(checked);
-      // 待つ間に読み直していれば、その値を優先する。
-      if (config && configRevision === revision) config.goals.showInApp = checked;
+      const commit = await setGoalsShowInApp(checked);
+      // 基準 + 1 ちょうどなら自分の保存だけなので反映する。それ以外は読み直す。
+      if (commit?.revision != null) {
+        if (config && commit.revision === configRevision + 1) {
+          config.goals.showInApp = commit.showInApp;
+          configRevision = commit.revision;
+        }
+        if (commit.revision > configSync.revision) configSync.revision = commit.revision;
+      }
     } catch (e) {
       goalsToggleError = e instanceof Error ? e.message : String(e);
     } finally {
@@ -887,7 +902,7 @@
           />
           <span>{goalsToggleSaving ? '保存中' : 'コメビュに表示'}</span>
         </label>
-        {#if configStale && !configLoading}
+        {#if configStale && !configLoading && configRetryWait}
           <span class="goals-toggle-error">{configReloadMessage}</span>
         {:else if goalsToggleError}
           <span class="goals-toggle-error" title={goalsToggleError}>保存失敗</span>

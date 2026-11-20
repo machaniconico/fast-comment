@@ -3,7 +3,7 @@
   import type {
     AppConfig, EffectRule, EffectsConfig, GoalsConfig, InjectTestCommentOptions, TtsDictEntry, TtsOptions,
     TimerConfig, WelcomeConfig, YoutubeOauthStatus, TwitchOauthStatus, TwitchDeviceLogin, OAuthService,
-    ConfigSnapshot
+    ConfigSnapshot, ConfigCommit, OAuthClientSaved
   } from '../ipc';
   import {
     isTauri, getConfigSnapshot, setConfig, configChangedError, getObsUrl, getObsGoalsUrl, getObsTimerUrl, exportCommentsCsv, injectTestComment,
@@ -41,7 +41,7 @@
   import { sanitizeXPostNumbers } from '../xAutopost';
   import { DEFAULT_TWITCASTING_CALLBACK_PORT } from '../twitcasting';
   import { appUpdate } from '../appUpdate.svelte';
-  import { configReloadMessage, configSync, subscribeModerationAppend } from '../configSync.svelte';
+  import { configReloadMessage, configSync } from '../configSync.svelte';
   import { progressLabel, statusText } from '../appUpdate';
 
   interface Props {
@@ -143,10 +143,9 @@
   let xPostPortInvalid = $state(false);
   const oauthConnecting = $state({ twitcasting: false, xPost: false });
   const oauthConfigRevision = $state({ twitcasting: 0, xPost: 0 });
-  // 取り違えを防ぐのは Rust の revision 照合。ここは「フォームが知っている保存済みの値」を持ち、
-  // 保存直前の読込と一致すればその revision を基準にして送る(ずれていれば Rust が拒否する)。
+  // フォームが基づく設定の revision。全体保存はこれを送り、古ければ Rust が拒否する。
+  // 進めるのは get_config で丸ごと置き換えた時と、自分の書込の応答が基準 + 1 ちょうどの時だけ。
   let baseRevision: number | undefined;
-  let serverView: AppConfig | null = null;
   let latest: ConfigSnapshot | null = null;
   const reloading = $state({ all: 0, moderation: 0, twitcasting: 0, xPost: 0 });
   const allFieldsLocked = $derived(reloading.all > 0 || configSync.importing === 'all');
@@ -422,15 +421,16 @@
     highlights = normalizeModerationEntries(rules.highlights);
   }
 
-  /** JSON として同じ値か(キー順と undefined の項目は問わない)。 */
-  function sameJson(a: unknown, b: unknown): boolean {
-    if (a === b) return true;
-    if (typeof a !== 'object' || typeof b !== 'object' || a === null || b === null) return false;
-    if (Array.isArray(a) !== Array.isArray(b)) return false;
-    const entries = (value: object) => Object.entries(value).filter(([, v]) => v !== undefined);
-    const left = entries(a);
-    const right = new Map(entries(b));
-    return left.length === right.size && left.every(([key, value]) => right.has(key) && sameJson(value, right.get(key)));
+  /** 自分が呼んだ書込の応答。基準 + 1 ちょうどなら書いた部分を反映して基準を進め、違えば読み直しを求める。 */
+  function applyCommit(revision: number | null, apply: () => void) {
+    if (revision === null || destroyed) return;
+    if (revision > configSync.revision) configSync.revision = revision;
+    if (baseRevision !== undefined && revision === baseRevision + 1) {
+      apply();
+      baseRevision = revision;
+    } else {
+      configSync.reloadRequired = true;
+    }
   }
 
   /** 読んだ設定のうち新しい方を返し、覚えておく。古い応答で新しい値を戻さない。 */
@@ -462,14 +462,12 @@
 
       if (scope === 'all') {
         hydrateConfig(saved);
-        serverView = structuredClone(saved);
         baseRevision = revision;
         setNotify(saved.ui.notifySound, saved.ui.notifyVolume);
         onConfigSaved?.(saved, revision);
         configSync.reloadRequired = false;
       } else if (scope === 'moderation') {
         applyModerationConfig(saved.moderation);
-        if (serverView) serverView.moderation = structuredClone(saved.moderation);
       } else {
         for (const service of scope) applySavedOAuthConfig(saved, service);
       }
@@ -492,24 +490,31 @@
     oauthConnecting[service] = connecting;
   }
 
-  /** 保存済みの OAuth 項目(ClientID と待受ポート)を写す。 */
-  function copyOAuthConfig(target: AppConfig, saved: AppConfig, service: OAuthService) {
-    if (service === 'xPost') {
-      target.credentials = { ...target.credentials, xPostClientId: saved.credentials?.xPostClientId };
-      if (target.xPost && saved.xPost) target.xPost.callbackPort = saved.xPost.callbackPort;
-    } else {
-      target.credentials = { ...target.credentials, twitcastingClientId: saved.credentials?.twitcastingClientId };
-      target.twitcasting = structuredClone(saved.twitcasting);
-    }
+  function applySavedOAuthConfig(saved: AppConfig, service: OAuthService) {
+    applyOAuthClient(service, {
+      clientId: (service === 'xPost' ? saved.credentials?.xPostClientId : saved.credentials?.twitcastingClientId) ?? null,
+      callbackPort: (service === 'xPost' ? saved.xPost?.callbackPort : saved.twitcasting?.callbackPort) ?? 0,
+    });
   }
 
-  function applySavedOAuthConfig(saved: AppConfig, service: OAuthService) {
+  /** 保存済みの OAuth 項目(ClientID と待受ポート)をフォームへ写す。 */
+  function applyOAuthClient(service: OAuthService, saved: OAuthClientSaved) {
     if (!config) return;
-    copyOAuthConfig(config, saved, service);
-    if (serverView) copyOAuthConfig(serverView, saved, service);
-    if (service === 'xPost') xPostPortInvalid = false;
-    else twitcastingPortInvalid = false;
+    const clientId = saved.clientId ?? undefined;
+    if (service === 'xPost') {
+      config.credentials = { ...config.credentials, xPostClientId: clientId };
+      if (config.xPost) config.xPost.callbackPort = saved.callbackPort;
+      xPostPortInvalid = false;
+    } else {
+      config.credentials = { ...config.credentials, twitcastingClientId: clientId };
+      config.twitcasting = { ...(config.twitcasting ?? {}), callbackPort: saved.callbackPort };
+      twitcastingPortInvalid = false;
+    }
     oauthConfigRevision[service] += 1;
+  }
+
+  function onOAuthConfigSaved(service: OAuthService, commit: ConfigCommit<OAuthClientSaved>) {
+    applyCommit(commit.revision, () => applyOAuthClient(service, commit));
   }
 
   onMount(async () => {
@@ -968,14 +973,6 @@
   // Updates received while a search request is in flight (re-applied onto its response).
   let pendingListenerUpdates: ListenerUpdate[] = [];
 
-  // 即時保存された追加を編集中の一覧に取り込む。
-  $effect(() => subscribeModerationAppend((kind, value) => {
-    const saved = serverView?.moderation[kind];
-    if (saved && !saved.includes(value)) saved.push(value);
-    if (kind === 'ngUsers' && !ngUsers.includes(value)) ngUsers = [...ngUsers, value];
-    if (kind === 'ngWords' && !ngWords.includes(value)) ngWords = [...ngWords, value];
-  }));
-
   function applyListenerUpdate(rows: ListenerRecord[], u: ListenerUpdate): ListenerRecord[] {
     const same = (x: ListenerRecord) => x.platform === u.platform && x.authorId === u.authorId;
     if (!rows.some(same)) return rows;
@@ -1332,36 +1329,11 @@
     };
     saveWarned = false;
     try {
-      // このフォームで編集しない項目(一覧の channels、接続コマンドが保存する Client ID)は最新を使う。
-      // それ以外がフォームの知る保存値と同じなら、最新の revision を基準にできる。
-      try {
-        const snapshot = await getConfigSnapshot();
-        if (snapshot) {
-          const { config: saved, revision } = newerSnapshot(snapshot);
-          for (const target of serverView ? [config, serverView] : [config]) {
-            target.channels = structuredClone(saved.channels);
-            target.credentials = {
-              ...target.credentials,
-              xPostClientId: saved.credentials?.xPostClientId,
-              twitcastingClientId: saved.credentials?.twitcastingClientId,
-            };
-          }
-          if (serverView && sameJson(serverView, saved)) baseRevision = revision;
-        }
-      } catch {
-        // 読めなければ手元の基準で送る。ずれていれば Rust が拒否する。
-      }
       if (saveBlockedReason) return;
       const result = await setConfig(config, baseRevision);
-      if (result) {
-        baseRevision = result.revision;
-        serverView = structuredClone($state.snapshot(config));
-        if (result.revision > configSync.revision) configSync.revision = result.revision;
-      }
+      // Rust が正規化した保存値(ログイン中に保持した OAuth 項目を含む)でフォームを置き換える。
+      if (result) applyCommit(result.revision, () => hydrateConfig(result.config));
       const warnings = result?.warnings ?? [];
-      if (result?.protectedOAuth.length) {
-        await reloadConfig(result.protectedOAuth);
-      }
       void localApiSettings?.refreshStatus();
       saveWarned = warnings.length > 0;
       try {
@@ -1373,7 +1345,7 @@
       // client_id の変更で Twitch 側も未接続になり得るので、こちらも取り直す。
       await refreshTwitchOauth();
       setNotify(config.ui.notifySound, config.ui.notifyVolume);
-      if (result) onConfigSaved?.(config, result.revision);
+      if (result) onConfigSaved?.(result.config, result.revision);
       saveMsg = saveWarned ? `保存しました(警告: ${warnings.join(' / ')})` : '保存しました';
     } catch (e) {
       saveWarned = false;
@@ -1399,14 +1371,10 @@
     youtubeOauthMsg = 'ブラウザでGoogleアカウントを選び、許可してください…';
     youtubeOauthOk = null;
     try {
-      youtubeOauthStatus = await connectYoutubeOauth(clientId);
+      youtubeOauthStatus = await connectYoutubeOauth(clientId, commit => applyCommit(commit.revision, () => {
+        if (config) config.credentials = { ...(config.credentials ?? {}), youtubeOauthClientId: commit.youtubeOauthClientId };
+      }));
       moderation.setYoutubeConnected(youtubeOauthStatus?.connected === true);
-      if (config) {
-        config.credentials = {
-          ...(config.credentials ?? {}),
-          youtubeOauthClientId: clientId,
-        };
-      }
       youtubeOauthMsg = 'Googleアカウントに接続しました';
       youtubeOauthOk = true;
     } catch (e) {
@@ -2122,6 +2090,7 @@
       configReloading={reloading.twitcasting > 0}
       onConnectingChange={(connecting) => onOAuthConnectingChange('twitcasting', connecting)}
       onConnectionSettled={async () => { await reloadConfig(['twitcasting']); }}
+      onConfigSaved={(commit) => onOAuthConfigSaved('twitcasting', commit)}
       onCallbackPortChange={(port) => {
         twitcastingPortInvalid = port === null;
         if (config && port !== null) config.twitcasting = { ...(config.twitcasting ?? {}), callbackPort: port };
@@ -2141,6 +2110,10 @@
         configReloading={reloading.xPost > 0}
         onConnectingChange={(connecting) => onOAuthConnectingChange('xPost', connecting)}
         onConnectionSettled={async () => { await reloadConfig(['xPost']); }}
+        onConfigSaved={(commit) => onOAuthConfigSaved('xPost', commit)}
+        onModeSaved={(commit) => applyCommit(commit.revision, () => {
+          if (config?.xPost) config.xPost.mode = commit.xPost.mode;
+        })}
         onCallbackPortChange={(port) => {
           xPostPortInvalid = port === null;
           if (config?.xPost && port !== null) config.xPost.callbackPort = port;
@@ -3092,7 +3065,10 @@
 
     </fieldset>
     <ModerationPortability
-      onImported={() => reloadConfig('moderation')}
+      onImported={(commit) => {
+        applyCommit(commit.revision, () => applyModerationConfig(commit.moderation));
+        return reloadConfig('moderation');
+      }}
       disabled={saving || allFieldsLocked}
     />
   </section>

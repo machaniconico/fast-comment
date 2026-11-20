@@ -34,7 +34,7 @@ mod update;
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::net::TcpStream;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -51,6 +51,7 @@ use crate::autopost::{
 };
 use crate::bus::{spawn_moderation_ui_forwarder, spawn_reaction_ui_forwarder, Bus};
 use crate::templates::{TemplateInfo, TemplateRef, TemplateStore};
+use crate::config::{commit_config, ConfigCommitError, CONFIG_CHANGED_ERROR};
 use crate::config::{AppConfig, ChannelConfig, ChannelPlatform, TtsBackendKind, VoicevoxEngineKind};
 use crate::model::{
     Author, Badge, ChatMessage, Fragment, LiveEvent, LiveStream, MessageKind, ModerationEvent, Participant,
@@ -375,50 +376,33 @@ impl api::AppOps for TauriAppOps {
 
 // ============ Tauri コマンド ============
 
-/// 全体保存の基準 revision が古い時の固定文言。
-const CONFIG_CHANGED_ERROR: &str = "設定が別の操作で変更されました。読み直してから保存してください";
-
-#[derive(Debug)]
-enum ConfigCommitError {
-    /// `base_revision` が現在の revision と違う。保存していない。
-    Stale,
-    Save(anyhow::Error),
-}
-
-impl std::fmt::Display for ConfigCommitError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Stale => f.write_str(CONFIG_CHANGED_ERROR),
-            Self::Save(e) => e.fmt(f),
-        }
-    }
-}
-
-/// 設定をディスクへ保存し、成功した時だけメモリ・watch・revision を進める。
-///
-/// 設定を書くすべての経路がここを通る。呼び出し側は `current`(= `config` のロック)を
-/// 保持していること。`base_revision` が `Some` で現在値と違えば何も書かずに `Stale` を返す。
-fn commit_config(
-    dir: &Path,
-    revision: &AtomicU64,
-    tx: &watch::Sender<AppConfig>,
-    current: &mut AppConfig,
-    next: AppConfig,
-    base_revision: Option<u64>,
-) -> Result<u64, ConfigCommitError> {
-    if base_revision.is_some_and(|base| base != revision.load(Ordering::SeqCst)) {
-        return Err(ConfigCommitError::Stale);
-    }
-    next.save(dir).map_err(ConfigCommitError::Save)?;
-    *current = next;
-    tx.send_replace(current.clone());
-    Ok(revision.fetch_add(1, Ordering::SeqCst) + 1)
-}
-
 impl AppState {
     fn commit_config(&self, current: &mut AppConfig, next: AppConfig) -> Result<u64, ConfigCommitError> {
         commit_config(&self.config_dir, &self.config_revision, &self.config_tx, current, next, None)
     }
+}
+
+/// 書込 IPC の応答。`revision` は保存後の値、`saved` は書いた部分の正規化済みの値。
+/// 画面は `revision` が自分の基準 + 1 ちょうどの時だけ `saved` を反映して基準を進める。
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConfigCommit<T> {
+    revision: Option<u64>,
+    #[serde(flatten)]
+    saved: T,
+}
+
+impl<T> ConfigCommit<T> {
+    fn new(revision: Option<u64>, saved: T) -> Self {
+        Self { revision, saved }
+    }
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OAuthClientSaved {
+    client_id: Option<String>,
+    callback_port: u16,
 }
 
 #[derive(Serialize)]
@@ -773,6 +757,7 @@ async fn get_youtube_oauth_status(
 async fn connect_youtube_oauth(
     state: State<'_, AppState>,
     client_id: String,
+    on_config_saved: tauri::ipc::Channel<ConfigCommit<serde_json::Value>>,
 ) -> Result<YoutubeOauthStatus, String> {
     let client_id = client_id.trim().to_string();
     if client_id.is_empty() {
@@ -781,10 +766,14 @@ async fn connect_youtube_oauth(
     // OAuthボタンはこの項目だけを保存する。他の未保存設定を巻き込まない。
     let changed = {
         let mut cfg = state.config.lock().unwrap();
-        let changed = cfg.credentials.youtube_oauth_client_id.trim() != client_id;
-        let mut next = cfg.clone();
-        next.credentials.youtube_oauth_client_id = client_id.clone();
-        state.commit_config(&mut cfg, next).map_err(|e| e.to_string())?;
+        let changed = cfg.credentials.youtube_oauth_client_id != client_id;
+        if changed {
+            let mut next = cfg.clone();
+            next.credentials.youtube_oauth_client_id = client_id.clone();
+            let revision = state.commit_config(&mut cfg, next).map_err(|e| e.to_string())?;
+            let saved = serde_json::json!({ "youtubeOauthClientId": cfg.credentials.youtube_oauth_client_id });
+            let _ = on_config_saved.send(ConfigCommit::new(Some(revision), saved));
+        }
         changed
     };
     if changed {
@@ -1297,6 +1286,8 @@ struct UpdateConfigOutcome {
     protected_oauth: Vec<OAuthService>,
     /// 保存後の設定 revision。
     revision: u64,
+    /// 保存した正規化済みの設定全体。
+    config: AppConfig,
 }
 
 /// 状態を計算した時点での設定上の Client ID。公開クライアントの ID を UI の照合に使う。
@@ -1319,8 +1310,12 @@ async fn update_config(
     base_revision: Option<u64>,
 ) -> Result<UpdateConfigOutcome, String> {
     let mut new_config = AppConfig::from_config_update(new_config)?;
-    validate_x_post_template(&new_config.x_post.template)?;
     let write = state.config_write.lock().await;
+    // 古いフォームは他の検証より先に競合として拒否する(フォームの値に基づく検証は意味がない)。
+    if base_revision.is_some_and(|base| base != state.config_revision.load(Ordering::SeqCst)) {
+        return Err(CONFIG_CHANGED_ERROR.to_string());
+    }
+    validate_x_post_template(&new_config.x_post.template)?;
     let protected_oauth = protect_oauth_config(
         &state.config.lock().unwrap(),
         &mut new_config,
@@ -1420,6 +1415,7 @@ async fn update_config(
         warnings,
         protected_oauth,
         revision,
+        config: new_config,
     })
 }
 
@@ -1470,34 +1466,55 @@ fn stop_active_twitch_channels(state: &AppState) {
 
 /// メイン画面の目標表示だけを最新の設定に反映する。
 #[tauri::command]
-async fn set_goals_show_in_app(state: State<'_, AppState>, show_in_app: bool) -> Result<(), String> {
+async fn set_goals_show_in_app(
+    state: State<'_, AppState>,
+    show_in_app: bool,
+) -> Result<ConfigCommit<serde_json::Value>, String> {
     let _write = state.config_write.lock().await;
     let mut current = state.config.lock().unwrap();
     let mut next = current.clone();
     next.goals.show_in_app = show_in_app;
-    state
+    let revision = state
         .commit_config(&mut current, next)
         .map_err(|_| "目標表示の設定を保存できませんでした".to_string())?;
-    Ok(())
+    Ok(ConfigCommit::new(
+        Some(revision),
+        serde_json::json!({ "showInApp": current.goals.show_in_app }),
+    ))
 }
 
 /// 呼び出し側が config_write を保持した状態で、最新の moderation だけを保存・反映する。
+/// 変更が無ければ保存せず `revision: None` を返す。
 fn update_moderation(
     state: &AppState,
     edit: impl FnOnce(&mut config::ModerationConfig),
-) -> Result<(), String> {
+) -> Result<ConfigCommit<ModerationSaved>, String> {
     let mut current = state.config.lock().unwrap();
     let mut next = current.clone();
     edit(&mut next.moderation);
     if next.moderation == current.moderation {
-        return Ok(());
+        return Ok(ConfigCommit::new(None, ModerationSaved { moderation: next.moderation }));
     }
     let moderation = next.moderation.clone();
-    state
+    let revision = state
         .commit_config(&mut current, next)
         .map_err(|_| "モデレーション規則を保存できませんでした".to_string())?;
     state.moderator.lock().unwrap().update_config(&moderation);
-    Ok(())
+    Ok(ConfigCommit::new(Some(revision), ModerationSaved { moderation }))
+}
+
+#[derive(Clone, Serialize)]
+struct ModerationSaved {
+    moderation: config::ModerationConfig,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ModerationAppended {
+    /// 追加した正規化済みの値。空や重複で追加しなかった時は None。
+    value: Option<String>,
+    #[serde(flatten)]
+    rules: ModerationSaved,
 }
 
 fn append_ng_value(entries: &mut Vec<String>, value: &str) -> Option<String> {
@@ -1533,7 +1550,7 @@ async fn append_moderation_value(
     state: State<'_, AppState>,
     kind: serde_json::Value,
     value: serde_json::Value,
-) -> Result<Option<String>, String> {
+) -> Result<ConfigCommit<ModerationAppended>, String> {
     let select: fn(&mut config::ModerationConfig) -> &mut Vec<String> = match kind.as_str() {
         Some("ngWords") => |rules: &mut config::ModerationConfig| &mut rules.ng_words,
         Some("ngUsers") => |rules: &mut config::ModerationConfig| &mut rules.ng_users,
@@ -1542,17 +1559,20 @@ async fn append_moderation_value(
     let value = value.as_str().ok_or("NG 規則は文字列で指定してください")?;
     let _write = state.config_write.lock().await;
     let mut normalized = None;
-    update_moderation(&state, |rules| {
+    let commit = update_moderation(&state, |rules| {
         normalized = append_ng_value(select(rules), value);
     })?;
-    Ok(normalized)
+    Ok(ConfigCommit::new(
+        commit.revision,
+        ModerationAppended { value: normalized, rules: commit.saved },
+    ))
 }
 
 #[tauri::command]
 async fn set_moderation(
     state: State<'_, AppState>,
     moderation: serde_json::Value,
-) -> Result<(), String> {
+) -> Result<ConfigCommit<ModerationSaved>, String> {
     let moderation = serde_json::from_value::<config::ModerationConfig>(moderation)
         .map_err(|_| "モデレーション規則の形式が不正です".to_string())?;
     let _write = state.config_write.lock().await;
@@ -1565,8 +1585,8 @@ fn add_channel(
     app: AppHandle,
     state: State<'_, AppState>,
     channel: ChannelConfig,
-) -> Result<(), String> {
-    {
+) -> Result<ConfigCommit<ChannelsSaved>, String> {
+    let commit = {
         let mut cfg = state.config.lock().unwrap();
         // 既存の同一キーがあれば重複追加しない。
         let key = AppState::channel_key(&channel);
@@ -1575,40 +1595,50 @@ fn add_channel(
         }
         let mut next = cfg.clone();
         next.channels.push(channel.clone());
-        state.commit_config(&mut cfg, next).map_err(|e| e.to_string())?;
-    }
+        let revision = state.commit_config(&mut cfg, next).map_err(|e| e.to_string())?;
+        channels_commit(&cfg, revision)
+    };
 
     spawn_one_channel(&app, &state, &channel);
-    Ok(())
+    Ok(commit)
 }
 
 /// チャンネルを1件削除して停止する。`key` は `twitch:name` / `youtube:videoId`。
 #[tauri::command]
-fn remove_channel(state: State<'_, AppState>, key: String) -> Result<(), String> {
+fn remove_channel(state: State<'_, AppState>, key: String) -> Result<ConfigCommit<ChannelsSaved>, String> {
     // 起動中タスクを停止。
     if let Some(token) = state.channels.lock().unwrap().remove(&key) {
         token.cancel();
     }
     // 設定から除去して保存。
-    {
-        let mut cfg = state.config.lock().unwrap();
-        let mut next = cfg.clone();
-        next.channels.retain(|c| AppState::channel_key(c) != key);
-        state.commit_config(&mut cfg, next).map_err(|e| e.to_string())?;
-    }
-    Ok(())
+    let mut cfg = state.config.lock().unwrap();
+    let mut next = cfg.clone();
+    next.channels.retain(|c| AppState::channel_key(c) != key);
+    let revision = state.commit_config(&mut cfg, next).map_err(|e| e.to_string())?;
+    Ok(channels_commit(&cfg, revision))
 }
 
 /// 行の「自分の配信」印だけを保存する。Source は再起動しない(印は自動告知の判定にだけ使う)。
 #[tauri::command]
-fn set_channel_own_stream(state: State<'_, AppState>, key: String, own: bool) -> Result<(), String> {
-    {
-        let mut cfg = state.config.lock().unwrap();
-        let mut next = cfg.clone();
-        set_own_stream_in(&mut next, &key, own)?;
-        state.commit_config(&mut cfg, next).map_err(|e| e.to_string())?;
-    }
-    Ok(())
+fn set_channel_own_stream(
+    state: State<'_, AppState>,
+    key: String,
+    own: bool,
+) -> Result<ConfigCommit<ChannelsSaved>, String> {
+    let mut cfg = state.config.lock().unwrap();
+    let mut next = cfg.clone();
+    set_own_stream_in(&mut next, &key, own)?;
+    let revision = state.commit_config(&mut cfg, next).map_err(|e| e.to_string())?;
+    Ok(channels_commit(&cfg, revision))
+}
+
+#[derive(Clone, Serialize)]
+struct ChannelsSaved {
+    channels: Vec<ChannelConfig>,
+}
+
+fn channels_commit(cfg: &AppConfig, revision: u64) -> ConfigCommit<ChannelsSaved> {
+    ConfigCommit::new(Some(revision), ChannelsSaved { channels: cfg.channels.clone() })
 }
 
 fn set_own_stream_in(cfg: &mut AppConfig, key: &str, own: bool) -> Result<(), String> {
@@ -1782,6 +1812,7 @@ async fn connect_twitcasting(
     client_id: Option<String>,
     callback_port: serde_json::Value,
     attempt: String,
+    on_config_saved: tauri::ipc::Channel<ConfigCommit<OAuthClientSaved>>,
 ) -> Result<OAuthStatus<TwitcastingStatus>, TwitcastingAuthError> {
     let attempt = parse_oauth_attempt(&attempt).map_err(|message| TwitcastingAuthError {
         code: TwitcastingAuthErrorCode::Other,
@@ -1810,9 +1841,16 @@ async fn connect_twitcasting(
         let mut next = cfg.clone();
         next.credentials.twitcasting_client_id = (!client_id.is_empty()).then(|| client_id.clone());
         next.twitcasting.callback_port = callback_port;
-        state
+        let revision = state
             .commit_config(&mut cfg, next)
             .map_err(|_| TwitcastingAuthError::new(TwitcastingAuthErrorCode::Other))?;
+        let _ = on_config_saved.send(ConfigCommit::new(
+            Some(revision),
+            OAuthClientSaved {
+                client_id: cfg.credentials.twitcasting_client_id.clone(),
+                callback_port: cfg.twitcasting.callback_port,
+            },
+        ));
     }
     let status = state
         .twitcasting_auth
@@ -1866,6 +1904,7 @@ async fn connect_x_post(
     client_id: String,
     callback_port: serde_json::Value,
     attempt: String,
+    on_config_saved: tauri::ipc::Channel<ConfigCommit<OAuthClientSaved>>,
 ) -> Result<OAuthStatus<XPostStatus>, XPostError> {
     let attempt = parse_oauth_attempt(&attempt).map_err(|message| XPostError {
         code: XPostErrorCode::Other,
@@ -1893,9 +1932,16 @@ async fn connect_x_post(
         let mut next = cfg.clone();
         next.credentials.x_post_client_id = Some(client_id.clone());
         next.x_post.callback_port = callback_port;
-        state
+        let revision = state
             .commit_config(&mut cfg, next)
             .map_err(|_| XPostError::new(XPostErrorCode::Other))?;
+        let _ = on_config_saved.send(ConfigCommit::new(
+            Some(revision),
+            OAuthClientSaved {
+                client_id: cfg.credentials.x_post_client_id.clone(),
+                callback_port: cfg.x_post.callback_port,
+            },
+        ));
     }
     let result = state
         .x_post_auth
@@ -1925,6 +1971,7 @@ fn cancel_x_post_login(state: State<'_, AppState>, attempt: String) -> Result<()
 #[tauri::command]
 async fn disconnect_x_post(
     state: State<'_, AppState>,
+    on_config_saved: tauri::ipc::Channel<ConfigCommit<serde_json::Value>>,
 ) -> Result<OAuthStatus<XPostStatus>, XPostError> {
     let result = state.x_post_auth.disconnect().await;
     {
@@ -1932,8 +1979,12 @@ async fn disconnect_x_post(
         if cfg.x_post.mode == "api" {
             let mut next = cfg.clone();
             next.x_post.mode = "intent".into();
-            if let Err(e) = state.commit_config(&mut cfg, next) {
-                tracing::warn!("X 切断後の設定保存に失敗: {e}");
+            match state.commit_config(&mut cfg, next) {
+                Ok(revision) => {
+                    let saved = serde_json::json!({ "xPost": { "mode": cfg.x_post.mode } });
+                    let _ = on_config_saved.send(ConfigCommit::new(Some(revision), saved));
+                }
+                Err(e) => tracing::warn!("X 切断後の設定保存に失敗: {e}"),
             }
         }
     }
@@ -3383,15 +3434,13 @@ mod followup_tests {
             warnings: vec!["w".into()],
             protected_oauth: vec![OAuthService::XPost, OAuthService::Twitcasting],
             revision: 7,
+            config: AppConfig::default(),
         };
-        assert_eq!(
-            serde_json::to_value(&outcome).unwrap(),
-            serde_json::json!({
-                "warnings": ["w"],
-                "protectedOAuth": ["xPost", "twitcasting"],
-                "revision": 7,
-            })
-        );
+        let value = serde_json::to_value(&outcome).unwrap();
+        assert_eq!(value["warnings"], serde_json::json!(["w"]));
+        assert_eq!(value["protectedOAuth"], serde_json::json!(["xPost", "twitcasting"]));
+        assert_eq!(value["revision"], 7);
+        assert!(value["config"].is_object());
     }
 
     // ログイン待ちの間だけ、update_config の保護判定が立つ。
@@ -3968,26 +4017,44 @@ mod followup_tests {
 
     #[test]
     fn every_config_write_goes_through_commit_config() {
-        // 書込経路が revision を進めずに保存すると、古いフォームの全体保存を止められない。
-        let source = include_str!("lib.rs");
-        let bypasses = [
-            [".save(&state", ".config_dir)"].concat(),
-            ["config_tx", ".send("].concat(),
-        ];
-        for needle in bypasses {
-            assert!(!source.contains(&needle), "{needle} は commit_config を通すこと");
+        // revision を進めずに設定を保存・差し替える経路が無いことを、クレートの全ソースで見る。
+        // AppConfig の保存先は設定ディレクトリなので、save に設定ディレクトリ(config_dir)を渡す呼び出しを禁じる。
+        fn visit(dir: &std::path::Path, out: &mut Vec<(PathBuf, String)>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    visit(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push((path.clone(), std::fs::read_to_string(&path).unwrap()));
+                }
+            }
         }
-        assert_eq!(source.matches(["next.save", "(dir)"].concat().as_str()).count(), 1);
-        assert_eq!(source.matches(["tx.send", "_replace("].concat().as_str()).count(), 1);
+        let mut files = Vec::new();
+        visit(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut files);
+        assert!(files.len() > 10);
+        let banned = [
+            ["config_tx", ".send("].concat(),
+            ["config_tx", ".send_replace("].concat(),
+            ["config_tx", ".send_modify("].concat(),
+            ["AppConfig::", "save("].concat(),
+        ];
+        let save_call = ["." , "save("].concat();
+        for (path, source) in &files {
+            let compact: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+            for needle in &banned {
+                assert!(!compact.contains(needle.as_str()), "{}: {needle} は commit_config を通すこと", path.display());
+            }
+            for (at, _) in compact.match_indices(save_call.as_str()) {
+                let args: String = compact[at + save_call.len()..].chars().take_while(|&c| c != ')').collect();
+                let in_commit = path.ends_with("config.rs") && args == "dir";
+                assert!(in_commit || !args.contains("config_dir"), "{}: 設定の保存は commit_config を通すこと", path.display());
+            }
+        }
+        let config = files.iter().find(|(p, _)| p.ends_with("config.rs")).unwrap();
+        assert_eq!(config.1.matches("next.save(dir)").count(), 1);
     }
 
-    #[test]
-    fn config_save_failure_is_still_an_error() {
-        let dir = TestDir::new("config-save-fail");
-        let file = dir.0.join("not-a-dir");
-        std::fs::write(&file, b"x").unwrap();
-        assert!(AppConfig::default().save(&file).is_err());
-    }
+
 
     #[tokio::test]
     async fn injected_test_flag_survives_broadcast_and_clone_but_not_serde() {

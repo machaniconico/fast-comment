@@ -688,3 +688,123 @@ test('the goals toggle waits for a fresh config after a full import from a close
   });
   assert.equal((await saved(page)).goals.showInApp, true);
 }, 'app'));
+
+const rejected = page => page.evaluate(() => window.mock.rejected);
+const writes = page => page.evaluate(() => window.mock.writes.length);
+const saveRowReload = page => page.locator('.save-row').getByText('設定を読み直してください', { exact: true });
+
+test('an NG append whose notice is still pending rejects the stale full save', async t => withSettings(t, async page => {
+  await page.evaluate(() => {
+    window.mock.holdAppendNotices = true;
+    void window.__TAURI_INTERNALS__.invoke('append_moderation_value', { kind: 'ngWords', value: 'spam' });
+  });
+  await page.waitForFunction(() => window.mock.heldAppendNotices.length === 1);
+  await save(page).click();
+  await page.waitForFunction(() => window.mock.rejected === 1);
+  await page.evaluate(() => window.mock.heldAppendNotices.shift()());
+  await saveRowReload(page).waitFor();
+  assert.equal(await writes(page), 0);
+  assert.deepEqual((await saved(page)).moderation.ngWords, ['spam']);
+}));
+
+test('a held goals save then an older settings read leaves the toggle matching the saved value', async t => withSettings(t, async page => {
+  const toggle = page.getByRole('checkbox', { name: 'コメビュに表示' });
+  await toggle.waitFor();
+  await page.evaluate(() => { window.mock.holdGoalsWrites = true; });
+  await toggle.click();
+  await page.waitForFunction(() => window.mock.heldGoalsWrites.length === 1);
+  await page.evaluate(() => { window.mock.holdReads = true; });
+  await page.getByRole('tab', { name: '設定', exact: true }).click();
+  await page.waitForFunction(() => window.mock.heldReads.length === 1);
+  await page.evaluate(() => window.mock.heldGoalsWrites.shift()());
+  await page.waitForFunction(() => window.mock.saved.goals.showInApp === true);
+  await page.evaluate(() => {
+    window.mock.holdReads = false;
+    window.mock.heldReads.shift()();
+  });
+  await page.waitForFunction(() => window.mock.configSync.reloading === 0);
+  await page.getByRole('tab', { name: 'コメント', exact: true }).click();
+  await toggle.waitFor();
+  await page.waitForFunction(() => document.querySelector('.goals-panel-toggle input')?.disabled === false);
+  assert.equal(await toggle.isChecked(), true);
+  assert.equal((await saved(page)).goals.showInApp, true);
+}, 'app'));
+
+test('the main window backs off and stops retrying a failing config read', async t => withSettings(t, async page => {
+  const toggle = page.getByRole('checkbox', { name: 'コメビュに表示' });
+  await toggle.waitFor();
+  await page.clock.install();
+  const start = await page.evaluate(() => {
+    window.mock.readsToFail = 100;
+    window.mock.configSync.revision = 5;
+    return window.mock.reads;
+  });
+  const readsAfter = n => page.waitForFunction(n => window.mock.reads === n, start + n);
+  await readsAfter(1);
+  for (const [wait, total] of [[1000, 2], [2000, 3], [4000, 4]]) {
+    await page.clock.fastForward(wait);
+    await readsAfter(total);
+  }
+  await page.clock.fastForward(60_000);
+  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(resolve)));
+  assert.equal(await page.evaluate(() => window.mock.reads), start + 4);
+  assert.equal(await toggle.isDisabled(), true);
+  await page.locator('.goals-panel').getByText('設定を読み直してください', { exact: true }).waitFor();
+}, 'app'));
+
+test('a retention normalized by Rust does not reject the next save', async t => withSettings(t, async page => {
+  await page.locator('#log-retention').fill('3651');
+  assert.equal((await saveSettings(page)).log.retentionDays, 3650);
+  await page.waitForFunction(() => document.getElementById('log-retention').value === '3650');
+  await page.locator('#log-retention').fill('30');
+  assert.equal((await saveSettings(page, 2)).log.retentionDays, 30);
+  assert.equal(await rejected(page), 0);
+}));
+
+test('an X disconnect from another path rejects an API-mode form save as a conflict', async t => withSettings(t, async page => {
+  await page.getByRole('tab', { name: '設定', exact: true }).waitFor();
+  await page.evaluate(() => {
+    window.mock.saved.xPost.mode = 'api';
+    window.mock.status.xPost = { ...window.mock.status.xPost, connected: true, username: 'current-x' };
+  });
+  await page.getByRole('tab', { name: '設定', exact: true }).click();
+  await save(page).waitFor();
+  await page.waitForFunction(() => window.mock.configSync.reloading === 0);
+  await page.evaluate(() => window.__TAURI_INTERNALS__.invoke('disconnect_x_post', {}));
+  await save(page).click();
+  await page.waitForFunction(() => window.mock.rejected === 1);
+  await saveRowReload(page).waitFor();
+  assert.equal(await page.evaluate(() => window.mock.configSync.reloadRequired), true);
+  assert.equal(await writes(page), 0);
+}, 'app'));
+
+for (const outcome of ['ok', 'fail', 'cancel']) {
+  test('YouTube OAuth connect (' + outcome + ') then another edit saves without a conflict', async t => withSettings(t, async page => {
+    await page.evaluate(outcome => { window.mock.youtubeConnect = outcome; }, outcome);
+    await page.locator('#cred-youtube-oauth-client-id').fill('yt-client');
+    await page.getByRole('button', { name: 'Googleに接続', exact: true }).click();
+    await page.waitForFunction(() => window.mock.saved.credentials.youtubeOauthClientId === 'yt-client');
+    await page.waitForFunction(() => !document.querySelector('.youtube-connect-btn')?.textContent.includes('接続待ち'));
+    await page.locator('#log-retention').fill('10');
+    const next = await saveSettings(page);
+    assert.equal(next.log.retentionDays, 10);
+    assert.equal(next.credentials.youtubeOauthClientId, 'yt-client');
+    assert.equal(await rejected(page), 0);
+  }));
+}
+
+test('disconnecting X in API mode from the form keeps the next save valid', async t => withSettings(t, async page => {
+  await page.getByRole('tab', { name: '設定', exact: true }).waitFor();
+  await page.evaluate(() => {
+    window.mock.saved.xPost.mode = 'api';
+    window.mock.status.xPost = { ...window.mock.status.xPost, connected: true, username: 'current-x' };
+  });
+  await page.getByRole('tab', { name: '設定', exact: true }).click();
+  await save(page).waitFor();
+  await page.getByRole('button', { name: '切断', exact: true }).click();
+  await page.waitForFunction(() => window.mock.saved.xPost.mode === 'intent');
+  await page.getByText(/X との接続を切りました/).waitFor();
+  const next = await saveSettings(page);
+  assert.equal(next.xPost.mode, 'intent');
+  assert.equal(await rejected(page), 0);
+}, 'app'));

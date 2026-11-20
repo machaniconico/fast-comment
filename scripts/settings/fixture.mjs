@@ -26,6 +26,12 @@ const initial = {
 };
 
 const keys = { twitcasting: 'twitcastingClientId', xPost: 'xPostClientId' };
+
+// Tauri の Channel へ 1 件送る(各 Channel の最初のメッセージは index 0)。
+function sendChannel(channel, message) {
+  if (!channel) return;
+  mock.callbacks.get(Number(String(channel.toJSON()).split(':').at(-1)))?.({ index: 0, message });
+}
 const mock = window.mock = {
   initial,
   saved: structuredClone(initial),
@@ -47,6 +53,9 @@ const mock = window.mock = {
   heldModerationWrites: [],
   holdModerationWrites: false,
   failModerationAppend: false,
+  heldAppendNotices: [],
+  holdAppendNotices: false,
+  youtubeConnect: 'ok',
   login: {},
   cancels: [],
   callbacks: new Map(),
@@ -84,11 +93,16 @@ if (location.search === '?browser') {
         }
         case 'update_config': {
           if (mock.updateError !== null) throw mock.updateError;
+          // Rust と同じく、基準 revision の照合を他の検証より先に行う。
           if (args.baseRevision != null && args.baseRevision !== mock.revision) {
             mock.rejected++;
             throw '設定が別の操作で変更されました。読み直してから保存してください';
           }
           const next = JSON.parse(JSON.stringify(args.newConfig));
+          if (next.xPost?.mode === 'api' && !mock.status.xPost.connected) {
+            throw 'API モードは X に接続してから選んでください';
+          }
+          if (next.log?.retentionDays > 3650) next.log.retentionDays = 3650;
           const protectedOAuth = [];
           for (const [service, id] of Object.entries(keys)) {
             if (typeof next[service].callbackPort !== 'number') {
@@ -106,15 +120,14 @@ if (location.search === '?browser') {
           }
           mock.writes.push(next);
           mock.saved = next;
-          return { warnings: [], protectedOAuth, revision: ++mock.revision };
+          return { warnings: [], protectedOAuth, revision: ++mock.revision, config: structuredClone(next) };
         }
         case 'set_goals_show_in_app':
           if (mock.holdGoalsWrites) {
             await new Promise(resolve => mock.heldGoalsWrites.push(resolve));
           }
           mock.saved.goals.showInApp = args.showInApp;
-          mock.revision++;
-          return null;
+          return { revision: ++mock.revision, showInApp: args.showInApp };
         case 'append_moderation_value':
         case 'set_moderation': {
           if (mock.holdModerationWrites) {
@@ -122,22 +135,44 @@ if (location.search === '?browser') {
           }
           if (command === 'set_moderation') {
             mock.saved.moderation = structuredClone(args.moderation);
-            mock.revision++;
-            return null;
+            return { revision: ++mock.revision, moderation: structuredClone(mock.saved.moderation) };
           }
           if (mock.failModerationAppend) throw new Error(args.value);
           const value = args.value.trim();
           const entries = mock.saved.moderation[args.kind];
+          let revision = null;
           if (value && !entries.includes(value)) {
             entries.push(value);
-            mock.revision++;
+            revision = ++mock.revision;
           }
-          return value || null;
+          // 保存は済み、完了の通知(応答)だけを止められる。
+          if (mock.holdAppendNotices) await new Promise(resolve => mock.heldAppendNotices.push(resolve));
+          return { value: value || null, revision, moderation: structuredClone(mock.saved.moderation) };
         }
         case 'cancel_twitcasting_login':
         case 'cancel_x_post_login':
           mock.cancels.push({ command, attempt: args.attempt });
           return null;
+        case 'connect_youtube_oauth': {
+          if (mock.saved.credentials.youtubeOauthClientId !== args.clientId) {
+            mock.saved.credentials.youtubeOauthClientId = args.clientId;
+            sendChannel(args.onConfigSaved, { revision: ++mock.revision, youtubeOauthClientId: args.clientId });
+          }
+          if (mock.youtubeConnect === 'fail') throw 'Google の認可に失敗しました';
+          if (mock.youtubeConnect === 'cancel') throw 'ログインを取り消しました';
+          return { configured: true, connected: true, channelTitle: 'test-channel' };
+        }
+        case 'disconnect_x_post': {
+          if (mock.saved.xPost.mode === 'api') {
+            mock.saved.xPost.mode = 'intent';
+            sendChannel(args?.onConfigSaved, { revision: ++mock.revision, xPost: { mode: 'intent' } });
+          }
+          mock.status.xPost = { ...mock.status.xPost, connected: false, username: null };
+          return mock.status.xPost;
+        }
+        case 'add_channel':
+          mock.saved.channels.push(args.channel);
+          return { revision: ++mock.revision, channels: structuredClone(mock.saved.channels) };
         case 'get_twitcasting_status': return mock.status.twitcasting;
         case 'get_x_post_status': return mock.status.xPost;
         case 'connect_twitcasting':
@@ -149,12 +184,11 @@ if (location.search === '?browser') {
               accept() {
                 mock.saved[service].callbackPort = args.callbackPort;
                 mock.saved.credentials[keys[service]] = args.clientId;
-                mock.revision++;
-                if (args.onConfigSaved) {
-                  mock.callbacks.get(Number(String(args.onConfigSaved.toJSON()).split(':').at(-1)))?.({
-                    index: 0, message: null,
-                  });
-                }
+                // Rust の状態は保存済みの ClientID で答える。
+                mock.status[service] = { ...mock.status[service], clientId: args.clientId };
+                sendChannel(args.onConfigSaved, {
+                  revision: ++mock.revision, clientId: args.clientId, callbackPort: args.callbackPort,
+                });
               },
               finish(result) {
                 delete mock.login[service];

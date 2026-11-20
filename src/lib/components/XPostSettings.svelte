@@ -9,6 +9,8 @@
     openUrl,
     previewXPost,
     sendXTestPost,
+    type ConfigCommit,
+    type OAuthClientSaved,
   } from '../ipc';
   import type { XPostConfig, XPostErrorInfo, XPostPreview, XPostStatus } from '../ipc';
   import { canSelectApiMode, errorText, testPostPreview } from '../xAutopost';
@@ -25,6 +27,8 @@
     onConnectionSettled,
     onCallbackPortChange,
     onConnectingChange,
+    onConfigSaved,
+    onModeSaved,
   }: {
     xPost: XPostConfig;
     clientId?: string;
@@ -35,6 +39,10 @@
     onConnectionSettled: () => Promise<void>;
     onCallbackPortChange: (port: number | null) => void;
     onConnectingChange: (connecting: boolean) => void;
+    /** 接続コマンドが ClientID と待受ポートを保存した。 */
+    onConfigSaved: (commit: ConfigCommit<OAuthClientSaved>) => void;
+    /** 切断が API モードを Intent モードへ戻して保存した。 */
+    onModeSaved: (commit: ConfigCommit<{ xPost: Pick<XPostConfig, 'mode'> }>) => void;
   } = $props();
 
   // ── API モードの接続 ──
@@ -108,7 +116,7 @@
     authMsg = 'ブラウザで X にログインし、アプリを許可してください…';
     authOk = null;
     try {
-      const next = await connectXPost(id, listenPort, current);
+      const next = await connectXPost(id, listenPort, current, onConfigSaved);
       if (!next) throw new Error('アプリからログイン結果を受け取れませんでした。');
       statusRequest += 1;
       latestStatus = next;
@@ -146,7 +154,7 @@
     disconnecting = true;
     successClientId = null;
     try {
-      latestStatus = await disconnectXPost();
+      latestStatus = await disconnectXPost(onModeSaved);
       authMsg = 'X との接続を切りました(この PC の認証を消しました。X 側の許可は X の設定から外せます)';
       authOk = true;
     } catch (e) {

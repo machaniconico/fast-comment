@@ -8,6 +8,7 @@
 use std::fs::File;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -1050,6 +1051,9 @@ impl AppConfig {
     ///
     /// 同一ディレクトリの一時ファイルへ書き込み → fsync → rename で原子的に置換する。
     /// rename は NTFS/POSIX いずれでも同一ディレクトリ内であれば原子的。
+    ///
+    /// クレート内では `commit_config` だけが呼ぶ(revision を進めない保存を作らない。lib.rs の
+    /// `every_config_write_goes_through_commit_config` で検査)。受け入れテストが使うので公開している。
     pub fn save(&self, dir: &Path) -> anyhow::Result<()> {
         std::fs::create_dir_all(dir)
             .map_err(|e| anyhow::anyhow!("設定ディレクトリ作成失敗 {}: {e}", dir.display()))?;
@@ -1068,6 +1072,47 @@ impl AppConfig {
             .map_err(|e| anyhow::anyhow!("設定ファイル置換失敗 {} -> {}: {e}", tmp_path.display(), path.display()))?;
         Ok(())
     }
+}
+
+/// 全体保存の基準 revision が古い時の固定文言。
+pub const CONFIG_CHANGED_ERROR: &str = "設定が別の操作で変更されました。読み直してから保存してください";
+
+#[derive(Debug)]
+pub enum ConfigCommitError {
+    /// `base_revision` が現在の revision と違う。保存していない。
+    Stale,
+    Save(anyhow::Error),
+}
+
+impl std::fmt::Display for ConfigCommitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Stale => f.write_str(CONFIG_CHANGED_ERROR),
+            Self::Save(e) => e.fmt(f),
+        }
+    }
+}
+
+/// 設定をディスクへ保存し、成功した時だけメモリ・watch・revision を進める。
+///
+/// 設定を書くすべての経路がここを通る。
+/// 呼び出し側は `current`(= 設定のロック)を保持していること。`base_revision` が `Some` で
+/// 現在値と違えば何も書かずに `Stale` を返す。
+pub fn commit_config(
+    dir: &Path,
+    revision: &AtomicU64,
+    tx: &tokio::sync::watch::Sender<AppConfig>,
+    current: &mut AppConfig,
+    next: AppConfig,
+    base_revision: Option<u64>,
+) -> Result<u64, ConfigCommitError> {
+    if base_revision.is_some_and(|base| base != revision.load(Ordering::SeqCst)) {
+        return Err(ConfigCommitError::Stale);
+    }
+    next.save(dir).map_err(ConfigCommitError::Save)?;
+    *current = next;
+    tx.send_replace(current.clone());
+    Ok(revision.fetch_add(1, Ordering::SeqCst) + 1)
 }
 
 // ---- serde default ヘルパ ----
