@@ -16,7 +16,7 @@
 
 - **ローカル API / Webhook の設定は `integrations.json` と資格情報ストア**。`config.json`・`update_config` に載せない。トークン・URL をログ・エラー文・emit に出さない。
 
-- **ツイキャスの既定経路は非公式(ログイン不要)**: 視聴ページ HTML → `eventpubsuburl.php` → WS(`sources/twitcasting.rs`)。壊れたら `twitcastingOverrides` で再ビルド無しに吸収する。公式 API は PR3' の代替(`mode` 切替)で、取得経路には使っていない。WS URL のトークンを保護するため、`tungstenite` と `tokio_tungstenite` 配下の DEBUG / TRACE はログレイヤーのフィルタで除外する。
+- **ツイキャスの既定経路は非公式(ログイン不要)**: 視聴ページ HTML → `eventpubsuburl.php` → WS(`sources/twitcasting.rs`)。壊れたら `twitcastingOverrides` で再ビルド無しに吸収する。公式 API は PR3' の代替(`mode` 切替)で、取得経路には使っていない。WS URL のトークンを保護するため、`tungstenite` と `tokio_tungstenite` 配下の DEBUG / TRACE は出力レイヤーの上限フィルタで落とす(`EnvFilter` ではない。`RUST_LOG` を引き上げない)。`Started` はアプリ全体で直近 256 件の movie_id を共有して重複を抑える(送信成功時だけ記録)。
 - **ツイキャスのログイン(公式 API v2 の Implicit)のトークンは資格情報ストアだけに置く**。config.json・ログ・エラー文・emit に出さない。ClientSecret を同梱しない。
 
 詳細仕様は `.claude/SPEC.md`。これが単一情報源。
