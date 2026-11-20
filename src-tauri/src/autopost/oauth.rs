@@ -280,12 +280,27 @@ impl<S: TokenStore> XPostAuth<S> {
         port: u16,
         open_browser: impl FnOnce(String) -> Result<(), String>,
     ) -> Result<XPostStatus, XPostError> {
+        self.connect_with_cancel(client_id, port, CancellationToken::new(), open_browser)
+            .await
+    }
+
+    pub(crate) async fn connect_with_cancel(
+        &self,
+        client_id: &str,
+        port: u16,
+        cancel: CancellationToken,
+        open_browser: impl FnOnce(String) -> Result<(), String>,
+    ) -> Result<XPostStatus, XPostError> {
         let client_id = client_id.trim();
         if client_id.is_empty() {
             return Err(XPostError::new(XPostErrorCode::Other));
         }
 
+        let cancel = cancel.child_token();
         let setup = self.setup.lock().await;
+        if cancel.is_cancelled() {
+            return Err(XPostError::new(XPostErrorCode::Cancelled));
+        }
         // 進行中の待受を止め、listener が閉じるのを待ってから同じポートへ bind する。
         if let Some(previous) = self.take_login() {
             previous.cancel.cancel();
@@ -312,7 +327,7 @@ impl<S: TokenStore> XPostAuth<S> {
         );
 
         let session_id = self.login_seq.fetch_add(1, Ordering::SeqCst) + 1;
-        let cancel = CancellationToken::new();
+        let _cancel_on_drop = cancel.clone().drop_guard();
         let wait_cancel = cancel.clone();
         let check_cancel = cancel.clone();
         let expected_state = state.secret().to_string();
@@ -342,14 +357,19 @@ impl<S: TokenStore> XPostAuth<S> {
         }
         drop(setup);
 
-        if open_browser(url).is_err() {
+        let open_result = if check_cancel.is_cancelled() {
+            Err(XPostErrorCode::Cancelled)
+        } else {
+            open_browser(url).map_err(|_| XPostErrorCode::Other)
+        };
+        if let Err(code) = open_result {
             if let Some(session) = self.remove_login(session_id) {
                 session.cancel.cancel();
                 if let Some(handle) = session.handle {
                     let _ = handle.await;
                 }
             }
-            return Err(XPostError::new(XPostErrorCode::Other));
+            return Err(XPostError::new(code));
         }
 
         let code = match result_rx.await {

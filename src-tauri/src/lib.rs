@@ -31,11 +31,10 @@ mod templates;
 pub mod tts;
 mod update;
 
-use std::collections::HashMap;
+use std::collections::{hash_map::Entry, HashMap};
 use std::fs;
 use std::net::TcpStream;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -43,6 +42,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use crate::autopost::{
     AutopostStatus, KeyringTokenStore, UserCommand as AutopostCommand, XEndpoints, XPostAuth,
@@ -1085,61 +1085,92 @@ enum OAuthService {
     Twitcasting,
 }
 
-/// 1 サービスの OAuth ログインの開始順と取消を管理する。
+fn parse_oauth_attempt(attempt: &str) -> Result<Uuid, &'static str> {
+    Uuid::parse_str(attempt).map_err(|_| "ログインの試行 ID が不正です")
+}
+
+enum OAuthAttempt {
+    CancelledBeforeBegin,
+    Running(CancellationToken),
+}
+
+/// 1 サービスの OAuth ログインの開始順と、試行 ID ごとの取消を管理する。
 #[derive(Default)]
 struct OAuthLoginGate {
-    /// 進行中のログイン数。0 でない間は update_config が Client ID・待受ポートを保護する。
-    active: AtomicUsize,
-    /// 取消要求の通し番号。ログイン受付時から進んでいれば、そのログインは取り消された。
-    cancels: AtomicU64,
+    attempts: Mutex<HashMap<Uuid, OAuthAttempt>>,
     /// 設定の保存から認証側のセッション登録(ブラウザを開く直前)までを 1 件ずつ通す。
-    /// 保存した Client ID の順と認証の開始順が逆転しないようにする。
     order: tokio::sync::Mutex<()>,
 }
 
 impl OAuthLoginGate {
     fn is_active(&self) -> bool {
-        self.active.load(Ordering::SeqCst) != 0
+        self.attempts
+            .lock()
+            .unwrap()
+            .values()
+            .any(|attempt| matches!(attempt, OAuthAttempt::Running(_)))
     }
 
-    /// 受付以降のログインを取り消す。セッション登録前でも、ブラウザを開く前に止まる。
-    fn cancel(&self) {
-        self.cancels.fetch_add(1, Ordering::SeqCst);
-    }
-
-    /// 取消の基準はロック待ちの前に取る(待っている間に届いた取消もこのログインに効かせる)。
-    async fn begin(&self) -> OAuthLogin<'_> {
-        let cancels = self.cancels.load(Ordering::SeqCst);
-        let order = self.order.lock().await;
-        self.active.fetch_add(1, Ordering::SeqCst);
-        OAuthLogin {
-            gate: self,
-            cancels,
-            order: Mutex::new(Some(order)),
+    fn cancel(&self, attempt: Uuid) {
+        let mut attempts = self.attempts.lock().unwrap();
+        let state = attempts
+            .entry(attempt)
+            .or_insert(OAuthAttempt::CancelledBeforeBegin);
+        if let OAuthAttempt::Running(cancel) = state {
+            cancel.cancel();
         }
+    }
+
+    async fn begin(&self, attempt: Uuid) -> Option<OAuthLogin<'_>> {
+        let cancel = CancellationToken::new();
+        {
+            let mut attempts = self.attempts.lock().unwrap();
+            match attempts.entry(attempt) {
+                Entry::Occupied(entry) => {
+                    if matches!(entry.get(), OAuthAttempt::CancelledBeforeBegin) {
+                        entry.remove();
+                    }
+                    return None;
+                }
+                Entry::Vacant(entry) => entry.insert(OAuthAttempt::Running(cancel.clone())),
+            };
+        }
+        let mut login = OAuthLogin {
+            gate: self,
+            attempt,
+            cancel,
+            order: None,
+        };
+        let order = tokio::select! {
+            biased;
+            _ = login.cancel.cancelled() => return None,
+            order = self.order.lock() => order,
+        };
+        login.order = Some(order);
+        Some(login)
     }
 }
 
 /// 同じサービスで次のログインが前のログインを取り消す場合も、最後の終了まで保護する。
 struct OAuthLogin<'a> {
     gate: &'a OAuthLoginGate,
-    cancels: u64,
-    order: Mutex<Option<tokio::sync::MutexGuard<'a, ()>>>,
+    attempt: Uuid,
+    cancel: CancellationToken,
+    order: Option<tokio::sync::MutexGuard<'a, ()>>,
 }
 
 impl OAuthLogin<'_> {
     fn cancelled(&self) -> bool {
-        self.gate.cancels.load(Ordering::SeqCst) != self.cancels
+        self.cancel.is_cancelled()
     }
 
-    /// 認証側がセッションを登録した後に呼ばれる。ここで次のログインの開始を許す。
-    /// 取消済みなら開かない(登録後の取消は認証側の cancel_login が届く)。
+    /// 認証側のセッション登録後、次の試行に開始順のロックを渡す。
     fn open_browser(
-        &self,
+        &mut self,
         url: String,
         open: impl FnOnce(String) -> Result<(), String>,
     ) -> Result<(), String> {
-        self.order.lock().unwrap().take();
+        self.order.take();
         if self.cancelled() {
             return Err("cancelled".into());
         }
@@ -1149,7 +1180,7 @@ impl OAuthLogin<'_> {
 
 impl Drop for OAuthLogin<'_> {
     fn drop(&mut self) {
-        self.gate.active.fetch_sub(1, Ordering::SeqCst);
+        self.gate.attempts.lock().unwrap().remove(&self.attempt);
     }
 }
 
@@ -1583,7 +1614,17 @@ async fn connect_twitcasting(
     state: State<'_, AppState>,
     client_id: Option<String>,
     callback_port: serde_json::Value,
+    attempt: String,
 ) -> Result<OAuthStatus<TwitcastingStatus>, TwitcastingAuthError> {
+    let attempt = parse_oauth_attempt(&attempt).map_err(|message| TwitcastingAuthError {
+        code: TwitcastingAuthErrorCode::Other,
+        message: message.into(),
+    })?;
+    let mut login = state
+        .twitcasting_login
+        .begin(attempt)
+        .await
+        .ok_or_else(|| TwitcastingAuthError::new(TwitcastingAuthErrorCode::Cancelled))?;
     let callback_port = parse_oauth_callback_port(callback_port).map_err(|message| {
         TwitcastingAuthError {
             code: TwitcastingAuthErrorCode::Other,
@@ -1593,7 +1634,6 @@ async fn connect_twitcasting(
     let client_id = client_id.unwrap_or_default().trim().to_owned();
     let effective = effective_client_id(Some(&client_id))
         .ok_or_else(|| TwitcastingAuthError::new(TwitcastingAuthErrorCode::NotConfigured))?;
-    let login = state.twitcasting_login.begin().await;
     {
         let _write = state.config_write.lock().await;
         if login.cancelled() {
@@ -1610,9 +1650,13 @@ async fn connect_twitcasting(
     }
     let status = state
         .twitcasting_auth
-        .connect_on(callback_port, &effective, timer_now_ms(), |url| {
-            login.open_browser(url, open_url)
-        })
+        .connect_on_with_cancel(
+            callback_port,
+            &effective,
+            timer_now_ms(),
+            login.cancel.clone(),
+            |url| login.open_browser(url, open_url),
+        )
         .await
         .map_err(|e| {
             if login.cancelled() {
@@ -1625,10 +1669,9 @@ async fn connect_twitcasting(
 }
 
 #[tauri::command]
-fn cancel_twitcasting_login(state: State<'_, AppState>) {
-    // 先に記録してから認証側を止める(どちらかが必ずまだ開いていないログインに届く)。
-    state.twitcasting_login.cancel();
-    state.twitcasting_auth.cancel_login();
+fn cancel_twitcasting_login(state: State<'_, AppState>, attempt: String) -> Result<(), &'static str> {
+    state.twitcasting_login.cancel(parse_oauth_attempt(&attempt)?);
+    Ok(())
 }
 
 #[tauri::command]
@@ -1656,7 +1699,17 @@ async fn connect_x_post(
     state: State<'_, AppState>,
     client_id: String,
     callback_port: serde_json::Value,
+    attempt: String,
 ) -> Result<OAuthStatus<XPostStatus>, XPostError> {
+    let attempt = parse_oauth_attempt(&attempt).map_err(|message| XPostError {
+        code: XPostErrorCode::Other,
+        message: message.into(),
+    })?;
+    let mut login = state
+        .x_post_login
+        .begin(attempt)
+        .await
+        .ok_or_else(|| XPostError::new(XPostErrorCode::Cancelled))?;
     let callback_port = parse_oauth_callback_port(callback_port).map_err(|message| XPostError {
         code: XPostErrorCode::Other,
         message: message.into(),
@@ -1665,7 +1718,6 @@ async fn connect_x_post(
     if client_id.is_empty() {
         return Err(XPostError::new(XPostErrorCode::NotLoggedIn));
     }
-    let login = state.x_post_login.begin().await;
     {
         let _write = state.config_write.lock().await;
         if login.cancelled() {
@@ -1682,7 +1734,9 @@ async fn connect_x_post(
     }
     let result = state
         .x_post_auth
-        .connect(&client_id, callback_port, |url| login.open_browser(url, open_url))
+        .connect_with_cancel(&client_id, callback_port, login.cancel.clone(), |url| {
+            login.open_browser(url, open_url)
+        })
         .await
         .map_err(|e| {
             if login.cancelled() {
@@ -1697,10 +1751,9 @@ async fn connect_x_post(
 
 /// 進行中の X ログインを取り消す(待受ポートを即座に解放する)。
 #[tauri::command]
-fn cancel_x_post_login(state: State<'_, AppState>) {
-    // 先に記録してから認証側を止める(どちらかが必ずまだ開いていないログインに届く)。
-    state.x_post_login.cancel();
-    state.x_post_auth.cancel_login();
+fn cancel_x_post_login(state: State<'_, AppState>, attempt: String) -> Result<(), &'static str> {
+    state.x_post_login.cancel(parse_oauth_attempt(&attempt)?);
+    Ok(())
 }
 
 /// この PC の X 認証を消す(X 側の許可は取り消さない)。API モードなら Intent モードへ戻す。
@@ -3158,21 +3211,17 @@ mod followup_tests {
     async fn oauth_review_pending_login_protects_the_config_until_it_ends() {
         let gate = OAuthLoginGate::default();
         let current = AppConfig::default();
-        let incoming = || {
-            let mut incoming = AppConfig::default();
-            incoming.credentials.twitcasting_client_id = Some("other".into());
-            incoming.twitcasting.callback_port = current.twitcasting.callback_port + 1;
-            incoming
-        };
         let protect = |gate: &OAuthLoginGate| {
-            let mut next = incoming();
+            let mut next = AppConfig::default();
+            next.credentials.twitcasting_client_id = Some("other".into());
+            next.twitcasting.callback_port = current.twitcasting.callback_port + 1;
             protect_oauth_config(&current, &mut next, |service| {
                 service == OAuthService::Twitcasting && gate.is_active()
             })
         };
 
         assert!(protect(&gate).is_empty());
-        let login = gate.begin().await;
+        let mut login = gate.begin(Uuid::new_v4()).await.unwrap();
         let _ = login.open_browser("url".into(), |_| Ok(()));
         // ブラウザを開いた後も、ログインが終わるまで保護する。
         assert_eq!(protect(&gate), [OAuthService::Twitcasting]);
@@ -3180,51 +3229,115 @@ mod followup_tests {
         assert!(protect(&gate).is_empty());
     }
 
-    // 指摘4: 設定保存中(セッション未登録)に届いた取消でも、ブラウザを開かずに終わる。
-    #[tokio::test]
-    async fn oauth_review_cancel_before_session_registration_keeps_the_browser_closed() {
-        let gate = OAuthLoginGate::default();
-        let auth = TwitcastingAuth::new(
+    fn twitcasting_auth_for_gate() -> Arc<TwitcastingAuth<integrations::MemorySecretStore>> {
+        TwitcastingAuth::new(
             integrations::MemorySecretStore::new(),
             TwitcastingEndpoints::default(),
             AuthOptions::default(),
-        );
-        auth.load(Some("client"), 0).await;
-        let login = gate.begin().await;
-        // cancel_twitcasting_login と同じ順。認証側にはまだ止めるセッションが無い。
-        gate.cancel();
-        auth.cancel_login();
-        let opened = std::sync::atomic::AtomicBool::new(false);
-        let result = auth
-            .connect_on(0, "client", 0, |url| {
-                login.open_browser(url, |_| {
-                    opened.store(true, Ordering::SeqCst);
-                    Ok(())
-                })
-            })
-            .await;
-        assert!(result.is_err());
-        assert!(login.cancelled());
-        assert!(!opened.load(Ordering::SeqCst));
+        )
     }
 
-    // 指摘4: 前のログインの順番待ち中に届いた取消も、待っていたログインに効く。
+    #[tokio::test]
+    async fn oauth_review_cancel_before_begin_prevents_login() {
+        let gate = OAuthLoginGate::default();
+        let attempt = Uuid::new_v4();
+        let begin = gate.begin(attempt);
+        gate.cancel(attempt);
+        // その後に別の取消を受け付けても、まだ始まっていない試行の取消を失わない。
+        for _ in 0..32 {
+            gate.cancel(Uuid::new_v4());
+        }
+        assert!(begin.await.is_none());
+        assert!(!gate.is_active());
+    }
+
     #[tokio::test]
     async fn oauth_review_cancel_while_waiting_for_the_previous_login_applies() {
         let gate = OAuthLoginGate::default();
-        let first = gate.begin().await;
-        let second = gate.begin();
+        let first = gate.begin(Uuid::new_v4()).await.unwrap();
+        let attempt = Uuid::new_v4();
+        let second = gate.begin(attempt);
         tokio::pin!(second);
         assert!(futures_util::poll!(second.as_mut()).is_pending());
-        gate.cancel();
+        gate.cancel(attempt);
+        assert!(matches!(futures_util::poll!(second.as_mut()), std::task::Poll::Ready(None)));
+        assert!(!first.cancelled());
         drop(first);
-        let second = second.await;
-        assert!(second.cancelled());
-        assert!(second.open_browser("url".into(), |_| Ok(())).is_err());
-        // 取消より後に受け付けたログインは取り消されない。
-        drop(second);
-        let third = gate.begin().await;
-        assert!(!third.cancelled());
+        assert!(!gate.is_active());
+    }
+
+    #[test]
+    fn oauth_review_rejects_invalid_attempt_ids_without_echoing_input() {
+        assert_eq!(parse_oauth_attempt("client-id"), Err("ログインの試行 ID が不正です"));
+    }
+
+    // 古い試行の取消は、ツイキャスの後続ログインを止めない。
+    #[tokio::test]
+    async fn oauth_review_stale_cancel_does_not_stop_a_newer_twitcasting_login() {
+        let gate = Arc::new(OAuthLoginGate::default());
+        let auth = twitcasting_auth_for_gate();
+        auth.load(Some("client"), 0).await;
+        let (opened_tx, opened_rx) = tokio::sync::oneshot::channel();
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut task = {
+            let gate = gate.clone();
+            tokio::spawn(async move {
+                let mut login = gate.begin(b).await.unwrap();
+                auth.connect_on_with_cancel(0, "client", 0, login.cancel.clone(), |url| {
+                    login.open_browser(url, |_| {
+                        let _ = opened_tx.send(());
+                        Ok(())
+                    })
+                })
+                .await
+                .map(|_| ())
+                .map_err(|e| e.code)
+            })
+        };
+        opened_rx.await.unwrap();
+        gate.cancel(a);
+        assert!(tokio::time::timeout(Duration::from_millis(50), &mut task).await.is_err());
+        gate.cancel(b);
+        assert!(matches!(
+            task.await.unwrap(),
+            Err(TwitcastingAuthErrorCode::Cancelled)
+        ));
+    }
+
+    // X では後続ログインが前の試行を置き換え、前の試行を取り消しても後続は待受を続ける。
+    #[tokio::test]
+    async fn oauth_review_x_post_logins_replace_in_order_and_cancel_by_attempt() {
+        use crate::autopost::oauth::MemoryTokenStore;
+
+        let gate = Arc::new(OAuthLoginGate::default());
+        let auth = Arc::new(XPostAuth::new(MemoryTokenStore::new(), XEndpoints::default()).unwrap());
+        let start = |attempt: Uuid| {
+            let (gate, auth) = (gate.clone(), auth.clone());
+            let (opened_tx, opened_rx) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(async move {
+                let mut login = gate.begin(attempt).await.unwrap();
+                auth.connect_with_cancel("client", 0, login.cancel.clone(), |url| {
+                    login.open_browser(url, |_| {
+                        let _ = opened_tx.send(());
+                        Ok(())
+                    })
+                })
+                .await
+                .map(|_| ())
+                .map_err(|e| e.code)
+            });
+            (task, opened_rx)
+        };
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let (first, first_opened) = start(a);
+        first_opened.await.unwrap();
+        let (mut second, second_opened) = start(b);
+        second_opened.await.unwrap();
+        assert_eq!(first.await.unwrap(), Err(XPostErrorCode::Cancelled));
+        gate.cancel(a);
+        assert!(tokio::time::timeout(Duration::from_millis(50), &mut second).await.is_err());
+        gate.cancel(b);
+        assert_eq!(second.await.unwrap(), Err(XPostErrorCode::Cancelled));
     }
 
     // 指摘5: 保存の順と認証セッションの登録順が逆転しない(後に保存した方が最後に登録される)。
@@ -3236,7 +3349,7 @@ mod followup_tests {
         let login = |name: &'static str, delay: usize| {
             let (gate, saved, registered) = (&gate, &saved, &registered);
             async move {
-                let login = gate.begin().await;
+                let mut login = gate.begin(Uuid::new_v4()).await.unwrap();
                 saved.lock().unwrap().push(name);
                 // 先に保存した方ほど、認証側の登録まで時間がかかる。
                 for _ in 0..delay {

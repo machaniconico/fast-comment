@@ -5,6 +5,7 @@
     connectXPost,
     disconnectXPost,
     getXPostStatus,
+    newOAuthAttempt,
     openUrl,
     previewXPost,
     sendXTestPost,
@@ -29,7 +30,7 @@
     clientId?: string;
     configRevision: number;
     saving: boolean;
-    onConnectionSettled: (unchanged: () => { clientId: boolean; port: boolean }) => Promise<boolean>;
+    onConnectionSettled: () => Promise<void>;
     onCallbackPortChange: (port: number | null) => void;
     onConnectingChange: (connecting: boolean) => void;
   } = $props();
@@ -40,6 +41,7 @@
     configRevision;
     clientIdInput = clientId;
   });
+  let attempt = $state<string | null>(null);
   const portInput = createCallbackPortInput(
     () => xPost.callbackPort, () => configRevision, (port) => onCallbackPortChange(port),
   );
@@ -96,16 +98,14 @@
       authOk = false;
       return;
     }
-    // 終了後の読み直しは、この時点から入力を変えていない項目だけに当てる。
-    const sentClientId = clientIdInput;
-    const sentPortText = portInput.text;
+    const current = attempt = newOAuthAttempt();
     connecting = true;
     onConnectingChange(true);
     successClientId = null;
     authMsg = 'ブラウザで X にログインし、アプリを許可してください…';
     authOk = null;
     try {
-      const next = await connectXPost(id, listenPort);
+      const next = await connectXPost(id, listenPort, current);
       if (!next) throw new Error('アプリからログイン結果を受け取れませんでした。');
       statusRequest += 1;
       latestStatus = next;
@@ -118,16 +118,12 @@
       authMsg = errorText(e);
       authOk = false;
     } finally {
-      connecting = false;
-      onConnectingChange(false);
-      const applied = await onConnectionSettled(() => ({
-        clientId: clientIdInput === sentClientId,
-        port: portInput.text === sentPortText,
-      }));
-      // 保存側の値を当てた項目は、入力欄も保存された値にそろえる。
-      if (applied && !connecting) {
-        if (clientIdInput === sentClientId) clientIdInput = clientId;
-        if (portInput.text === sentPortText) portInput.reset();
+      attempt = null;
+      try {
+        await onConnectionSettled();
+      } finally {
+        connecting = false;
+        onConnectingChange(false);
       }
       if (authOk === false) void refreshStatus();
     }
@@ -135,7 +131,7 @@
 
   async function cancelLogin() {
     try {
-      await cancelXPostLogin();
+      if (attempt) await cancelXPostLogin(attempt);
     } catch (e) {
       authMsg = errorText(e);
       authOk = false;
@@ -425,10 +421,10 @@
     <p class="xpost-warn">⚠ 認証の保存に失敗しました。アプリを終了するまでに保存できないと、再ログインが必要になります。</p>
   {/if}
   <div class="field-row">
-    {#if connecting}
+    {#if attempt}
       <button type="button" class="btn-small" onclick={cancelLogin}>ログインを取り消す</button>
     {:else}
-      <button type="button" class="btn-small primary" onclick={connect} disabled={saving || disconnecting}>
+      <button type="button" class="btn-small primary" onclick={connect} disabled={saving || connecting || disconnecting}>
         {connected ? '別のアカウントで接続し直す' : 'X に接続'}
       </button>
     {/if}

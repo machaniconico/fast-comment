@@ -1112,12 +1112,18 @@ export async function getXPostStatus(): Promise<XPostStatus | null> {
 }
 
 /** Client ID とポートだけを保存し、ブラウザで X にログインする。失敗は `XPostErrorInfo` で reject。 */
-export async function connectXPost(clientId: string, callbackPort: number): Promise<XPostStatus | null> {
-  return invoke<XPostStatus>('connect_x_post', { clientId, callbackPort });
+export async function connectXPost(clientId: string, callbackPort: number, attempt: string): Promise<XPostStatus | null> {
+  return invoke<XPostStatus>('connect_x_post', { clientId, callbackPort, attempt });
 }
 
-export async function cancelXPostLogin(): Promise<void> {
-  await invoke<void>('cancel_x_post_login');
+/** `attempt` の X ログインだけを取り消す(接続コマンドより先に届いても効く)。 */
+export async function cancelXPostLogin(attempt: string): Promise<void> {
+  await invoke<void>('cancel_x_post_login', { attempt });
+}
+
+/** OAuth ログインの試行 ID。接続と取消の対応づけに使う。 */
+export function newOAuthAttempt(): string {
+  return crypto.randomUUID();
 }
 
 /** X の許可を取り消し、この PC の保存を消す。API モードだった時は Intent モードへ戻る。 */
@@ -1145,14 +1151,17 @@ export async function reloadTwitcastingStatus(): Promise<import('./types').Twitc
 export async function connectTwitcasting(
   clientId: string | undefined,
   callbackPort: number,
+  attempt: string,
 ): Promise<import('./types').TwitcastingStatus | null> {
   return invoke<import('./types').TwitcastingStatus>('connect_twitcasting', {
     clientId: clientId || null,
     callbackPort,
+    attempt,
   });
 }
-export async function cancelTwitcastingLogin(): Promise<void> {
-  await invoke<void>('cancel_twitcasting_login');
+/** `attempt` のツイキャスログインだけを取り消す(接続コマンドより先に届いても効く)。 */
+export async function cancelTwitcastingLogin(attempt: string): Promise<void> {
+  await invoke<void>('cancel_twitcasting_login', { attempt });
 }
 export async function disconnectTwitcasting(): Promise<import('./types').TwitcastingStatus | null> {
   return invoke<import('./types').TwitcastingStatus>('disconnect_twitcasting');

@@ -37,6 +37,7 @@ const mock = window.mock = {
   heldReads: [],
   holdReads: false,
   login: {},
+  cancels: [],
   callbacks: new Map(),
   appearance: () => theme.getSnapshot(),
 };
@@ -84,6 +85,10 @@ if (location.search === '?browser') {
           mock.saved = next;
           return { warnings: [], protectedOAuth };
         }
+        case 'cancel_twitcasting_login':
+        case 'cancel_x_post_login':
+          mock.cancels.push({ command, attempt: args.attempt });
+          return null;
         case 'get_twitcasting_status': return mock.status.twitcasting;
         case 'get_x_post_status': return mock.status.xPost;
         case 'connect_twitcasting':
@@ -91,6 +96,7 @@ if (location.search === '?browser') {
           const service = command === 'connect_twitcasting' ? 'twitcasting' : 'xPost';
           return new Promise((resolve, reject) => {
             mock.login[service] = {
+              attempt: args.attempt,
               accept() {
                 mock.saved[service].callbackPort = args.callbackPort;
                 mock.saved.credentials[keys[service]] = args.clientId;

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { getTwitcastingStatus, reloadTwitcastingStatus, connectTwitcasting, cancelTwitcastingLogin, disconnectTwitcasting } from '../ipc';
+  import { getTwitcastingStatus, reloadTwitcastingStatus, connectTwitcasting, cancelTwitcastingLogin, disconnectTwitcasting, newOAuthAttempt } from '../ipc';
   import type { TwitcastingStatus } from '../types';
   import { errorText } from '../xAutopost';
   import { DEFAULT_TWITCASTING_CALLBACK_PORT, twitcastingDisplayCallbackUrl } from '../twitcasting';
@@ -16,13 +16,14 @@
     saving: boolean;
     onCallbackPortChange: (port: number | null) => void;
     onConnectingChange: (connecting: boolean) => void;
-    onConnectionSettled: (unchanged: () => { clientId: boolean; port: boolean }) => Promise<boolean>;
+    onConnectionSettled: () => Promise<void>;
   } = $props();
   let clientIdInput = $state('');
   $effect.pre(() => {
     configRevision;
     clientIdInput = clientId;
   });
+  let attempt = $state<string | null>(null);
   const portInput = createCallbackPortInput(
     () => callbackPort, () => configRevision, (port) => onCallbackPortChange(port),
   );
@@ -106,7 +107,7 @@
     const timer = setInterval(() => void refresh(), 30000);
     return () => {
       clearInterval(timer);
-      if (connecting) void cancelTwitcastingLogin().catch(() => {});
+      if (attempt) void cancelTwitcastingLogin(attempt).catch(() => {});
     };
   });
   async function connect() {
@@ -117,9 +118,7 @@
       failed = true;
       return;
     }
-    // 終了後の読み直しは、この時点から入力を変えていない項目だけに当てる。
-    const sentClientId = clientIdInput;
-    const sentPortText = portInput.text;
+    const current = attempt = newOAuthAttempt();
     connecting = true;
     onConnectingChange(true);
     listeningPort = listenPort;
@@ -127,7 +126,7 @@
     successClientId = null;
     message = 'ブラウザでツイキャスにログインし、アプリを許可してください…';
     try {
-      const next = await connectTwitcasting(clientIdInput.trim(), listenPort);
+      const next = await connectTwitcasting(clientIdInput.trim(), listenPort, current);
       if (!next) throw new Error('アプリからログイン結果を受け取れませんでした。');
       statusRequest += 1;
       latestStatus = next;
@@ -140,23 +139,20 @@
       message = errorText(e);
       failed = true;
     } finally {
-      connecting = false;
+      attempt = null;
       listeningPort = null;
-      onConnectingChange(false);
-      const applied = await onConnectionSettled(() => ({
-        clientId: clientIdInput === sentClientId,
-        port: portInput.text === sentPortText,
-      }));
-      // 保存側の値を当てた項目は、入力欄も保存された値にそろえる。
-      if (applied && !connecting) {
-        if (clientIdInput === sentClientId) clientIdInput = clientId;
-        if (portInput.text === sentPortText) portInput.reset();
+      try {
+        await onConnectionSettled();
+      } finally {
+        connecting = false;
+        onConnectingChange(false);
       }
       if (failed) void refresh();
     }
   }
   async function cancel() {
-    try { await cancelTwitcastingLogin(); }
+    if (!attempt) return;
+    try { await cancelTwitcastingLogin(attempt); }
     catch (e) { message = errorText(e); failed = true; }
   }
   async function disconnect() {
@@ -211,10 +207,10 @@
     <p>有効期限は不明です。認証が切れたら再ログインしてください。</p>
   {/if}
   <div class="field-row">
-    {#if connecting}
+    {#if attempt}
       <button type="button" onclick={cancel}>取り消す</button>
     {:else}
-      <button type="button" class="primary" onclick={connect} disabled={saving || disconnecting || reloading || !status || status.state === 'loading' || status.logoutPending}>ログイン</button>
+      <button type="button" class="primary" onclick={connect} disabled={saving || connecting || disconnecting || reloading || !status || status.state === 'loading' || status.logoutPending}>ログイン</button>
     {/if}
     {#if statusError}
       <button type="button" onclick={retryStatus} disabled={connecting || disconnecting || reloading}>{status ? 'ログイン状態を再取得' : '再読み込み'}</button>

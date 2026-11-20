@@ -1017,15 +1017,30 @@ impl<S: SecretStore> TwitcastingAuth<S> {
         now_ms: u64,
         open_browser: impl FnOnce(String) -> Result<(), String>,
     ) -> Result<TwitcastingStatus, TwitcastingAuthError> {
+        self.connect_on_with_cancel(port, client_id, now_ms, CancellationToken::new(), open_browser)
+            .await
+    }
+
+    pub(crate) async fn connect_on_with_cancel(
+        self: &Arc<Self>,
+        port: u16,
+        client_id: &str,
+        now_ms: u64,
+        cancel: CancellationToken,
+        open_browser: impl FnOnce(String) -> Result<(), String>,
+    ) -> Result<TwitcastingStatus, TwitcastingAuthError> {
         let observed_at = Instant::now();
         let deadline = observed_at + self.options.login_timeout;
         if client_id.trim().is_empty() {
             return Err(error(Code::NotConfigured));
         }
-        let cancel = CancellationToken::new();
+        let cancel = cancel.child_token();
         let _cancel_on_drop = cancel.clone().drop_guard();
         {
             let mut login = self.login.lock().unwrap();
+            if cancel.is_cancelled() {
+                return Err(error(Code::Cancelled));
+            }
             let memory = self.session.memory.lock().unwrap();
             // Until the startup check answers, a stale logout could delete this login.
             if memory.logout_pending || memory.initializing {
