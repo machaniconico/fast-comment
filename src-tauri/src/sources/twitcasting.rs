@@ -127,10 +127,11 @@ pub fn extract_screen_id(input: &str) -> Option<String> {
     } else if head.starts_with("//") {
         // プロトコル相対 URL は UI と同じく受け付けない。
         return None;
+    } else if let Some(rest) = strip_allowed_host_prefix(raw) {
+        // 許可ホストを先に判定する。後続パスの `://`(`…/movie/https://x`)で全体を拒否しない(UI と同じ)。
+        rest
     } else if head.contains("://") {
         return None;
-    } else if let Some(rest) = strip_allowed_host_prefix(raw) {
-        rest
     } else if head.contains('/') {
         // スキーム無しの他ホスト・パスは受け付けない。
         return None;
