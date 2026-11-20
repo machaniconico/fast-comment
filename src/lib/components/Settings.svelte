@@ -2,10 +2,11 @@
   import { onMount, onDestroy, untrack } from 'svelte';
   import type {
     AppConfig, EffectRule, EffectsConfig, GoalsConfig, InjectTestCommentOptions, TtsDictEntry, TtsOptions,
-    TimerConfig, WelcomeConfig, YoutubeOauthStatus, TwitchOauthStatus, TwitchDeviceLogin, OAuthService
+    TimerConfig, WelcomeConfig, YoutubeOauthStatus, TwitchOauthStatus, TwitchDeviceLogin, OAuthService,
+    ConfigSnapshot
   } from '../ipc';
   import {
-    isTauri, getConfig, setConfig, getObsUrl, getObsGoalsUrl, getObsTimerUrl, exportCommentsCsv, injectTestComment,
+    isTauri, getConfigSnapshot, setConfig, configChangedError, getObsUrl, getObsGoalsUrl, getObsTimerUrl, exportCommentsCsv, injectTestComment,
     setTtsPaused, clearTtsQueue, skipCurrentTts, testTts, probeTtsEngine, getYoutubeOauthStatus,
     connectYoutubeOauth, disconnectYoutubeOauth, getTwitchOauthStatus, beginTwitchLogin,
     awaitTwitchLogin, cancelTwitchLogin, disconnectTwitchOauth, getGoalSkinInfo, openUrl,
@@ -44,7 +45,7 @@
   import { progressLabel, statusText } from '../appUpdate';
 
   interface Props {
-    onConfigSaved?: (config: AppConfig) => void;
+    onConfigSaved?: (config: AppConfig, revision: number) => void;
     focus?: 'all' | 'goals' | 'danmaku';
   }
 
@@ -142,8 +143,11 @@
   let xPostPortInvalid = $state(false);
   const oauthConnecting = $state({ twitcasting: false, xPost: false });
   const oauthConfigRevision = $state({ twitcasting: 0, xPost: 0 });
-  const configSections = ['moderation', 'twitcasting', 'xPost'] as const;
-  const revisions = { all: 0, moderation: 0, twitcasting: 0, xPost: 0 };
+  // 取り違えを防ぐのは Rust の revision 照合。ここは「フォームが知っている保存済みの値」を持ち、
+  // 保存直前の読込と一致すればその revision を基準にして送る(ずれていれば Rust が拒否する)。
+  let baseRevision: number | undefined;
+  let serverView: AppConfig | null = null;
+  let latest: ConfigSnapshot | null = null;
   const reloading = $state({ all: 0, moderation: 0, twitcasting: 0, xPost: 0 });
   const allFieldsLocked = $derived(reloading.all > 0 || configSync.importing === 'all');
   const moderationFieldsLocked = $derived(reloading.moderation > 0 || configSync.importing === 'moderation');
@@ -418,52 +422,60 @@
     highlights = normalizeModerationEntries(rules.highlights);
   }
 
+  /** JSON として同じ値か(キー順と undefined の項目は問わない)。 */
+  function sameJson(a: unknown, b: unknown): boolean {
+    if (a === b) return true;
+    if (typeof a !== 'object' || typeof b !== 'object' || a === null || b === null) return false;
+    if (Array.isArray(a) !== Array.isArray(b)) return false;
+    const entries = (value: object) => Object.entries(value).filter(([, v]) => v !== undefined);
+    const left = entries(a);
+    const right = new Map(entries(b));
+    return left.length === right.size && left.every(([key, value]) => right.has(key) && sameJson(value, right.get(key)));
+  }
+
+  /** 読んだ設定のうち新しい方を返し、覚えておく。古い応答で新しい値を戻さない。 */
+  function newerSnapshot(snapshot: ConfigSnapshot): ConfigSnapshot {
+    if (!latest || snapshot.revision >= latest.revision) latest = structuredClone(snapshot);
+    if (latest.revision > configSync.revision) configSync.revision = latest.revision;
+    return structuredClone(latest);
+  }
+
   async function reloadConfig(scope: 'all' | 'moderation' | readonly OAuthService[]): Promise<boolean> {
     if (destroyed) return false;
 
-    const targets: readonly (keyof typeof revisions)[] = typeof scope === 'string' ? [scope] : scope;
-    const sections = scope === 'all' ? configSections : targets;
-    const revision = { ...revisions };
-    const coveredByFullReload = () => scope !== 'all' && revisions.all !== revision.all;
-    const { importRevision, goalsRevision } = configSync;
+    const targets: readonly (keyof typeof reloading)[] = typeof scope === 'string' ? [scope] : scope;
     for (const target of targets) reloading[target] += 1;
     configSync.reloading += 1;
 
-    const expiresAt = performance.now() + 10_000;
     let timeout: number | undefined;
     try {
       const deadline = new Promise<null>(resolve => {
         timeout = window.setTimeout(() => resolve(null), 10_000);
       });
-      const saved = await Promise.race([getConfig(), deadline]);
+      const snapshot = await Promise.race([getConfigSnapshot(), deadline]);
       if (destroyed) return false;
-      if (coveredByFullReload()) return true;
-      if (
-        !saved || performance.now() >= expiresAt ||
-        configSync.importRevision !== importRevision || revisions.all !== revision.all ||
-        sections.some(section => revisions[section] !== revision[section]) ||
-        (scope === 'all' && configSync.goalsRevision !== goalsRevision)
-      ) {
+      if (!snapshot) {
         configSync.reloadRequired = true;
         return false;
       }
+      const { config: saved, revision } = newerSnapshot(snapshot);
 
       if (scope === 'all') {
         hydrateConfig(saved);
+        serverView = structuredClone(saved);
+        baseRevision = revision;
         setNotify(saved.ui.notifySound, saved.ui.notifyVolume);
-        onConfigSaved?.(saved);
+        onConfigSaved?.(saved, revision);
         configSync.reloadRequired = false;
       } else if (scope === 'moderation') {
         applyModerationConfig(saved.moderation);
+        if (serverView) serverView.moderation = structuredClone(saved.moderation);
       } else {
         for (const service of scope) applySavedOAuthConfig(saved, service);
       }
-      for (const target of targets) revisions[target] += 1;
       return true;
     } catch {
-      if (destroyed) return false;
-      if (coveredByFullReload()) return true;
-      configSync.reloadRequired = true;
+      if (!destroyed) configSync.reloadRequired = true;
       return false;
     } finally {
       window.clearTimeout(timeout);
@@ -477,27 +489,26 @@
   }
 
   function onOAuthConnectingChange(service: OAuthService, connecting: boolean) {
-    if (connecting) revisions[service] += 1;
     oauthConnecting[service] = connecting;
   }
 
-  async function reloadOAuthConfig(service: OAuthService) {
-    // 接続コマンドが設定を保存した可能性があるため、先に開始した読込を無効にする。
-    revisions[service] += 1;
-    await reloadConfig([service]);
+  /** 保存済みの OAuth 項目(ClientID と待受ポート)を写す。 */
+  function copyOAuthConfig(target: AppConfig, saved: AppConfig, service: OAuthService) {
+    if (service === 'xPost') {
+      target.credentials = { ...target.credentials, xPostClientId: saved.credentials?.xPostClientId };
+      if (target.xPost && saved.xPost) target.xPost.callbackPort = saved.xPost.callbackPort;
+    } else {
+      target.credentials = { ...target.credentials, twitcastingClientId: saved.credentials?.twitcastingClientId };
+      target.twitcasting = structuredClone(saved.twitcasting);
+    }
   }
 
   function applySavedOAuthConfig(saved: AppConfig, service: OAuthService) {
     if (!config) return;
-    if (service === 'xPost' && config.xPost && saved.xPost) {
-      config.credentials = { ...config.credentials, xPostClientId: saved.credentials?.xPostClientId };
-      config.xPost.callbackPort = saved.xPost.callbackPort;
-      xPostPortInvalid = false;
-    } else if (service === 'twitcasting') {
-      config.credentials = { ...config.credentials, twitcastingClientId: saved.credentials?.twitcastingClientId };
-      config.twitcasting = saved.twitcasting;
-      twitcastingPortInvalid = false;
-    }
+    copyOAuthConfig(config, saved, service);
+    if (serverView) copyOAuthConfig(serverView, saved, service);
+    if (service === 'xPost') xPostPortInvalid = false;
+    else twitcastingPortInvalid = false;
     oauthConfigRevision[service] += 1;
   }
 
@@ -959,7 +970,8 @@
 
   // 即時保存された追加を編集中の一覧に取り込む。
   $effect(() => subscribeModerationAppend((kind, value) => {
-    revisions.moderation += 1;
+    const saved = serverView?.moderation[kind];
+    if (saved && !saved.includes(value)) saved.push(value);
     if (kind === 'ngUsers' && !ngUsers.includes(value)) ngUsers = [...ngUsers, value];
     if (kind === 'ngWords' && !ngWords.includes(value)) ngWords = [...ngWords, value];
   }));
@@ -1320,20 +1332,32 @@
     };
     saveWarned = false;
     try {
-      // 一覧で付けた「告知」印(ownStream)が、開きっぱなしの古い channels で戻らないよう保存直前に取り直す。
+      // このフォームで編集しない項目(一覧の channels、接続コマンドが保存する Client ID)は最新を使う。
+      // それ以外がフォームの知る保存値と同じなら、最新の revision を基準にできる。
       try {
-        const latest = await getConfig();
-        if (latest) {
-          config.channels = latest.channels;
-          // Client ID の保存は接続コマンドとインポートに限る。
-          config.credentials.xPostClientId = latest.credentials?.xPostClientId;
-          config.credentials.twitcastingClientId = latest.credentials?.twitcastingClientId;
+        const snapshot = await getConfigSnapshot();
+        if (snapshot) {
+          const { config: saved, revision } = newerSnapshot(snapshot);
+          for (const target of serverView ? [config, serverView] : [config]) {
+            target.channels = structuredClone(saved.channels);
+            target.credentials = {
+              ...target.credentials,
+              xPostClientId: saved.credentials?.xPostClientId,
+              twitcastingClientId: saved.credentials?.twitcastingClientId,
+            };
+          }
+          if (serverView && sameJson(serverView, saved)) baseRevision = revision;
         }
       } catch {
-        // 取れなければ手元の channels で保存する。
+        // 読めなければ手元の基準で送る。ずれていれば Rust が拒否する。
       }
       if (saveBlockedReason) return;
-      const result = await setConfig(config);
+      const result = await setConfig(config, baseRevision);
+      if (result) {
+        baseRevision = result.revision;
+        serverView = structuredClone($state.snapshot(config));
+        if (result.revision > configSync.revision) configSync.revision = result.revision;
+      }
       const warnings = result?.warnings ?? [];
       if (result?.protectedOAuth.length) {
         await reloadConfig(result.protectedOAuth);
@@ -1349,11 +1373,13 @@
       // client_id の変更で Twitch 側も未接続になり得るので、こちらも取り直す。
       await refreshTwitchOauth();
       setNotify(config.ui.notifySound, config.ui.notifyVolume);
-      onConfigSaved?.(config);
+      if (result) onConfigSaved?.(config, result.revision);
       saveMsg = saveWarned ? `保存しました(警告: ${warnings.join(' / ')})` : '保存しました';
     } catch (e) {
       saveWarned = false;
-      saveMsg = `保存に失敗しました: ${e instanceof Error ? e.message : String(e)}`;
+      const message = e instanceof Error ? e.message : String(e);
+      if (message === configChangedError) configSync.reloadRequired = true;
+      saveMsg = `保存に失敗しました: ${message}`;
     } finally {
       saving = false;
     }
@@ -2095,9 +2121,8 @@
       {allFieldsLocked}
       configReloading={reloading.twitcasting > 0}
       onConnectingChange={(connecting) => onOAuthConnectingChange('twitcasting', connecting)}
-      onConnectionSettled={() => reloadOAuthConfig('twitcasting')}
+      onConnectionSettled={async () => { await reloadConfig(['twitcasting']); }}
       onCallbackPortChange={(port) => {
-        revisions.twitcasting += 1;
         twitcastingPortInvalid = port === null;
         if (config && port !== null) config.twitcasting = { ...(config.twitcasting ?? {}), callbackPort: port };
       }}
@@ -2115,9 +2140,8 @@
         {allFieldsLocked}
         configReloading={reloading.xPost > 0}
         onConnectingChange={(connecting) => onOAuthConnectingChange('xPost', connecting)}
-        onConnectionSettled={() => reloadOAuthConfig('xPost')}
+        onConnectionSettled={async () => { await reloadConfig(['xPost']); }}
         onCallbackPortChange={(port) => {
-          revisions.xPost += 1;
           xPostPortInvalid = port === null;
           if (config?.xPost && port !== null) config.xPost.callbackPort = port;
         }}

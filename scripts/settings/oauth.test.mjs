@@ -504,7 +504,7 @@ async function commitTwitcasting(page, failRead = false) {
   );
 }
 
-test('manual reload discards 40321 when TwitCasting commits 40322 before its reply', async t => withSettings(t, async page => {
+test('manual reload uses 40322 when TwitCasting commits it before the 40321 reply', async t => withSettings(t, async page => {
   await startTwitcasting(page, '40321');
   await commitTwitcasting(page, true);
 
@@ -519,11 +519,10 @@ test('manual reload discards 40321 when TwitCasting commits 40322 before its rep
   await page.evaluate(() => { window.mock.holdReads = false; });
   await commitTwitcasting(page);
   assert.equal((await saved(page)).twitcasting.callbackPort, 40322);
+  // The older reply is replaced by the newer snapshot read after the login.
   await page.evaluate(() => window.mock.heldReads.shift()());
-  await reloadSettings(page).waitFor();
+  await page.waitForFunction(() => window.mock.configSync.reloading === 0);
   assert.equal(await twitcastingPort(page).inputValue(), '40322');
-  assert.equal(await save(page).isDisabled(), true);
-  await reloadSettings(page).click();
   assert.equal((await saveSettings(page)).twitcasting.callbackPort, 40322);
 }));
 
@@ -636,3 +635,56 @@ for (const [kind, action] of [
     assert.deepEqual((await saved(page)).moderation[kind], []);
   }, 'app'));
 }
+
+test('a moderation import committed after reopening settings rejects the stale form save', async t => withSettings(t, async page => {
+  const settingsTab = page.getByRole('tab', { name: '設定', exact: true });
+  await settingsTab.click();
+  await page.locator('#moderation-import-json').waitFor();
+  await page.evaluate(() => { window.mock.holdModerationWrites = true; });
+  await importModeration(page, spamRules);
+  await page.waitForFunction(() => window.mock.heldModerationWrites.length === 1);
+
+  // The reopened form reads the rules from before the pending import.
+  await page.getByRole('tab', { name: 'コメント', exact: true }).click();
+  await settingsTab.click();
+  await save(page).waitFor();
+  await page.waitForFunction(() => window.mock.configSync.reloading === 0);
+  await page.evaluate(() => window.mock.heldModerationWrites.shift()());
+  await page.waitForFunction(() => window.mock.saved.moderation.ngWords.length === 1);
+
+  await save(page).click();
+  await page.waitForFunction(() => window.mock.rejected === 1);
+  await page.locator('.save-row').getByText('設定を読み直してください', { exact: true }).waitFor();
+  assert.equal(await page.evaluate(() => window.mock.writes.length), 0);
+  assert.deepEqual((await saved(page)).moderation, spamRules);
+  assert.equal(await save(page).isDisabled(), true);
+
+  await reloadSettings(page).click();
+  assert.deepEqual((await saveSettings(page)).moderation, spamRules);
+}, 'app'));
+
+test('the goals toggle waits for a fresh config after a full import from a closed settings tab', async t => withSettings(t, async page => {
+  await page.getByRole('tab', { name: '設定', exact: true }).click();
+  await page.locator('#settings-import-json').waitFor();
+  const config = await initial(page);
+  config.goals.showInApp = true;
+  await page.evaluate(() => { window.mock.holdReads = true; });
+  await importConfig(page, { config });
+  await page.waitForFunction(() => window.mock.saved.goals.showInApp === true && window.mock.heldReads.length > 0);
+
+  await page.getByRole('tab', { name: 'コメント', exact: true }).click();
+  const toggle = page.getByRole('checkbox', { name: 'コメビュに表示' });
+  await toggle.waitFor();
+  assert.equal(await toggle.isDisabled(), true);
+  assert.equal(await toggle.isChecked(), false);
+
+  await page.evaluate(() => {
+    window.mock.holdReads = false;
+    while (window.mock.heldReads.length) window.mock.heldReads.shift()();
+  });
+  await page.waitForFunction(() => {
+    const input = [...document.querySelectorAll('.goals-panel-toggle input')][0];
+    return input && !input.disabled && input.checked;
+  });
+  assert.equal((await saved(page)).goals.showInApp, true);
+}, 'app'));

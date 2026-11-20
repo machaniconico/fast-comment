@@ -606,8 +606,18 @@ export interface UpdateStatus {
   releaseUrl: string;
 }
 
+/** 設定と、その時点の revision(Rust 側で保存のたびに進む)。 */
+export interface ConfigSnapshot {
+  config: AppConfig;
+  revision: number;
+}
+
+export async function getConfigSnapshot(): Promise<ConfigSnapshot | null> {
+  return invoke<ConfigSnapshot>('get_config');
+}
+
 export async function getConfig(): Promise<AppConfig | null> {
-  return invoke<AppConfig>('get_config');
+  return (await getConfigSnapshot())?.config ?? null;
 }
 
 export async function exportCommentsCsv(csv: string): Promise<string | null> {
@@ -619,10 +629,19 @@ export type OAuthService = 'xPost' | 'twitcasting';
 export interface UpdateConfigOutcome {
   warnings: string[];
   protectedOAuth: OAuthService[];
+  /** 保存後の設定 revision。 */
+  revision: number;
 }
 
-export async function setConfig(config: AppConfig): Promise<UpdateConfigOutcome | null> {
-  return invoke<UpdateConfigOutcome>('update_config', { newConfig: config });
+/** Rust の `CONFIG_CHANGED_ERROR` と同じ文言。`baseRevision` が古くて保存されなかった。 */
+export const configChangedError = '設定が別の操作で変更されました。読み直してから保存してください';
+
+/**
+ * 設定全体を保存する。`baseRevision` を渡すと、その後に別経路で保存されていた場合は
+ * 保存せず `configChangedError` で拒否される。インポートは意図的な上書きなので渡さない。
+ */
+export async function setConfig(config: AppConfig, baseRevision?: number): Promise<UpdateConfigOutcome | null> {
+  return invoke<UpdateConfigOutcome>('update_config', { newConfig: config, baseRevision: baseRevision ?? null });
 }
 
 export async function setGoalsShowInApp(showInApp: boolean): Promise<void> {

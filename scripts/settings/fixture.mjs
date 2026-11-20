@@ -29,6 +29,9 @@ const keys = { twitcasting: 'twitcastingClientId', xPost: 'xPostClientId' };
 const mock = window.mock = {
   initial,
   saved: structuredClone(initial),
+  // Rust の config_revision と同じく、保存に成功するたびに 1 進む。
+  revision: 0,
+  rejected: 0,
   writes: [],
   reads: 0,
   status: {
@@ -74,13 +77,17 @@ if (location.search === '?browser') {
             mock.readsToFail--;
             throw new Error('config read failed');
           }
-          const snapshot = structuredClone(mock.saved);
+          const snapshot = { config: structuredClone(mock.saved), revision: mock.revision };
           return mock.holdReads
             ? new Promise(resolve => mock.heldReads.push(() => resolve(snapshot)))
             : snapshot;
         }
         case 'update_config': {
           if (mock.updateError !== null) throw mock.updateError;
+          if (args.baseRevision != null && args.baseRevision !== mock.revision) {
+            mock.rejected++;
+            throw '設定が別の操作で変更されました。読み直してから保存してください';
+          }
           const next = JSON.parse(JSON.stringify(args.newConfig));
           const protectedOAuth = [];
           for (const [service, id] of Object.entries(keys)) {
@@ -99,13 +106,14 @@ if (location.search === '?browser') {
           }
           mock.writes.push(next);
           mock.saved = next;
-          return { warnings: [], protectedOAuth };
+          return { warnings: [], protectedOAuth, revision: ++mock.revision };
         }
         case 'set_goals_show_in_app':
           if (mock.holdGoalsWrites) {
             await new Promise(resolve => mock.heldGoalsWrites.push(resolve));
           }
           mock.saved.goals.showInApp = args.showInApp;
+          mock.revision++;
           return null;
         case 'append_moderation_value':
         case 'set_moderation': {
@@ -114,12 +122,16 @@ if (location.search === '?browser') {
           }
           if (command === 'set_moderation') {
             mock.saved.moderation = structuredClone(args.moderation);
+            mock.revision++;
             return null;
           }
           if (mock.failModerationAppend) throw new Error(args.value);
           const value = args.value.trim();
           const entries = mock.saved.moderation[args.kind];
-          if (value && !entries.includes(value)) entries.push(value);
+          if (value && !entries.includes(value)) {
+            entries.push(value);
+            mock.revision++;
+          }
           return value || null;
         }
         case 'cancel_twitcasting_login':
@@ -137,6 +149,7 @@ if (location.search === '?browser') {
               accept() {
                 mock.saved[service].callbackPort = args.callbackPort;
                 mock.saved.credentials[keys[service]] = args.clientId;
+                mock.revision++;
                 if (args.onConfigSaved) {
                   mock.callbacks.get(Number(String(args.onConfigSaved.toJSON()).split(':').at(-1)))?.({
                     index: 0, message: null,

@@ -179,10 +179,10 @@
     if (!ok) return;
 
     configSync.importing = 'all';
-    configSync.importRevision += 1;
     status = null;
     try {
       const result = await setConfig(parsed.config);
+      if (result && result.revision > configSync.revision) configSync.revision = result.revision;
       if (parsed.appearance !== undefined) theme.applySnapshot(parsed.appearance);
       if (!result) {
         showSuccess(parsed.appearance === undefined

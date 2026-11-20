@@ -40,7 +40,7 @@
   } from './lib/displayFilter';
   import type { MessageKind } from './lib/types';
   import {
-    getConfig,
+    getConfigSnapshot,
     setGoalsShowInApp,
     getTtsQueueState,
     onTtsNotice,
@@ -116,6 +116,10 @@
   }
   let danmakuOpen = $state(false);
   let goalsToggleSaving = $state(false);
+  // config を読んだ時の revision。インポートなど別の画面の保存で古くなったら読み直す。
+  let configRevision = $state(0);
+  let configLoading = $state(false);
+  const configStale = $derived(configRevision < configSync.revision);
   let goalsToggleError = $state('');
   let ttsPaused = $state(false);
   let ttsToggleBusy = $state(false);
@@ -410,13 +414,25 @@
   }
 
   async function loadConfig() {
+    if (configLoading) return;
+    configLoading = true;
     try {
-      const loaded = await getConfig();
-      if (loaded) config = loaded;
+      const loaded = await getConfigSnapshot();
+      if (loaded && loaded.revision >= configRevision) {
+        config = loaded.config;
+        configRevision = loaded.revision;
+        if (loaded.revision > configSync.revision) configSync.revision = loaded.revision;
+      }
     } catch (e) {
       console.warn('[config] load failed', e);
+    } finally {
+      configLoading = false;
     }
   }
+
+  $effect(() => {
+    if (configStale && !configLoading) void loadConfig();
+  });
 
   function showTtsNotice(notice: TtsNotice) {
     ttsNotice = notice;
@@ -435,24 +451,24 @@
     }
   }
 
-  function onSettingsSaved(nextConfig: AppConfig) {
+  function onSettingsSaved(nextConfig: AppConfig, revision: number) {
+    if (revision < configRevision) return;
     config = structuredClone($state.snapshot(nextConfig));
+    configRevision = revision;
   }
 
   async function toggleGoalsInApp(event: Event) {
     const input = event.currentTarget as HTMLInputElement;
     const checked = input.checked;
     input.checked = showGoalsBar;
-    if (!config || goalsToggleSaving || !!configSync.importing || !!configSync.reloading || configSync.reloadRequired) return;
+    if (!config || goalsToggleSaving || !!configSync.importing || configStale) return;
     goalsToggleSaving = true;
     goalsToggleError = '';
-    const revision = configSync.importRevision;
+    const revision = configRevision;
     try {
       await setGoalsShowInApp(checked);
-      configSync.goalsRevision += 1;
-      if (config && configSync.importRevision === revision) {
-        config.goals.showInApp = checked;
-      }
+      // 待つ間に読み直していれば、その値を優先する。
+      if (config && configRevision === revision) config.goals.showInApp = checked;
     } catch (e) {
       goalsToggleError = e instanceof Error ? e.message : String(e);
     } finally {
@@ -866,12 +882,12 @@
           <input
             type="checkbox"
             checked={showGoalsBar}
-            disabled={goalsToggleSaving || !!configSync.importing || !!configSync.reloading || configSync.reloadRequired}
+            disabled={goalsToggleSaving || !!configSync.importing || configStale}
             onchange={toggleGoalsInApp}
           />
           <span>{goalsToggleSaving ? '保存中' : 'コメビュに表示'}</span>
         </label>
-        {#if configSync.reloadRequired}
+        {#if configStale && !configLoading}
           <span class="goals-toggle-error">{configReloadMessage}</span>
         {:else if goalsToggleError}
           <span class="goals-toggle-error" title={goalsToggleError}>保存失敗</span>
