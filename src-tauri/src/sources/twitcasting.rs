@@ -58,7 +58,7 @@ pub const DEFAULT_MOVIE_ID_FALLBACK_PATTERN: &str = r#"var\s+movieid\s*=\s*"(\d+
 pub const DEFAULT_IS_ONLIVE_PATTERN: &str = r#"data-is-onlive="(true|false)""#;
 
 const NOT_FOUND_NOTICE: &str = "ツイキャスのユーザーが見つかりません";
-const UNAVAILABLE_NOTICE: &str = "この配信は取得できません";
+const UNAVAILABLE_NOTICE: &str = "この配信は非公開のため取得できません";
 const INVALID_ID_NOTICE: &str = "ツイキャスの配信者 ID を解釈できません";
 
 /// ツイキャスの非公式経路で使うエンドポイント・正規表現の上書き。
@@ -559,7 +559,13 @@ fn is_anonymous(event: &Value, author: &Value) -> bool {
         .and_then(Value::as_str)
         .map(str::trim)
         .map(str::to_ascii_lowercase)
-        .is_some_and(|id| id.starts_with("c:tw") || id == "twitcastinguest")
+        .is_some_and(|id| is_anonymous_id(&id) || id == "twitcastinguest")
+}
+
+/// `c:tw` の後ろが数字 1 個以上だけ(`c:tw1`)を匿名とする。`c:twinkle` は実ユーザー。
+fn is_anonymous_id(id: &str) -> bool {
+    id.strip_prefix("c:tw")
+        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
 }
 
 fn display_name(author: &Value) -> Option<String> {
@@ -798,6 +804,24 @@ impl TwitcastingSource {
         let _ = tx.send(update).await;
     }
 
+    /// WS 接続成功。配信中として通知し、待機中の notice を消す。
+    async fn send_connected(&self) {
+        let Some(tx) = &self.metadata_tx else { return };
+        let update = YoutubeMetadataUpdate {
+            platform: Platform::Twitcasting,
+            channel: self.channel_name(),
+            concurrent_viewers: None,
+            viewers_kind: ViewerCountKind::Concurrent,
+            likes: None,
+            title: None,
+            live: Some(true),
+            notice: None,
+            reactions_delta: None,
+            full_snapshot: false,
+        };
+        let _ = tx.send(update).await;
+    }
+
     /// 待機中(live=false)のままチップへ状態メッセージを出す。
     /// 次の send_live_state で消える。
     async fn send_notice(&self, message: &str) {
@@ -865,6 +889,7 @@ impl Source for TwitcastingSource {
             let mut seen = CommentDedup::new(SEEN_LIMIT);
             let mut current_movie: Option<String> = None;
             let mut jitter = jitter_seed();
+            let mut last_quiet: Option<SessionOutcome> = None;
 
             self.send_live_state(false).await;
 
@@ -886,6 +911,7 @@ impl Source for TwitcastingSource {
                     )
                     .await;
 
+                let repeated = is_repeated_quiet(&mut last_quiet, outcome);
                 match outcome {
                     SessionOutcome::Cancelled => return Ok(()),
                     SessionOutcome::Offline => {
@@ -896,12 +922,20 @@ impl Source for TwitcastingSource {
                         self.send_notice(NOT_FOUND_NOTICE).await;
                     }
                     SessionOutcome::Unavailable => {
-                        tracing::warn!("twitcasting:{channel} {UNAVAILABLE_NOTICE}");
+                        if repeated {
+                            tracing::debug!("twitcasting:{channel} {UNAVAILABLE_NOTICE}");
+                        } else {
+                            tracing::warn!("twitcasting:{channel} {UNAVAILABLE_NOTICE}");
+                        }
                         self.send_notice(UNAVAILABLE_NOTICE).await;
                     }
                     SessionOutcome::Recheck => {
                         // 次のループで HTML から配信状態を確認し直す。
-                        tracing::debug!("twitcasting:{channel} eventpubsuburl の応答から再確認");
+                        if repeated {
+                            tracing::debug!("twitcasting:{channel} eventpubsuburl の応答から再確認");
+                        } else {
+                            tracing::warn!("twitcasting:{channel} eventpubsuburl の応答から再確認");
+                        }
                     }
                     SessionOutcome::Disconnected { .. } => {
                         self.send_live_state(false).await;
@@ -1104,7 +1138,8 @@ impl TwitcastingSource {
         };
         let status = response.status();
         if let Some(outcome) = classify_eventpubsub_status(status) {
-            tracing::warn!(
+            // 30 秒ごとに繰り返しうるので、run 側が初回だけ warn にする。
+            tracing::debug!(
                 "twitcasting:{screen_id} eventpubsuburl が HTTP {} を返しました",
                 status.as_u16()
             );
@@ -1120,7 +1155,7 @@ impl TwitcastingSource {
         match parse_eventpubsub_response(&body) {
             Some(url) => Ok(url),
             None => {
-                tracing::warn!(
+                tracing::debug!(
                     "twitcasting:{screen_id} eventpubsuburl が url を返しません(限定配信など)"
                 );
                 Err(SessionOutcome::Unavailable)
@@ -1166,6 +1201,7 @@ impl TwitcastingSource {
             }
         };
         tracing::info!("twitcasting:{channel} WS 接続開始 ({ws_url})");
+        self.send_connected().await;
 
         let (mut write, mut read) = ws_stream.split();
         let connected_at = tokio::time::Instant::now();
@@ -1241,6 +1277,14 @@ impl TwitcastingSource {
             }
         }
     }
+}
+
+/// Unavailable / Recheck が同じ状態のまま続いているか。続く 2 回目以降は debug に落とす。
+fn is_repeated_quiet(last: &mut Option<SessionOutcome>, outcome: SessionOutcome) -> bool {
+    let quiet = matches!(outcome, SessionOutcome::Unavailable | SessionOutcome::Recheck);
+    let repeated = quiet && *last == Some(outcome);
+    *last = quiet.then_some(outcome);
+    repeated
 }
 
 /// 視聴ページの HTTP 状態から次の遷移を決める。302/404 だけを行エラーにする。
@@ -1544,6 +1588,69 @@ mod tests {
         assert_eq!(message.timestamp_ms, 1795121838000);
         assert_eq!(message.plain_text(), "こんにちは");
         assert!(message.amount.is_none());
+    }
+
+    #[test]
+    fn anonymous_id_requires_digits_after_c_tw() {
+        for id in ["c:tw1", "c:tw23", "C:TW7"] {
+            assert!(is_anonymous_id(&id.to_ascii_lowercase()), "{id}");
+        }
+        for id in ["c:twinkle", "c:tw", "c:tw1a", "c:twitter", "c:alice"] {
+            assert!(!is_anonymous_id(id), "{id}");
+        }
+        let event = json!({"type":"comment","id":1,"message":"a","createdAt":1000,
+            "author":{"id":"c:twinkle","name":"Twinkle","screenName":"c:twinkle"}});
+        assert!(!is_anonymous(&event, &event["author"]));
+        let event = json!({"type":"comment","id":1,"message":"a","createdAt":1000,
+            "author":{"id":"C:TW23","name":"x","screenName":"c:tw23"}});
+        assert!(is_anonymous(&event, &event["author"]));
+    }
+
+    #[test]
+    fn repeated_quiet_outcomes_log_only_first_at_warn() {
+        let mut last = None;
+        assert!(!is_repeated_quiet(&mut last, SessionOutcome::Unavailable));
+        assert!(is_repeated_quiet(&mut last, SessionOutcome::Unavailable));
+        assert!(!is_repeated_quiet(&mut last, SessionOutcome::Recheck));
+        assert!(is_repeated_quiet(&mut last, SessionOutcome::Recheck));
+        assert!(!is_repeated_quiet(&mut last, SessionOutcome::Offline));
+        assert!(!is_repeated_quiet(&mut last, SessionOutcome::Recheck));
+    }
+
+    #[test]
+    fn unavailable_notice_matches_design() {
+        assert_eq!(UNAVAILABLE_NOTICE, "この配信は非公開のため取得できません");
+    }
+
+    #[tokio::test]
+    async fn ws_connect_sends_live_true_without_notice_then_disconnect_is_not_live() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(sock).await.unwrap();
+            let _ = ws.close(None).await;
+        });
+        let (mtx, mut mrx) = mpsc::channel(8);
+        let source = TwitcastingSource::new(
+            "alice".to_string(),
+            TwitcastingOverrides::default(),
+            Some(mtx),
+        );
+        let (tx, _rx) = broadcast::channel(8);
+        let mut seen = CommentDedup::new(10);
+        let cancel = CancellationToken::new();
+        let url = SecretWsUrl::new(format!("ws://127.0.0.1:{port}/"));
+        let outcome = source
+            .listen_ws(&url, "alice", "alice", &mut seen, &tx, &cancel)
+            .await;
+        let update = mrx.try_recv().expect("接続成功で通知が届く");
+        assert_eq!(update.live, Some(true));
+        assert_eq!(update.notice, None);
+        // 切断は Disconnected で返り、run ループが live=false を送る経路に入る。
+        assert!(matches!(outcome, SessionOutcome::Disconnected { .. }));
+        source.send_live_state(false).await;
+        assert_eq!(mrx.try_recv().expect("切断後").live, Some(false));
     }
 
     #[test]
