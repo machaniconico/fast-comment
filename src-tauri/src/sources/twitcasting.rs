@@ -27,7 +27,9 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_util::sync::CancellationToken;
 
 use super::{Backoff, Source};
-use crate::model::{Author, Badge, ChatMessage, Fragment, MessageKind, Platform, Roles};
+use crate::model::{
+    Author, Badge, ChatMessage, Fragment, LiveEvent, LiveStream, MessageKind, Platform, Roles,
+};
 use crate::stats::{ViewerCountKind, YoutubeMetadataUpdate};
 
 const USER_PAGE_BASE_URL: &str = "https://twitcasting.tv/";
@@ -782,6 +784,13 @@ impl Default for CommentDedup {
     }
 }
 
+/// 設定の identifier から ChatMessage.channel / 集計キーに使う正規化名を作る。
+pub fn channel_name(identifier: &str) -> String {
+    extract_screen_id(identifier)
+        .unwrap_or_else(|| identifier.trim().to_string())
+        .to_ascii_lowercase()
+}
+
 /// ツイキャス1チャンネルを購読する Source。
 pub struct TwitcastingSource {
     /// 設定の identifier(LiveStream.channel_identifier の照合キー)。
@@ -789,6 +798,8 @@ pub struct TwitcastingSource {
     screen_id: Option<String>,
     overrides: TwitcastingOverrides,
     metadata_tx: Option<mpsc::Sender<YoutubeMetadataUpdate>>,
+    /// 配信開始/終了イベント(X 自動告知用)。
+    live_tx: Option<mpsc::Sender<LiveEvent>>,
 }
 
 impl TwitcastingSource {
@@ -803,14 +814,43 @@ impl TwitcastingSource {
             screen_id,
             overrides,
             metadata_tx,
+            live_tx: None,
         }
     }
 
+    pub fn with_live_tx(mut self, live_tx: Option<mpsc::Sender<LiveEvent>>) -> Self {
+        self.live_tx = live_tx;
+        self
+    }
+
+    fn send_live_started(&self, screen_id: &str, movie_id: &str) {
+        let Some(tx) = &self.live_tx else { return };
+        super::send_live_event(
+            tx,
+            LiveEvent::Started(LiveStream {
+                platform: Platform::Twitcasting,
+                channel_identifier: self.identifier.clone(),
+                stream_id: movie_id.to_string(),
+                title: None,
+                url: format!("{USER_PAGE_BASE_URL}{screen_id}/movie/{movie_id}"),
+                started_at_ms: None,
+            }),
+        );
+    }
+
+    fn send_live_ended(&self) {
+        let Some(tx) = &self.live_tx else { return };
+        super::send_live_event(
+            tx,
+            LiveEvent::Ended {
+                platform: Platform::Twitcasting,
+                channel_identifier: self.identifier.clone(),
+            },
+        );
+    }
+
     fn channel_name(&self) -> String {
-        self.screen_id
-            .as_deref()
-            .unwrap_or(self.identifier.trim())
-            .to_ascii_lowercase()
+        channel_name(&self.identifier)
     }
 
     async fn send_live_state(&self, live: bool) {
@@ -942,6 +982,7 @@ impl Source for TwitcastingSource {
                     SessionOutcome::Cancelled => return Ok(()),
                     SessionOutcome::Offline => {
                         self.send_live_state(false).await;
+                        self.send_live_ended();
                     }
                     SessionOutcome::NotFound => {
                         tracing::warn!("twitcasting:{channel} {NOT_FOUND_NOTICE}");
@@ -1019,6 +1060,7 @@ impl TwitcastingSource {
             Ok(url) => url,
             Err(outcome) => return outcome,
         };
+        self.send_live_started(screen_id, &movie_id);
         let ws_url = SecretWsUrl::new(ws_connect_url(&url));
         self.listen_ws(&ws_url, screen_id, channel, seen, tx, cancel)
             .await

@@ -476,4 +476,15 @@ mod tests {
         let result = render("before {url} after {unfinished", &streams, now()).unwrap();
         assert!(result.text.ends_with("after {unfinished"));
     }
+
+    #[test]
+    fn twitcasting_platform_label() {
+        let result = render(
+            "{platform}\n{url}",
+            &[stream(Platform::Twitcasting, None, "https://twitcasting.tv/a/movie/1")],
+            now(),
+        )
+        .unwrap();
+        assert!(result.text.starts_with("ツイキャス\n"));
+    }
 }

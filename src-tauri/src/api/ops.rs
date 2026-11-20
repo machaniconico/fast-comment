@@ -145,7 +145,7 @@ async fn body(request: Request) -> Result<Option<serde_json::Value>, Response> {
 fn validate(req: &TestCommentRequest) -> Result<(), Response> {
     if !matches!(
         req.platform.as_str(),
-        "twitch" | "youtube" | "x" | "niconico"
+        "twitch" | "youtube" | "x" | "niconico" | "twitcasting"
     ) {
         return Err(invalid("platform"));
     }

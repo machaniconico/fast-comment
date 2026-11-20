@@ -15,6 +15,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config::{AppConfig, ChannelPlatform};
 use crate::model::{ChatMessage, Platform};
 use crate::sources::niconico::extract_live_id;
+use crate::sources::twitcasting::channel_name as twitcasting_channel_name;
 use crate::sources::x::x_channel_name;
 use crate::sources::youtube::{extract_video_id, is_channel_identifier};
 
@@ -538,6 +539,9 @@ fn enabled_scope_keys(config: &AppConfig) -> HashSet<String> {
             ChannelPlatform::Niconico => {
                 format!("niconico:{}", extract_live_id(&ch.identifier))
             }
+            ChannelPlatform::Twitcasting => {
+                format!("twitcasting:{}", twitcasting_channel_name(&ch.identifier))
+            }
         })
         .collect()
 }
@@ -573,6 +577,10 @@ fn enabled_metadata_keys(config: &AppConfig) -> HashSet<String> {
             ChannelPlatform::Niconico => {
                 metadata_key(Platform::Niconico, &extract_live_id(&ch.identifier))
             }
+            ChannelPlatform::Twitcasting => metadata_key(
+                Platform::Twitcasting,
+                &twitcasting_channel_name(&ch.identifier),
+            ),
         })
         .collect()
 }
@@ -1072,5 +1080,21 @@ mod tests {
         assert_eq!(metadata[&key].notice.as_deref(), Some("msg"));
         merge_metadata_update(&mut metadata, upd(Some(true), None));
         assert_eq!(metadata[&key].notice, None);
+    }
+
+    #[test]
+    fn twitcasting_scope_and_metadata_keys_are_normalized() {
+        let cfg = AppConfig {
+            channels: vec![ChannelConfig {
+                platform: ChannelPlatform::Twitcasting,
+                identifier: "https://twitcasting.tv/Alice_1/movie/9".to_string(),
+                enabled: true,
+                own_stream: false,
+            }],
+            ..AppConfig::default()
+        };
+        assert!(enabled_scope_keys(&cfg).contains("twitcasting:alice_1"));
+        assert!(enabled_metadata_keys(&cfg).contains(&metadata_key(Platform::Twitcasting, "alice_1")));
+        assert_eq!(platform_key(Platform::Twitcasting), "twitcasting");
     }
 }

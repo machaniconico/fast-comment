@@ -649,6 +649,7 @@ fn eligible(settings: &AutopostSettings, stream: &LiveStream) -> bool {
             ChannelPlatform::Twitch => Platform::Twitch,
             ChannelPlatform::Niconico => Platform::Niconico,
             ChannelPlatform::X => Platform::X,
+            ChannelPlatform::Twitcasting => Platform::Twitcasting,
         };
         row.enabled
             && row.own_stream
@@ -1497,5 +1498,22 @@ mod tests {
         let actions = c.handle(Input::UserRetry, NOW + 3);
         assert_eq!(external(&actions), 1);
         assert_eq!(c.ledger().get("youtube:1").unwrap().state, LedgerState::Opened);
+    }
+
+    #[test]
+    fn twitcasting_own_stream_is_eligible() {
+        let mut s = settings("intent");
+        s.channels.push(ChannelConfig {
+            platform: ChannelPlatform::Twitcasting,
+            identifier: "mine".into(),
+            enabled: true,
+            own_stream: true,
+        });
+        let st = stream(Platform::Twitcasting, "1");
+        assert!(eligible(&s, &st));
+        assert_eq!(stream_key(&st), "twitcasting:1");
+        let mut c = Coordinator::new(Ledger::default(), s);
+        let actions = started(&mut c, st, NOW + 1000);
+        assert!(!actions.is_empty());
     }
 }

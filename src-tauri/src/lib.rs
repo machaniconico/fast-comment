@@ -256,6 +256,7 @@ impl AppState {
             config::ChannelPlatform::Youtube => "youtube",
             config::ChannelPlatform::X => "x",
             config::ChannelPlatform::Niconico => "niconico",
+            config::ChannelPlatform::Twitcasting => "twitcasting",
         };
         format!("{p}:{}", ch.identifier)
     }
@@ -2815,7 +2816,7 @@ fn spawn_one_channel(_app: &AppHandle, state: &AppState, ch: &ChannelConfig) {
         return;
     }
     let key = AppState::channel_key(ch);
-    let (overrides, youtube_api_key, x_overrides, x_auth, niconico_overrides, twitch_viewer_auth) = {
+    let (overrides, youtube_api_key, x_overrides, x_auth, niconico_overrides, twitcasting_overrides, twitch_viewer_auth) = {
         let config = state.config.lock().unwrap();
         // X の名前解決 cookie は auth_token / ct0 の両方が揃って初めて有効。
         let x_auth = {
@@ -2841,6 +2842,7 @@ fn spawn_one_channel(_app: &AppHandle, state: &AppState, ch: &ChannelConfig) {
             config.x_overrides.clone(),
             x_auth,
             config.niconico_overrides.clone(),
+            config.twitcasting_overrides.clone(),
             twitch_viewer_auth,
         )
     };
@@ -2868,6 +2870,7 @@ fn spawn_one_channel(_app: &AppHandle, state: &AppState, ch: &ChannelConfig) {
             x_overrides,
             x_auth,
             niconico_overrides,
+            twitcasting_overrides,
             Some(state.metadata_tx.clone()),
             Some(state.reaction_tx.clone()),
             Some(state.mod_tx.clone()),
