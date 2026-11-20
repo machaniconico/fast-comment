@@ -3,6 +3,7 @@
   import type { ChannelConfig, ChannelStatus } from '../ipc';
   import { addChannel, removeChannel, getConfig, onStats, openUrl, setChannelOwnStream } from '../ipc';
   import { ownStreamBlockedReason } from '../xAutopost';
+  import { extractTwitcastingScreenId, isPrefixedTwitcastingId, isTwitcastingUrl } from '../twitcastingId';
 
   // 追加成功時に親へ通知(任意)。
   let { onAdded }: { onAdded?: (ch: ChannelConfig) => void } = $props();
@@ -92,6 +93,9 @@
     }
     if (ch.platform === 'niconico') {
       return `https://live.nicovideo.jp/watch/${encodeURIComponent(ch.identifier)}`;
+    }
+    if (ch.platform === 'twitcasting') {
+      return `https://twitcasting.tv/${encodeURIComponent(ch.identifier)}`;
     }
     const id = ch.identifier;
     if (id.startsWith('@')) {
@@ -283,7 +287,7 @@
     'turbo', 'user', 'videos', 'wallet', 'whispers'
   ]);
   const SUPPORTED_SCHEMELESS_URL_RE =
-    /^(?:(?:www|m)\.twitch\.tv|twitch\.tv|(?:www|m|music)\.youtube\.com|youtube\.com|youtu\.be|(?:www\.)?x\.com|(?:www\.)?twitter\.com|live2?\.nicovideo\.jp|nico\.ms)(?::\d{1,5})?(?:[/?#].*)?$/i;
+    /^(?:(?:www|m)\.twitch\.tv|twitch\.tv|(?:www|m|music)\.youtube\.com|youtube\.com|youtu\.be|(?:www\.)?x\.com|(?:www\.)?twitter\.com|live2?\.nicovideo\.jp|nico\.ms|twitcasting\.tv)(?::\d{1,5})?(?:[/?#].*)?$/i;
 
   // スキーム無しの "twitch.tv/foo" / "youtu.be/xxx" 等も URL として拾う。
   function parseUrlLoose(input: string): URL | null {
@@ -411,6 +415,24 @@
 
   function detectChannel(input: string): ChannelDetection {
     const raw = input.trim();
+    // ツイキャスは URL か接頭辞付きの裸 ID(c:xxx 等)の時だけ自動判定。接頭辞なしの裸 ID は
+    // 他と衝突するため、プラットフォーム選択が「ツイキャス」の時だけ受ける。
+    if (isPrefixedTwitcastingId(raw)) {
+      return { kind: 'detected', platform: 'twitcasting', identifier: raw };
+    }
+    if (isTwitcastingUrl(raw)) {
+      const id = extractTwitcastingScreenId(raw);
+      if (id) return { kind: 'detected', platform: 'twitcasting', identifier: id };
+      return {
+        kind: 'known-url',
+        platform: 'twitcasting',
+        message: 'ツイキャスの配信者IDが見つかりません。URL(twitcasting.tv/配信者ID)か配信者IDを入力してください。'
+      };
+    }
+    if (newPlatform === 'twitcasting') {
+      const id = extractTwitcastingScreenId(raw);
+      if (id) return { kind: 'detected', platform: 'twitcasting', identifier: id };
+    }
     const url = parseUrlLoose(raw);
     if (!url) {
       if (NICONICO_LIVE_ID_RE.test(raw)) {
@@ -498,7 +520,7 @@
     return {
       kind: 'unsupported-url',
       host,
-      message: `未対応のURLです (${host})。Twitch/YouTube/X/ニコ生の配信URLか識別子を入力してください。`
+      message: `未対応のURLです (${host})。Twitch/YouTube/X/ニコ生/ツイキャスの配信URLか識別子を入力してください。`
     };
   }
 
@@ -532,7 +554,9 @@
           ? 'X'
           : detection.platform === 'niconico'
             ? 'ニコニコ生放送'
-            : detection.youtubeKind === 'channel'
+            : detection.platform === 'twitcasting'
+              ? 'ツイキャス'
+              : detection.youtubeKind === 'channel'
               ? 'YouTubeチャンネル'
               : 'YouTube動画';
       if (detection.platform === 'x' && detection.identifier.startsWith('@')) {
@@ -563,7 +587,13 @@
     }
 
     const platform = det.kind === 'detected' ? det.platform : newPlatform;
-    const identifier = det.kind === 'detected' ? det.identifier : raw;
+    let identifier = det.kind === 'detected' ? det.identifier : raw;
+    if (platform === 'twitcasting' && det.kind !== 'detected') {
+      // 手動選択でも §4 の screen_id 規則を通す(不正な ID を IPC に渡さない)
+      const id = extractTwitcastingScreenId(raw);
+      if (!id) { addError = 'ツイキャスの配信者 ID(英数字と _、1〜32 文字。c: などの接頭辞可)か配信 URL を入力してください'; return; }
+      identifier = id;
+    }
 
     const ch: ChannelConfig = { platform, identifier, enabled: true };
     try {
@@ -601,21 +631,22 @@
       aria-label="プラットフォーム"
       onchange={(e) => {
         const value = (e.currentTarget as HTMLSelectElement).value;
-        if (value === 'twitch' || value === 'youtube' || value === 'x' || value === 'niconico') newPlatform = value;
+        if (value === 'twitch' || value === 'youtube' || value === 'x' || value === 'niconico' || value === 'twitcasting') newPlatform = value;
       }}
     >
       <option value="twitch">Twitch</option>
       <option value="youtube">YouTube</option>
       <option value="x">X (Twitter)</option>
       <option value="niconico">ニコニコ生放送</option>
+      <option value="twitcasting">ツイキャス</option>
     </select>
     <input
       type="text"
       bind:this={idInputEl}
       bind:value={newIdentifier}
-      placeholder="配信URLを貼り付け（または Twitchチャンネル名 / YouTube動画ID / @handle / X broadcast ID / ニコ生lv番組ID）"
+      placeholder="配信URLを貼り付け（または Twitchチャンネル名 / YouTube動画ID / @handle / X broadcast ID / ニコ生lv番組ID / ツイキャスURL）"
       class="id-input"
-      aria-label="配信URL または チャンネル名 / 動画ID / YouTubeチャンネル指定 / X broadcast ID / ニコ生lv番組ID"
+      aria-label="配信URL または チャンネル名 / 動画ID / YouTubeチャンネル指定 / X broadcast ID / ニコ生lv番組ID / ツイキャス配信者ID"
       onkeydown={(e) => e.key === 'Enter' && onAddChannel()}
     />
     <button class="add-btn" onclick={onAddChannel}>追加</button>
@@ -643,6 +674,7 @@
           class:youtube={ch.platform === 'youtube'}
           class:x={ch.platform === 'x'}
           class:niconico={ch.platform === 'niconico'}
+          class:twitcasting={ch.platform === 'twitcasting'}
           class:live={isLive}
           class:idle={isIdle}
           role="listitem"
@@ -815,6 +847,12 @@
     background: rgba(252,200,0,0.12);
   }
   .chip.niconico .chip-dot { background: #fcc800; }
+
+  .chip.twitcasting {
+    border-color: rgba(30,120,255,0.55);
+    background: rgba(30,120,255,0.12);
+  }
+  .chip.twitcasting .chip-dot { background: #1e78ff; }
 
   /* X 未登録時の常設プレースホルダー。破線+減光で「未接続の枠」を示す。 */
   .chip.placeholder {

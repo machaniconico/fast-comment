@@ -135,6 +135,7 @@ pub fn render(
         Platform::Twitch => 1,
         Platform::Niconico => 2,
         Platform::X => 3,
+        Platform::Twitcasting => 4,
     });
     let title = sanitize_title(
         streams
@@ -154,6 +155,7 @@ pub fn render(
             Platform::Twitch => "Twitch",
             Platform::Niconico => "ニコ生",
             Platform::X => "X",
+            Platform::Twitcasting => "ツイキャス",
         };
         if !platforms.contains(&name) {
             platforms.push(name);
@@ -473,5 +475,16 @@ mod tests {
         assert_eq!(render("{url}", &[], now()).unwrap().text, "");
         let result = render("before {url} after {unfinished", &streams, now()).unwrap();
         assert!(result.text.ends_with("after {unfinished"));
+    }
+
+    #[test]
+    fn twitcasting_platform_label() {
+        let result = render(
+            "{platform}\n{url}",
+            &[stream(Platform::Twitcasting, None, "https://twitcasting.tv/a/movie/1")],
+            now(),
+        )
+        .unwrap();
+        assert!(result.text.starts_with("ツイキャス\n"));
     }
 }

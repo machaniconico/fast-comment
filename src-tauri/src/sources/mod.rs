@@ -5,6 +5,7 @@
 //! 正規化済み `ChatMessage` を `broadcast::Sender` へ流す。
 
 pub mod niconico;
+pub mod twitcasting;
 pub mod twitcasting_auth;
 pub mod twitch;
 pub mod twitch_auth;
@@ -115,6 +116,9 @@ pub struct SourceManager {
     x_auth: Option<x::XAuth>,
     /// ニコニコ生放送の overrides スナップショット。
     niconico_overrides: crate::config::NiconicoOverrides,
+    /// ツイキャス非公式経路の overrides スナップショット。
+    twitcasting_overrides: twitcasting::TwitcastingOverrides,
+    twitcasting_started_movies: twitcasting::StartedMovies,
 }
 
 impl SourceManager {
@@ -126,6 +130,7 @@ impl SourceManager {
         x_overrides: crate::config::XOverrides,
         x_auth: Option<x::XAuth>,
         niconico_overrides: crate::config::NiconicoOverrides,
+        twitcasting_overrides: twitcasting::TwitcastingOverrides,
         metadata_tx: Option<mpsc::Sender<YoutubeMetadataUpdate>>,
         reaction_tx: Option<mpsc::Sender<Vec<YoutubeReaction>>>,
         mod_tx: Option<mpsc::Sender<ModerationEvent>>,
@@ -141,12 +146,22 @@ impl SourceManager {
             x_overrides,
             x_auth,
             niconico_overrides,
+            twitcasting_overrides,
+            twitcasting_started_movies: Default::default(),
         }
     }
 
     /// 配信開始/終了イベントの送り先を設定する(`TwitchSource::with_moderation_tx` と同じ形)。
     pub fn with_live_tx(mut self, live_tx: Option<mpsc::Sender<LiveEvent>>) -> Self {
         self.live_tx = live_tx;
+        self
+    }
+
+    pub(crate) fn with_twitcasting_started_movies(
+        mut self,
+        started_movies: twitcasting::StartedMovies,
+    ) -> Self {
+        self.twitcasting_started_movies = started_movies;
         self
     }
 
@@ -210,17 +225,31 @@ impl SourceManager {
                     run_with_logging(&src, tx, child).await;
                 });
             }
+            ChannelPlatform::Twitcasting => {
+                let src = twitcasting::TwitcastingSource::new(
+                    identifier,
+                    self.twitcasting_overrides.clone(),
+                    metadata_tx,
+                )
+                .with_started_movies(self.twitcasting_started_movies.clone())
+                .with_live_tx(self.live_tx.clone());
+                tauri::async_runtime::spawn(async move {
+                    run_with_logging(&src, tx, child).await;
+                });
+            }
         }
 
         cancel
     }
 }
 
-/// 配信開始/終了イベントを送る。満杯・切断でも待たず、warn を出して捨てる(Source を止めない)。
-pub(crate) fn send_live_event(tx: &mpsc::Sender<LiveEvent>, event: LiveEvent) {
+/// 配信開始/終了イベントを送る。満杯・切断では warn を出して false を返す。
+pub(crate) fn send_live_event(tx: &mpsc::Sender<LiveEvent>, event: LiveEvent) -> bool {
     if let Err(e) = tx.try_send(event) {
         tracing::warn!("LiveEvent を送れず破棄しました: {e}");
+        return false;
     }
+    true
 }
 
 /// Source を実行し、終了理由をログする小ヘルパ。
@@ -258,5 +287,49 @@ mod tests {
         // 受信側が閉じていても戻る。
         drop(rx);
         send_live_event(&tx, ended());
+    }
+
+    fn manager(metadata_tx: mpsc::Sender<YoutubeMetadataUpdate>) -> SourceManager {
+        let (tx, _rx) = broadcast::channel(4);
+        SourceManager::new(
+            tx,
+            Default::default(),
+            String::new(),
+            Default::default(),
+            None,
+            Default::default(),
+            Default::default(),
+            Some(metadata_tx),
+            None,
+            None,
+        )
+    }
+
+    fn twitcasting_channel(enabled: bool) -> ChannelConfig {
+        ChannelConfig {
+            platform: ChannelPlatform::Twitcasting,
+            // 解釈できない識別子は起動直後に状態メッセージを出して待機する(通信しない)。
+            identifier: "!!".to_string(),
+            enabled,
+            own_stream: false,
+        }
+    }
+
+    /// 登録したツイキャスは TwitcastingSource が起動し、enabled=false は起動しない。
+    #[tokio::test]
+    async fn spawn_channel_starts_twitcasting_only_when_enabled() {
+        let (mtx, mut mrx) = mpsc::channel(8);
+        let m = manager(mtx);
+        let off = m.spawn_channel(&twitcasting_channel(false));
+        let quiet = tokio::time::timeout(Duration::from_millis(300), mrx.recv()).await;
+        assert!(quiet.is_err(), "enabled=false なのに Source が動いた");
+        let on = m.spawn_channel(&twitcasting_channel(true));
+        let update = tokio::time::timeout(Duration::from_secs(5), mrx.recv())
+            .await
+            .expect("Source が起動していない")
+            .expect("channel closed");
+        assert_eq!(update.platform, Platform::Twitcasting);
+        on.cancel();
+        off.cancel();
     }
 }

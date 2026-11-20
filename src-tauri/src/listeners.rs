@@ -195,6 +195,7 @@ impl ListenerStore {
             Platform::Youtube => "youtube",
             Platform::X => "x",
             Platform::Niconico => "niconico",
+            Platform::Twitcasting => "twitcasting",
         };
         let author_id = if msg.author.id.is_empty() {
             &msg.author.name
