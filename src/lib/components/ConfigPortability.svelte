@@ -4,6 +4,8 @@
   import { theme, type AppearanceSnapshot } from '../theme.svelte';
 
   const SCHEMA = 'fast-comment/settings';
+  // update_config の型エラーは Rust が固定フィールド名だけで組み立てる。
+  const configTypeError = /^設定の形式が不正です \(項目 (?:\.|[a-zA-Z][a-zA-Z0-9]*(?:\.[a-zA-Z][a-zA-Z0-9]*)*)\)$/;
 
   interface SettingsBundle {
     schema: typeof SCHEMA;
@@ -200,8 +202,9 @@
         ? '設定をインポートしました。'
         : '設定をインポートし、外観設定を反映しました。';
       showSuccess([base, ...notices].join(' '));
-    } catch {
-      showError('設定のインポートに失敗しました。');
+    } catch (e) {
+      const typeError = typeof e === 'string' ? configTypeError.exec(e) : null;
+      showError(typeError?.[0] ?? '設定のインポートに失敗しました。');
     } finally {
       configSync.importing = null;
     }
@@ -235,7 +238,7 @@
   {#if configSync.reloadRequired}
     <p class="portability-banner banner-error" role="status">{configReloadMessage}</p>
     <div class="field-row">
-      <button type="button" class="export-btn" onclick={onReload} disabled={reloading || disabled || !!configSync.importing}>
+      <button type="button" class="export-btn" onclick={onReload} disabled={disabled}>
         {reloading ? '読込中...' : '設定を再読み込み'}
       </button>
     </div>

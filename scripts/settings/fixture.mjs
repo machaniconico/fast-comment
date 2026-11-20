@@ -2,6 +2,7 @@ import { mount } from 'svelte';
 import App from '../../src/App.svelte';
 import Settings from '../../src/lib/components/Settings.svelte';
 import ConfigPortability from '../../src/lib/components/ConfigPortability.svelte';
+import { configSync } from '../../src/lib/configSync.svelte';
 import { theme } from '../../src/lib/theme.svelte';
 import { store } from '../../src/lib/stores.svelte';
 
@@ -35,6 +36,7 @@ const mock = window.mock = {
     xPost: { clientId: 'saved-x', configured: true, connected: false },
   },
   readsToFail: 0,
+  updateError: null,
   heldReads: [],
   holdReads: false,
   heldGoalsWrites: [],
@@ -45,6 +47,7 @@ const mock = window.mock = {
   login: {},
   cancels: [],
   callbacks: new Map(),
+  configSync,
   appearance: () => theme.getSnapshot(),
   pushComment: comment => store.pushBatch([comment]),
 };
@@ -77,9 +80,13 @@ if (location.search === '?browser') {
             : snapshot;
         }
         case 'update_config': {
+          if (mock.updateError !== null) throw mock.updateError;
           const next = JSON.parse(JSON.stringify(args.newConfig));
           const protectedOAuth = [];
           for (const [service, id] of Object.entries(keys)) {
+            if (typeof next[service].callbackPort !== 'number') {
+              throw `設定の形式が不正です (項目 ${service}.callbackPort)`;
+            }
             next[service].callbackPort = next[service].callbackPort < 1024
               ? initial[service].callbackPort : next[service].callbackPort;
             if (!mock.login[service]) continue;

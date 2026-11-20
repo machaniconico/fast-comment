@@ -147,7 +147,10 @@
   const reloading = $state({ all: 0, moderation: 0, twitcasting: 0, xPost: 0 });
   const allFieldsLocked = $derived(reloading.all > 0 || configSync.importing === 'all');
   const moderationFieldsLocked = $derived(reloading.moderation > 0 || configSync.importing === 'moderation');
-  const manualReloadDisabled = $derived(saving || !!configSync.importing || reloading.all > 0);
+  // 規則の保存が済み、再読込を待っている間は全体を読み直せる。
+  const manualReloadDisabled = $derived(
+    saving || allFieldsLocked || (configSync.importing === 'moderation' && reloading.moderation === 0)
+  );
   const saveBlockedReason = $derived.by(() => {
     if (configSync.reloadRequired) return configReloadMessage;
     if (configSync.importing) return '設定をインポート中です';
@@ -416,14 +419,12 @@
   }
 
   async function reloadConfig(scope: 'all' | 'moderation' | readonly OAuthService[]): Promise<boolean> {
-    if (destroyed) {
-      configSync.reloadRequired = true;
-      return false;
-    }
+    if (destroyed) return false;
 
     const targets: readonly (keyof typeof revisions)[] = typeof scope === 'string' ? [scope] : scope;
     const sections = scope === 'all' ? configSections : targets;
     const revision = { ...revisions };
+    const coveredByFullReload = () => scope !== 'all' && revisions.all !== revision.all;
     const { importRevision, goalsRevision } = configSync;
     for (const target of targets) reloading[target] += 1;
     configSync.reloading += 1;
@@ -435,8 +436,10 @@
         timeout = window.setTimeout(() => resolve(null), 10_000);
       });
       const saved = await Promise.race([getConfig(), deadline]);
+      if (destroyed) return false;
+      if (coveredByFullReload()) return true;
       if (
-        !saved || destroyed || performance.now() >= expiresAt ||
+        !saved || performance.now() >= expiresAt ||
         configSync.importRevision !== importRevision || revisions.all !== revision.all ||
         sections.some(section => revisions[section] !== revision[section]) ||
         (scope === 'all' && configSync.goalsRevision !== goalsRevision)
@@ -445,7 +448,6 @@
         return false;
       }
 
-      for (const target of targets) revisions[target] += 1;
       if (scope === 'all') {
         hydrateConfig(saved);
         setNotify(saved.ui.notifySound, saved.ui.notifyVolume);
@@ -456,8 +458,11 @@
       } else {
         for (const service of scope) applySavedOAuthConfig(saved, service);
       }
+      for (const target of targets) revisions[target] += 1;
       return true;
     } catch {
+      if (destroyed) return false;
+      if (coveredByFullReload()) return true;
       configSync.reloadRequired = true;
       return false;
     } finally {
@@ -1687,7 +1692,7 @@
     <ConfigPortability
       onImported={() => reloadConfig('all')}
       onReload={reloadImportedConfig}
-      disabled={saving || allFieldsLocked}
+      disabled={manualReloadDisabled}
       reloading={reloading.all > 0}
     />
   </section>
@@ -1814,8 +1819,14 @@
     </p>
   </section>
 
+  {/if}
+  </fieldset>
+
+  {#if config}
+  <div class="settings-fields">
   <section id="settings-posting">
     <h3>コメント投稿（送信）</h3>
+    <fieldset class="settings-fields" disabled={allFieldsLocked}>
     <p class="hint">
       コメント一覧の下にある「✍ 自分でコメントを投稿」から、配信チャットへ自分でコメントを送れます。
       YouTubeは接続した配信者アカウント、Twitchは設定したアカウントとして投稿されます。
@@ -2075,11 +2086,13 @@
     <p class="hint">
       ⚠ トークンはこの PC の config.json に平文で保存されます。共有 PC では取り扱いに注意してください。
     </p>
+    </fieldset>
     <TwitcastingSettings
       clientId={config.credentials?.twitcastingClientId ?? ''}
       callbackPort={config.twitcasting?.callbackPort ?? DEFAULT_TWITCASTING_CALLBACK_PORT}
       configRevision={oauthConfigRevision.twitcasting}
       {saving}
+      {allFieldsLocked}
       configReloading={reloading.twitcasting > 0}
       onConnectingChange={(connecting) => onOAuthConnectingChange('twitcasting', connecting)}
       onConnectionSettled={() => reloadOAuthConfig('twitcasting')}
@@ -2099,6 +2112,7 @@
         clientId={config.credentials?.xPostClientId ?? ''}
         configRevision={oauthConfigRevision.xPost}
         {saving}
+        {allFieldsLocked}
         configReloading={reloading.xPost > 0}
         onConnectingChange={(connecting) => onOAuthConnectingChange('xPost', connecting)}
         onConnectionSettled={() => reloadOAuthConfig('xPost')}
@@ -2110,7 +2124,11 @@
       />
     {/if}
   </section>
+  </div>
+  {/if}
 
+  <fieldset class="settings-fields" disabled={allFieldsLocked}>
+  {#if config}
   <section id="settings-tts">
     <h3>TTS（読み上げ）</h3>
     <div class="field-row">

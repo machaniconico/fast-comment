@@ -8,12 +8,13 @@
 
   let {
     clientId = '', callbackPort = DEFAULT_TWITCASTING_CALLBACK_PORT, configRevision,
-    saving, configReloading, onCallbackPortChange, onConnectingChange, onConnectionSettled,
+    saving, allFieldsLocked, configReloading, onCallbackPortChange, onConnectingChange, onConnectionSettled,
   }: {
     clientId?: string;
     callbackPort?: number;
     configRevision: number;
     saving: boolean;
+    allFieldsLocked: boolean;
     configReloading: boolean;
     onCallbackPortChange: (port: number | null) => void;
     onConnectingChange: (connecting: boolean) => void;
@@ -37,6 +38,8 @@
   const status = $derived(!connecting && latestStatus?.clientId === clientId.trim() ? latestStatus : null);
   let disconnecting = $state(false);
   let reloading = $state(false);
+  const authControlsLocked = $derived(allFieldsLocked || connecting || disconnecting || reloading);
+  const fieldsLocked = $derived(allFieldsLocked || configReloading || connecting || disconnecting);
   let statusError = $state('');
   let message = $state('');
   let successClientId = $state<string | null>(null);
@@ -112,7 +115,7 @@
     };
   });
   async function connect() {
-    if (saving || configReloading || connecting || disconnecting || reloading || !status || status.state === 'loading') return;
+    if (saving || configReloading || authControlsLocked || !status || status.state === 'loading') return;
     const listenPort = portInput.port;
     if (listenPort === null) {
       message = 'ポートは 1024〜65535 の整数にしてください';
@@ -211,20 +214,20 @@
     {#if attempt}
       <button type="button" onclick={cancel}>取り消す</button>
     {:else}
-      <button type="button" class="primary" onclick={connect} disabled={saving || configReloading || connecting || disconnecting || reloading || !status || status.state === 'loading' || status.logoutPending}>ログイン</button>
+      <button type="button" class="primary" onclick={connect} disabled={saving || configReloading || authControlsLocked || !status || status.state === 'loading' || status.logoutPending}>ログイン</button>
     {/if}
     {#if statusError}
-      <button type="button" onclick={retryStatus} disabled={connecting || disconnecting || reloading}>{status ? 'ログイン状態を再取得' : '再読み込み'}</button>
+      <button type="button" onclick={retryStatus} disabled={authControlsLocked}>{status ? 'ログイン状態を再取得' : '再読み込み'}</button>
     {/if}
     {#if status?.logoutPending}
       {#if status.logoutIssue === 'checkTimedOut'}
-        <button type="button" onclick={reload} disabled={connecting || disconnecting || reloading}>再読み込み</button>
+        <button type="button" onclick={reload} disabled={authControlsLocked}>再読み込み</button>
       {/if}
-      <button type="button" onclick={disconnect} disabled={connecting || disconnecting || reloading}>ログアウトを再試行</button>
+      <button type="button" onclick={disconnect} disabled={authControlsLocked}>ログアウトを再試行</button>
     {:else if status?.state === 'ready' || status?.state === 'reloginRequired' || status?.state === 'loadFailed'}
-      <button type="button" onclick={disconnect} disabled={connecting || disconnecting || reloading}>ログアウト</button>
+      <button type="button" onclick={disconnect} disabled={authControlsLocked}>ログアウト</button>
       {#if status.state === 'loadFailed'}
-        <button type="button" onclick={reload} disabled={connecting || disconnecting || reloading}>認証情報を再読み込み</button>
+        <button type="button" onclick={reload} disabled={authControlsLocked}>認証情報を再読み込み</button>
       {/if}
     {/if}
   </div>
@@ -233,11 +236,11 @@
     <summary>詳細: 自分の ClientID を使う</summary>
     <div class="field-row">
       <label for="twitcasting-client-id">ClientID</label>
-      <input id="twitcasting-client-id" type="text" bind:value={clientIdInput} disabled={configReloading || connecting || disconnecting} autocomplete="off" spellcheck="false" />
+      <input id="twitcasting-client-id" type="text" bind:value={clientIdInput} disabled={fieldsLocked} autocomplete="off" spellcheck="false" />
     </div>
     <div class="field-row">
       <label for="twitcasting-port">待受ポート</label>
-      <input id="twitcasting-port" type="text" inputmode="numeric" value={portInput.text} oninput={portInput.onInput} disabled={configReloading || connecting || disconnecting} autocomplete="off" />
+      <input id="twitcasting-port" type="text" inputmode="numeric" value={portInput.text} oninput={portInput.onInput} disabled={fieldsLocked} autocomplete="off" />
     </div>
     {#if portInput.port === null}
       <p class="warn">ポートは 1024〜65535 の整数にしてください</p>

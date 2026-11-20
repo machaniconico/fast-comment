@@ -21,7 +21,7 @@
     xPost,
     clientId = '',
     configRevision,
-    saving, configReloading,
+    saving, allFieldsLocked, configReloading,
     onConnectionSettled,
     onCallbackPortChange,
     onConnectingChange,
@@ -30,6 +30,7 @@
     clientId?: string;
     configRevision: number;
     saving: boolean;
+    allFieldsLocked: boolean;
     configReloading: boolean;
     onConnectionSettled: () => Promise<void>;
     onCallbackPortChange: (port: number | null) => void;
@@ -49,6 +50,7 @@
   let latestStatus = $state<XPostStatus | null>(null);
   let statusRequest = 0;
   let connecting = $state(false);
+  const fieldsLocked = $derived(allFieldsLocked || configReloading || connecting);
   const status = $derived(!connecting && latestStatus?.clientId === clientId.trim() ? latestStatus : null);
   let disconnecting = $state(false);
   let authMsg = $state('');
@@ -86,7 +88,7 @@
   });
 
   async function connect() {
-    if (saving || configReloading || connecting) return;
+    if (saving || fieldsLocked) return;
     const id = clientIdInput.trim();
     if (!id) {
       authMsg = 'Client ID を入力してください';
@@ -182,7 +184,7 @@
 
   async function confirmTestPost() {
     testConfirm = null;
-    if (testBusy) return;
+    if (allFieldsLocked || testBusy) return;
     testBusy = true;
     testMsg = '投稿しています…';
     testOk = null;
@@ -273,6 +275,7 @@
   const over = $derived(preview !== null && preview.weightedLen > X_LIMIT);
 </script>
 
+<fieldset class="xpost-fields" disabled={allFieldsLocked}>
 <p class="hint">
   {#if xPost.mode === 'api'}
     配信開始を検知すると、猶予のあと X API で自動的に投稿します(従量課金。下の「X API で自動投稿」で接続が必要)。
@@ -380,6 +383,7 @@
   <span class="hint-inline">件(1〜20)</span>
 </div>
 
+</fieldset>
 <fieldset class="xpost-api">
   <legend>X API で自動投稿(任意)</legend>
   <details class="xpost-steps">
@@ -394,18 +398,18 @@
 
   <div class="field-row">
     <label for="xpost-client-id">Client ID</label>
-    <input id="xpost-client-id" type="text" bind:value={clientIdInput} disabled={configReloading || connecting} class="text-input" autocomplete="off" spellcheck="false" />
+    <input id="xpost-client-id" type="text" bind:value={clientIdInput} disabled={fieldsLocked} class="text-input" autocomplete="off" spellcheck="false" />
   </div>
   <div class="field-row">
     <label for="xpost-port">コールバックポート</label>
-    <input id="xpost-port" type="text" inputmode="numeric" value={portInput.text} oninput={portInput.onInput} disabled={configReloading || connecting} class="num-input" />
+    <input id="xpost-port" type="text" inputmode="numeric" value={portInput.text} oninput={portInput.onInput} disabled={fieldsLocked} class="num-input" />
     <span class="hint-inline">既定 47821。変えたら X の登録も直す</span>
   </div>
   <div class="field-row">
     <span class="label-like">コールバック URL</span>
     {#if displayCallbackUrl}
       <code class="xpost-url">{displayCallbackUrl}</code>
-      <button type="button" class="btn-small" onclick={copyCallbackUrl}>{copied ? 'コピーしました' : 'コピー'}</button>
+      <button type="button" class="btn-small" onclick={copyCallbackUrl} disabled={allFieldsLocked}>{copied ? 'コピーしました' : 'コピー'}</button>
     {:else}
       <span class="xpost-error">ポートは 1024〜65535 の整数にしてください</span>
     {/if}
@@ -426,12 +430,12 @@
     {#if attempt}
       <button type="button" class="btn-small" onclick={cancelLogin}>ログインを取り消す</button>
     {:else}
-      <button type="button" class="btn-small primary" onclick={connect} disabled={saving || configReloading || connecting || disconnecting}>
+      <button type="button" class="btn-small primary" onclick={connect} disabled={saving || fieldsLocked || disconnecting}>
         {connected ? '別のアカウントで接続し直す' : 'X に接続'}
       </button>
     {/if}
     {#if connected}
-      <button type="button" class="btn-small" onclick={disconnect} disabled={connecting || disconnecting}>切断</button>
+      <button type="button" class="btn-small" onclick={disconnect} disabled={allFieldsLocked || connecting || disconnecting}>切断</button>
     {/if}
   </div>
   {#if authMsg && (successClientId === null || successClientId === clientId.trim())}
@@ -444,14 +448,14 @@
       class="btn-small"
       bind:this={testButtonEl}
       onclick={askTestPost}
-      disabled={!connected || testBusy || connecting}
+      disabled={allFieldsLocked || !connected || testBusy || connecting}
     >テスト投稿</button>
     <span class="hint-inline">「fast-comment 連携テスト 日付 時刻」を実際に投稿します(URL なし)。告知の記録・上限には数えません</span>
   </div>
   {#if testMsg}
     <p class="xpost-msg" class:ok={testOk === true} class:ng={testOk === false} aria-live="polite">
       {testMsg}
-      {#if testTweetUrl}<button type="button" class="xpost-link" onclick={() => void openUrl(testTweetUrl ?? '')}>ポストを開く</button>{/if}
+      {#if testTweetUrl}<button type="button" class="xpost-link" onclick={() => void openUrl(testTweetUrl ?? '')} disabled={allFieldsLocked}>ポストを開く</button>{/if}
     </p>
   {/if}
 
@@ -481,14 +485,15 @@
         <p class="xpost-warn">実際に X で公開され、X API の利用料(1 件 $0.015 の目安)が課金されます。</p>
       </div>
       <div class="xpost-dialog-actions">
-        <button type="button" class="btn-small" bind:this={confirmCancelEl} onclick={closeConfirm}>やめる</button>
-        <button type="button" class="btn-small primary" onclick={confirmTestPost}>投稿する</button>
+        <button type="button" class="btn-small" bind:this={confirmCancelEl} onclick={closeConfirm} disabled={allFieldsLocked}>やめる</button>
+        <button type="button" class="btn-small primary" onclick={confirmTestPost} disabled={allFieldsLocked}>投稿する</button>
       </div>
     </div>
   </div>
 {/if}
 
 <style>
+  .xpost-fields { display: contents; }
   .xpost-api {
     margin-top: 14px;
     border: 1px solid rgba(255,255,255,0.12);

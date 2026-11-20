@@ -129,7 +129,7 @@ for (const service of services) {
     }));
   }
 
-  test(service.name + ' ignores a reconnect read that predates the imported config', async t => withSettings(t, async page => {
+  test(service.name + ' ignores an older login read after a successful full import reload', async t => withSettings(t, async page => {
     await start(page);
     await accept(page);
     await page.evaluate(() => { window.mock.holdReads = true; });
@@ -145,9 +145,49 @@ for (const service of services) {
     await page.evaluate(() => new Promise(resolve => requestAnimationFrame(resolve)));
     assert.equal(await id(page).inputValue(), 'imported-after-login');
     assert.equal(await port(page).inputValue(), '41322');
-    await reloadSettings(page).waitFor();
-    assert.equal(await save(page).isDisabled(), true);
+    assert.equal(await page.evaluate(() => window.mock.configSync.reloadRequired), false);
+    assert.equal(await save(page).isEnabled(), true);
   }));
+
+  test(service.name + ' can cancel a pending login during a full reload', async t => withSettings(t, async page => {
+    await start(page);
+    await page.evaluate(() => { window.mock.readsToFail = 1; });
+    await finish(page, 'cancelled');
+    await reloadSettings(page).waitFor();
+    await start(page);
+    const attempt = await page.evaluate(key => window.mock.login[key].attempt, service.key);
+    await page.evaluate(() => { window.mock.holdReads = true; });
+    await reloadSettings(page).click();
+    await page.waitForFunction(() => window.mock.heldReads.length === 1);
+    assert.equal(await page.locator('#appearance-theme').isDisabled(), true);
+    assert.equal(await port(page).isDisabled(), true);
+    assert.equal(await save(page).isDisabled(), true);
+    const cancel = page.getByRole('button', { name: service.cancel, exact: true });
+    assert.equal(await cancel.isEnabled(), true);
+    await cancel.click();
+    assert.deepEqual(await page.evaluate(() => window.mock.cancels), [{ command: service.cancelCommand, attempt }]);
+    await page.evaluate(() => { window.mock.holdReads = false; });
+    await finish(page, 'cancelled');
+    await page.evaluate(() => window.mock.heldReads.shift()());
+    await page.waitForFunction(() => window.mock.configSync.reloading === 0);
+  }));
+
+  test(service.name + ' closing settings cancels login and leaves the goals toggle enabled', async t => withSettings(t, async page => {
+    await page.getByRole('tab', { name: '設定', exact: true }).click();
+    if (service.key === 'twitcasting') {
+      await page.locator('details').filter({ hasText: '自分の ClientID を使う' }).locator('summary').click();
+    }
+    await start(page);
+    await accept(page);
+    const attempt = await page.evaluate(key => window.mock.login[key].attempt, service.key);
+    await page.getByRole('tab', { name: 'コメント', exact: true }).click();
+    await page.waitForFunction(() => window.mock.cancels.length === 1);
+    assert.deepEqual(await page.evaluate(() => window.mock.cancels), [{ command: service.cancelCommand, attempt }]);
+    await finish(page, 'cancelled');
+    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(resolve)));
+    assert.equal(await page.evaluate(() => window.mock.configSync.reloadRequired), false);
+    assert.equal(await page.getByRole('checkbox', { name: 'コメビュに表示' }).isEnabled(), true);
+  }, 'app'));
 
   test(service.name + ' asks to reload when the post-login read fails', async t => withSettings(t, async page => {
     await start(page);
@@ -278,17 +318,17 @@ for (const service of services) {
   }));
 }
 
-test('X cancels its pending login when the settings tab closes', async t => withSettings(t, async page => {
+test('closing untouched settings before its initial config reply leaves the goals toggle enabled', async t => withSettings(t, async page => {
+  const toggle = page.getByRole('checkbox', { name: 'コメビュに表示' });
+  await toggle.waitFor();
+  await page.evaluate(() => { window.mock.holdReads = true; });
   await page.getByRole('tab', { name: '設定', exact: true }).click();
-  await page.locator('#xpost-client-id').fill('new-client');
-  await page.getByRole('button', { name: 'X に接続', exact: true }).click();
-  const attempt = await page.evaluate(() => window.mock.login.xPost.attempt);
-
+  await page.waitForFunction(() => window.mock.heldReads.length === 1);
   await page.getByRole('tab', { name: 'コメント', exact: true }).click();
-  await page.waitForFunction(() => window.mock.cancels.length === 1);
-  assert.deepEqual(await page.evaluate(() => window.mock.cancels), [
-    { command: 'cancel_x_post_login', attempt },
-  ]);
+  await page.evaluate(() => window.mock.heldReads.shift()());
+  await page.waitForFunction(() => window.mock.configSync.reloading === 0);
+  assert.equal(await page.evaluate(() => window.mock.configSync.reloadRequired), false);
+  assert.equal(await toggle.isEnabled(), true);
 }, 'app'));
 
 test('ツイキャス treats a missing connect result as a failure', async t => withSettings(t, async page => {
@@ -322,6 +362,29 @@ test('a browser import applies appearance when no persisted config exists', asyn
   assert.match(await page.getByRole('status').textContent(), /外観設定を反映しました/);
   assert.equal((await page.evaluate(() => window.mock.appearance())).theme, 'light');
 }, 'browser'));
+
+test('importing callbackPort "bad" shows the fixed field name without the value', async t => withSettings(t, async page => {
+  await page.getByRole('button', { name: '設定JSONをエクスポート' }).click();
+  const exported = page.locator('#settings-export-json');
+  await page.waitForFunction(() => document.getElementById('settings-export-json').value !== '');
+  const bundle = JSON.parse(await exported.inputValue());
+  bundle.config.twitcasting.callbackPort = 'bad';
+  await importConfig(page, bundle);
+  const status = page.locator('#settings-portability').getByRole('status');
+  await status.waitFor();
+  assert.equal(await status.textContent(), '設定の形式が不正です (項目 twitcasting.callbackPort)');
+  assert.equal(await page.evaluate(() => window.mock.writes.length), 0);
+}));
+
+test('a config import error with a raw value shows only the generic message', async t => withSettings(t, async page => {
+  await page.evaluate(() => {
+    window.mock.updateError = '設定の形式が不正です (項目 twitcasting.callbackPort): private-input';
+  });
+  await importConfig(page, { config: await initial(page) });
+  const status = page.locator('#settings-portability').getByRole('status');
+  await status.waitFor();
+  assert.equal(await status.textContent(), '設定のインポートに失敗しました。');
+}));
 
 test('the main window preserves OAuth settings when saving the goals toggle', async t => withSettings(t, async page => {
   const toggle = page.getByRole('checkbox', { name: 'コメビュに表示' });
@@ -429,12 +492,16 @@ async function startTwitcasting(page, port) {
 }
 
 async function commitTwitcasting(page, failRead = false) {
+  const before = await page.evaluate(() => ({ reads: window.mock.reads, reloading: window.mock.configSync.reloading }));
   await page.evaluate(fail => {
     window.mock.login.twitcasting.accept();
     if (fail) window.mock.readsToFail = 1;
     window.mock.login.twitcasting.finish(new Error('cancelled'));
   }, failRead);
-  await page.waitForFunction(() => !document.getElementById('twitcasting-port').disabled);
+  await page.waitForFunction(
+    ({ reads, reloading }) => window.mock.reads > reads && window.mock.configSync.reloading === reloading,
+    before,
+  );
 }
 
 test('manual reload discards 40321 when TwitCasting commits 40322 before its reply', async t => withSettings(t, async page => {
@@ -478,6 +545,24 @@ test('moderation reload keeps OAuth 40322 when its held reply contains 39822', a
   const config = await saveSettings(page);
   assert.equal(config.twitcasting.callbackPort, 40322);
   assert.deepEqual(config.moderation, spamRules);
+}));
+
+test('a successful full reload supersedes the pending moderation import reload', async t => withSettings(t, async page => {
+  await startTwitcasting(page, '40321');
+  await commitTwitcasting(page, true);
+  await reloadSettings(page).waitFor();
+  await page.evaluate(() => { window.mock.holdReads = true; });
+  await importModeration(page, spamRules);
+  await page.waitForFunction(() => window.mock.heldReads.length === 1);
+
+  await page.evaluate(() => { window.mock.holdReads = false; });
+  assert.equal(await reloadSettings(page).isEnabled(), true);
+  await reloadSettings(page).click();
+  await page.waitForFunction(() => !window.mock.configSync.reloadRequired);
+  await page.evaluate(() => window.mock.heldReads.shift()());
+  await page.getByText('モデレーション規則をインポートしました。', { exact: true }).waitFor();
+  assert.equal(await page.evaluate(() => window.mock.configSync.reloadRequired), false);
+  assert.deepEqual((await saveSettings(page)).moderation, spamRules);
 }));
 
 for (const outcome of ['failed', 'unanswered']) {
