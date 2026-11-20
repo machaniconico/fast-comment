@@ -102,12 +102,14 @@ impl TwitcastingOverrides {
 /// `c:abc` / `g:123`、裸の ID を受ける。他ホスト・空・不正文字は None。
 /// 返り値は大小文字を保つ(API 呼び出し用)。
 pub fn extract_screen_id(input: &str) -> Option<String> {
-    let raw = input.trim();
+    let raw = input.trim_matches(is_js_trim_char);
     if raw.is_empty() {
         return None;
     }
 
     let lower = raw.to_ascii_lowercase();
+    // 裸の ID の検査は ?/# より前だけに行う(UI と同じ順。`abc?next=/movie` は abc)。
+    let head = raw.split(['?', '#']).next().unwrap_or("");
     let path = if lower.starts_with("http://") || lower.starts_with("https://") {
         let after_scheme = &raw[raw.find("://")? + 3..];
         let authority_end = after_scheme
@@ -122,14 +124,14 @@ pub fn extract_screen_id(input: &str) -> Option<String> {
             return None;
         }
         &after_scheme[authority_end..]
-    } else if raw.starts_with("//") {
+    } else if head.starts_with("//") {
         // プロトコル相対 URL は UI と同じく受け付けない。
         return None;
-    } else if raw.contains("://") {
+    } else if head.contains("://") {
         return None;
     } else if let Some(rest) = strip_allowed_host_prefix(raw) {
         rest
-    } else if raw.contains('/') {
+    } else if head.contains('/') {
         // スキーム無しの他ホスト・パスは受け付けない。
         return None;
     } else {
@@ -142,6 +144,12 @@ pub fn extract_screen_id(input: &str) -> Option<String> {
     let segment = path.split('/').next().unwrap_or("");
     let segment = decode_percent_colon(segment);
     validate_screen_id(&segment)
+}
+
+/// JS の `String.prototype.trim` と同じ集合(Unicode White_Space から U+0085 を除き U+FEFF を足す)。
+/// UI(twitcastingId.ts)と trim 対象を揃えるため明示する。
+fn is_js_trim_char(c: char) -> bool {
+    (c.is_whitespace() && c != '\u{85}') || c == '\u{FEFF}'
 }
 
 const ALLOWED_HOSTS: [&str; 5] = [
@@ -330,15 +338,32 @@ pub fn parse_user_page_for(html: &str, screen_id: &str) -> Option<UserPage> {
         .parse_for(html, Some(screen_id))
 }
 
-/// eventpubsuburl.php の応答から WS URL を取り出す。欠落・空・非 JSON は None。
-pub fn parse_eventpubsub_response(body: &str) -> Option<String> {
-    let value: Value = serde_json::from_str(body.trim()).ok()?;
-    value
-        .get("url")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
+/// eventpubsuburl.php の応答の解釈。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EventPubsub {
+    Url(String),
+    /// url キーが無い・null・空文字(限定配信など、公開状態として読める形)。
+    Private,
+    /// 非 JSON・オブジェクトでない・url が文字列でない(解析不能。非公開とは区別する)。
+    Malformed,
+}
+
+pub fn parse_eventpubsub_response(body: &str) -> EventPubsub {
+    let Ok(Value::Object(map)) = serde_json::from_str::<Value>(body.trim()) else {
+        return EventPubsub::Malformed;
+    };
+    match map.get("url") {
+        None | Some(Value::Null) => EventPubsub::Private,
+        Some(Value::String(s)) => {
+            let s = s.trim();
+            if s.is_empty() {
+                EventPubsub::Private
+            } else {
+                EventPubsub::Url(s.to_string())
+            }
+        }
+        Some(_) => EventPubsub::Malformed,
+    }
 }
 
 /// トークン入り WS URL に `&gift=1` を付ける(実 URL は必ず `?` を持つ)。
@@ -1138,11 +1163,19 @@ impl TwitcastingSource {
         };
         let status = response.status();
         if let Some(outcome) = classify_eventpubsub_status(status) {
-            // 30 秒ごとに繰り返しうるので、run 側が初回だけ warn にする。
-            tracing::debug!(
-                "twitcasting:{screen_id} eventpubsuburl が HTTP {} を返しました",
-                status.as_u16()
-            );
+            // Recheck は 30 秒ごとに繰り返しうるので run 側が初回だけ warn にする。
+            // Backoff 経路(5xx)は run 側で出さないのでここで warn する。
+            if is_quiet_outcome(outcome) {
+                tracing::debug!(
+                    "twitcasting:{screen_id} eventpubsuburl が HTTP {} を返しました",
+                    status.as_u16()
+                );
+            } else {
+                tracing::warn!(
+                    "twitcasting:{screen_id} eventpubsuburl が HTTP {} を返しました",
+                    status.as_u16()
+                );
+            }
             return Err(outcome);
         }
         let body = match response.text().await {
@@ -1153,12 +1186,16 @@ impl TwitcastingSource {
             }
         };
         match parse_eventpubsub_response(&body) {
-            Some(url) => Ok(url),
-            None => {
+            EventPubsub::Url(url) => Ok(url),
+            EventPubsub::Private => {
                 tracing::debug!(
                     "twitcasting:{screen_id} eventpubsuburl が url を返しません(限定配信など)"
                 );
                 Err(SessionOutcome::Unavailable)
+            }
+            EventPubsub::Malformed => {
+                tracing::warn!("twitcasting:{screen_id} eventpubsuburl の応答を解析できません");
+                Err(SessionOutcome::Disconnected { stable: false })
             }
         }
     }
@@ -1280,8 +1317,12 @@ impl TwitcastingSource {
 }
 
 /// Unavailable / Recheck が同じ状態のまま続いているか。続く 2 回目以降は debug に落とす。
+fn is_quiet_outcome(outcome: SessionOutcome) -> bool {
+    matches!(outcome, SessionOutcome::Unavailable | SessionOutcome::Recheck)
+}
+
 fn is_repeated_quiet(last: &mut Option<SessionOutcome>, outcome: SessionOutcome) -> bool {
-    let quiet = matches!(outcome, SessionOutcome::Unavailable | SessionOutcome::Recheck);
+    let quiet = is_quiet_outcome(outcome);
     let repeated = quiet && *last == Some(outcome);
     *last = quiet.then_some(outcome);
     repeated
@@ -1551,13 +1592,19 @@ mod tests {
     #[test]
     fn parses_eventpubsub_response_and_appends_gift() {
         assert_eq!(
-            parse_eventpubsub_response(r#"{"url":"wss://example/events?token=t"}"#).as_deref(),
-            Some("wss://example/events?token=t")
+            parse_eventpubsub_response(r#"{"url":"wss://example/events?token=t"}"#),
+            EventPubsub::Url("wss://example/events?token=t".to_string())
         );
-        assert_eq!(parse_eventpubsub_response(r#"{"url":"  "}"#), None);
-        assert_eq!(parse_eventpubsub_response(r#"{"url":null}"#), None);
-        assert_eq!(parse_eventpubsub_response(""), None);
-        assert_eq!(parse_eventpubsub_response("not json"), None);
+        assert_eq!(parse_eventpubsub_response(r#"{"url":"  "}"#), EventPubsub::Private);
+        assert_eq!(parse_eventpubsub_response(r#"{"url":null}"#), EventPubsub::Private);
+        assert_eq!(parse_eventpubsub_response("{}"), EventPubsub::Private);
+        for malformed in ["", "not json", r#"{"url":42}"#, r#"{"url":["x"]}"#, "[]", "null"] {
+            assert_eq!(
+                parse_eventpubsub_response(malformed),
+                EventPubsub::Malformed,
+                "body={malformed:?}"
+            );
+        }
         assert_eq!(
             ws_connect_url("wss://example/events?token=t"),
             "wss://example/events?token=t&gift=1"
@@ -1615,6 +1662,22 @@ mod tests {
         assert!(is_repeated_quiet(&mut last, SessionOutcome::Recheck));
         assert!(!is_repeated_quiet(&mut last, SessionOutcome::Offline));
         assert!(!is_repeated_quiet(&mut last, SessionOutcome::Recheck));
+    }
+
+    #[test]
+    fn only_recheck_style_statuses_are_quiet_candidates() {
+        let quiet = |s| is_quiet_outcome(classify_eventpubsub_status(s).unwrap());
+        assert!(quiet(reqwest::StatusCode::NOT_FOUND));
+        assert!(!quiet(reqwest::StatusCode::SERVICE_UNAVAILABLE));
+        assert!(!quiet(reqwest::StatusCode::INTERNAL_SERVER_ERROR));
+    }
+
+    #[test]
+    fn extract_screen_id_trims_like_js_and_checks_slash_after_query() {
+        assert_eq!(extract_screen_id("abc?next=/movie").as_deref(), Some("abc"));
+        assert_eq!(extract_screen_id("abc#a/b").as_deref(), Some("abc"));
+        assert_eq!(extract_screen_id("\u{85}abc?x"), None);
+        assert_eq!(extract_screen_id("\u{feff}abc").as_deref(), Some("abc"));
     }
 
     #[test]
