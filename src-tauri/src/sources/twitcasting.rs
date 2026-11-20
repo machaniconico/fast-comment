@@ -15,6 +15,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
@@ -57,7 +58,16 @@ const ANONYMOUS_AUTHOR_ID: &str = "tc:anonymous";
 
 pub const DEFAULT_MOVIE_ID_PATTERN: &str = r#"data-movie-id="(\d+)""#;
 pub const DEFAULT_MOVIE_ID_FALLBACK_PATTERN: &str = r#"var\s+movieid\s*=\s*"(\d+)""#;
-pub const DEFAULT_IS_ONLIVE_PATTERN: &str = r#"data-is-onlive="(true|false)""#;
+pub const DEFAULT_IS_ONLIVE_PATTERN: &str = r#"data-is-onlive="([^"]*)""#;
+
+static HTML_TAGS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?s)<!--.*?(?:-->|$)|<[a-zA-Z](?:[^<>"']|"[^"]*"|'[^']*')*>"#)
+        .expect("static tag pattern")
+});
+static HTML_ATTRIBUTES: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"\s+([^\s=/<>"']+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s<>"']+)))?"#)
+        .expect("static attribute pattern")
+});
 
 const NOT_FOUND_NOTICE: &str = "ツイキャスのユーザーが見つかりません";
 const UNAVAILABLE_NOTICE: &str = "この配信は非公開のため取得できません";
@@ -268,58 +278,52 @@ impl UserPagePatterns {
             .or_else(|| Self::capture(self.movie_id_fallback.as_ref(), html))
     }
 
-    /// 配信者本人の要素(data-broadcaster-screen-name / data-broadcaster-id)に
-    /// 紐づく movie_id を優先する。他配信のカードが先頭にあっても拾わない。
-    fn owner_movie_id(&self, html: &str, screen_id: Option<&str>) -> Option<String> {
-        let screen_id = screen_id?;
-        let screen = screen_id.to_ascii_lowercase();
-        let mut search_start = 0;
-        while let Some(relative) = html[search_start..].find("data-movie-id=") {
-            let index = search_start + relative;
-            let Some(tag_start) = html[..index].rfind('<') else {
-                search_start = index + "data-movie-id=".len();
-                continue;
-            };
-            let Some(tag_end) = html[index..].find('>').map(|offset| index + offset) else {
-                break;
-            };
-            let tag = &html[tag_start..=tag_end];
-            let tag_lower = tag.to_ascii_lowercase();
-            let own = tag_lower.contains(&format!("data-broadcaster-screen-name=\"{screen}\""))
-                || tag_lower.contains(&format!("data-broadcaster-id=\"{screen}\""));
-            if own {
-                if let Some(movie_id) = self.first_movie_id(tag) {
-                    return Some(movie_id);
-                }
-            }
-            search_start = tag_end + 1;
-        }
-        None
-    }
-
     fn parse(&self, html: &str) -> Option<UserPage> {
         self.parse_for(html, None)
     }
 
     fn parse_for(&self, html: &str, screen_id: Option<&str>) -> Option<UserPage> {
-        let movie_id = if let Some(screen_id) = screen_id {
-            if let Some(movie_id) = self.owner_movie_id(html, Some(screen_id)) {
-                Some(movie_id)
-            } else if has_broadcaster_attribute(html) {
-                // 他配信のカードしか無い場合は、誤って別枠の movie_id を使わない。
-                None
-            } else {
-                self.first_movie_id(html)
+        let mut owner_movie_id = None;
+        let mut has_broadcaster = false;
+        let mut ignored_tags = Vec::new();
+        for tag in HTML_TAGS.find_iter(html) {
+            if tag.as_str().starts_with("<!--") {
+                ignored_tags.push(tag.range());
+                continue;
             }
+            if let Some(owner_matches) =
+                screen_id.and_then(|screen_id| tag_broadcaster_matches(tag.as_str(), screen_id))
+            {
+                has_broadcaster = true;
+                if owner_matches {
+                    if owner_movie_id.is_none() {
+                        owner_movie_id = self.first_movie_id(tag.as_str());
+                    }
+                } else {
+                    ignored_tags.push(tag.range());
+                }
+            }
+        }
+        let movie_id = if has_broadcaster {
+            owner_movie_id
         } else {
             self.first_movie_id(html)
         };
-        let is_onlive = self
-            .is_onlive
-            .as_ref()
-            .and_then(|regex| regex.captures(html))
-            .and_then(|captures| captures.get(1))
-            .map(|matched| matched.as_str().eq_ignore_ascii_case("true"));
+        let onlive_value = self.is_onlive.as_ref().and_then(|regex| {
+            regex
+                .captures_iter(html)
+                .filter_map(|captures| captures.get(1))
+                .find(|value| {
+                    let tag = ignored_tags.partition_point(|tag| tag.end <= value.start());
+                    !ignored_tags.get(tag).is_some_and(|tag| tag.contains(&value.start()))
+                })
+        });
+        let is_onlive = match onlive_value.map(|value| value.as_str()) {
+            Some(value) if value.eq_ignore_ascii_case("true") => Some(true),
+            Some(value) if value.eq_ignore_ascii_case("false") => Some(false),
+            Some(_) => return None,
+            None => None,
+        };
         // movie_id が無くても is-onlive=false が明示されていれば未配信(配信歴ゼロ)。
         // それ以外で何も読めない HTML は None(呼び出し側で Unreadable)。
         if movie_id.is_none() && is_onlive != Some(false) {
@@ -329,9 +333,21 @@ impl UserPagePatterns {
     }
 }
 
-fn has_broadcaster_attribute(html: &str) -> bool {
-    let lower = html.to_ascii_lowercase();
-    lower.contains("data-broadcaster-screen-name=") || lower.contains("data-broadcaster-id=")
+fn tag_broadcaster_matches(tag: &str, screen_id: &str) -> Option<bool> {
+    let mut matches = None;
+    for attr in HTML_ATTRIBUTES.captures_iter(tag) {
+        let name = &attr[1];
+        if name.eq_ignore_ascii_case("data-broadcaster-id")
+            || name.eq_ignore_ascii_case("data-broadcaster-screen-name")
+        {
+            let value = attr.get(2).or_else(|| attr.get(3)).or_else(|| attr.get(4));
+            if !value.is_some_and(|value| value.as_str().eq_ignore_ascii_case(screen_id)) {
+                return Some(false);
+            }
+            matches = Some(true);
+        }
+    }
+    matches
 }
 
 /// 既定パターンで HTML を解析する。
@@ -795,6 +811,9 @@ pub fn channel_name(identifier: &str) -> String {
         .to_ascii_lowercase()
 }
 
+/// アプリ内の全 Source で共有し、送信に成功した movie_id を保持する。
+pub(crate) type StartedMovies = Arc<Mutex<HashSet<String>>>;
+
 /// ツイキャス1チャンネルを購読する Source。
 pub struct TwitcastingSource {
     /// 設定の identifier(LiveStream.channel_identifier の照合キー)。
@@ -804,10 +823,7 @@ pub struct TwitcastingSource {
     metadata_tx: Option<mpsc::Sender<YoutubeMetadataUpdate>>,
     /// 配信開始/終了イベント(X 自動告知用)。
     live_tx: Option<mpsc::Sender<LiveEvent>>,
-    /// 最後に Started を送った movie_id。同じ枠の WS 再接続で告知を重ねない
-    /// (台帳は件数で切り詰められるので、台帳の重複判定に頼らない)。
-    /// 未配信を観測した時だけ消す。
-    last_started: std::sync::Mutex<Option<String>>,
+    started_movies: StartedMovies,
 }
 
 impl TwitcastingSource {
@@ -823,7 +839,7 @@ impl TwitcastingSource {
             overrides,
             metadata_tx,
             live_tx: None,
-            last_started: std::sync::Mutex::new(None),
+            started_movies: Default::default(),
         }
     }
 
@@ -832,16 +848,19 @@ impl TwitcastingSource {
         self
     }
 
+    pub(crate) fn with_started_movies(mut self, started_movies: StartedMovies) -> Self {
+        self.started_movies = started_movies;
+        self
+    }
+
     fn send_live_started(&self, screen_id: &str, movie_id: &str) {
         let Some(tx) = &self.live_tx else { return };
-        {
-            let mut last = self.last_started.lock().unwrap_or_else(|e| e.into_inner());
-            if last.as_deref() == Some(movie_id) {
-                return;
-            }
-            *last = Some(movie_id.to_string());
+        // 複数の Source が同じ配信を検知しても、照合から記録までを直列化する。
+        let mut started = self.started_movies.lock().unwrap_or_else(|e| e.into_inner());
+        if started.contains(movie_id) {
+            return;
         }
-        super::send_live_event(
+        if super::send_live_event(
             tx,
             LiveEvent::Started(LiveStream {
                 platform: Platform::Twitcasting,
@@ -851,11 +870,9 @@ impl TwitcastingSource {
                 url: format!("{USER_PAGE_BASE_URL}{screen_id}/movie/{movie_id}"),
                 started_at_ms: None,
             }),
-        );
-    }
-
-    fn forget_started(&self) {
-        *self.last_started.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        ) {
+            started.insert(movie_id.to_string());
+        }
     }
 
     fn send_live_ended(&self) {
@@ -971,7 +988,8 @@ impl Source for TwitcastingSource {
                 .connect_timeout(CONNECT_TIMEOUT)
                 // 存在しないユーザーは 302。reqwest の既定追従を切って検知する。
                 .redirect(reqwest::redirect::Policy::none())
-                .build()?;
+                .build()
+                .map_err(reqwest::Error::without_url)?;
             let patterns = UserPagePatterns::from_overrides(&self.overrides);
             let channel = self.channel_name();
             let mut backoff = Backoff::new();
@@ -1006,7 +1024,6 @@ impl Source for TwitcastingSource {
                     SessionOutcome::Offline => {
                         self.send_live_state(false).await;
                         self.send_live_ended();
-                        self.forget_started();
                     }
                     SessionOutcome::NotFound => {
                         tracing::warn!("twitcasting:{channel} {NOT_FOUND_NOTICE}");
@@ -1115,7 +1132,10 @@ impl TwitcastingSource {
         let response = match response {
             Ok(response) => response,
             Err(e) => {
-                tracing::warn!("twitcasting:{screen_id} 視聴ページ取得失敗: {e}");
+                tracing::warn!(
+                    "twitcasting:{screen_id} 視聴ページ取得失敗: {}",
+                    e.without_url()
+                );
                 return Err(SessionOutcome::Disconnected { stable: false });
             }
         };
@@ -1133,7 +1153,10 @@ impl TwitcastingSource {
         let html = match response.text().await {
             Ok(html) => html,
             Err(e) => {
-                tracing::warn!("twitcasting:{screen_id} 視聴ページ本文の読み取り失敗: {e}");
+                tracing::warn!(
+                    "twitcasting:{screen_id} 視聴ページ本文の読み取り失敗: {}",
+                    e.without_url()
+                );
                 return Err(SessionOutcome::Disconnected { stable: false });
             }
         };
@@ -1174,7 +1197,10 @@ impl TwitcastingSource {
             Ok(response) if response.status().is_success() => match response.text().await {
                 Ok(body) => body,
                 Err(e) => {
-                    tracing::warn!("twitcasting:{channel} listall 本文の読み取り失敗: {e}");
+                    tracing::warn!(
+                        "twitcasting:{channel} listall 本文の読み取り失敗: {}",
+                        e.without_url()
+                    );
                     return;
                 }
             },
@@ -1186,7 +1212,10 @@ impl TwitcastingSource {
                 return;
             }
             Err(e) => {
-                tracing::warn!("twitcasting:{channel} listall 取得失敗: {e}");
+                tracing::warn!(
+                    "twitcasting:{channel} listall 取得失敗: {}",
+                    e.without_url()
+                );
                 return;
             }
         };
@@ -1225,7 +1254,10 @@ impl TwitcastingSource {
         let response = match response {
             Ok(response) => response,
             Err(e) => {
-                tracing::warn!("twitcasting:{screen_id} eventpubsuburl 取得失敗: {e}");
+                tracing::warn!(
+                    "twitcasting:{screen_id} eventpubsuburl 取得失敗: {}",
+                    e.without_url()
+                );
                 return Err(SessionOutcome::Disconnected { stable: false });
             }
         };
@@ -1249,7 +1281,10 @@ impl TwitcastingSource {
         let body = match response.text().await {
             Ok(body) => body,
             Err(e) => {
-                tracing::warn!("twitcasting:{screen_id} eventpubsuburl 本文の読み取り失敗: {e}");
+                tracing::warn!(
+                    "twitcasting:{screen_id} eventpubsuburl 本文の読み取り失敗: {}",
+                    e.without_url()
+                );
                 return Err(SessionOutcome::Disconnected { stable: false });
             }
         };
@@ -1830,6 +1865,50 @@ mod tests {
     }
 
     #[test]
+    fn foreign_broadcaster_status_does_not_end_alice() {
+        let bob = r#"<div data-broadcaster-id="bob" data-movie-id="7" data-is-onlive="false"></div>"#;
+        assert_eq!(
+            classify_fetched_page(parse_user_page_for(bob, "alice")),
+            Err(SessionOutcome::Unreadable)
+        );
+
+        let alice =
+            r#"<div data-broadcaster-id="Alice" data-movie-id="42" data-is-onlive="TrUe"></div>"#;
+        let page = classify_fetched_page(parse_user_page_for(&format!("{bob}{alice}"), "alice"))
+            .expect("Alice is live");
+        assert_eq!(page.movie_id.as_deref(), Some("42"));
+        assert_eq!(page.is_onlive, Some(true));
+        assert_eq!(
+            classify_fetched_page(parse_user_page_for(
+                r#"<body data-is-onlive="FaLsE">"#,
+                "alice"
+            )),
+            Err(SessionOutcome::Offline)
+        );
+    }
+
+    #[test]
+    fn unknown_onlive_override_is_unreadable() {
+        let overrides = TwitcastingOverrides {
+            patterns: HashMap::from([(
+                "isOnlive".to_string(),
+                r#"(?i)data-is-onlive="(\w+)""#.to_string(),
+            )]),
+            ..TwitcastingOverrides::default()
+        };
+        let patterns = UserPagePatterns::from_overrides(&overrides);
+        for body in [
+            r#"<body data-is-onlive="不明">"#,
+            r#"<body data-is-onlive="不明" data-movie-id="42">"#,
+        ] {
+            assert_eq!(
+                classify_fetched_page(patterns.parse_for(body, Some("alice"))),
+                Err(SessionOutcome::Unreadable)
+            );
+        }
+    }
+
+    #[test]
     fn unreadable_is_a_quiet_recheck_of_at_least_30s() {
         let mut last = None;
         assert!(!is_repeated_quiet(&mut last, SessionOutcome::Unreadable));
@@ -1840,33 +1919,127 @@ mod tests {
         assert!(delay >= OFFLINE_INTERVAL);
     }
 
+    #[tokio::test]
+    async fn started_stays_deduplicated_after_ledger_eviction_and_ended() {
+        use crate::autopost::{ledger::MAX_ENTRIES, Ledger, LedgerEntry, LedgerState};
+
+        let (port, _) = serve_html(r#"<body data-is-onlive="false"></body>"#).await;
+        let (source, mut live_rx) = source_for_page(port);
+        source.send_live_started("alice", "42");
+        source.send_live_started("alice", "42");
+        let Ok(LiveEvent::Started(first)) = live_rx.try_recv() else {
+            panic!("missing Started(42)");
+        };
+        assert_eq!(first.stream_id, "42");
+        assert_eq!(
+            live_rx.try_recv().unwrap_err(),
+            mpsc::error::TryRecvError::Empty
+        );
+
+        let mut ledger = Ledger::default();
+        let posted = LedgerEntry {
+            key: "twitcasting:42".into(),
+            platform: first.platform,
+            stream_id: first.stream_id,
+            channel: first.channel_identifier,
+            state: LedgerState::Posted,
+            at_ms: 0,
+            tweet_id: None,
+            text: None,
+            reason: None,
+        };
+        ledger.upsert(posted.clone()).unwrap();
+        for offset in 1..=MAX_ENTRIES {
+            let id = (100 + offset).to_string();
+            ledger
+                .upsert(LedgerEntry {
+                    key: format!("twitcasting:{id}"),
+                    stream_id: id,
+                    at_ms: offset as u64,
+                    ..posted.clone()
+                })
+                .unwrap();
+        }
+        assert!(ledger.get("twitcasting:42").is_none());
+
+        let (tx, _rx) = broadcast::channel(8);
+        let cancel = CancellationToken::new();
+        {
+            let runner = source.run(tx, cancel.clone());
+            tokio::pin!(runner);
+            tokio::select! {
+                _ = &mut runner => panic!("source stopped before Ended"),
+                event = tokio::time::timeout(Duration::from_secs(5), live_rx.recv()) => {
+                    assert!(matches!(event.unwrap(), Some(LiveEvent::Ended { .. })));
+                }
+            }
+            cancel.cancel();
+            runner.await.unwrap();
+        }
+        source.send_live_started("alice", "42");
+        assert_eq!(
+            live_rx.try_recv().unwrap_err(),
+            mpsc::error::TryRecvError::Empty
+        );
+
+        // 設定更新で Source を作り直した場合も、同じアプリ内では記録を共有する。
+        let replacement = TwitcastingSource::new("alice".into(), Default::default(), None)
+            .with_started_movies(source.started_movies.clone())
+            .with_live_tx(source.live_tx.clone());
+        replacement.send_live_started("alice", "42");
+        replacement.send_live_started("alice", "43");
+        replacement.send_live_started("alice", "42");
+        assert!(matches!(
+            live_rx.try_recv(),
+            Ok(LiveEvent::Started(stream)) if stream.stream_id == "43"
+        ));
+        assert_eq!(
+            live_rx.try_recv().unwrap_err(),
+            mpsc::error::TryRecvError::Empty
+        );
+    }
+
     #[test]
-    fn live_started_is_sent_once_per_movie_until_offline_is_observed() {
-        let (live_tx, mut live_rx) = mpsc::channel(8);
-        let source = TwitcastingSource::new(
-            "alice".to_string(),
-            TwitcastingOverrides::default(),
-            None,
-        )
-        .with_live_tx(Some(live_tx));
-        let started = |rx: &mut mpsc::Receiver<LiveEvent>| matches!(rx.try_recv(), Ok(LiveEvent::Started(_)));
-
-        // 同じ movie_id での WS 再接続を繰り返しても告知は 1 回。
-        source.send_live_started("alice", "42");
-        source.send_live_started("alice", "42");
-        source.send_live_started("alice", "42");
-        assert!(started(&mut live_rx));
-        assert!(live_rx.try_recv().is_err(), "同じ movie_id は再送しない");
-
-        // 別の movie_id は新しい配信として 1 回送る。
+    fn started_retries_movie_43_after_a_full_notification_queue() {
+        let (live_tx, mut live_rx) = mpsc::channel(1);
+        let source = TwitcastingSource::new("alice".into(), Default::default(), None)
+            .with_live_tx(Some(live_tx));
+        source.send_live_ended();
         source.send_live_started("alice", "43");
-        assert!(started(&mut live_rx));
-        assert!(live_rx.try_recv().is_err());
-
-        // 未配信を観測したら覚えた値を消し、同じ movie_id でも新しく送る。
-        source.forget_started();
+        assert!(matches!(live_rx.try_recv(), Ok(LiveEvent::Ended { .. })));
         source.send_live_started("alice", "43");
-        assert!(started(&mut live_rx));
+        assert!(matches!(
+            live_rx.try_recv(),
+            Ok(LiveEvent::Started(stream)) if stream.stream_id == "43"
+        ));
+        source.send_live_started("alice", "43");
+        assert_eq!(
+            live_rx.try_recv().unwrap_err(),
+            mpsc::error::TryRecvError::Empty
+        );
+    }
+
+    #[tokio::test]
+    async fn eventpubsub_connection_error_omits_override_url_and_query() {
+        use tracing::instrument::WithSubscriber;
+
+        let url = "http://127.0.0.1:1/?token=SECRET";
+        let overrides = TwitcastingOverrides {
+            endpoints: HashMap::from([("eventPubsubUrl".into(), url.into())]),
+            ..Default::default()
+        };
+        let source = TwitcastingSource::new("alice".into(), overrides, None);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let sink = crate::log_filter_tests::Sink::default();
+        let outcome = source
+            .fetch_eventpubsub_url(&client, "42", "alice", &CancellationToken::new())
+            .with_subscriber(crate::log_subscriber(Some("warn"), sink.clone()))
+            .await;
+        assert_eq!(outcome, Err(SessionOutcome::Disconnected { stable: false }));
+        let output = sink.output();
+        assert!(output.contains("eventpubsuburl 取得失敗"));
+        assert!(!output.contains("127.0.0.1:1"));
+        assert!(!output.contains("SECRET"));
     }
 
     #[test]
