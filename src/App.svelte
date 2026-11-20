@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, onDestroy, tick } from 'svelte';
+  import { onMount, onDestroy, tick, untrack } from 'svelte';
   import { TauriEvent } from '@tauri-apps/api/event';
   import type { Platform } from './lib/types';
   import CommentList from './lib/components/CommentList.svelte';
@@ -117,7 +117,8 @@
   let danmakuOpen = $state(false);
   let goalsToggleSaving = $state(false);
   // config を読んだ時の revision。インポートなど別の画面の保存で古くなったら読み直す。
-  let configRevision = $state(0);
+  // revision は単調増加。まだ読んでいない間は -1 で、それ以下の応答は反映しない。
+  let configRevision = $state(-1);
   let configLoading = $state(false);
   // 読込に失敗したら間を空けて再試行し、続けて失敗したら止める(get_config を連打しない)。
   let configRetryWait = $state(false);
@@ -422,12 +423,12 @@
     configLoading = true;
     try {
       const loaded = await getConfigSnapshot();
-      if (loaded && loaded.revision >= configRevision) {
+      if (loaded && loaded.revision > configRevision) {
         config = loaded.config;
         configRevision = loaded.revision;
         if (loaded.revision > configSync.revision) configSync.revision = loaded.revision;
       }
-      configFailures = 0;
+      resetConfigRetry();
     } catch (e) {
       console.warn('[config] load failed', e);
       configFailures += 1;
@@ -439,6 +440,17 @@
       configLoading = false;
     }
   }
+
+  function resetConfigRetry() {
+    configFailures = 0;
+    configRetryWait = false;
+  }
+
+  // 新しい revision を知ったら、諦めていた再試行もやり直す。
+  $effect(() => {
+    void configSync.revision;
+    untrack(resetConfigRetry);
+  });
 
   $effect(() => {
     if (configStale && !configLoading && !configRetryWait) void loadConfig();
@@ -462,7 +474,8 @@
   }
 
   function onSettingsSaved(nextConfig: AppConfig, revision: number) {
-    if (revision < configRevision) return;
+    resetConfigRetry();
+    if (revision <= configRevision) return;
     config = structuredClone($state.snapshot(nextConfig));
     configRevision = revision;
   }

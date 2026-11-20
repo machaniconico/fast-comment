@@ -1299,6 +1299,18 @@ struct OAuthStatus<T> {
     status: T,
 }
 
+/// 古いフォームは型変換を含む他の検証より先に競合として拒否し、それから設定へ変換する。
+fn parse_config_update(
+    revision: u64,
+    base_revision: Option<u64>,
+    new_config: serde_json::Value,
+) -> Result<AppConfig, String> {
+    if base_revision.is_some_and(|base| base != revision) {
+        return Err(CONFIG_CHANGED_ERROR.to_string());
+    }
+    AppConfig::from_config_update(new_config)
+}
+
 /// 設定全体を更新して保存する。moderation/tts/obs などの実行時状態も反映する。
 ///
 /// チャンネル一覧の差分適用(追加/削除)も行う。
@@ -1309,12 +1321,12 @@ async fn update_config(
     new_config: serde_json::Value,
     base_revision: Option<u64>,
 ) -> Result<UpdateConfigOutcome, String> {
-    let mut new_config = AppConfig::from_config_update(new_config)?;
     let write = state.config_write.lock().await;
-    // 古いフォームは他の検証より先に競合として拒否する(フォームの値に基づく検証は意味がない)。
-    if base_revision.is_some_and(|base| base != state.config_revision.load(Ordering::SeqCst)) {
-        return Err(CONFIG_CHANGED_ERROR.to_string());
-    }
+    let mut new_config = parse_config_update(
+        state.config_revision.load(Ordering::SeqCst),
+        base_revision,
+        new_config,
+    )?;
     validate_x_post_template(&new_config.x_post.template)?;
     let protected_oauth = protect_oauth_config(
         &state.config.lock().unwrap(),
@@ -3999,6 +4011,17 @@ mod followup_tests {
         assert_eq!(current.moderation.ng_words, vec!["spam".to_string()]);
         assert_eq!(tx.borrow().moderation.ng_words, vec!["spam".to_string()]);
         assert_eq!(AppConfig::load(dir.path()).unwrap().moderation.ng_words, vec!["spam".to_string()]);
+    }
+
+    #[test]
+    fn stale_base_revision_is_reported_before_type_errors() {
+        let mut value = serde_json::to_value(AppConfig::default()).unwrap();
+        value["log"]["retentionDays"] = serde_json::json!("bad");
+        assert_eq!(parse_config_update(1, Some(0), value.clone()).unwrap_err(), CONFIG_CHANGED_ERROR);
+        let type_error = parse_config_update(1, Some(1), value.clone()).unwrap_err();
+        assert_ne!(type_error, CONFIG_CHANGED_ERROR);
+        assert!(!type_error.contains("bad"));
+        assert!(parse_config_update(1, None, value).is_err());
     }
 
     #[test]

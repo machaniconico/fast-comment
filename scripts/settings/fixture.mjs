@@ -30,7 +30,10 @@ const keys = { twitcasting: 'twitcastingClientId', xPost: 'xPostClientId' };
 // Tauri の Channel へ 1 件送る(各 Channel の最初のメッセージは index 0)。
 function sendChannel(channel, message) {
   if (!channel) return;
-  mock.callbacks.get(Number(String(channel.toJSON()).split(':').at(-1)))?.({ index: 0, message });
+  const deliver = () => mock.callbacks.get(Number(String(channel.toJSON()).split(':').at(-1)))?.({ index: 0, message });
+  // 通知の配送だけを遅らせられる(保存とコマンドの応答は先に進む)。
+  if (mock.holdConfigSaved) mock.heldConfigSaved.push(deliver);
+  else deliver();
 }
 const mock = window.mock = {
   initial,
@@ -56,6 +59,10 @@ const mock = window.mock = {
   heldAppendNotices: [],
   holdAppendNotices: false,
   youtubeConnect: 'ok',
+  heldUpdates: [],
+  holdUpdates: false,
+  heldConfigSaved: [],
+  holdConfigSaved: false,
   login: {},
   cancels: [],
   callbacks: new Map(),
@@ -120,7 +127,9 @@ if (location.search === '?browser') {
           }
           mock.writes.push(next);
           mock.saved = next;
-          return { warnings: [], protectedOAuth, revision: ++mock.revision, config: structuredClone(next) };
+          const outcome = { warnings: [], protectedOAuth, revision: ++mock.revision, config: structuredClone(next) };
+          if (mock.holdUpdates) await new Promise(resolve => mock.heldUpdates.push(resolve));
+          return outcome;
         }
         case 'set_goals_show_in_app':
           if (mock.holdGoalsWrites) {

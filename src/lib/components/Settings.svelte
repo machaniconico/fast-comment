@@ -3,7 +3,7 @@
   import type {
     AppConfig, EffectRule, EffectsConfig, GoalsConfig, InjectTestCommentOptions, TtsDictEntry, TtsOptions,
     TimerConfig, WelcomeConfig, YoutubeOauthStatus, TwitchOauthStatus, TwitchDeviceLogin, OAuthService,
-    ConfigSnapshot, ConfigCommit, OAuthClientSaved
+    ConfigCommit, OAuthClientSaved
   } from '../ipc';
   import {
     isTauri, getConfigSnapshot, setConfig, configChangedError, getObsUrl, getObsGoalsUrl, getObsTimerUrl, exportCommentsCsv, injectTestComment,
@@ -146,9 +146,9 @@
   // フォームが基づく設定の revision。全体保存はこれを送り、古ければ Rust が拒否する。
   // 進めるのは get_config で丸ごと置き換えた時と、自分の書込の応答が基準 + 1 ちょうどの時だけ。
   let baseRevision: number | undefined;
-  let latest: ConfigSnapshot | null = null;
   const reloading = $state({ all: 0, moderation: 0, twitcasting: 0, xPost: 0 });
-  const allFieldsLocked = $derived(reloading.all > 0 || configSync.importing === 'all');
+  // 全体保存の応答はフォーム全体を置き換えるので、保存中も入力させない。
+  const allFieldsLocked = $derived(saving || reloading.all > 0 || configSync.importing === 'all');
   const moderationFieldsLocked = $derived(reloading.moderation > 0 || configSync.importing === 'moderation');
   // 規則の保存が済み、再読込を待っている間は全体を読み直せる。
   const manualReloadDisabled = $derived(
@@ -421,23 +421,21 @@
     highlights = normalizeModerationEntries(rules.highlights);
   }
 
-  /** 自分が呼んだ書込の応答。基準 + 1 ちょうどなら書いた部分を反映して基準を進め、違えば読み直しを求める。 */
-  function applyCommit(revision: number | null, apply: () => void) {
-    if (revision === null || destroyed) return;
+  /** 基準より新しい revision か。基準は単調増加で、それ以下の応答は何も反映しない。 */
+  function newerThanBase(revision: number): boolean {
     if (revision > configSync.revision) configSync.revision = revision;
+    return baseRevision === undefined || revision > baseRevision;
+  }
+
+  /** 自分が呼んだ書込の応答。基準 + 1 ちょうどなら書いた部分を反映して基準を進め、それより先なら読み直しを求める。 */
+  function applyCommit(revision: number | null, apply: () => void) {
+    if (revision === null || destroyed || !newerThanBase(revision)) return;
     if (baseRevision !== undefined && revision === baseRevision + 1) {
       apply();
       baseRevision = revision;
     } else {
       configSync.reloadRequired = true;
     }
-  }
-
-  /** 読んだ設定のうち新しい方を返し、覚えておく。古い応答で新しい値を戻さない。 */
-  function newerSnapshot(snapshot: ConfigSnapshot): ConfigSnapshot {
-    if (!latest || snapshot.revision >= latest.revision) latest = structuredClone(snapshot);
-    if (latest.revision > configSync.revision) configSync.revision = latest.revision;
-    return structuredClone(latest);
   }
 
   async function reloadConfig(scope: 'all' | 'moderation' | readonly OAuthService[]): Promise<boolean> {
@@ -458,18 +456,23 @@
         configSync.reloadRequired = true;
         return false;
       }
-      const { config: saved, revision } = newerSnapshot(snapshot);
+      const { config: saved, revision } = snapshot;
+      const newer = newerThanBase(revision);
 
       if (scope === 'all') {
-        hydrateConfig(saved);
-        baseRevision = revision;
-        setNotify(saved.ui.notifySound, saved.ui.notifyVolume);
-        onConfigSaved?.(saved, revision);
-        configSync.reloadRequired = false;
-      } else if (scope === 'moderation') {
-        applyModerationConfig(saved.moderation);
-      } else {
-        for (const service of scope) applySavedOAuthConfig(saved, service);
+        if (newer) {
+          hydrateConfig(saved);
+          baseRevision = revision;
+          setNotify(saved.ui.notifySound, saved.ui.notifyVolume);
+          onConfigSaved?.(saved, revision);
+        }
+        // 基準と同じ revision を読めたなら、フォームは保存済みの設定と揃っている。
+        if (baseRevision === revision) configSync.reloadRequired = false;
+      } else if (newer) {
+        // 部分読込では基準を進めない。基準より新しい保存があったので、全体の読み直しを求める。
+        if (scope === 'moderation') applyModerationConfig(saved.moderation);
+        else for (const service of scope) applySavedOAuthConfig(saved, service);
+        configSync.reloadRequired = true;
       }
       return true;
     } catch {
@@ -1846,6 +1849,7 @@
           id="cred-youtube-oauth-client-id"
           type="text"
           bind:value={credYoutubeOauthClientId}
+          disabled={youtubeOauthBusy}
           class="id-input"
           placeholder="xxxxx.apps.googleusercontent.com"
           autocomplete="off"

@@ -295,7 +295,7 @@
 
 <div class="field-row">
   <label for="xpost-mode">投稿の方法</label>
-  <select id="xpost-mode" bind:value={xPost.mode} class="platform-select">
+  <select id="xpost-mode" bind:value={xPost.mode} class="platform-select" disabled={disconnecting}>
     <option value="intent">投稿画面を開く(無料・自分で投稿)</option>
     <option value="api" disabled={!connected && xPost.mode !== 'api'}>X API で自動投稿(有料・要接続)</option>
   </select>

@@ -118,6 +118,16 @@ for (const service of services) {
       const reads = await page.evaluate(() => window.mock.reads);
       await finish(page, result === 'success' ? { ...service.ready, clientId: 'typed-client' } : result);
       await page.waitForFunction(n => window.mock.reads > n, reads);
+      if (result === 'failure before save') {
+        // Nothing was saved, so the read is not newer than the form and the typed values stay.
+        await page.waitForFunction(() => window.mock.configSync.reloading === 0);
+        assert.equal(await id(page).inputValue(), 'typed-client');
+        assert.equal(await port(page).inputValue(), '040321');
+        const next = await saveSettings(page);
+        assert.equal(next.credentials[service.id], (await initial(page)).credentials[service.id]);
+        assert.equal(next[service.key].callbackPort, 40321);
+        return;
+      }
       const expected = await saved(page);
       await page.waitForFunction(({ prefix, expected }) => document.getElementById(prefix + '-port').value === String(expected), { prefix: service.prefix, expected: expected[service.key].callbackPort });
       // Inputs and the parent form must both reflect what was actually persisted.
@@ -278,6 +288,7 @@ for (const service of services) {
     await page.evaluate(({ key, id }) => {
       window.mock.saved.credentials[id] = 'retry-client';
       window.mock.saved[key].callbackPort = 40322;
+      window.mock.revision++;
       window.mock.holdReads = false;
     }, service);
     await reload.click();
@@ -519,11 +530,14 @@ test('manual reload uses 40322 when TwitCasting commits it before the 40321 repl
   await page.evaluate(() => { window.mock.holdReads = false; });
   await commitTwitcasting(page);
   assert.equal((await saved(page)).twitcasting.callbackPort, 40322);
-  // The older reply is replaced by the newer snapshot read after the login.
+  // The older reply is not newer than the base advanced by the 40322 notice, so it changes nothing.
   await page.evaluate(() => window.mock.heldReads.shift()());
   await page.waitForFunction(() => window.mock.configSync.reloading === 0);
   assert.equal(await twitcastingPort(page).inputValue(), '40322');
+  // The earlier failed read still asks for a reload; reading the base revision clears it.
+  await reloadSettings(page).click();
   assert.equal((await saveSettings(page)).twitcasting.callbackPort, 40322);
+  assert.equal(await page.evaluate(() => window.mock.rejected), 0);
 }));
 
 test('moderation reload keeps OAuth 40322 when its held reply contains 39822', async t => withSettings(t, async page => {
@@ -734,10 +748,13 @@ test('the main window backs off and stops retrying a failing config read', async
   const toggle = page.getByRole('checkbox', { name: 'コメビュに表示' });
   await toggle.waitFor();
   await page.clock.install();
-  const start = await page.evaluate(() => {
+  const start = await page.evaluate(async () => {
+    // Another path saves, and some screen learns the new revision.
+    await window.__TAURI_INTERNALS__.invoke('set_moderation', { moderation: { ngWords: ['spam'], ngUsers: [], highlights: [] } });
     window.mock.readsToFail = 100;
-    window.mock.configSync.revision = 5;
-    return window.mock.reads;
+    const reads = window.mock.reads;
+    window.mock.configSync.revision = window.mock.revision;
+    return reads;
   });
   const readsAfter = n => page.waitForFunction(n => window.mock.reads === n, start + n);
   await readsAfter(1);
@@ -808,3 +825,96 @@ test('disconnecting X in API mode from the form keeps the next save valid', asyn
   assert.equal(next.xPost.mode, 'intent');
   assert.equal(await rejected(page), 0);
 }, 'app'));
+
+test('the form is disabled while its full save response is pending', async t => withSettings(t, async page => {
+  await page.locator('#log-retention').fill('10');
+  await page.evaluate(() => { window.mock.holdUpdates = true; });
+  await save(page).click();
+  await page.waitForFunction(() => window.mock.heldUpdates.length === 1);
+  assert.equal(await page.locator('#log-retention').isDisabled(), true);
+  await page.evaluate(() => { window.mock.holdUpdates = false; window.mock.heldUpdates.shift()(); });
+  await page.getByText('保存しました', { exact: true }).waitFor();
+  assert.equal(await page.locator('#log-retention').isEnabled(), true);
+  assert.equal(await page.locator('#log-retention').inputValue(), '10');
+}));
+
+test('a TwitCasting save notice delivered after the login settles does not overwrite a new edit', async t => withSettings(t, async page => {
+  await page.evaluate(() => { window.mock.holdConfigSaved = true; });
+  await startTwitcasting(page, '40322');
+  await commitTwitcasting(page);
+  await page.waitForFunction(() => document.getElementById('twitcasting-port').disabled === false);
+  await twitcastingPort(page).fill('40323');
+  await page.evaluate(() => window.mock.heldConfigSaved.shift()());
+  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(resolve)));
+  assert.equal(await twitcastingPort(page).inputValue(), '40323');
+}));
+
+test('an older 39822 read after the 40322 notice keeps the form and base at 40322', async t => withSettings(t, async page => {
+  await page.evaluate(() => { window.mock.readsToFail = 1; });
+  await importModeration(page, spamRules);
+  await reloadSettings(page).waitFor();
+  await startTwitcasting(page, '40322');
+  await page.evaluate(() => { window.mock.holdReads = true; });
+  await reloadSettings(page).click();
+  await page.waitForFunction(() => window.mock.heldReads.length === 1);
+  await page.evaluate(() => window.mock.login.twitcasting.accept());
+  await page.evaluate(() => {
+    window.mock.holdReads = false;
+    window.mock.heldReads.shift()();
+  });
+  await page.waitForFunction(() => window.mock.configSync.reloading === 0);
+  assert.equal(await twitcastingPort(page).inputValue(), '40322');
+  await page.evaluate(() => window.mock.login.twitcasting.finish(new Error('cancelled')));
+  await page.waitForFunction(() => window.mock.configSync.reloading === 0 && !window.mock.login.twitcasting);
+  await reloadSettings(page).click();
+  const next = await saveSettings(page);
+  assert.equal(next.twitcasting.callbackPort, 40322);
+  assert.deepEqual(next.moderation, spamRules);
+  assert.equal(await rejected(page), 0);
+}));
+
+test('the main window reads again after giving up once settings reload and an OAuth save', async t => withSettings(t, async page => {
+  await page.getByRole('checkbox', { name: 'コメビュに表示' }).waitFor();
+  await page.clock.install();
+  const start = await page.evaluate(async () => {
+    await window.__TAURI_INTERNALS__.invoke('set_moderation', { moderation: { ngWords: ['spam'], ngUsers: [], highlights: [] } });
+    window.mock.readsToFail = 4;
+    const reads = window.mock.reads;
+    window.mock.configSync.revision = window.mock.revision;
+    return reads;
+  });
+  await page.waitForFunction(n => window.mock.reads === n, start + 1);
+  for (const [wait, total] of [[1000, 2], [2000, 3], [4000, 4]]) {
+    await page.clock.fastForward(wait);
+    await page.waitForFunction(n => window.mock.reads === n, start + total);
+  }
+  await page.getByRole('tab', { name: '設定', exact: true }).click();
+  await page.locator('details').filter({ hasText: '自分の ClientID を使う' }).locator('summary').click();
+  await page.waitForFunction(() => window.mock.configSync.reloading === 0);
+  const before = await page.evaluate(() => window.mock.reads);
+  await startTwitcasting(page, '40322');
+  await page.evaluate(() => window.mock.login.twitcasting.accept());
+  // The App learns revision 2 from the OAuth save and reads again despite the earlier failures.
+  await page.waitForFunction(n => window.mock.reads > n, before);
+  await page.evaluate(() => window.mock.login.twitcasting.finish(new Error('cancelled')));
+  await page.getByRole('tab', { name: 'コメント', exact: true }).click();
+  await page.waitForFunction(() => document.querySelector('.goals-panel-toggle input')?.disabled === false);
+}, 'app'));
+
+test('an own moderation import answered at base+2 asks for a reload', async t => withSettings(t, async page => {
+  await page.evaluate(() => { window.mock.holdModerationWrites = true; });
+  await importModeration(page, spamRules);
+  await page.waitForFunction(() => window.mock.heldModerationWrites.length === 1);
+  await page.evaluate(() => window.__TAURI_INTERNALS__.invoke('set_goals_show_in_app', { showInApp: true }));
+  await page.evaluate(() => {
+    window.mock.holdModerationWrites = false;
+    window.mock.heldModerationWrites.shift()();
+  });
+  await page.waitForFunction(() => window.mock.configSync.reloadRequired === true);
+  await page.waitForFunction(() => window.mock.configSync.importing === null && window.mock.configSync.reloading === 0);
+  assert.equal(await save(page).isDisabled(), true);
+  await reloadSettings(page).click();
+  const next = await saveSettings(page);
+  assert.deepEqual(next.moderation, spamRules);
+  assert.equal(next.goals.showInApp, true);
+}));

@@ -624,6 +624,24 @@ function configSavedChannel<T>(handler?: (commit: ConfigCommit<T>) => void): Cha
   return channel;
 }
 
+/**
+ * 接続系コマンドを呼ぶ。`onConfigSaved` の通知はコマンドが settle する前に届いた物だけ渡す
+ * (settle 後の状態はコマンドの応答と、その後の再読込で決める)。
+ */
+async function invokeWithConfigSaved<T, C>(
+  cmd: string,
+  args: Record<string, unknown>,
+  handler?: (commit: ConfigCommit<C>) => void,
+): Promise<T | null> {
+  let settled = false;
+  const onConfigSaved = configSavedChannel<C>(commit => { if (!settled) handler?.(commit); });
+  try {
+    return await invoke<T>(cmd, { ...args, onConfigSaved });
+  } finally {
+    settled = true;
+  }
+}
+
 /** 設定と、その時点の revision(Rust 側で保存のたびに進む)。 */
 export interface ConfigSnapshot {
   config: AppConfig;
@@ -897,8 +915,9 @@ export async function connectYoutubeOauth(
   clientId: string,
   onConfigSaved?: (commit: ConfigCommit<{ youtubeOauthClientId: string }>) => void,
 ): Promise<YoutubeOauthStatus> {
-  const args = { clientId, onConfigSaved: configSavedChannel(onConfigSaved) };
-  return (await invoke<YoutubeOauthStatus>('connect_youtube_oauth', args)) ?? {
+  return (await invokeWithConfigSaved<YoutubeOauthStatus, { youtubeOauthClientId: string }>(
+    'connect_youtube_oauth', { clientId }, onConfigSaved,
+  )) ?? {
     configured: false,
     connected: false,
     channelTitle: null,
@@ -1160,9 +1179,9 @@ export async function connectXPost(
   attempt: string,
   onConfigSaved?: (commit: ConfigCommit<OAuthClientSaved>) => void,
 ): Promise<XPostStatus | null> {
-  return invoke<XPostStatus>('connect_x_post', {
-    clientId, callbackPort, attempt, onConfigSaved: configSavedChannel(onConfigSaved),
-  });
+  return invokeWithConfigSaved<XPostStatus, OAuthClientSaved>(
+    'connect_x_post', { clientId, callbackPort, attempt }, onConfigSaved,
+  );
 }
 
 /** `attempt` の X ログインだけを取り消す(接続コマンドより先に届いても効く)。 */
@@ -1179,7 +1198,7 @@ export function newOAuthAttempt(): string {
 export async function disconnectXPost(
   onConfigSaved?: (commit: ConfigCommit<{ xPost: Pick<XPostConfig, 'mode'> }>) => void,
 ): Promise<XPostStatus | null> {
-  return invoke<XPostStatus>('disconnect_x_post', { onConfigSaved: configSavedChannel(onConfigSaved) });
+  return invokeWithConfigSaved<XPostStatus, { xPost: Pick<XPostConfig, 'mode'> }>('disconnect_x_post', {}, onConfigSaved);
 }
 
 /** テスト投稿(実際に公開され、課金される)。呼ぶ前に必ず確認を取る。 */
@@ -1205,12 +1224,11 @@ export async function connectTwitcasting(
   attempt: string,
   onConfigSaved?: (commit: ConfigCommit<OAuthClientSaved>) => void,
 ): Promise<import('./types').TwitcastingStatus | null> {
-  return invoke<import('./types').TwitcastingStatus>('connect_twitcasting', {
+  return invokeWithConfigSaved<import('./types').TwitcastingStatus, OAuthClientSaved>('connect_twitcasting', {
     clientId: clientId || null,
     callbackPort,
     attempt,
-    onConfigSaved: configSavedChannel(onConfigSaved),
-  });
+  }, onConfigSaved);
 }
 /** `attempt` のツイキャスログインだけを取り消す(接続コマンドより先に届いても効く)。 */
 export async function cancelTwitcastingLogin(attempt: string): Promise<void> {
