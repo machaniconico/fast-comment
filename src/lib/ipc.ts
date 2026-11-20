@@ -12,10 +12,11 @@ import { invoke as tauriInvoke } from '@tauri-apps/api/core';
 import { emit, listen } from '@tauri-apps/api/event';
 import { getCurrentWindow, primaryMonitor } from '@tauri-apps/api/window';
 import { createTtsAudioPlayer } from './ttsAudio';
+import { notifyModerationAppend } from './configSync.svelte';
 
 // ---- Tauri availability guard ----
 // @tauri-apps/api throws when window.__TAURI_INTERNALS__ is absent (browser dev).
-const isTauri = (): boolean =>
+export const isTauri = (): boolean =>
   typeof window !== 'undefined' && !!(window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
 
 // ---- rAF batch queue ----
@@ -689,11 +690,8 @@ export async function appendModerationValue(kind: 'ngUsers' | 'ngWords', value: 
 
   // Let an open Settings form merge it into its unsaved edit state, otherwise its next save
   // would overwrite the config with the stale list and drop this entry.
-  window.dispatchEvent(new CustomEvent<ModerationAppended>(MODERATION_APPENDED_EVENT, { detail: { kind, value: normalized } }));
+  notifyModerationAppend(kind, normalized);
 }
-
-export const MODERATION_APPENDED_EVENT = 'fc:moderation-appended';
-export type ModerationAppended = { kind: 'ngUsers' | 'ngWords'; value: string };
 
 export async function getTtsQueueState(): Promise<TtsQueueState | null> {
   return invoke<TtsQueueState>('get_tts_queue_state');

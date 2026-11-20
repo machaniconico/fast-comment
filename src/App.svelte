@@ -443,12 +443,13 @@
     const input = event.currentTarget as HTMLInputElement;
     const checked = input.checked;
     input.checked = showGoalsBar;
-    if (!config || goalsToggleSaving || configSync.importing || configSync.reloadRequired) return;
+    if (!config || goalsToggleSaving || !!configSync.importing || !!configSync.reloading || configSync.reloadRequired) return;
     goalsToggleSaving = true;
     goalsToggleError = '';
     const revision = configSync.importRevision;
     try {
       await setGoalsShowInApp(checked);
+      configSync.goalsRevision += 1;
       if (config && configSync.importRevision === revision) {
         config.goals.showInApp = checked;
       }
@@ -865,7 +866,7 @@
           <input
             type="checkbox"
             checked={showGoalsBar}
-            disabled={goalsToggleSaving || configSync.importing || configSync.reloadRequired}
+            disabled={goalsToggleSaving || !!configSync.importing || !!configSync.reloading || configSync.reloadRequired}
             onchange={toggleGoalsInApp}
           />
           <span>{goalsToggleSaving ? '保存中' : 'コメビュに表示'}</span>

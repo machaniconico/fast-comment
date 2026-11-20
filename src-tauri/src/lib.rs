@@ -1430,6 +1430,34 @@ fn update_moderation(
     Ok(())
 }
 
+fn append_ng_value(entries: &mut Vec<String>, value: &str) -> Option<String> {
+    // ECMAScript WhiteSpace + LineTerminator (U+0085 は除き、U+FEFF を含む)。
+    let value = value.trim_matches(|c| {
+        matches!(
+            c,
+            '\u{0009}'..='\u{000D}'
+                | '\u{0020}'
+                | '\u{00A0}'
+                | '\u{1680}'
+                | '\u{2000}'..='\u{200A}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202F}'
+                | '\u{205F}'
+                | '\u{3000}'
+                | '\u{FEFF}'
+        )
+    });
+    if value.is_empty() {
+        return None;
+    }
+    let value = value.to_owned();
+    if !entries.contains(&value) {
+        entries.push(value.clone());
+    }
+    Some(value)
+}
+
 #[tauri::command]
 async fn append_moderation_value(
     state: State<'_, AppState>,
@@ -1441,22 +1469,13 @@ async fn append_moderation_value(
         Some("ngUsers") => |rules: &mut config::ModerationConfig| &mut rules.ng_users,
         _ => return Err("NG リストの種類が不正です".into()),
     };
-    let value = value
-        .as_str()
-        .ok_or("NG 規則は文字列で指定してください")?
-        .trim();
-    if value.is_empty() {
-        return Ok(None);
-    }
+    let value = value.as_str().ok_or("NG 規則は文字列で指定してください")?;
     let _write = state.config_write.lock().await;
-    let value = value.to_owned();
+    let mut normalized = None;
     update_moderation(&state, |rules| {
-        let entries = select(rules);
-        if !entries.contains(&value) {
-            entries.push(value.clone());
-        }
+        normalized = append_ng_value(select(rules), value);
     })?;
-    Ok(Some(value))
+    Ok(normalized)
 }
 
 #[tauri::command]
@@ -3273,6 +3292,28 @@ pub fn run() {
 #[cfg(test)]
 mod followup_tests {
     use super::*;
+
+    #[test]
+    fn ng_append_matches_javascript_trim_and_deduplicates_bom() {
+        let mut rules = config::ModerationConfig {
+            ng_users: vec!["bot".into()],
+            ..config::ModerationConfig::default()
+        };
+        assert_eq!(
+            append_ng_value(&mut rules.ng_users, "\u{FEFF}bot").as_deref(),
+            Some("bot")
+        );
+        assert_eq!(rules.ng_users, ["bot"]);
+
+        let js_whitespace = "\t\n\u{000B}\u{000C}\r \u{00A0}\u{1680}\u{2000}\u{2001}\u{2002}\u{2003}\u{2004}\u{2005}\u{2006}\u{2007}\u{2008}\u{2009}\u{200A}\u{2028}\u{2029}\u{202F}\u{205F}\u{3000}\u{FEFF}";
+        assert_eq!(append_ng_value(&mut rules.ng_users, js_whitespace), None);
+        let preserved = "\u{0085}\u{180E}bot\u{200B}";
+        assert_eq!(
+            append_ng_value(&mut rules.ng_users, preserved).as_deref(),
+            Some(preserved)
+        );
+        assert_eq!(rules.ng_users, ["bot", preserved]);
+    }
 
     // 指摘1: UI は `protectedOAuth` を読む。camelCase 変換の `protectedOauth` では届かない。
     #[test]

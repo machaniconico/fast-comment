@@ -41,6 +41,7 @@ const mock = window.mock = {
   holdGoalsWrites: false,
   heldModerationWrites: [],
   holdModerationWrites: false,
+  failModerationAppend: false,
   login: {},
   cancels: [],
   callbacks: new Map(),
@@ -54,6 +55,7 @@ if (location.search === '?browser') {
   mount(ConfigPortability, { target: document.body });
 } else {
   window.__TAURI_INTERNALS__ = {
+    metadata: { currentWindow: { label: 'main' } },
     transformCallback(callback) {
       const id = mock.callbacks.size + 1;
       mock.callbacks.set(id, callback);
@@ -62,6 +64,7 @@ if (location.search === '?browser') {
     unregisterCallback(id) { mock.callbacks.delete(id); },
     async invoke(command, args) {
       switch (command) {
+        case 'plugin:window|get_all_windows': return ['main'];
         case 'get_config': {
           mock.reads++;
           if (mock.readsToFail > 0) {
@@ -106,6 +109,7 @@ if (location.search === '?browser') {
             mock.saved.moderation = structuredClone(args.moderation);
             return null;
           }
+          if (mock.failModerationAppend) throw new Error(args.value);
           const value = args.value.trim();
           const entries = mock.saved.moderation[args.kind];
           if (value && !entries.includes(value)) entries.push(value);

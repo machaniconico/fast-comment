@@ -2,14 +2,14 @@
   import { onMount, onDestroy, untrack } from 'svelte';
   import type {
     AppConfig, EffectRule, EffectsConfig, GoalsConfig, InjectTestCommentOptions, TtsDictEntry, TtsOptions,
-    TimerConfig, WelcomeConfig, YoutubeOauthStatus, ModerationAppended, TwitchOauthStatus, TwitchDeviceLogin, OAuthService
+    TimerConfig, WelcomeConfig, YoutubeOauthStatus, TwitchOauthStatus, TwitchDeviceLogin, OAuthService
   } from '../ipc';
   import {
-    getConfig, setConfig, getObsUrl, getObsGoalsUrl, getObsTimerUrl, exportCommentsCsv, injectTestComment,
+    isTauri, getConfig, setConfig, getObsUrl, getObsGoalsUrl, getObsTimerUrl, exportCommentsCsv, injectTestComment,
     setTtsPaused, clearTtsQueue, skipCurrentTts, testTts, probeTtsEngine, getYoutubeOauthStatus,
     connectYoutubeOauth, disconnectYoutubeOauth, getTwitchOauthStatus, beginTwitchLogin,
     awaitTwitchLogin, cancelTwitchLogin, disconnectTwitchOauth, getGoalSkinInfo, openUrl,
-    getCommentLogDir, openCommentLogDir, listListeners, deleteListener, MODERATION_APPENDED_EVENT
+    getCommentLogDir, openCommentLogDir, listListeners, deleteListener
   } from '../ipc';
   import {
     urlForEngineChange, buildVoicevoxParams, buildAutoSpeed, buildQueueLimits, kindTemplate, allTemplate,
@@ -40,7 +40,7 @@
   import { sanitizeXPostNumbers } from '../xAutopost';
   import { DEFAULT_TWITCASTING_CALLBACK_PORT } from '../twitcasting';
   import { appUpdate } from '../appUpdate.svelte';
-  import { configReloadMessage, configSync } from '../configSync.svelte';
+  import { configReloadMessage, configSync, subscribeModerationAppend } from '../configSync.svelte';
   import { progressLabel, statusText } from '../appUpdate';
 
   interface Props {
@@ -142,10 +142,16 @@
   let xPostPortInvalid = $state(false);
   const oauthConnecting = $state({ twitcasting: false, xPost: false });
   const oauthConfigRevision = $state({ twitcasting: 0, xPost: 0 });
-  let reloadingConfig = $state(false);
+  const configSections = ['moderation', 'twitcasting', 'xPost'] as const;
+  const revisions = { all: 0, moderation: 0, twitcasting: 0, xPost: 0 };
+  const reloading = $state({ all: 0, moderation: 0, twitcasting: 0, xPost: 0 });
+  const allFieldsLocked = $derived(reloading.all > 0 || configSync.importing === 'all');
+  const moderationFieldsLocked = $derived(reloading.moderation > 0 || configSync.importing === 'moderation');
+  const manualReloadDisabled = $derived(saving || !!configSync.importing || reloading.all > 0);
   const saveBlockedReason = $derived.by(() => {
     if (configSync.reloadRequired) return configReloadMessage;
     if (configSync.importing) return '設定をインポート中です';
+    if (configSync.reloading) return '設定を読み込み中です';
     if (twitcastingPortInvalid || xPostPortInvalid) return 'OAuth の待受ポートを確認してください';
     if (oauthConnecting.twitcasting || oauthConnecting.xPost) return 'OAuth の接続処理中です';
     return '';
@@ -343,9 +349,7 @@
     twitcastingPortInvalid = false;
     xPostPortInvalid = false;
     if (config) {
-      ngWords = normalizeModerationEntries(config.moderation.ngWords);
-      ngUsers = normalizeModerationEntries(config.moderation.ngUsers);
-      highlights = normalizeModerationEntries(config.moderation.highlights);
+      applyModerationConfig(config.moderation);
       credTwitchOauth = config.credentials?.twitchOauth ?? '';
       credTwitchUsername = config.credentials?.twitchUsername ?? '';
       credTwitchClientId = config.credentials?.twitchClientId ?? '';
@@ -404,33 +408,78 @@
     }
   }
 
-  function onConfigImported(importedConfig: AppConfig) {
-    hydrateConfig(importedConfig);
-    setNotify(importedConfig.ui.notifySound, importedConfig.ui.notifyVolume);
-    onConfigSaved?.(importedConfig);
+  function applyModerationConfig(rules: AppConfig['moderation']) {
+    if (config) config.moderation = rules;
+    ngWords = normalizeModerationEntries(rules.ngWords);
+    ngUsers = normalizeModerationEntries(rules.ngUsers);
+    highlights = normalizeModerationEntries(rules.highlights);
   }
 
-  function readConfigWithTimeout(): Promise<AppConfig | null> {
-    let timeout: number | undefined;
-    const deadline = new Promise<null>(resolve => {
-      timeout = window.setTimeout(() => resolve(null), 10_000);
-    });
-    return Promise.race([getConfig().catch(() => null), deadline])
-      .finally(() => window.clearTimeout(timeout));
-  }
-
-  async function reloadImportedConfig() {
-    if (destroyed || reloadingConfig) return;
-    reloadingConfig = true;
-    try {
-      const saved = await readConfigWithTimeout();
-      if (!destroyed && saved) {
-        onConfigImported(saved);
-        configSync.reloadRequired = false;
-      }
-    } finally {
-      reloadingConfig = false;
+  async function reloadConfig(scope: 'all' | 'moderation' | readonly OAuthService[]): Promise<boolean> {
+    if (destroyed) {
+      configSync.reloadRequired = true;
+      return false;
     }
+
+    const targets: readonly (keyof typeof revisions)[] = typeof scope === 'string' ? [scope] : scope;
+    const sections = scope === 'all' ? configSections : targets;
+    const revision = { ...revisions };
+    const { importRevision, goalsRevision } = configSync;
+    for (const target of targets) reloading[target] += 1;
+    configSync.reloading += 1;
+
+    const expiresAt = performance.now() + 10_000;
+    let timeout: number | undefined;
+    try {
+      const deadline = new Promise<null>(resolve => {
+        timeout = window.setTimeout(() => resolve(null), 10_000);
+      });
+      const saved = await Promise.race([getConfig(), deadline]);
+      if (
+        !saved || destroyed || performance.now() >= expiresAt ||
+        configSync.importRevision !== importRevision || revisions.all !== revision.all ||
+        sections.some(section => revisions[section] !== revision[section]) ||
+        (scope === 'all' && configSync.goalsRevision !== goalsRevision)
+      ) {
+        configSync.reloadRequired = true;
+        return false;
+      }
+
+      for (const target of targets) revisions[target] += 1;
+      if (scope === 'all') {
+        hydrateConfig(saved);
+        setNotify(saved.ui.notifySound, saved.ui.notifyVolume);
+        onConfigSaved?.(saved);
+        configSync.reloadRequired = false;
+      } else if (scope === 'moderation') {
+        applyModerationConfig(saved.moderation);
+      } else {
+        for (const service of scope) applySavedOAuthConfig(saved, service);
+      }
+      return true;
+    } catch {
+      configSync.reloadRequired = true;
+      return false;
+    } finally {
+      window.clearTimeout(timeout);
+      for (const target of targets) reloading[target] -= 1;
+      configSync.reloading -= 1;
+    }
+  }
+
+  function reloadImportedConfig() {
+    if (!manualReloadDisabled) return reloadConfig('all');
+  }
+
+  function onOAuthConnectingChange(service: OAuthService, connecting: boolean) {
+    if (connecting) revisions[service] += 1;
+    oauthConnecting[service] = connecting;
+  }
+
+  async function reloadOAuthConfig(service: OAuthService) {
+    // 接続コマンドが設定を保存した可能性があるため、先に開始した読込を無効にする。
+    revisions[service] += 1;
+    await reloadConfig([service]);
   }
 
   function applySavedOAuthConfig(saved: AppConfig, service: OAuthService) {
@@ -447,33 +496,10 @@
     oauthConfigRevision[service] += 1;
   }
 
-  // ログイン終了後に、接続コマンドが保存した Client ID・ポートを読み直す。
-  // 読めなければ再読込を求める(フォームの値が保存側とずれたまま保存させない)。
-  async function reloadOAuthConfig(service: OAuthService) {
-    if (destroyed) return;
-    const revision = oauthConfigRevision[service];
-    const saved = await readConfigWithTimeout();
-    // 読込中にインポートなどで設定を置き換えた場合は、その値を使う。
-    if (destroyed || oauthConfigRevision[service] !== revision) return;
-    if (!saved) {
-      configSync.reloadRequired = true;
-      return;
-    }
-    applySavedOAuthConfig(saved, service);
-  }
-
-  async function onModerationImported() {
-    const importedConfig = await getConfig();
-    hydrateConfig(importedConfig);
-    if (importedConfig) {
-      setNotify(importedConfig.ui.notifySound, importedConfig.ui.notifyVolume);
-      onConfigSaved?.(importedConfig);
-    }
-  }
-
   onMount(async () => {
     void appUpdate.loadCurrentVersion();
-    hydrateConfig(await getConfig());
+    if (isTauri()) await reloadConfig('all');
+    if (destroyed) return;
     refreshLogDir();
     try {
       youtubeOauthStatus = await getYoutubeOauthStatus();
@@ -926,17 +952,12 @@
   // Updates received while a search request is in flight (re-applied onto its response).
   let pendingListenerUpdates: ListenerUpdate[] = [];
 
-  // NG entries added from the UserCard go straight to the config; mirror them into the form
-  // so saving the form does not write back the stale list.
-  function onModerationAppended(e: Event) {
-    const { kind, value } = (e as CustomEvent<ModerationAppended>).detail;
+  // 即時保存された追加を編集中の一覧に取り込む。
+  $effect(() => subscribeModerationAppend((kind, value) => {
+    revisions.moderation += 1;
     if (kind === 'ngUsers' && !ngUsers.includes(value)) ngUsers = [...ngUsers, value];
     if (kind === 'ngWords' && !ngWords.includes(value)) ngWords = [...ngWords, value];
-  }
-  $effect(() => {
-    window.addEventListener(MODERATION_APPENDED_EVENT, onModerationAppended);
-    return () => window.removeEventListener(MODERATION_APPENDED_EVENT, onModerationAppended);
-  });
+  }));
 
   function applyListenerUpdate(rows: ListenerRecord[], u: ListenerUpdate): ListenerRecord[] {
     const same = (x: ListenerRecord) => x.platform === u.platform && x.authorId === u.authorId;
@@ -1310,12 +1331,7 @@
       const result = await setConfig(config);
       const warnings = result?.warnings ?? [];
       if (result?.protectedOAuth.length) {
-        const saved = await getConfig().catch(() => null);
-        if (saved) {
-          for (const service of result.protectedOAuth) applySavedOAuthConfig(saved, service);
-        } else {
-          configSync.reloadRequired = true;
-        }
+        await reloadConfig(result.protectedOAuth);
       }
       void localApiSettings?.refreshStatus();
       saveWarned = warnings.length > 0;
@@ -1567,6 +1583,7 @@
 >
   <h2>{focus === 'goals' ? '目標設定' : focus === 'danmaku' ? '弾幕・OBS設定' : '設定'}</h2>
 
+  <fieldset class="settings-fields" disabled={allFieldsLocked}>
   <section id="settings-appearance">
     <h3>外観</h3>
     <div class="field-row">
@@ -1668,10 +1685,10 @@
   <section id="settings-portability">
     <h3>設定のバックアップ/移行</h3>
     <ConfigPortability
-      onImported={onConfigImported}
+      onImported={() => reloadConfig('all')}
       onReload={reloadImportedConfig}
-      disabled={saving}
-      reloading={reloadingConfig}
+      disabled={saving || allFieldsLocked}
+      reloading={reloading.all > 0}
     />
   </section>
 
@@ -2063,9 +2080,11 @@
       callbackPort={config.twitcasting?.callbackPort ?? DEFAULT_TWITCASTING_CALLBACK_PORT}
       configRevision={oauthConfigRevision.twitcasting}
       {saving}
-      onConnectingChange={(connecting) => { oauthConnecting.twitcasting = connecting; }}
+      configReloading={reloading.twitcasting > 0}
+      onConnectingChange={(connecting) => onOAuthConnectingChange('twitcasting', connecting)}
       onConnectionSettled={() => reloadOAuthConfig('twitcasting')}
       onCallbackPortChange={(port) => {
+        revisions.twitcasting += 1;
         twitcastingPortInvalid = port === null;
         if (config && port !== null) config.twitcasting = { ...(config.twitcasting ?? {}), callbackPort: port };
       }}
@@ -2080,9 +2099,11 @@
         clientId={config.credentials?.xPostClientId ?? ''}
         configRevision={oauthConfigRevision.xPost}
         {saving}
-        onConnectingChange={(connecting) => { oauthConnecting.xPost = connecting; }}
+        configReloading={reloading.xPost > 0}
+        onConnectingChange={(connecting) => onOAuthConnectingChange('xPost', connecting)}
         onConnectionSettled={() => reloadOAuthConfig('xPost')}
         onCallbackPortChange={(port) => {
+          revisions.xPost += 1;
           xPostPortInvalid = port === null;
           if (config?.xPost && port !== null) config.xPost.callbackPort = port;
         }}
@@ -2899,6 +2920,7 @@
   <!-- ── Moderation ── -->
   <section id="settings-moderation">
     <h3>モデレーション</h3>
+    <fieldset class="settings-fields" disabled={moderationFieldsLocked}>
 
     <div class="mod-list">
       <div class="mod-list-header">
@@ -3026,7 +3048,11 @@
 
     <ModerationTester {ngWords} {ngUsers} {highlights} />
 
-    <ModerationPortability onImported={onModerationImported} />
+    </fieldset>
+    <ModerationPortability
+      onImported={() => reloadConfig('moderation')}
+      disabled={saving || allFieldsLocked}
+    />
   </section>
 
   <!-- ── Notification ── -->
@@ -3122,21 +3148,25 @@
     {/if}
   </section>
 
+  {/if}
+
   <!-- ── Save ── -->
+  {#if config || (configSync.reloadRequired && focus !== 'all')}
   <div class="save-row">
-    <button class="save-btn" onclick={onSave} disabled={saving || !!saveBlockedReason}>
+    <button class="save-btn" onclick={onSave} disabled={!config || saving || !!saveBlockedReason}>
       {saving ? '保存中...' : '設定を保存'}
     </button>
     {#if saveBlockedReason}
       <span class="save-warn" role="status">{saveBlockedReason}</span>
       {#if configSync.reloadRequired && focus !== 'all'}
-        <button class="save-btn" onclick={reloadImportedConfig} disabled={reloadingConfig}>設定を再読み込み</button>
+        <button class="save-btn" onclick={reloadImportedConfig} disabled={manualReloadDisabled}>設定を再読み込み</button>
       {/if}
     {:else if saveMsg}
       <span class={saveWarned ? 'save-warn' : 'save-ok'}>{saveMsg}</span>
     {/if}
   </div>
   {/if}
+  </fieldset>
 </div>
 
 <style>
@@ -3147,13 +3177,15 @@
     box-sizing: border-box;
   }
 
-  .settings.focus-goals > section:not(#settings-goals),
-  .settings.focus-danmaku > section:not(#settings-danmaku) {
+  .settings-fields { display: contents; }
+
+  .settings.focus-goals > .settings-fields > section:not(#settings-goals),
+  .settings.focus-danmaku > .settings-fields > section:not(#settings-danmaku) {
     display: none;
   }
 
-  .settings:not(.focus-goals):not(.focus-danmaku) > #settings-goals,
-  .settings:not(.focus-goals):not(.focus-danmaku) > #settings-danmaku {
+  .settings:not(.focus-goals):not(.focus-danmaku) > .settings-fields > #settings-goals,
+  .settings:not(.focus-goals):not(.focus-danmaku) > .settings-fields > #settings-danmaku {
     display: none;
   }
 

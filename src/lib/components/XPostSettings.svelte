@@ -21,7 +21,7 @@
     xPost,
     clientId = '',
     configRevision,
-    saving,
+    saving, configReloading,
     onConnectionSettled,
     onCallbackPortChange,
     onConnectingChange,
@@ -30,6 +30,7 @@
     clientId?: string;
     configRevision: number;
     saving: boolean;
+    configReloading: boolean;
     onConnectionSettled: () => Promise<void>;
     onCallbackPortChange: (port: number | null) => void;
     onConnectingChange: (connecting: boolean) => void;
@@ -85,7 +86,7 @@
   });
 
   async function connect() {
-    if (saving || connecting) return;
+    if (saving || configReloading || connecting) return;
     const id = clientIdInput.trim();
     if (!id) {
       authMsg = 'Client ID を入力してください';
@@ -393,11 +394,11 @@
 
   <div class="field-row">
     <label for="xpost-client-id">Client ID</label>
-    <input id="xpost-client-id" type="text" bind:value={clientIdInput} disabled={connecting} class="text-input" autocomplete="off" spellcheck="false" />
+    <input id="xpost-client-id" type="text" bind:value={clientIdInput} disabled={configReloading || connecting} class="text-input" autocomplete="off" spellcheck="false" />
   </div>
   <div class="field-row">
     <label for="xpost-port">コールバックポート</label>
-    <input id="xpost-port" type="text" inputmode="numeric" value={portInput.text} oninput={portInput.onInput} disabled={connecting} class="num-input" />
+    <input id="xpost-port" type="text" inputmode="numeric" value={portInput.text} oninput={portInput.onInput} disabled={configReloading || connecting} class="num-input" />
     <span class="hint-inline">既定 47821。変えたら X の登録も直す</span>
   </div>
   <div class="field-row">
@@ -425,7 +426,7 @@
     {#if attempt}
       <button type="button" class="btn-small" onclick={cancelLogin}>ログインを取り消す</button>
     {:else}
-      <button type="button" class="btn-small primary" onclick={connect} disabled={saving || connecting || disconnecting}>
+      <button type="button" class="btn-small primary" onclick={connect} disabled={saving || configReloading || connecting || disconnecting}>
         {connected ? '別のアカウントで接続し直す' : 'X に接続'}
       </button>
     {/if}

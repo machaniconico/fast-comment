@@ -264,6 +264,14 @@
     ];
   }
 
+  function addCommentNg(kind: 'ngUsers' | 'ngWords', value: string) {
+    store.hideMessage(message.id);
+    void ipcHideMessage(message.id, message.platform, message.channel);
+    void appendModerationValue(kind, value).catch(() => {
+      ui.showToast('NG 規則を保存できませんでした。', 'error');
+    });
+  }
+
   function buildMenuItems(): ContextMenuItem[] {
     const pinnedLabel = pinned ? 'ピン留め解除' : 'ピン留め';
     const ngWord = getNgWordCandidate();
@@ -274,20 +282,13 @@
       {
         label: 'この人をNGユーザーに追加',
         danger: true,
-        action: () => {
-          store.hideMessage(message.id);
-          void ipcHideMessage(message.id, message.platform, message.channel);
-          void appendModerationValue('ngUsers', message.author.name);
-        },
+        action: () => addCommentNg('ngUsers', message.author.name),
       },
       {
         label: 'この語をNGワードに追加',
         danger: true,
         action: () => {
-          if (!ngWord) return;
-          store.hideMessage(message.id);
-          void ipcHideMessage(message.id, message.platform, message.channel);
-          void appendModerationValue('ngWords', ngWord);
+          if (ngWord) addCommentNg('ngWords', ngWord);
         },
       },
       { label: '今すぐ読み上げ', action: speakNow },

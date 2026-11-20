@@ -41,6 +41,14 @@ async function importConfig(page, bundle) {
 
 const saved = page => page.evaluate(() => window.mock.saved);
 const initial = page => page.evaluate(() => window.mock.initial);
+const reloadSettings = page => page.getByRole('button', { name: '設定を再読み込み', exact: true });
+const moderationImport = page => page.locator('.portability').filter({ has: page.locator('#moderation-import-json') });
+
+async function importModeration(page, moderation) {
+  await page.locator('#moderation-import-json').fill(JSON.stringify({ moderation }));
+  await moderationImport(page).getByRole('button', { name: 'テキストから読込' }).click();
+}
+
 
 async function saveSettings(page, writeCount = 1) {
   await save(page).click();
@@ -137,6 +145,8 @@ for (const service of services) {
     await page.evaluate(() => new Promise(resolve => requestAnimationFrame(resolve)));
     assert.equal(await id(page).inputValue(), 'imported-after-login');
     assert.equal(await port(page).inputValue(), '41322');
+    await reloadSettings(page).waitFor();
+    assert.equal(await save(page).isDisabled(), true);
   }));
 
   test(service.name + ' asks to reload when the post-login read fails', async t => withSettings(t, async page => {
@@ -395,16 +405,149 @@ test('comment NG append preserves both OAuth settings committed before its save'
 
 test('moderation import preserves both OAuth settings committed before its save', async t => withSettings(t, async page => {
   const moderation = { ngWords: ['spam'], ngUsers: ['bot'], highlights: ['important'] };
-  const input = page.locator('#moderation-import-json');
-  await input.fill(JSON.stringify({ moderation }));
   await page.evaluate(() => {
     window.mock.holdReads = true;
     window.mock.holdModerationWrites = true;
   });
-  await page.locator('.portability').filter({ has: input }).getByRole('button', { name: 'テキストから読込' }).click();
+  await importModeration(page, moderation);
   await commitOAuthBeforeWrite(page, 'heldModerationWrites', 'holdModerationWrites');
   await page.getByText('モデレーション規則をインポートしました。', { exact: true }).waitFor();
   await assertOAuthPreserved(page);
   assert.deepEqual((await saved(page)).moderation, moderation);
   assert.equal(await page.evaluate(() => window.mock.writes.length), 0);
 }));
+
+
+const twitcastingPort = page => page.locator('#twitcasting-port');
+const spamRules = { ngWords: ['spam'], ngUsers: [], highlights: [] };
+
+async function startTwitcasting(page, port) {
+  await page.locator('#twitcasting-client-id').fill('client-' + port);
+  await twitcastingPort(page).fill(port);
+  await page.getByRole('button', { name: 'ログイン', exact: true }).click();
+  await page.waitForFunction(() => !!window.mock.login.twitcasting);
+}
+
+async function commitTwitcasting(page, failRead = false) {
+  await page.evaluate(fail => {
+    window.mock.login.twitcasting.accept();
+    if (fail) window.mock.readsToFail = 1;
+    window.mock.login.twitcasting.finish(new Error('cancelled'));
+  }, failRead);
+  await page.waitForFunction(() => !document.getElementById('twitcasting-port').disabled);
+}
+
+test('manual reload discards 40321 when TwitCasting commits 40322 before its reply', async t => withSettings(t, async page => {
+  await startTwitcasting(page, '40321');
+  await commitTwitcasting(page, true);
+
+  // The login can already be pending when the manual reload locks the fields.
+  await startTwitcasting(page, '40322');
+  await page.evaluate(() => { window.mock.holdReads = true; });
+  await reloadSettings(page).click();
+  await page.waitForFunction(() => window.mock.heldReads.length === 1);
+  assert.equal(await page.locator('#xpost-port').isDisabled(), true);
+  assert.equal(await save(page).isDisabled(), true);
+
+  await page.evaluate(() => { window.mock.holdReads = false; });
+  await commitTwitcasting(page);
+  assert.equal((await saved(page)).twitcasting.callbackPort, 40322);
+  await page.evaluate(() => window.mock.heldReads.shift()());
+  await reloadSettings(page).waitFor();
+  assert.equal(await twitcastingPort(page).inputValue(), '40322');
+  assert.equal(await save(page).isDisabled(), true);
+  await reloadSettings(page).click();
+  assert.equal((await saveSettings(page)).twitcasting.callbackPort, 40322);
+}));
+
+test('moderation reload keeps OAuth 40322 when its held reply contains 39822', async t => withSettings(t, async page => {
+  await page.evaluate(() => { window.mock.holdReads = true; });
+  await importModeration(page, spamRules);
+  await page.waitForFunction(() => window.mock.heldReads.length === 1);
+  assert.equal(await page.getByRole('textbox', { name: 'NGワードを追加', exact: true }).isDisabled(), true);
+  assert.equal(await save(page).isDisabled(), true);
+  assert.equal(await twitcastingPort(page).isEnabled(), true);
+
+  await page.evaluate(() => { window.mock.holdReads = false; });
+  await startTwitcasting(page, '40322');
+  await commitTwitcasting(page);
+  assert.equal((await saved(page)).twitcasting.callbackPort, 40322);
+  assert.equal(await save(page).isDisabled(), true);
+  await page.evaluate(() => window.mock.heldReads.shift()());
+  await page.getByText('モデレーション規則をインポートしました。', { exact: true }).waitFor();
+  const config = await saveSettings(page);
+  assert.equal(config.twitcasting.callbackPort, 40322);
+  assert.deepEqual(config.moderation, spamRules);
+}));
+
+for (const outcome of ['failed', 'unanswered']) {
+  test('moderation reload (' + outcome + ') releases import and blocks saving over spam', async t => withSettings(t, async page => {
+    if (outcome === 'failed') {
+      await page.evaluate(() => { window.mock.readsToFail = 1; });
+      await importModeration(page, spamRules);
+    } else {
+      await page.clock.install();
+      await page.evaluate(() => { window.mock.holdReads = true; });
+      await importModeration(page, spamRules);
+      await page.waitForFunction(() => window.mock.heldReads.length === 1);
+      assert.equal(await moderationImport(page).getByRole('button', { name: '読込中...' }).isDisabled(), true);
+      await page.clock.fastForward(10_000);
+      await page.evaluate(() => { window.mock.holdReads = false; });
+    }
+
+    await reloadSettings(page).waitFor();
+    assert.equal(await reloadSettings(page).isEnabled(), true);
+    assert.equal(await moderationImport(page).getByRole('button', { name: 'テキストから読込' }).isEnabled(), true);
+    assert.equal(await save(page).isDisabled(), true);
+    assert.deepEqual((await saved(page)).moderation.ngWords, ['spam']);
+    assert.equal(await page.evaluate(() => window.mock.writes.length), 0);
+    await reloadSettings(page).click();
+    assert.deepEqual((await saveSettings(page)).moderation.ngWords, ['spam']);
+  }));
+}
+
+test('an unanswered full import reload releases the form for a manual retry', async t => withSettings(t, async page => {
+  const config = await initial(page);
+  config.twitcasting.callbackPort = 40322;
+  await page.clock.install();
+  await page.evaluate(() => { window.mock.holdReads = true; });
+  await importConfig(page, { config });
+  await page.waitForFunction(() => window.mock.heldReads.length === 1);
+  assert.equal(await twitcastingPort(page).isDisabled(), true);
+  assert.equal(await save(page).isDisabled(), true);
+
+  await page.clock.fastForward(10_000);
+  await page.evaluate(() => { window.mock.holdReads = false; });
+  await reloadSettings(page).waitFor();
+  assert.equal(await twitcastingPort(page).isEnabled(), true);
+  assert.equal(await save(page).isDisabled(), true);
+  await reloadSettings(page).click();
+  assert.equal((await saveSettings(page, 2)).twitcasting.callbackPort, 40322);
+}));
+
+for (const [kind, action] of [
+  ['ngUsers', 'この人をNGユーザーに追加'],
+  ['ngWords', 'この語をNGワードに追加'],
+]) {
+  test(kind + ' save failure shows a toast without leaking the value or rejecting', async t => withSettings(t, async page => {
+    const pageErrors = [];
+    page.on('pageerror', error => pageErrors.push(error));
+    await page.getByRole('checkbox', { name: 'コメビュに表示' }).waitFor();
+    await page.evaluate(() => {
+      window.mock.failModerationAppend = true;
+      window.mock.pushComment({
+        id: 'ng-save-failure', platform: 'twitch', channel: 'test-channel', kind: 'normal',
+        timestampMs: Date.now(),
+        author: { id: 'test-user', name: 'Private NG user', badges: [], roles: {} },
+        fragments: [{ type: 'text', text: 'Private NG word' }],
+      });
+    });
+    await page.getByRole('button', { name: 'コメント操作メニューを開く' }).click();
+    await page.getByRole('menuitem', { name: action }).click();
+    const toast = page.getByRole('alert').filter({ hasText: 'NG 規則を保存できませんでした。' });
+    await toast.waitFor();
+    assert.equal((await toast.textContent()).trim(), 'NG 規則を保存できませんでした。');
+    assert.deepEqual(pageErrors, []);
+    assert.deepEqual((await saved(page)).moderation[kind], []);
+  }, 'app'));
+}

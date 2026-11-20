@@ -14,8 +14,8 @@
   }
 
   interface Props {
-    onImported?: (config: AppConfig) => void;
-    onReload?: () => Promise<void>;
+    onImported?: () => Promise<boolean>;
+    onReload?: () => Promise<boolean> | undefined;
     disabled?: boolean;
     reloading?: boolean;
   }
@@ -26,7 +26,7 @@
   let importText: string = $state('');
   let status: { kind: 'success' | 'error'; message: string } | null = $state(null);
   let exporting: boolean = $state(false);
-  const importDisabled = $derived(disabled || configSync.importing || configSync.reloadRequired);
+  const importDisabled = $derived(disabled || !!configSync.importing || configSync.reloadRequired);
   let exportTextarea: HTMLTextAreaElement | null = null;
   let importFileInput: HTMLInputElement | null = null;
 
@@ -176,7 +176,7 @@
       : window.confirm('現在の設定をバックアップJSONの内容で上書きします。続行しますか？');
     if (!ok) return;
 
-    configSync.importing = true;
+    configSync.importing = 'all';
     configSync.importRevision += 1;
     status = null;
     try {
@@ -189,12 +189,7 @@
         return;
       }
 
-      const saved = await getConfig().catch(() => null);
-      if (!saved) {
-        configSync.reloadRequired = true;
-        return;
-      }
-      onImported?.(saved);
+      if (!(await onImported?.())) return;
 
       const notices = [...result.warnings];
       if (result.protectedOAuth.length > 0) {
@@ -205,10 +200,10 @@
         ? '設定をインポートしました。'
         : '設定をインポートし、外観設定を反映しました。';
       showSuccess([base, ...notices].join(' '));
-    } catch (e) {
-      showError(`インポートに失敗しました: ${e instanceof Error ? e.message : String(e)}`);
+    } catch {
+      showError('設定のインポートに失敗しました。');
     } finally {
-      configSync.importing = false;
+      configSync.importing = null;
     }
   }
 
@@ -240,7 +235,7 @@
   {#if configSync.reloadRequired}
     <p class="portability-banner banner-error" role="status">{configReloadMessage}</p>
     <div class="field-row">
-      <button type="button" class="export-btn" onclick={onReload} disabled={reloading}>
+      <button type="button" class="export-btn" onclick={onReload} disabled={reloading || disabled || !!configSync.importing}>
         {reloading ? '読込中...' : '設定を再読み込み'}
       </button>
     </div>
@@ -292,7 +287,7 @@
         aria-label="インポートする設定JSONファイル"
       />
       <button type="button" class="export-btn" onclick={onImportFromText} disabled={importDisabled}>
-        {configSync.importing ? '読込中...' : 'テキストから読込'}
+        {configSync.importing === 'all' ? '読込中...' : 'テキストから読込'}
       </button>
     </div>
     <label class="portability-label" for="settings-import-json">貼り付け用JSON</label>

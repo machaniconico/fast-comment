@@ -1,5 +1,6 @@
 <script lang="ts">
   import { getConfig, setModeration, type AppConfig } from '../ipc';
+  import { configSync } from '../configSync.svelte';
 
   const SCHEMA = 'fast-comment-moderation';
 
@@ -13,16 +14,18 @@
   }
 
   interface Props {
-    onImported: () => void;
+    onImported: () => Promise<boolean>;
+    disabled: boolean;
   }
 
-  let { onImported }: Props = $props();
+  let { onImported, disabled }: Props = $props();
 
   let exportedJson: string = $state('');
   let importText: string = $state('');
   let status: { kind: 'success' | 'error'; message: string } | null = $state(null);
   let exporting: boolean = $state(false);
-  let importing: boolean = $state(false);
+  const importing = $derived(configSync.importing === 'moderation');
+  const importDisabled = $derived(disabled || !!configSync.importing);
   let exportTextarea: HTMLTextAreaElement | null = null;
   let importFileInput: HTMLInputElement | null = null;
 
@@ -154,7 +157,7 @@
   }
 
   async function applyRawImport(raw: string): Promise<void> {
-    if (importing) return;
+    if (importDisabled) return;
 
     const trimmed = raw.trim();
     if (!trimmed) {
@@ -175,16 +178,19 @@
       : window.confirm('現在のNGワード、NGユーザー、ハイライトをJSONの内容で上書きします。続行しますか？');
     if (!ok) return;
 
-    importing = true;
+    configSync.importing = 'moderation';
     status = null;
     try {
       await setModeration(moderation);
-      await onImported();
-      showSuccess('モデレーション規則をインポートしました。');
-    } catch (e) {
-      showError(`インポートに失敗しました: ${e instanceof Error ? e.message : String(e)}`);
+      if (await onImported()) {
+        showSuccess('モデレーション規則をインポートしました。');
+      } else {
+        showError('モデレーション規則は保存されました。設定を読み直してください。');
+      }
+    } catch {
+      showError('モデレーション規則のインポートに失敗しました。');
     } finally {
-      importing = false;
+      configSync.importing = null;
     }
   }
 
@@ -257,9 +263,10 @@
         type="file"
         accept=".json,application/json"
         onchange={onFileSelected}
+        disabled={importDisabled}
         aria-label="インポートするモデレーション規則JSONファイル"
       />
-      <button type="button" class="export-btn" onclick={onImportFromText} disabled={importing}>
+      <button type="button" class="export-btn" onclick={onImportFromText} disabled={importDisabled}>
         {importing ? '読込中...' : 'テキストから読込'}
       </button>
     </div>
