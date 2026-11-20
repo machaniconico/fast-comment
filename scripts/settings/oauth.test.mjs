@@ -150,6 +150,46 @@ for (const service of services) {
     assert.equal(await port(page).inputValue(), '41322');
   }));
 
+  test(service.name + ' asks to reload when the post-login read fails', async t => withSettings(t, async page => {
+    await start(page);
+    await accept(page);
+    await page.evaluate(() => { window.mock.readsToFail = 1; });
+    await finish(page, { ...service.ready, clientId: 'new-client' });
+    await page.getByText('設定を読み直してください', { exact: false }).first().waitFor();
+    assert.equal(await save(page).isDisabled(), true);
+    await page.getByRole('button', { name: '設定を再読み込み', exact: true }).click();
+    await page.getByText(/として(ログイン|接続)中/).waitFor();
+    assert.equal(await id(page).inputValue(), 'new-client');
+    assert.equal(await save(page).isEnabled(), true);
+  }));
+
+  test(service.name + ' keeps inputs edited while the post-login read is pending', async t => withSettings(t, async page => {
+    await start(page, 'new-client', '40321');
+    await accept(page);
+    await page.evaluate(() => { window.mock.holdReads = true; });
+    await finish(page, 'cancelled');
+    await page.waitForFunction(() => window.mock.heldReads.length === 1);
+    await port(page).fill('41321');
+    await id(page).fill('edited-client');
+    await page.evaluate(() => { window.mock.holdReads = false; window.mock.heldReads.shift()(); });
+    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(resolve)));
+    assert.equal(await port(page).inputValue(), '41321');
+    assert.equal(await id(page).inputValue(), 'edited-client');
+    assert.equal((await saveSettings(page))[service.key].callbackPort, 41321);
+  }));
+
+  test(service.name + ' applies the post-login read only to unedited inputs', async t => withSettings(t, async page => {
+    await start(page, 'typed-client', '40321');
+    await page.evaluate(() => { window.mock.holdReads = true; });
+    await finish(page, 'failure before save');
+    await page.waitForFunction(() => window.mock.heldReads.length === 1);
+    await port(page).fill('41321');
+    await page.evaluate(() => { window.mock.holdReads = false; window.mock.heldReads.shift()(); });
+    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(resolve)));
+    assert.equal(await id(page).inputValue(), service.oldId);
+    assert.equal(await port(page).inputValue(), '41321');
+  }));
+
   test(service.name + ' hides login status for a different saved ClientID', async t => withSettings(t, async page => {
     await start(page);
     await accept(page);

@@ -25,6 +25,11 @@ export function createCallbackPortInput(
   return {
     get text() { return text; },
     get port() { return port; },
+    /** 入力を親の現在のポートに戻す。 */
+    reset() {
+      syncedPort = readPort();
+      text = String(syncedPort);
+    },
     onInput(event: Event & { currentTarget: HTMLInputElement }) {
       text = event.currentTarget.value;
       const nextPort = parseCallbackPort(text);

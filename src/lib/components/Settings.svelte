@@ -427,18 +427,29 @@
     }
   }
 
-  function applySavedOAuthConfig(saved: AppConfig, service: OAuthService) {
+  // fields 省略時は保存側の値で入力欄も置き換える(サーバが保護した値に戻す時)。
+  // fields 指定時はその項目だけを当て、入力欄は作り直さない(当てた項目の欄は子がそろえる)。
+  function applySavedOAuthConfig(
+    saved: AppConfig,
+    service: OAuthService,
+    fields?: { clientId: boolean; port: boolean },
+  ) {
     if (!config) return;
+    const { clientId, port } = fields ?? { clientId: true, port: true };
     if (service === 'xPost' && config.xPost && saved.xPost) {
-      config.credentials = { ...config.credentials, xPostClientId: saved.credentials?.xPostClientId };
-      config.xPost.callbackPort = saved.xPost.callbackPort;
-      xPostPortInvalid = false;
+      if (clientId) config.credentials = { ...config.credentials, xPostClientId: saved.credentials?.xPostClientId };
+      if (port) {
+        config.xPost.callbackPort = saved.xPost.callbackPort;
+        xPostPortInvalid = false;
+      }
     } else if (service === 'twitcasting') {
-      config.credentials = { ...config.credentials, twitcastingClientId: saved.credentials?.twitcastingClientId };
-      config.twitcasting = saved.twitcasting;
-      twitcastingPortInvalid = false;
+      if (clientId) config.credentials = { ...config.credentials, twitcastingClientId: saved.credentials?.twitcastingClientId };
+      if (port) {
+        config.twitcasting = saved.twitcasting;
+        twitcastingPortInvalid = false;
+      }
     }
-    oauthInputRevision[service] += 1;
+    if (!fields) oauthInputRevision[service] += 1;
   }
 
   function onOAuthConnectingChange(service: OAuthService, connecting: boolean) {
@@ -446,13 +457,19 @@
     if (connecting) oauthAttempts[service] += 1;
   }
 
-  async function reloadOAuthConfig(service: OAuthService) {
+  // ログイン終了後に、接続コマンドが保存した Client ID・ポートを読み直す。
+  // 読めなければ再読込を求める(フォームの値が保存側とずれたまま保存させない)。
+  async function reloadOAuthConfig(service: OAuthService, unchanged: () => { clientId: boolean; port: boolean }) {
     const revision = configRevision;
     const attempt = oauthAttempts[service];
     const saved = await getConfig().catch(() => null);
-    if (saved && configRevision === revision && oauthAttempts[service] === attempt) {
-      applySavedOAuthConfig(saved, service);
+    if (configRevision !== revision || oauthAttempts[service] !== attempt) return false;
+    if (!saved) {
+      configSync.reloadRequired = true;
+      return false;
     }
+    applySavedOAuthConfig(saved, service, unchanged());
+    return true;
   }
 
   async function onModerationImported() {
@@ -2057,7 +2074,7 @@
       configRevision={configRevision + oauthInputRevision.twitcasting}
       {saving}
       onConnectingChange={(connecting) => onOAuthConnectingChange('twitcasting', connecting)}
-      onConnectionSettled={() => reloadOAuthConfig('twitcasting')}
+      onConnectionSettled={(unchanged) => reloadOAuthConfig('twitcasting', unchanged)}
       onCallbackPortChange={(port) => {
         twitcastingPortInvalid = port === null;
         if (config && port !== null) config.twitcasting = { ...(config.twitcasting ?? {}), callbackPort: port };
@@ -2074,7 +2091,7 @@
         configRevision={configRevision + oauthInputRevision.xPost}
         {saving}
         onConnectingChange={(connecting) => onOAuthConnectingChange('xPost', connecting)}
-        onConnectionSettled={() => reloadOAuthConfig('xPost')}
+        onConnectionSettled={(unchanged) => reloadOAuthConfig('xPost', unchanged)}
         onCallbackPortChange={(port) => {
           xPostPortInvalid = port === null;
           if (config?.xPost && port !== null) config.xPost.callbackPort = port;

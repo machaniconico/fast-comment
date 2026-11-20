@@ -29,7 +29,7 @@
     clientId?: string;
     configRevision: number;
     saving: boolean;
-    onConnectionSettled: () => Promise<void>;
+    onConnectionSettled: (unchanged: () => { clientId: boolean; port: boolean }) => Promise<boolean>;
     onCallbackPortChange: (port: number | null) => void;
     onConnectingChange: (connecting: boolean) => void;
   } = $props();
@@ -96,6 +96,9 @@
       authOk = false;
       return;
     }
+    // 終了後の読み直しは、この時点から入力を変えていない項目だけに当てる。
+    const sentClientId = clientIdInput;
+    const sentPortText = portInput.text;
     connecting = true;
     onConnectingChange(true);
     successClientId = null;
@@ -117,7 +120,15 @@
     } finally {
       connecting = false;
       onConnectingChange(false);
-      await onConnectionSettled();
+      const applied = await onConnectionSettled(() => ({
+        clientId: clientIdInput === sentClientId,
+        port: portInput.text === sentPortText,
+      }));
+      // 保存側の値を当てた項目は、入力欄も保存された値にそろえる。
+      if (applied && !connecting) {
+        if (clientIdInput === sentClientId) clientIdInput = clientId;
+        if (portInput.text === sentPortText) portInput.reset();
+      }
       if (authOk === false) void refreshStatus();
     }
   }
