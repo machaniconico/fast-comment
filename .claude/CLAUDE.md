@@ -16,6 +16,7 @@
 
 - **ローカル API / Webhook の設定は `integrations.json` と資格情報ストア**。`config.json`・`update_config` に載せない。トークン・URL をログ・エラー文・emit に出さない。
 
-- **ツイキャスは公式 API v2 のみ**(非公式 WS・frontendapi・cookie を使わない)。通信は必ず `TwitcastingApi` 経由(60 req/分を全行で共有)。トークンは資格情報ストアだけに置き、config.json・ログ・エラー文・emit に出さない。ClientSecret を同梱しない。
+- **ツイキャスの既定経路は非公式(ログイン不要)**: 視聴ページ HTML → `eventpubsuburl.php` → WS(`sources/twitcasting.rs`)。壊れたら `twitcastingOverrides` で再ビルド無しに吸収する。公式 API は PR3' の代替(`mode` 切替)で、取得経路には使っていない。WS URL のトークンをログに出さない(`tungstenite=info` に抑える)。
+- **ツイキャスのログイン(公式 API v2 の Implicit)のトークンは資格情報ストアだけに置く**。config.json・ログ・エラー文・emit に出さない。ClientSecret を同梱しない。
 
 詳細仕様は `.claude/SPEC.md`。これが単一情報源。
