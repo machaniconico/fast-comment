@@ -13,7 +13,7 @@ function splitUrl(raw: string): [string, string] | null {
   const rest = raw.replace(SCHEME_RE, '');
   const i = rest.search(/[/?#]/);
   const host = i < 0 ? rest : rest.slice(0, i);
-  if (!hasScheme && i < 0 && !host.includes('.')) return null;
+  if (!hasScheme && !host.includes('.') && (i < 0 || rest[i] !== '/')) return null;
   return [host, i < 0 ? '' : rest.slice(i)];
 }
 
@@ -33,7 +33,11 @@ export function extractTwitcastingScreenId(input: string): string | null {
   const raw = input.trim();
   if (!raw) return null;
   const parts = splitUrl(raw);
-  if (!parts) return ID_RE.test(raw) ? raw : null;
+  if (!parts) {
+    // 裸の ID。Rust に合わせ、?/# 以降は捨て、%3A は 1 回だけ : に戻す。
+    const bare = raw.split(/[?#]/)[0].replace(/%3A/gi, ':');
+    return ID_RE.test(bare) ? bare : null;
+  }
   if (!HOST_RE.test(parts[0])) return null;
   const segment = parts[1].replace(/^\//, '').split(/[/?#]/)[0];
   if (!segment) return null;
