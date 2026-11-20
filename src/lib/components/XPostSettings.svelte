@@ -1,16 +1,20 @@
 <script lang="ts">
-  import { onDestroy, onMount, tick } from 'svelte';
+  import { onDestroy, tick } from 'svelte';
   import {
     cancelXPostLogin,
     connectXPost,
     disconnectXPost,
     getXPostStatus,
+    newOAuthAttempt,
     openUrl,
     previewXPost,
     sendXTestPost,
+    type ConfigSavedHandler,
+    type OAuthClientSaved,
   } from '../ipc';
   import type { XPostConfig, XPostErrorInfo, XPostPreview, XPostStatus } from '../ipc';
-  import { canSelectApiMode, errorText, parseCallbackPort, testPostPreview } from '../xAutopost';
+  import { canSelectApiMode, errorText, testPostPreview } from '../xAutopost';
+  import { createCallbackPortInput } from '../callbackPortInput.svelte';
 
   // X 自動告知の設定欄。値は親の config.xPost を直接編集し、保存は設定画面の保存ボタンで行う。
   // 文字数・警告は Rust の preview_x_post の結果をそのまま表示する(UI では数えない)。
@@ -18,22 +22,47 @@
   let {
     xPost,
     clientId = '',
-    onClientIdSaved,
+    configRevision,
+    saving, allFieldsLocked, configReloading,
+    onConnectionSettled,
+    onCallbackPortChange,
+    onConnectingChange,
+    onConfigSaved,
+    onModeSaved,
   }: {
     xPost: XPostConfig;
     clientId?: string;
-    onClientIdSaved?: (clientId: string) => void;
+    configRevision: number;
+    saving: boolean;
+    allFieldsLocked: boolean;
+    configReloading: boolean;
+    onConnectionSettled: () => Promise<void>;
+    onCallbackPortChange: (port: number | null) => void;
+    onConnectingChange: (connecting: boolean) => void;
+    /** 接続コマンドが ClientID と待受ポートを保存した。 */
+    onConfigSaved: ConfigSavedHandler<OAuthClientSaved>;
+    /** 切断が API モードを Intent モードへ戻して保存した。 */
+    onModeSaved: ConfigSavedHandler<{ xPost: Pick<XPostConfig, 'mode'> }>;
   } = $props();
 
   // ── API モードの接続 ──
-  // svelte-ignore state_referenced_locally
-  let clientIdInput = $state(clientId);
-  // svelte-ignore state_referenced_locally
-  let portInput = $state(String(xPost.callbackPort));
-  let status = $state<XPostStatus | null>(null);
+  let clientIdInput = $state('');
+  $effect.pre(() => {
+    configRevision;
+    clientIdInput = clientId;
+  });
+  let attempt = $state<string | null>(null);
+  const portInput = createCallbackPortInput(
+    () => xPost.callbackPort, () => configRevision, (port) => onCallbackPortChange(port),
+  );
+  let latestStatus = $state<XPostStatus | null>(null);
+  let statusRequest = 0;
   let connecting = $state(false);
+  const fieldsLocked = $derived(allFieldsLocked || configReloading || connecting);
+  const status = $derived(!connecting && latestStatus?.clientId === clientId.trim() ? latestStatus : null);
   let disconnecting = $state(false);
   let authMsg = $state('');
+  let successClientId = $state<string | null>(null);
   let authOk = $state<boolean | null>(null);
   let copied = $state(false);
   let testConfirm = $state<string | null>(null);
@@ -44,59 +73,78 @@
   let confirmCancelEl: HTMLButtonElement | null = $state(null);
   let testButtonEl: HTMLButtonElement | null = $state(null);
 
-  const port = $derived(parseCallbackPort(portInput));
+  const port = $derived(portInput.port);
   const displayCallbackUrl = $derived(port !== null ? `http://127.0.0.1:${port}/callback` : '');
   const connected = $derived(canSelectApiMode(status));
 
   async function refreshStatus() {
+    const request = ++statusRequest;
     try {
-      status = await getXPostStatus();
+      const next = await getXPostStatus();
+      if (request === statusRequest) latestStatus = next;
     } catch (e) {
-      status = null;
+      if (request !== statusRequest) return;
+      latestStatus = null;
       authMsg = errorText(e);
       authOk = false;
     }
   }
 
-  onMount(() => {
+  $effect(() => {
+    clientId;
     void refreshStatus();
   });
 
   async function connect() {
-    if (connecting) return;
+    if (saving || fieldsLocked) return;
     const id = clientIdInput.trim();
     if (!id) {
       authMsg = 'Client ID を入力してください';
       authOk = false;
       return;
     }
-    if (port === null) {
+    const listenPort = port;
+    if (listenPort === null) {
       authMsg = 'ポートは 1024〜65535 の整数にしてください';
       authOk = false;
       return;
     }
+    const current = attempt = newOAuthAttempt();
     connecting = true;
+    onConnectingChange(true);
+    successClientId = null;
     authMsg = 'ブラウザで X にログインし、アプリを許可してください…';
     authOk = null;
     try {
-      // Client ID とポートは Rust 側で保存済み。親の未保存フォームにも反映して、設定保存で戻らないようにする。
-      onClientIdSaved?.(id);
-      xPost.callbackPort = port;
-      status = await connectXPost(id, port);
-      authMsg = status?.username ? `@${status.username} として接続しました` : 'X に接続しました';
+      const next = await connectXPost(id, listenPort, current, onConfigSaved);
+      if (!next) throw new Error('アプリからログイン結果を受け取れませんでした。');
+      statusRequest += 1;
+      latestStatus = next;
+      successClientId = next.clientId;
+      authMsg = next.username ? `@${next.username} として接続しました` : 'X に接続しました';
       authOk = true;
     } catch (e) {
+      statusRequest += 1;
+      latestStatus = null;
+      // 全体保存は ClientID を送らないので、欄を保存済みの値に戻して表示と揃える(待受ポートは全体保存で送る)。
+      clientIdInput = clientId;
       authMsg = errorText(e);
       authOk = false;
-      await refreshStatus();
     } finally {
-      connecting = false;
+      attempt = null;
+      try {
+        await onConnectionSettled();
+      } finally {
+        connecting = false;
+        onConnectingChange(false);
+      }
+      if (authOk === false) void refreshStatus();
     }
   }
 
   async function cancelLogin() {
     try {
-      await cancelXPostLogin();
+      if (attempt) await cancelXPostLogin(attempt);
     } catch (e) {
       authMsg = errorText(e);
       authOk = false;
@@ -106,8 +154,9 @@
   async function disconnect() {
     if (disconnecting) return;
     disconnecting = true;
+    successClientId = null;
     try {
-      status = await disconnectXPost();
+      latestStatus = await disconnectXPost(onModeSaved);
       authMsg = 'X との接続を切りました(この PC の認証を消しました。X 側の許可は X の設定から外せます)';
       authOk = true;
     } catch (e) {
@@ -145,7 +194,7 @@
 
   async function confirmTestPost() {
     testConfirm = null;
-    if (testBusy) return;
+    if (allFieldsLocked || testBusy) return;
     testBusy = true;
     testMsg = '投稿しています…';
     testOk = null;
@@ -214,6 +263,7 @@
   onDestroy(() => {
     if (timer) clearTimeout(timer);
     previewSeq++;
+    if (attempt) void cancelXPostLogin(attempt).catch(() => {});
   });
 
   function insertVariable(v: string) {
@@ -235,6 +285,7 @@
   const over = $derived(preview !== null && preview.weightedLen > X_LIMIT);
 </script>
 
+<fieldset class="xpost-fields" disabled={allFieldsLocked}>
 <p class="hint">
   {#if xPost.mode === 'api'}
     配信開始を検知すると、猶予のあと X API で自動的に投稿します(従量課金。下の「X API で自動投稿」で接続が必要)。
@@ -246,7 +297,7 @@
 
 <div class="field-row">
   <label for="xpost-mode">投稿の方法</label>
-  <select id="xpost-mode" bind:value={xPost.mode} class="platform-select">
+  <select id="xpost-mode" bind:value={xPost.mode} class="platform-select" disabled={disconnecting}>
     <option value="intent">投稿画面を開く(無料・自分で投稿)</option>
     <option value="api" disabled={!connected && xPost.mode !== 'api'}>X API で自動投稿(有料・要接続)</option>
   </select>
@@ -342,6 +393,7 @@
   <span class="hint-inline">件(1〜20)</span>
 </div>
 
+</fieldset>
 <fieldset class="xpost-api">
   <legend>X API で自動投稿(任意)</legend>
   <details class="xpost-steps">
@@ -356,18 +408,18 @@
 
   <div class="field-row">
     <label for="xpost-client-id">Client ID</label>
-    <input id="xpost-client-id" type="text" bind:value={clientIdInput} class="text-input" autocomplete="off" spellcheck="false" />
+    <input id="xpost-client-id" type="text" bind:value={clientIdInput} disabled={fieldsLocked} class="text-input" autocomplete="off" spellcheck="false" />
   </div>
   <div class="field-row">
     <label for="xpost-port">コールバックポート</label>
-    <input id="xpost-port" type="text" inputmode="numeric" bind:value={portInput} class="num-input" />
+    <input id="xpost-port" type="text" inputmode="numeric" value={portInput.text} oninput={portInput.onInput} disabled={fieldsLocked} class="num-input" />
     <span class="hint-inline">既定 47821。変えたら X の登録も直す</span>
   </div>
   <div class="field-row">
     <span class="label-like">コールバック URL</span>
     {#if displayCallbackUrl}
       <code class="xpost-url">{displayCallbackUrl}</code>
-      <button type="button" class="btn-small" onclick={copyCallbackUrl}>{copied ? 'コピーしました' : 'コピー'}</button>
+      <button type="button" class="btn-small" onclick={copyCallbackUrl} disabled={allFieldsLocked}>{copied ? 'コピーしました' : 'コピー'}</button>
     {:else}
       <span class="xpost-error">ポートは 1024〜65535 の整数にしてください</span>
     {/if}
@@ -377,7 +429,7 @@
     <span class="label-like">接続</span>
     {#if connected}
       <span class="xpost-connected">@{status?.username ?? '?'} として接続中</span>
-    {:else}
+    {:else if status}
       <span class="hint-inline">未接続</span>
     {/if}
   </div>
@@ -385,18 +437,18 @@
     <p class="xpost-warn">⚠ 認証の保存に失敗しました。アプリを終了するまでに保存できないと、再ログインが必要になります。</p>
   {/if}
   <div class="field-row">
-    {#if connecting}
+    {#if attempt}
       <button type="button" class="btn-small" onclick={cancelLogin}>ログインを取り消す</button>
     {:else}
-      <button type="button" class="btn-small primary" onclick={connect} disabled={disconnecting}>
+      <button type="button" class="btn-small primary" onclick={connect} disabled={saving || fieldsLocked || disconnecting}>
         {connected ? '別のアカウントで接続し直す' : 'X に接続'}
       </button>
     {/if}
     {#if connected}
-      <button type="button" class="btn-small" onclick={disconnect} disabled={connecting || disconnecting}>切断</button>
+      <button type="button" class="btn-small" onclick={disconnect} disabled={allFieldsLocked || connecting || disconnecting}>切断</button>
     {/if}
   </div>
-  {#if authMsg}
+  {#if authMsg && (successClientId === null || successClientId === clientId.trim())}
     <p class="xpost-msg" class:ok={authOk === true} class:ng={authOk === false} aria-live="polite">{authMsg}</p>
   {/if}
 
@@ -406,14 +458,14 @@
       class="btn-small"
       bind:this={testButtonEl}
       onclick={askTestPost}
-      disabled={!connected || testBusy || connecting}
+      disabled={allFieldsLocked || !connected || testBusy || connecting}
     >テスト投稿</button>
     <span class="hint-inline">「fast-comment 連携テスト 日付 時刻」を実際に投稿します(URL なし)。告知の記録・上限には数えません</span>
   </div>
   {#if testMsg}
     <p class="xpost-msg" class:ok={testOk === true} class:ng={testOk === false} aria-live="polite">
       {testMsg}
-      {#if testTweetUrl}<button type="button" class="xpost-link" onclick={() => void openUrl(testTweetUrl ?? '')}>ポストを開く</button>{/if}
+      {#if testTweetUrl}<button type="button" class="xpost-link" onclick={() => void openUrl(testTweetUrl ?? '')} disabled={allFieldsLocked}>ポストを開く</button>{/if}
     </p>
   {/if}
 
@@ -443,14 +495,15 @@
         <p class="xpost-warn">実際に X で公開され、X API の利用料(1 件 $0.015 の目安)が課金されます。</p>
       </div>
       <div class="xpost-dialog-actions">
-        <button type="button" class="btn-small" bind:this={confirmCancelEl} onclick={closeConfirm}>やめる</button>
-        <button type="button" class="btn-small primary" onclick={confirmTestPost}>投稿する</button>
+        <button type="button" class="btn-small" bind:this={confirmCancelEl} onclick={closeConfirm} disabled={allFieldsLocked}>やめる</button>
+        <button type="button" class="btn-small primary" onclick={confirmTestPost} disabled={allFieldsLocked}>投稿する</button>
       </div>
     </div>
   </div>
 {/if}
 
 <style>
+  .xpost-fields { display: contents; }
   .xpost-api {
     margin-top: 14px;
     border: 1px solid rgba(255,255,255,0.12);

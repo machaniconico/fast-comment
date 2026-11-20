@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, onDestroy, tick } from 'svelte';
+  import { onMount, onDestroy, tick, untrack } from 'svelte';
   import { TauriEvent } from '@tauri-apps/api/event';
   import type { Platform } from './lib/types';
   import CommentList from './lib/components/CommentList.svelte';
@@ -40,8 +40,8 @@
   } from './lib/displayFilter';
   import type { MessageKind } from './lib/types';
   import {
-    getConfig,
-    setConfig,
+    getConfigSnapshot,
+    setGoalsShowInApp,
     getTtsQueueState,
     onTtsNotice,
     onTtsQueueState,
@@ -52,6 +52,7 @@
   } from './lib/ipc';
   import type { AppConfig, TtsNotice } from './lib/ipc';
   import { appUpdate } from './lib/appUpdate.svelte';
+  import { configReloadMessage, configSync } from './lib/configSync.svelte';
   import { progressLabel, progressPercent } from './lib/appUpdate';
 
   let unlisten: (() => void) | null = null;
@@ -115,6 +116,15 @@
   }
   let danmakuOpen = $state(false);
   let goalsToggleSaving = $state(false);
+  // config を読んだ時の revision。インポートなど別の画面の保存で古くなったら読み直す。
+  // revision は単調増加。まだ読んでいない間は -1 で、それ以下の応答は反映しない。
+  let configRevision = $state(-1);
+  let configLoading = $state(false);
+  // 読込に失敗したら間を空けて再試行し、続けて失敗したら止める(get_config を連打しない)。
+  let configRetryWait = $state(false);
+  let configFailures = 0;
+  const CONFIG_RETRY_LIMIT = 3;
+  const configStale = $derived(configRevision < configSync.revision);
   let goalsToggleError = $state('');
   let ttsPaused = $state(false);
   let ttsToggleBusy = $state(false);
@@ -409,13 +419,44 @@
   }
 
   async function loadConfig() {
+    if (configLoading) return;
+    configLoading = true;
     try {
-      const loaded = await getConfig();
-      if (loaded) config = loaded;
+      const loaded = await getConfigSnapshot();
+      // Tauri の外などで読めなかった時も失敗として扱い、再試行の上限に乗せる。
+      if (!loaded) throw new Error('config is unavailable');
+      if (loaded.revision > configRevision) {
+        config = loaded.config;
+        configRevision = loaded.revision;
+        if (loaded.revision > configSync.revision) configSync.revision = loaded.revision;
+      }
+      resetConfigRetry();
     } catch (e) {
       console.warn('[config] load failed', e);
+      configFailures += 1;
+      configRetryWait = true;
+      if (configFailures <= CONFIG_RETRY_LIMIT) {
+        setTimeout(() => { configRetryWait = false; }, 1000 * 2 ** (configFailures - 1));
+      }
+    } finally {
+      configLoading = false;
     }
   }
+
+  function resetConfigRetry() {
+    configFailures = 0;
+    configRetryWait = false;
+  }
+
+  // 新しい revision を知ったら、諦めていた再試行もやり直す。
+  $effect(() => {
+    void configSync.revision;
+    untrack(resetConfigRetry);
+  });
+
+  $effect(() => {
+    if (configStale && !configLoading && !configRetryWait) void loadConfig();
+  });
 
   function showTtsNotice(notice: TtsNotice) {
     ttsNotice = notice;
@@ -434,22 +475,31 @@
     }
   }
 
-  function onSettingsSaved(nextConfig: AppConfig) {
+  function onSettingsSaved(nextConfig: AppConfig, revision: number) {
+    resetConfigRetry();
+    if (revision <= configRevision) return;
     config = structuredClone($state.snapshot(nextConfig));
+    configRevision = revision;
   }
 
   async function toggleGoalsInApp(event: Event) {
-    if (!config || goalsToggleSaving) return;
-    const previous = $state.snapshot(config);
-    const next = structuredClone(previous);
-    next.goals.showInApp = (event.currentTarget as HTMLInputElement).checked;
-    config = next;
+    const input = event.currentTarget as HTMLInputElement;
+    const checked = input.checked;
+    input.checked = showGoalsBar;
+    if (!config || goalsToggleSaving || !!configSync.importing || configStale) return;
     goalsToggleSaving = true;
     goalsToggleError = '';
     try {
-      await setConfig(next);
+      const commit = await setGoalsShowInApp(checked);
+      // 基準 + 1 ちょうどなら自分の保存だけなので反映する。それ以外は読み直す。
+      if (commit?.revision != null) {
+        if (config && commit.revision === configRevision + 1) {
+          config.goals.showInApp = commit.showInApp;
+          configRevision = commit.revision;
+        }
+        if (commit.revision > configSync.revision) configSync.revision = commit.revision;
+      }
     } catch (e) {
-      config = previous;
       goalsToggleError = e instanceof Error ? e.message : String(e);
     } finally {
       goalsToggleSaving = false;
@@ -862,12 +912,14 @@
           <input
             type="checkbox"
             checked={showGoalsBar}
-            disabled={goalsToggleSaving}
+            disabled={goalsToggleSaving || !!configSync.importing || configStale}
             onchange={toggleGoalsInApp}
           />
           <span>{goalsToggleSaving ? '保存中' : 'コメビュに表示'}</span>
         </label>
-        {#if goalsToggleError}
+        {#if configStale && !configLoading && configRetryWait}
+          <span class="goals-toggle-error">{configReloadMessage}</span>
+        {:else if goalsToggleError}
           <span class="goals-toggle-error" title={goalsToggleError}>保存失敗</span>
         {/if}
       </div>

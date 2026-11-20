@@ -8,14 +8,14 @@
  */
 
 import type { ChatMessage, ListenerRecord, ListenerUpdate, ModerationEvent, TtsVoiceOverride, YoutubeReaction } from './types';
-import { invoke as tauriInvoke } from '@tauri-apps/api/core';
+import { Channel, invoke as tauriInvoke } from '@tauri-apps/api/core';
 import { emit, listen } from '@tauri-apps/api/event';
 import { getCurrentWindow, primaryMonitor } from '@tauri-apps/api/window';
 import { createTtsAudioPlayer } from './ttsAudio';
 
 // ---- Tauri availability guard ----
 // @tauri-apps/api throws when window.__TAURI_INTERNALS__ is absent (browser dev).
-const isTauri = (): boolean =>
+export const isTauri = (): boolean =>
   typeof window !== 'undefined' && !!(window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
 
 // ---- rAF batch queue ----
@@ -427,9 +427,16 @@ export interface AppConfig {
     xCsrfToken?: string;
     // X 自動告知(API モード)用 Client ID。未設定なら省略。
     xPostClientId?: string;
+    twitcastingClientId?: string;
   };
   // X 自動告知の設定(Rust `XPostConfig`)。古い config.json には無い。
   xPost?: XPostConfig;
+  // ツイキャスのログイン設定(Rust `TwitcastingConfig`)。古い config.json には無い。
+  twitcasting?: TwitcastingConfig;
+}
+
+export interface TwitcastingConfig {
+  callbackPort: number;
 }
 
 export interface XPostConfig {
@@ -598,20 +605,97 @@ export interface UpdateStatus {
   releaseUrl: string;
 }
 
+/**
+ * 書込 IPC の応答。`revision` は保存後の設定 revision(保存しなかった時は null)、残りは書いた部分の
+ * 正規化済みの値。画面は `revision` が自分の基準 + 1 ちょうどの時だけ反映して基準を進める。
+ */
+export type ConfigCommit<T> = T & { revision: number | null };
+
+export interface OAuthClientSaved {
+  clientId: string | null;
+  callbackPort: number;
+}
+
+/** 接続系コマンドの保存通知。`late` はコマンドが settle した後に届いた(反映してはいけない)時に true。 */
+export type ConfigSavedHandler<T> = (commit: ConfigCommit<T>, late: boolean) => void;
+
+/** 接続コマンドが設定を保存した時に呼ばれる Channel。 */
+function configSavedChannel<T>(handler: (commit: ConfigCommit<T>) => void): Channel<ConfigCommit<T>> | undefined {
+  if (!isTauri()) return undefined;
+  const channel = new Channel<ConfigCommit<T>>();
+  channel.onmessage = handler;
+  return channel;
+}
+
+/**
+ * 接続系コマンドを呼ぶ。`onConfigSaved` の通知には、コマンドが settle した後に届いたかを添える
+ * (settle 後の通知は反映せず、状態はコマンドの応答と、その後の再読込で決める)。
+ */
+async function invokeWithConfigSaved<T, C>(
+  cmd: string,
+  args: Record<string, unknown>,
+  handler?: ConfigSavedHandler<C>,
+): Promise<T | null> {
+  let settled = false;
+  const onConfigSaved = configSavedChannel<C>(commit => handler?.(commit, settled));
+  try {
+    return await invoke<T>(cmd, { ...args, onConfigSaved });
+  } finally {
+    settled = true;
+  }
+}
+
+/** 設定と、その時点の revision(Rust 側で保存のたびに進む)。 */
+export interface ConfigSnapshot {
+  config: AppConfig;
+  revision: number;
+}
+
+export async function getConfigSnapshot(): Promise<ConfigSnapshot | null> {
+  return invoke<ConfigSnapshot>('get_config');
+}
+
 export async function getConfig(): Promise<AppConfig | null> {
-  return invoke<AppConfig>('get_config');
+  return (await getConfigSnapshot())?.config ?? null;
 }
 
 export async function exportCommentsCsv(csv: string): Promise<string | null> {
   return invoke<string>('export_comments_csv', { csv });
 }
 
-/** Saves the config. Resolves with non-fatal warnings (e.g. chatlog could not be opened). */
-export async function setConfig(config: AppConfig): Promise<string[]> {
-  // Rust command is `update_config(new_config)`; Tauri maps the snake_case
-  // param `new_config` to the JS key `newConfig`.
-  const res = await invoke<{ warnings?: string[] } | undefined>('update_config', { newConfig: config });
-  return res?.warnings ?? [];
+export type OAuthService = 'xPost' | 'twitcasting';
+
+export interface UpdateConfigOutcome {
+  warnings: string[];
+  protectedOAuth: OAuthService[];
+  /** 保存後の設定 revision。 */
+  revision: number;
+  /** 保存した正規化済みの設定全体。 */
+  config: AppConfig;
+}
+
+/** Rust の `CONFIG_CHANGED_ERROR` と同じ文言。`baseRevision` が古くて保存されなかった。 */
+export const configChangedError = '設定が別の操作で変更されました。読み直してから保存してください';
+
+/**
+ * 設定全体を保存する。`baseRevision` を渡すと、その後に別経路で保存されていた場合は
+ * 保存せず `configChangedError` で拒否される。インポートは意図的な上書きなので渡さない。
+ */
+export async function setConfig(config: AppConfig, baseRevision?: number): Promise<UpdateConfigOutcome | null> {
+  return invoke<UpdateConfigOutcome>('update_config', { newConfig: config, baseRevision: baseRevision ?? null });
+}
+
+export async function setGoalsShowInApp(showInApp: boolean): Promise<ConfigCommit<{ showInApp: boolean }> | null> {
+  return invoke<ConfigCommit<{ showInApp: boolean }>>('set_goals_show_in_app', { showInApp });
+}
+
+export type ModerationCommit = ConfigCommit<{ moderation: AppConfig['moderation'] }>;
+
+export async function setModeration(moderation: AppConfig['moderation']): Promise<ModerationCommit> {
+  if (!isTauri()) throw new Error('Tauri環境で開いてから再試行してください。');
+  const commit = await invoke<ModerationCommit>('set_moderation', { moderation });
+  if (!commit) throw new Error('Tauri環境で開いてから再試行してください。');
+  return commit;
 }
 
 export async function setTtsPaused(paused: boolean): Promise<void> {
@@ -664,25 +748,10 @@ export async function startListenerUpdatedListener(handler: (u: ListenerUpdate) 
 }
 
 /** Append a value to the moderation NG list (ngUsers / ngWords) in the config. */
+/** 開いている設定画面には知らせない。古いフォームの全体保存は Rust が revision で拒否する。 */
 export async function appendModerationValue(kind: 'ngUsers' | 'ngWords', value: string): Promise<void> {
-  const normalized = value.trim();
-  if (!normalized) return;
-
-  const config = await getConfig();
-  if (!config) return;
-
-  const current = config.moderation[kind] ?? [];
-  if (!current.includes(normalized)) {
-    config.moderation[kind] = [...current, normalized];
-    await setConfig(config);
-  }
-  // Let an open Settings form merge it into its unsaved edit state, otherwise its next save
-  // would overwrite the config with the stale list and drop this entry.
-  window.dispatchEvent(new CustomEvent<ModerationAppended>(MODERATION_APPENDED_EVENT, { detail: { kind, value: normalized } }));
+  await invoke('append_moderation_value', { kind, value });
 }
-
-export const MODERATION_APPENDED_EVENT = 'fc:moderation-appended';
-export type ModerationAppended = { kind: 'ngUsers' | 'ngWords'; value: string };
 
 export async function getTtsQueueState(): Promise<TtsQueueState | null> {
   return invoke<TtsQueueState>('get_tts_queue_state');
@@ -845,8 +914,13 @@ export async function getYoutubeOauthStatus(): Promise<YoutubeOauthStatus | null
   return invoke<YoutubeOauthStatus>('get_youtube_oauth_status');
 }
 
-export async function connectYoutubeOauth(clientId: string): Promise<YoutubeOauthStatus> {
-  return (await invoke<YoutubeOauthStatus>('connect_youtube_oauth', { clientId })) ?? {
+export async function connectYoutubeOauth(
+  clientId: string,
+  onConfigSaved?: ConfigSavedHandler<{ youtubeOauthClientId: string }>,
+): Promise<YoutubeOauthStatus> {
+  return (await invokeWithConfigSaved<YoutubeOauthStatus, { youtubeOauthClientId: string }>(
+    'connect_youtube_oauth', { clientId }, onConfigSaved,
+  )) ?? {
     configured: false,
     connected: false,
     channelTitle: null,
@@ -1081,6 +1155,7 @@ export async function previewXPost(template: string): Promise<XPostPreview | nul
 
 /** Rust `XPostStatus`。API モードの接続状態。 */
 export interface XPostStatus {
+  clientId: string;
   configured: boolean;
   connected: boolean;
   username?: string | null;
@@ -1101,17 +1176,32 @@ export async function getXPostStatus(): Promise<XPostStatus | null> {
 }
 
 /** Client ID とポートだけを保存し、ブラウザで X にログインする。失敗は `XPostErrorInfo` で reject。 */
-export async function connectXPost(clientId: string, callbackPort: number): Promise<XPostStatus | null> {
-  return invoke<XPostStatus>('connect_x_post', { clientId, callbackPort });
+export async function connectXPost(
+  clientId: string,
+  callbackPort: number,
+  attempt: string,
+  onConfigSaved?: ConfigSavedHandler<OAuthClientSaved>,
+): Promise<XPostStatus | null> {
+  return invokeWithConfigSaved<XPostStatus, OAuthClientSaved>(
+    'connect_x_post', { clientId, callbackPort, attempt }, onConfigSaved,
+  );
 }
 
-export async function cancelXPostLogin(): Promise<void> {
-  await invoke<void>('cancel_x_post_login');
+/** `attempt` の X ログインだけを取り消す(接続コマンドより先に届いても効く)。 */
+export async function cancelXPostLogin(attempt: string): Promise<void> {
+  await invoke<void>('cancel_x_post_login', { attempt });
+}
+
+/** OAuth ログインの試行 ID。接続と取消の対応づけに使う。 */
+export function newOAuthAttempt(): string {
+  return crypto.randomUUID();
 }
 
 /** X の許可を取り消し、この PC の保存を消す。API モードだった時は Intent モードへ戻る。 */
-export async function disconnectXPost(): Promise<XPostStatus | null> {
-  return invoke<XPostStatus>('disconnect_x_post');
+export async function disconnectXPost(
+  onConfigSaved?: ConfigSavedHandler<{ xPost: Pick<XPostConfig, 'mode'> }>,
+): Promise<XPostStatus | null> {
+  return invokeWithConfigSaved<XPostStatus, { xPost: Pick<XPostConfig, 'mode'> }>('disconnect_x_post', {}, onConfigSaved);
 }
 
 /** テスト投稿(実際に公開され、課金される)。呼ぶ前に必ず確認を取る。 */
@@ -1122,4 +1212,31 @@ export async function sendXTestPost(): Promise<XTestPostResult | null> {
 /** 行の「自分の配信」印だけを保存する(Source は再起動しない)。key は `${platform}:${identifier}`。 */
 export async function setChannelOwnStream(key: string, own: boolean): Promise<void> {
   await invoke<void>('set_channel_own_stream', { key, own });
+}
+
+
+export async function getTwitcastingStatus(): Promise<import('./types').TwitcastingStatus | null> {
+  return invoke<import('./types').TwitcastingStatus>('get_twitcasting_status');
+}
+export async function reloadTwitcastingStatus(): Promise<import('./types').TwitcastingStatus | null> {
+  return invoke<import('./types').TwitcastingStatus>('reload_twitcasting_status');
+}
+export async function connectTwitcasting(
+  clientId: string | undefined,
+  callbackPort: number,
+  attempt: string,
+  onConfigSaved?: ConfigSavedHandler<OAuthClientSaved>,
+): Promise<import('./types').TwitcastingStatus | null> {
+  return invokeWithConfigSaved<import('./types').TwitcastingStatus, OAuthClientSaved>('connect_twitcasting', {
+    clientId: clientId || null,
+    callbackPort,
+    attempt,
+  }, onConfigSaved);
+}
+/** `attempt` のツイキャスログインだけを取り消す(接続コマンドより先に届いても効く)。 */
+export async function cancelTwitcastingLogin(attempt: string): Promise<void> {
+  await invoke<void>('cancel_twitcasting_login', { attempt });
+}
+export async function disconnectTwitcasting(): Promise<import('./types').TwitcastingStatus | null> {
+  return invoke<import('./types').TwitcastingStatus>('disconnect_twitcasting');
 }

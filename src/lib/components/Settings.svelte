@@ -2,14 +2,15 @@
   import { onMount, onDestroy, untrack } from 'svelte';
   import type {
     AppConfig, EffectRule, EffectsConfig, GoalsConfig, InjectTestCommentOptions, TtsDictEntry, TtsOptions,
-    TimerConfig, WelcomeConfig, YoutubeOauthStatus, ModerationAppended, TwitchOauthStatus, TwitchDeviceLogin
+    TimerConfig, WelcomeConfig, YoutubeOauthStatus, TwitchOauthStatus, TwitchDeviceLogin, OAuthService,
+    ConfigCommit, OAuthClientSaved
   } from '../ipc';
   import {
-    getConfig, setConfig, getObsUrl, getObsGoalsUrl, getObsTimerUrl, exportCommentsCsv, injectTestComment,
+    isTauri, getConfigSnapshot, setConfig, configChangedError, getObsUrl, getObsGoalsUrl, getObsTimerUrl, exportCommentsCsv, injectTestComment,
     setTtsPaused, clearTtsQueue, skipCurrentTts, testTts, probeTtsEngine, getYoutubeOauthStatus,
     connectYoutubeOauth, disconnectYoutubeOauth, getTwitchOauthStatus, beginTwitchLogin,
     awaitTwitchLogin, cancelTwitchLogin, disconnectTwitchOauth, getGoalSkinInfo, openUrl,
-    getCommentLogDir, openCommentLogDir, listListeners, deleteListener, MODERATION_APPENDED_EVENT
+    getCommentLogDir, openCommentLogDir, listListeners, deleteListener
   } from '../ipc';
   import {
     urlForEngineChange, buildVoicevoxParams, buildAutoSpeed, buildQueueLimits, kindTemplate, allTemplate,
@@ -35,13 +36,16 @@
   import ModerationTester from './ModerationTester.svelte';
   import TemplateEditor from './TemplateEditor.svelte';
   import XPostSettings from './XPostSettings.svelte';
+  import TwitcastingSettings from './TwitcastingSettings.svelte';
   import IntegrationsSettings from './IntegrationsSettings.svelte';
   import { sanitizeXPostNumbers } from '../xAutopost';
+  import { DEFAULT_TWITCASTING_CALLBACK_PORT } from '../twitcasting';
   import { appUpdate } from '../appUpdate.svelte';
+  import { configReloadMessage, configSync } from '../configSync.svelte';
   import { progressLabel, statusText } from '../appUpdate';
 
   interface Props {
-    onConfigSaved?: (config: AppConfig) => void;
+    onConfigSaved?: (config: AppConfig, revision: number) => void;
     focus?: 'all' | 'goals' | 'danmaku';
   }
 
@@ -135,6 +139,29 @@
   }
 
   let saving: boolean = $state(false);
+  let twitcastingPortInvalid = $state(false);
+  let xPostPortInvalid = $state(false);
+  const oauthConnecting = $state({ twitcasting: false, xPost: false });
+  const oauthConfigRevision = $state({ twitcasting: 0, xPost: 0 });
+  // フォームが基づく設定の revision。全体保存はこれを送り、古ければ Rust が拒否する。
+  // 進めるのは get_config で丸ごと置き換えた時と、自分の書込の応答が基準 + 1 ちょうどの時だけ。
+  let baseRevision: number | undefined;
+  const reloading = $state({ all: 0, moderation: 0, twitcasting: 0, xPost: 0 });
+  // 全体保存の応答はフォーム全体を置き換えるので、保存中も入力させない。
+  const allFieldsLocked = $derived(saving || reloading.all > 0 || configSync.importing === 'all');
+  const moderationFieldsLocked = $derived(reloading.moderation > 0 || configSync.importing === 'moderation');
+  // 規則の保存が済み、再読込を待っている間は全体を読み直せる。
+  const manualReloadDisabled = $derived(
+    saving || allFieldsLocked || (configSync.importing === 'moderation' && reloading.moderation === 0)
+  );
+  const saveBlockedReason = $derived.by(() => {
+    if (configSync.reloadRequired) return configReloadMessage;
+    if (configSync.importing) return '設定をインポート中です';
+    if (configSync.reloading) return '設定を読み込み中です';
+    if (twitcastingPortInvalid || xPostPortInvalid) return 'OAuth の待受ポートを確認してください';
+    if (oauthConnecting.twitcasting || oauthConnecting.xPost) return 'OAuth の接続処理中です';
+    return '';
+  });
   let saveMsg: string = $state('');
   let saveWarned: boolean = $state(false);
   let exportingCsv: boolean = $state(false);
@@ -323,10 +350,12 @@
 
   function hydrateConfig(nextConfig: AppConfig | null) {
     config = nextConfig;
+    oauthConfigRevision.twitcasting += 1;
+    oauthConfigRevision.xPost += 1;
+    twitcastingPortInvalid = false;
+    xPostPortInvalid = false;
     if (config) {
-      ngWords = normalizeModerationEntries(config.moderation.ngWords);
-      ngUsers = normalizeModerationEntries(config.moderation.ngUsers);
-      highlights = normalizeModerationEntries(config.moderation.highlights);
+      applyModerationConfig(config.moderation);
       credTwitchOauth = config.credentials?.twitchOauth ?? '';
       credTwitchUsername = config.credentials?.twitchUsername ?? '';
       credTwitchClientId = config.credentials?.twitchClientId ?? '';
@@ -385,24 +414,117 @@
     }
   }
 
-  function onConfigImported(importedConfig: AppConfig) {
-    hydrateConfig(importedConfig);
-    setNotify(importedConfig.ui.notifySound, importedConfig.ui.notifyVolume);
-    onConfigSaved?.(importedConfig);
+  function applyModerationConfig(rules: AppConfig['moderation']) {
+    if (config) config.moderation = rules;
+    ngWords = normalizeModerationEntries(rules.ngWords);
+    ngUsers = normalizeModerationEntries(rules.ngUsers);
+    highlights = normalizeModerationEntries(rules.highlights);
   }
 
-  async function onModerationImported() {
-    const importedConfig = await getConfig();
-    hydrateConfig(importedConfig);
-    if (importedConfig) {
-      setNotify(importedConfig.ui.notifySound, importedConfig.ui.notifyVolume);
-      onConfigSaved?.(importedConfig);
+  /** 基準より新しい revision か。基準は単調増加で、それ以下の応答は何も反映しない。 */
+  function newerThanBase(revision: number): boolean {
+    if (revision > configSync.revision) configSync.revision = revision;
+    return baseRevision === undefined || revision > baseRevision;
+  }
+
+  /** 自分が呼んだ書込の応答。基準 + 1 ちょうどなら書いた部分を反映して基準を進め、それより先なら読み直しを求める。 */
+  function applyCommit(revision: number | null, apply: () => void, late = false) {
+    if (revision === null || destroyed || !newerThanBase(revision)) return;
+    // コマンドが settle した後に届いた接続系の通知は反映しない。基準より新しい保存なので読み直しを求める。
+    if (!late && baseRevision !== undefined && revision === baseRevision + 1) {
+      apply();
+      baseRevision = revision;
+    } else {
+      configSync.reloadRequired = true;
     }
+  }
+
+  async function reloadConfig(scope: 'all' | 'moderation' | readonly OAuthService[]): Promise<boolean> {
+    if (destroyed) return false;
+
+    const targets: readonly (keyof typeof reloading)[] = typeof scope === 'string' ? [scope] : scope;
+    for (const target of targets) reloading[target] += 1;
+    configSync.reloading += 1;
+
+    let timeout: number | undefined;
+    try {
+      const deadline = new Promise<null>(resolve => {
+        timeout = window.setTimeout(() => resolve(null), 10_000);
+      });
+      const snapshot = await Promise.race([getConfigSnapshot(), deadline]);
+      if (destroyed) return false;
+      if (!snapshot) {
+        configSync.reloadRequired = true;
+        return false;
+      }
+      const { config: saved, revision } = snapshot;
+      const newer = newerThanBase(revision);
+
+      if (scope === 'all') {
+        if (newer) {
+          hydrateConfig(saved);
+          baseRevision = revision;
+          setNotify(saved.ui.notifySound, saved.ui.notifyVolume);
+          onConfigSaved?.(saved, revision);
+        }
+        // 基準と同じ revision を読めたなら、フォームは保存済みの設定と揃っている。
+        if (baseRevision === revision) configSync.reloadRequired = false;
+      } else if (newer) {
+        // 部分読込では基準を進めない。基準より新しい保存があったので、全体の読み直しを求める。
+        if (scope === 'moderation') applyModerationConfig(saved.moderation);
+        else for (const service of scope) applySavedOAuthConfig(saved, service);
+        configSync.reloadRequired = true;
+      }
+      return true;
+    } catch {
+      if (!destroyed) configSync.reloadRequired = true;
+      return false;
+    } finally {
+      window.clearTimeout(timeout);
+      for (const target of targets) reloading[target] -= 1;
+      configSync.reloading -= 1;
+    }
+  }
+
+  function reloadImportedConfig() {
+    if (!manualReloadDisabled) return reloadConfig('all');
+  }
+
+  function onOAuthConnectingChange(service: OAuthService, connecting: boolean) {
+    oauthConnecting[service] = connecting;
+  }
+
+  function applySavedOAuthConfig(saved: AppConfig, service: OAuthService) {
+    applyOAuthClient(service, {
+      clientId: (service === 'xPost' ? saved.credentials?.xPostClientId : saved.credentials?.twitcastingClientId) ?? null,
+      callbackPort: (service === 'xPost' ? saved.xPost?.callbackPort : saved.twitcasting?.callbackPort) ?? 0,
+    });
+  }
+
+  /** 保存済みの OAuth 項目(ClientID と待受ポート)をフォームへ写す。 */
+  function applyOAuthClient(service: OAuthService, saved: OAuthClientSaved) {
+    if (!config) return;
+    const clientId = saved.clientId ?? undefined;
+    if (service === 'xPost') {
+      config.credentials = { ...config.credentials, xPostClientId: clientId };
+      if (config.xPost) config.xPost.callbackPort = saved.callbackPort;
+      xPostPortInvalid = false;
+    } else {
+      config.credentials = { ...config.credentials, twitcastingClientId: clientId };
+      config.twitcasting = { ...(config.twitcasting ?? {}), callbackPort: saved.callbackPort };
+      twitcastingPortInvalid = false;
+    }
+    oauthConfigRevision[service] += 1;
+  }
+
+  function onOAuthConfigSaved(service: OAuthService, commit: ConfigCommit<OAuthClientSaved>, late: boolean) {
+    applyCommit(commit.revision, () => applyOAuthClient(service, commit), late);
   }
 
   onMount(async () => {
     void appUpdate.loadCurrentVersion();
-    hydrateConfig(await getConfig());
+    if (isTauri()) await reloadConfig('all');
+    if (destroyed) return;
     refreshLogDir();
     try {
       youtubeOauthStatus = await getYoutubeOauthStatus();
@@ -855,18 +977,6 @@
   // Updates received while a search request is in flight (re-applied onto its response).
   let pendingListenerUpdates: ListenerUpdate[] = [];
 
-  // NG entries added from the UserCard go straight to the config; mirror them into the form
-  // so saving the form does not write back the stale list.
-  function onModerationAppended(e: Event) {
-    const { kind, value } = (e as CustomEvent<ModerationAppended>).detail;
-    if (kind === 'ngUsers' && !ngUsers.includes(value)) ngUsers = [...ngUsers, value];
-    if (kind === 'ngWords' && !ngWords.includes(value)) ngWords = [...ngWords, value];
-  }
-  $effect(() => {
-    window.addEventListener(MODERATION_APPENDED_EVENT, onModerationAppended);
-    return () => window.removeEventListener(MODERATION_APPENDED_EVENT, onModerationAppended);
-  });
-
   function applyListenerUpdate(rows: ListenerRecord[], u: ListenerUpdate): ListenerRecord[] {
     const same = (x: ListenerRecord) => x.platform === u.platform && x.authorId === u.authorId;
     if (!rows.some(same)) return rows;
@@ -1155,7 +1265,7 @@
   }
 
   async function onSave() {
-    if (!config) return;
+    if (!config || saving || saveBlockedReason) return;
     saving = true;
     saveMsg = '';
     config.moderation.ngWords = [...ngWords];
@@ -1219,17 +1329,15 @@
       xCsrfToken: credXCsrfToken.trim(),
       // このフォームでは編集しない値(API モード用)。作り直しで消えないよう既存値を引き継ぐ。
       xPostClientId: config.credentials?.xPostClientId,
+      twitcastingClientId: config.credentials?.twitcastingClientId,
     };
     saveWarned = false;
     try {
-      // 一覧で付けた「告知」印(ownStream)が、開きっぱなしの古い channels で戻らないよう保存直前に取り直す。
-      try {
-        const latest = await getConfig();
-        if (latest) config.channels = latest.channels;
-      } catch {
-        // 取れなければ手元の channels で保存する。
-      }
-      const warnings = await setConfig(config);
+      if (saveBlockedReason) return;
+      const result = await setConfig(config, baseRevision);
+      // Rust が正規化した保存値(ログイン中に保持した OAuth 項目を含む)でフォームを置き換える。
+      if (result) applyCommit(result.revision, () => hydrateConfig(result.config));
+      const warnings = result?.warnings ?? [];
       void localApiSettings?.refreshStatus();
       saveWarned = warnings.length > 0;
       try {
@@ -1241,11 +1349,13 @@
       // client_id の変更で Twitch 側も未接続になり得るので、こちらも取り直す。
       await refreshTwitchOauth();
       setNotify(config.ui.notifySound, config.ui.notifyVolume);
-      onConfigSaved?.(config);
+      if (result) onConfigSaved?.(result.config, result.revision);
       saveMsg = saveWarned ? `保存しました(警告: ${warnings.join(' / ')})` : '保存しました';
     } catch (e) {
       saveWarned = false;
-      saveMsg = `保存に失敗しました: ${e instanceof Error ? e.message : String(e)}`;
+      const message = e instanceof Error ? e.message : String(e);
+      if (message === configChangedError) configSync.reloadRequired = true;
+      saveMsg = `保存に失敗しました: ${message}`;
     } finally {
       saving = false;
     }
@@ -1265,14 +1375,10 @@
     youtubeOauthMsg = 'ブラウザでGoogleアカウントを選び、許可してください…';
     youtubeOauthOk = null;
     try {
-      youtubeOauthStatus = await connectYoutubeOauth(clientId);
+      youtubeOauthStatus = await connectYoutubeOauth(clientId, (commit, late) => applyCommit(commit.revision, () => {
+        if (config) config.credentials = { ...(config.credentials ?? {}), youtubeOauthClientId: commit.youtubeOauthClientId };
+      }, late));
       moderation.setYoutubeConnected(youtubeOauthStatus?.connected === true);
-      if (config) {
-        config.credentials = {
-          ...(config.credentials ?? {}),
-          youtubeOauthClientId: clientId,
-        };
-      }
       youtubeOauthMsg = 'Googleアカウントに接続しました';
       youtubeOauthOk = true;
     } catch (e) {
@@ -1480,6 +1586,7 @@
 >
   <h2>{focus === 'goals' ? '目標設定' : focus === 'danmaku' ? '弾幕・OBS設定' : '設定'}</h2>
 
+  <fieldset class="settings-fields" disabled={allFieldsLocked}>
   <section id="settings-appearance">
     <h3>外観</h3>
     <div class="field-row">
@@ -1580,7 +1687,12 @@
 
   <section id="settings-portability">
     <h3>設定のバックアップ/移行</h3>
-    <ConfigPortability onImported={onConfigImported} />
+    <ConfigPortability
+      onImported={() => reloadConfig('all')}
+      onReload={reloadImportedConfig}
+      disabled={manualReloadDisabled}
+      reloading={reloading.all > 0}
+    />
   </section>
 
   <section id="settings-danmaku">
@@ -1705,8 +1817,14 @@
     </p>
   </section>
 
+  {/if}
+  </fieldset>
+
+  {#if config}
+  <div class="settings-fields">
   <section id="settings-posting">
     <h3>コメント投稿（送信）</h3>
+    <fieldset class="settings-fields" disabled={allFieldsLocked}>
     <p class="hint">
       コメント一覧の下にある「✍ 自分でコメントを投稿」から、配信チャットへ自分でコメントを送れます。
       YouTubeは接続した配信者アカウント、Twitchは設定したアカウントとして投稿されます。
@@ -1732,6 +1850,7 @@
           id="cred-youtube-oauth-client-id"
           type="text"
           bind:value={credYoutubeOauthClientId}
+          disabled={youtubeOauthBusy}
           class="id-input"
           placeholder="xxxxx.apps.googleusercontent.com"
           autocomplete="off"
@@ -1966,6 +2085,22 @@
     <p class="hint">
       ⚠ トークンはこの PC の config.json に平文で保存されます。共有 PC では取り扱いに注意してください。
     </p>
+    </fieldset>
+    <TwitcastingSettings
+      clientId={config.credentials?.twitcastingClientId ?? ''}
+      callbackPort={config.twitcasting?.callbackPort ?? DEFAULT_TWITCASTING_CALLBACK_PORT}
+      configRevision={oauthConfigRevision.twitcasting}
+      {saving}
+      {allFieldsLocked}
+      configReloading={reloading.twitcasting > 0}
+      onConnectingChange={(connecting) => onOAuthConnectingChange('twitcasting', connecting)}
+      onConnectionSettled={async () => { await reloadConfig(['twitcasting']); }}
+      onConfigSaved={(commit, late) => onOAuthConfigSaved('twitcasting', commit, late)}
+      onCallbackPortChange={(port) => {
+        twitcastingPortInvalid = port === null;
+        if (config && port !== null) config.twitcasting = { ...(config.twitcasting ?? {}), callbackPort: port };
+      }}
+    />
   </section>
 
   <section id="settings-x-post">
@@ -1974,13 +2109,28 @@
       <XPostSettings
         xPost={config.xPost}
         clientId={config.credentials?.xPostClientId ?? ''}
-        onClientIdSaved={(id) => {
-          if (config) config.credentials = { ...(config.credentials ?? {}), xPostClientId: id };
+        configRevision={oauthConfigRevision.xPost}
+        {saving}
+        {allFieldsLocked}
+        configReloading={reloading.xPost > 0}
+        onConnectingChange={(connecting) => onOAuthConnectingChange('xPost', connecting)}
+        onConnectionSettled={async () => { await reloadConfig(['xPost']); }}
+        onConfigSaved={(commit, late) => onOAuthConfigSaved('xPost', commit, late)}
+        onModeSaved={(commit, late) => applyCommit(commit.revision, () => {
+          if (config?.xPost) config.xPost.mode = commit.xPost.mode;
+        }, late)}
+        onCallbackPortChange={(port) => {
+          xPostPortInvalid = port === null;
+          if (config?.xPost && port !== null) config.xPost.callbackPort = port;
         }}
       />
     {/if}
   </section>
+  </div>
+  {/if}
 
+  <fieldset class="settings-fields" disabled={allFieldsLocked}>
+  {#if config}
   <section id="settings-tts">
     <h3>TTS（読み上げ）</h3>
     <div class="field-row">
@@ -2790,6 +2940,7 @@
   <!-- ── Moderation ── -->
   <section id="settings-moderation">
     <h3>モデレーション</h3>
+    <fieldset class="settings-fields" disabled={moderationFieldsLocked}>
 
     <div class="mod-list">
       <div class="mod-list-header">
@@ -2917,7 +3068,14 @@
 
     <ModerationTester {ngWords} {ngUsers} {highlights} />
 
-    <ModerationPortability onImported={onModerationImported} />
+    </fieldset>
+    <ModerationPortability
+      onImported={(commit) => {
+        applyCommit(commit.revision, () => applyModerationConfig(commit.moderation));
+        return reloadConfig('moderation');
+      }}
+      disabled={saving || allFieldsLocked}
+    />
   </section>
 
   <!-- ── Notification ── -->
@@ -3013,14 +3171,25 @@
     {/if}
   </section>
 
+  {/if}
+
   <!-- ── Save ── -->
+  {#if config || (configSync.reloadRequired && focus !== 'all')}
   <div class="save-row">
-    <button class="save-btn" onclick={onSave} disabled={saving}>
+    <button class="save-btn" onclick={onSave} disabled={!config || saving || !!saveBlockedReason}>
       {saving ? '保存中...' : '設定を保存'}
     </button>
-    {#if saveMsg}<span class={saveWarned ? 'save-warn' : 'save-ok'}>{saveMsg}</span>{/if}
+    {#if saveBlockedReason}
+      <span class="save-warn" role="status">{saveBlockedReason}</span>
+      {#if configSync.reloadRequired && focus !== 'all'}
+        <button class="save-btn" onclick={reloadImportedConfig} disabled={manualReloadDisabled}>設定を再読み込み</button>
+      {/if}
+    {:else if saveMsg}
+      <span class={saveWarned ? 'save-warn' : 'save-ok'}>{saveMsg}</span>
+    {/if}
   </div>
   {/if}
+  </fieldset>
 </div>
 
 <style>
@@ -3031,13 +3200,15 @@
     box-sizing: border-box;
   }
 
-  .settings.focus-goals > section:not(#settings-goals),
-  .settings.focus-danmaku > section:not(#settings-danmaku) {
+  .settings-fields { display: contents; }
+
+  .settings.focus-goals > .settings-fields > section:not(#settings-goals),
+  .settings.focus-danmaku > .settings-fields > section:not(#settings-danmaku) {
     display: none;
   }
 
-  .settings:not(.focus-goals):not(.focus-danmaku) > #settings-goals,
-  .settings:not(.focus-goals):not(.focus-danmaku) > #settings-danmaku {
+  .settings:not(.focus-goals):not(.focus-danmaku) > .settings-fields > #settings-goals,
+  .settings:not(.focus-goals):not(.focus-danmaku) > .settings-fields > #settings-danmaku {
     display: none;
   }
 

@@ -1,8 +1,11 @@
 <script lang="ts">
   import { getConfig, setConfig, type AppConfig } from '../ipc';
+  import { configReloadMessage, configSync } from '../configSync.svelte';
   import { theme, type AppearanceSnapshot } from '../theme.svelte';
 
   const SCHEMA = 'fast-comment/settings';
+  // update_config の型エラーは Rust が固定フィールド名だけで組み立てる。
+  const configTypeError = /^設定の形式が不正です \(項目 (?:\.|[a-zA-Z][a-zA-Z0-9]*(?:\.[a-zA-Z][a-zA-Z0-9]*)*)\)$/;
 
   interface SettingsBundle {
     schema: typeof SCHEMA;
@@ -13,16 +16,19 @@
   }
 
   interface Props {
-    onImported?: (config: AppConfig) => void;
+    onImported?: () => Promise<boolean>;
+    onReload?: () => Promise<boolean> | undefined;
+    disabled?: boolean;
+    reloading?: boolean;
   }
 
-  let { onImported }: Props = $props();
+  let { onImported, onReload, disabled = false, reloading = false }: Props = $props();
 
   let exportedJson: string = $state('');
   let importText: string = $state('');
   let status: { kind: 'success' | 'error'; message: string } | null = $state(null);
   let exporting: boolean = $state(false);
-  let importing: boolean = $state(false);
+  const importDisabled = $derived(disabled || !!configSync.importing || configSync.reloadRequired);
   let exportTextarea: HTMLTextAreaElement | null = null;
   let importFileInput: HTMLInputElement | null = null;
 
@@ -146,7 +152,7 @@
   }
 
   async function applyRawImport(raw: string): Promise<void> {
-    if (importing) return;
+    if (importDisabled) return;
 
     const trimmed = raw.trim();
     if (!trimmed) {
@@ -172,20 +178,35 @@
       : window.confirm('現在の設定をバックアップJSONの内容で上書きします。続行しますか？');
     if (!ok) return;
 
-    importing = true;
+    configSync.importing = 'all';
     status = null;
     try {
-      const warnings = await setConfig(parsed.config);
-      if (parsed.appearance !== undefined) {
-        theme.applySnapshot(parsed.appearance);
+      const result = await setConfig(parsed.config);
+      if (result && result.revision > configSync.revision) configSync.revision = result.revision;
+      if (parsed.appearance !== undefined) theme.applySnapshot(parsed.appearance);
+      if (!result) {
+        showSuccess(parsed.appearance === undefined
+          ? '設定JSONを読み込みました。'
+          : '外観設定を反映しました。');
+        return;
       }
-      onImported?.(parsed.config);
-      const base = '設定をインポートしました。外観設定も反映済みです。';
-      showSuccess(warnings.length > 0 ? `${base}(警告: ${warnings.join(' / ')})` : base);
+
+      if (!(await onImported?.())) return;
+
+      const notices = [...result.warnings];
+      if (result.protectedOAuth.length > 0) {
+        const services = result.protectedOAuth.map(service => service === 'xPost' ? 'X' : 'ツイキャス');
+        notices.push(`ログイン中の ${services.join('、')} の Client ID と待受ポートを保持しました。`);
+      }
+      const base = parsed.appearance === undefined
+        ? '設定をインポートしました。'
+        : '設定をインポートし、外観設定を反映しました。';
+      showSuccess([base, ...notices].join(' '));
     } catch (e) {
-      showError(`インポートに失敗しました: ${e instanceof Error ? e.message : String(e)}`);
+      const typeError = typeof e === 'string' ? configTypeError.exec(e) : null;
+      showError(typeError?.[0] ?? '設定のインポートに失敗しました。');
     } finally {
-      importing = false;
+      configSync.importing = null;
     }
   }
 
@@ -214,7 +235,14 @@
 </script>
 
 <div class="portability">
-  {#if status}
+  {#if configSync.reloadRequired}
+    <p class="portability-banner banner-error" role="status">{configReloadMessage}</p>
+    <div class="field-row">
+      <button type="button" class="export-btn" onclick={onReload} disabled={disabled}>
+        {reloading ? '読込中...' : '設定を再読み込み'}
+      </button>
+    </div>
+  {:else if status}
     <p
       class:banner-success={status.kind === 'success'}
       class:banner-error={status.kind === 'error'}
@@ -256,12 +284,13 @@
         bind:this={importFileInput}
         class="file-input"
         type="file"
+        disabled={importDisabled}
         accept=".json,application/json"
         onchange={onFileSelected}
         aria-label="インポートする設定JSONファイル"
       />
-      <button type="button" class="export-btn" onclick={onImportFromText} disabled={importing}>
-        {importing ? '読込中...' : 'テキストから読込'}
+      <button type="button" class="export-btn" onclick={onImportFromText} disabled={importDisabled}>
+        {configSync.importing === 'all' ? '読込中...' : 'テキストから読込'}
       </button>
     </div>
     <label class="portability-label" for="settings-import-json">貼り付け用JSON</label>

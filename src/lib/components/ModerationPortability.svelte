@@ -1,5 +1,6 @@
 <script lang="ts">
-  import { getConfig, setConfig, type AppConfig } from '../ipc';
+  import { getConfig, setModeration, type AppConfig, type ModerationCommit } from '../ipc';
+  import { configSync } from '../configSync.svelte';
 
   const SCHEMA = 'fast-comment-moderation';
 
@@ -13,16 +14,19 @@
   }
 
   interface Props {
-    onImported: () => void;
+    /** 保存の応答を受け取り、設定を読み直せたら true。 */
+    onImported: (commit: ModerationCommit) => Promise<boolean>;
+    disabled: boolean;
   }
 
-  let { onImported }: Props = $props();
+  let { onImported, disabled }: Props = $props();
 
   let exportedJson: string = $state('');
   let importText: string = $state('');
   let status: { kind: 'success' | 'error'; message: string } | null = $state(null);
   let exporting: boolean = $state(false);
-  let importing: boolean = $state(false);
+  const importing = $derived(configSync.importing === 'moderation');
+  const importDisabled = $derived(disabled || !!configSync.importing);
   let exportTextarea: HTMLTextAreaElement | null = null;
   let importFileInput: HTMLInputElement | null = null;
 
@@ -154,7 +158,7 @@
   }
 
   async function applyRawImport(raw: string): Promise<void> {
-    if (importing) return;
+    if (importDisabled) return;
 
     const trimmed = raw.trim();
     if (!trimmed) {
@@ -175,25 +179,19 @@
       : window.confirm('現在のNGワード、NGユーザー、ハイライトをJSONの内容で上書きします。続行しますか？');
     if (!ok) return;
 
-    importing = true;
+    configSync.importing = 'moderation';
     status = null;
     try {
-      const currentConfig = await getConfig();
-      if (!currentConfig) {
-        showError('現在の設定を取得できませんでした。Tauri環境で開いてから再試行してください。');
-        return;
+      const commit = await setModeration(moderation);
+      if (await onImported(commit)) {
+        showSuccess('モデレーション規則をインポートしました。');
+      } else {
+        showError('モデレーション規則は保存されました。設定を読み直してください。');
       }
-
-      await setConfig({
-        ...currentConfig,
-        moderation,
-      });
-      await onImported();
-      showSuccess('モデレーション規則をインポートしました。');
-    } catch (e) {
-      showError(`インポートに失敗しました: ${e instanceof Error ? e.message : String(e)}`);
+    } catch {
+      showError('モデレーション規則のインポートに失敗しました。');
     } finally {
-      importing = false;
+      configSync.importing = null;
     }
   }
 
@@ -266,9 +264,10 @@
         type="file"
         accept=".json,application/json"
         onchange={onFileSelected}
+        disabled={importDisabled}
         aria-label="インポートするモデレーション規則JSONファイル"
       />
-      <button type="button" class="export-btn" onclick={onImportFromText} disabled={importing}>
+      <button type="button" class="export-btn" onclick={onImportFromText} disabled={importDisabled}>
         {importing ? '読込中...' : 'テキストから読込'}
       </button>
     </div>
