@@ -188,7 +188,7 @@ trait Source {
 - 既定の取得経路。認証もログイン cookie も使わない(§1.3 の公式ログインとは独立)。非公式のため予告なく壊れうる。公式 API ポーリングと `mode` 切替(`auto` / `unofficial` / `official`)は PR3' で、この版には無い。
 - `identifier`: `extract_screen_id()` で正規化する。許可ホストは `twitcasting.tv` / `www.` / `ssl.` / `en.` / `ja.`(ポート・認証情報付きは不可)、接頭辞は `c:` `g:` `f:` `ig:`、本体は英数字と `_` の 32 文字以下。URL は `/movie/…` 等の後続パス可、`%3A` だけデコードする。`ChatMessage.channel` は小文字化した ID。解釈できなければ接続せず、チップに「ツイキャスの配信者 ID を解釈できません」を出して cancel まで待機する。
 - 手順(1 セッション):
-  1. `GET <userPageBaseUrl><screen_id>`(既定 `https://twitcasting.tv/`)の HTML から movie_id と `data-is-onlive` を読む。リダイレクトは追わず、一般ブラウザの User-Agent を使う。タイムアウトは HTTP 15 秒。
+  1. `GET <userPageBaseUrl><screen_id>`(既定 `https://twitcasting.tv/`)の HTML から movie_id と `data-is-onlive` を読む。別の配信者 ID を持つタグの状態値は無視する。リダイレクトは追わず、一般ブラウザの User-Agent を使う。タイムアウトは HTTP 15 秒。
   2. movie_id が前回と違う時だけ重複排除を空にし、`GET <commentHistoryUrl><screen_id>/userajax.php?c=listall&m=<movie_id>&k=0&f=0&n=20`(既定 `https://twitcasting.tv/`)で直近 20 件を取る。`type` が comment / gift のものを古い順・`type:id` 重複なしで流し、`skip_tts=true`(読み上げない)。
   3. `POST <eventPubsubUrl>`(既定 `https://twitcasting.tv/eventpubsuburl.php`、フォーム `movie_id` と `__n`=現在 ms)の JSON `url` を得る。
   4. `Started` を送り、`<url>&gift=1` へ WS 接続する(接続タイムアウト 20 秒)。接続成功でチップを配信中にする。以降のテキストフレームは JSON 配列で、要素ごとに正規化する(配列でない・JSON でないフレーム、未知の `type` は debug ログを出して捨てる)。Ping には Pong、Close は切断扱い。キャンセル時は Close を送る(待ちは 2 秒まで)。
@@ -198,14 +198,14 @@ trait Source {
 | 結果 | 条件 | 動き |
 |---|---|---|
 | Offline | 視聴ページが未配信(`data-is-onlive=false`、または movie_id が無く `false` が明示) | チップを待機にし `Ended` を送る。30 秒 ±20% で HTML を再取得 |
-| Unreadable | HTTP 200 だが movie_id も未配信の明示も読めない(他配信のカードしか無い場合を含む) | **`Ended` を送らず、チップも変えない**。30 秒固定で再確認。ログは初回 warn、連続時 debug |
+| Unreadable | HTTP 200 だが movie_id も未配信の明示も読めない(他配信のカードしか無い場合を含む)、または読み取った is-onlive が未知値 | **`Ended` を送らず、チップも変えない**。30 秒固定で再確認。ログは初回 warn、連続時 debug |
 | NotFound | 視聴ページが 3xx / 404(存在しないユーザー) | チップに「ツイキャスのユーザーが見つかりません」。5 分後に再試行 |
 | Unavailable | eventpubsuburl の `url` が無い・null・空(限定配信など) | チップに「この配信は非公開のため取得できません」。30 秒 ±20% で再試行。連続時は debug |
 | Recheck | eventpubsuburl が 3xx / 4xx | 30 秒固定で HTML から確認し直す |
 | Disconnected | 通信失敗、HTML・eventpubsuburl の 5xx や本文不正、WS 切断・受信エラー、90 秒無フレーム | チップを待機にする(`Ended` は送らない)。指数バックオフ 1→30 秒で張り直す。バックオフは、フレームを受けたか接続 30 秒以上の後に戻す |
 
 - 配信開始/終了(§3.1):
-  - `Started` は eventpubsuburl の `url` を得た時に送る。`stream_id` は movie_id、`url` は `https://twitcasting.tv/<screen_id>/movie/<movie_id>`、title・開始時刻は無し。**同じ movie_id には 1 回だけ**(WS 再接続・Disconnected・Unreadable では再送しない)。重複抑止の記録は Offline を観測した時だけ消す。
+  - `Started` は eventpubsuburl の `url` を得た時に送る。`stream_id` は movie_id、`url` は `https://twitcasting.tv/<screen_id>/movie/<movie_id>`、title・開始時刻は無し。**同じ movie_id はプロセス内で 1 回だけ**。キューへの送信成功後に記録し、Ended や Source の再生成後も保持する。キューが満杯なら次の接続試行で再送できる。
   - `Ended` は Offline の時だけ送る。Unreadable・Unavailable・Recheck・Disconnected・NotFound では送らない(配信状態を確認できていないため)。
 - 正規化(`ChatMessage`):
   - comment: `id`=`tc-<id>`、`channel`=正規化済み ID、本文=`message`(空白だけは捨てる)。`author.id`=`author.id`(`screenName` ではない)、表示名=`author.name`(空なら `author.screenName`、それも無ければ `author.id`)、アイコン=`author.profileImage`(`//` 始まりは `https:` を補い、`https://` 以外は捨てる)。`roles.broadcaster` は非匿名で `author.id` が配信者 ID と一致(大文字小文字無視)した時。
@@ -214,7 +214,7 @@ trait Source {
   - 匿名: `isAnonymous` が真、または `author.id` が `c:tw` + 数字 1 桁以上(`c:twinkle` は実ユーザー)か `twitcastinguest` なら、`author.id` を固定の `tc:anonymous` に置き換え、バッジ `anonymous`(「匿名」)を付ける(同じ ID を複数人が共有するため。ユーザー単位の NG・色分けに使わせない)。
   - 視聴者数・タイトルは取らない(チップは live の真偽と notice のみ更新)。
 - 対応しない物: 公式 API によるポーリングと自動切替(PR3')、合言葉・限定配信(Unavailable の文言を出すのみ)、コメント投稿、モデレーション、金額換算。
-- ログ: WS URL にトークンが入るので、ログ・エラー文にはホスト名だけを出す(`SecretWsUrl`)。tungstenite は TRACE でハンドシェイクのリクエスト行を平文に出すため、`lib.rs` の `build_log_filter` が `RUST_LOG` の後ろに `tungstenite=info` と `tokio_tungstenite=info` を足して上書きさせない。
+- ログ: WS URL にトークンが入るので、ログ・エラー文にはホスト名だけを出す(`SecretWsUrl`)。`tungstenite` と `tokio_tungstenite` およびその配下のターゲットの DEBUG / TRACE は、`RUST_LOG` に加えてログレイヤーのフィルタで除外する。HTTP 取得・本文の読み取り失敗ログでは `reqwest::Error` から URL を除く。
 - 壊れうる箇所と吸収:
 
 | 箇所 | 壊れ方 | 吸収 |
@@ -406,7 +406,7 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
   - `twitcasting{callbackPort=39822}`: ツイキャスのログイン待受ポート(§1.3)。serde default で旧 config.json も読める。`xPost.callbackPort` と同じく、設定画面と接続コマンドは 1024〜65535 の整数を受け付ける。設定ロードと `update_config` では 1024 未満を各サービスの既定値に戻す。設定画面のログイン(`connect_twitcasting`)が `credentials.twitcastingClientId` と一緒にこの値だけを保存し、待受と status の `callbackUrl` に使う。
   - `twitcastingOverrides{endpoints?, patterns?}`: ツイキャス非公式経路(§4.5)の上書き。両方とも文字列→文字列のマップで、全項目が既定値(未指定・空文字・前後空白のみは既定を使用)。値が既定(両マップが空)なら JSON から省略し、旧 config.json も読める。チャンネルの Source を起動する時に読む。
     - `endpoints`: `userPageBaseUrl`(既定 `https://twitcasting.tv/`、末尾に配信者 ID を連結)/ `eventPubsubUrl`(既定 `https://twitcasting.tv/eventpubsuburl.php`)/ `commentHistoryUrl`(既定 `https://twitcasting.tv/`、`<配信者 ID>/userajax.php` を連結)。
-    - `patterns`(正規表現。キャプチャ 1 番目を使う): `movieId`(既定 `data-movie-id="(\d+)"`)/ `movieIdFallback`(既定 `var\s+movieid\s*=\s*"(\d+)"`、`movieId` で取れない時に試す)/ `isOnlive`(既定 `data-is-onlive="(true|false)"`、`true` なら配信中)。不正な正規表現は warn ログを出して既定へ戻す。
+    - `patterns`(正規表現。キャプチャ 1 番目を使う): `movieId`(既定 `data-movie-id="(\d+)"`)/ `movieIdFallback`(既定 `var\s+movieid\s*=\s*"(\d+)"`、`movieId` で取れない時に試す)/ `isOnlive`(既定 `data-is-onlive="([^"]*)"`、`true` / `false` を ASCII の大文字小文字を区別せず判定し、未知値は Unreadable)。不正な正規表現は warn ログを出して既定へ戻す。
   - `credentials.twitcastingClientId`(任意): ツイキャス公開 ClientID の上書き。未設定は JSON から省略し、空欄なら既定値を使用する。トークンは資格情報一覧の `twitcasting-oauth-token` にのみ保存する(§1.3)。
   - `credentials.xPostClientId`(任意): API モード用の X OAuth 2.0 Client ID。未設定なら JSON に出さない。設定画面の「X に接続」(`connect_x_post`)が `xPost.callbackPort` と一緒にこの 2 項目だけを保存する。
   - `xOverrides.endpoints` の `postAuthorizeUrl` / `postTokenUrl` / `postTweetsUrl` / `postUsersMeUrl`: API モードの X エンドポイントの上書き(起動時に読む。変えたらアプリを再起動)。

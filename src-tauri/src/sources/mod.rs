@@ -118,6 +118,7 @@ pub struct SourceManager {
     niconico_overrides: crate::config::NiconicoOverrides,
     /// ツイキャス非公式経路の overrides スナップショット。
     twitcasting_overrides: twitcasting::TwitcastingOverrides,
+    twitcasting_started_movies: twitcasting::StartedMovies,
 }
 
 impl SourceManager {
@@ -146,12 +147,21 @@ impl SourceManager {
             x_auth,
             niconico_overrides,
             twitcasting_overrides,
+            twitcasting_started_movies: Default::default(),
         }
     }
 
     /// 配信開始/終了イベントの送り先を設定する(`TwitchSource::with_moderation_tx` と同じ形)。
     pub fn with_live_tx(mut self, live_tx: Option<mpsc::Sender<LiveEvent>>) -> Self {
         self.live_tx = live_tx;
+        self
+    }
+
+    pub(crate) fn with_twitcasting_started_movies(
+        mut self,
+        started_movies: twitcasting::StartedMovies,
+    ) -> Self {
+        self.twitcasting_started_movies = started_movies;
         self
     }
 
@@ -221,6 +231,7 @@ impl SourceManager {
                     self.twitcasting_overrides.clone(),
                     metadata_tx,
                 )
+                .with_started_movies(self.twitcasting_started_movies.clone())
                 .with_live_tx(self.live_tx.clone());
                 tauri::async_runtime::spawn(async move {
                     run_with_logging(&src, tx, child).await;
@@ -232,11 +243,13 @@ impl SourceManager {
     }
 }
 
-/// 配信開始/終了イベントを送る。満杯・切断でも待たず、warn を出して捨てる(Source を止めない)。
-pub(crate) fn send_live_event(tx: &mpsc::Sender<LiveEvent>, event: LiveEvent) {
+/// 配信開始/終了イベントを送る。満杯・切断では warn を出して false を返す。
+pub(crate) fn send_live_event(tx: &mpsc::Sender<LiveEvent>, event: LiveEvent) -> bool {
     if let Err(e) = tx.try_send(event) {
         tracing::warn!("LiveEvent を送れず破棄しました: {e}");
+        return false;
     }
+    true
 }
 
 /// Source を実行し、終了理由をログする小ヘルパ。
