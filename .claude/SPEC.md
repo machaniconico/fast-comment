@@ -20,6 +20,7 @@
 
 ### 1.3 ツイキャス認証 (`sources/twitcasting_auth.rs`、PR1)
 
+- コメント取得はこのログインを使わない非公式経路(§4.5)が既定。保存したトークンは PR3' の公式 API ポーリングと `twitcasting.mode`(`auto` 既定。ログイン済みなら非公式の連続読込失敗で公式へ切替)で使う。この版ではログインの有無で取得経路は変わらない。
 - 公式 API v2 の Implicit (`response_type=token`) のみ。ClientSecret は扱わない。公開 ClientID は `DEFAULT_CLIENT_ID` (未登録のため空文字) + 任意の上書き `credentials.twitcastingClientId`。空白だけの上書きは既定へ戻す。
 - ログイン中だけ `127.0.0.1:<port>` と `[::1]:<port>` を bind(`<port>` は `twitcasting.callbackPort`、既定 39822 = `CALLBACK_PORT`。WSL の mirrored モードが Windows 側の 44620〜48715 を確保して bind できないため範囲外にした)。IPv6 無効(アドレス使用不可)のみ IPv4 だけに劣化し、いずれかが使用中なら開始しない(`PortInUse`。エラー文で WSL の確保範囲と、ポートを変えて開発者ページのコールバック URL を登録し直す案内を出す)。コールバックは `http://localhost:<port>/twitcasting/callback`(status の `callbackUrl`)。180 秒・取消・次のログインで終了し、コマンドが返るまでにポートを解放する。
 - 固定 HTML は `history.replaceState` で URL のフラグメントとクエリを消す。ページとサーバーの両方でキーと値をパーセントデコードし、`+` はリテラルとして保持し、同じキーは最後の値を採用する。ページはフラグメントの `access_token` / `expires_in` / `state` の採用分だけを再エンコードせず同一オリジンへ POST する。拒否 (`result=denied` または OAuth の `error`) はクエリまたはフラグメントから固定の `result=denied` と、存在する場合だけ同じ場所の `state` を送る。POST は Host / Origin 検査後に state 省略または一致で拒否を確定し、不一致（空も含む）は待受を続ける。GET クエリの拒否は state が一致した時だけ確定する。state を省略した拒否の GET は待受を続け、ページのスクリプトが同一オリジンへ拒否を POST した時点で確定する。不一致の state を含む拒否の GET には中立の終了ページを返す。
@@ -404,7 +405,7 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
   - `channels[].ownStream`(bool 既定false): 「自分の配信」の印(X 自動告知の対象)。旧 config は欠落で false。
   - `xPost{enabled=false, mode="intent"|"api"="intent", intentOpen="button"|"auto"="button", combine=false, template, delaySecs=60, staleMinutes=15, cooldownMinutes=60, dailyLimit=5, callbackPort=47821}`: X 自動告知。`template` 既定は `{title}\n{url}\n{date} {time}`。全項目 serde default。`normalize_all()` で clamp(`delaySecs` 0..=600, `staleMinutes` 0..=180, `cooldownMinutes` 10..=1440, `dailyLimit` 1..=20、`mode` / `intentOpen` は不正値なら既定)。
   - `twitcasting{callbackPort=39822}`: ツイキャスのログイン待受ポート(§1.3)。serde default で旧 config.json も読める。`xPost.callbackPort` と同じく、設定画面と接続コマンドは 1024〜65535 の整数を受け付ける。設定ロードと `update_config` では 1024 未満を各サービスの既定値に戻す。設定画面のログイン(`connect_twitcasting`)が `credentials.twitcastingClientId` と一緒にこの値だけを保存し、待受と status の `callbackUrl` に使う。
-  - `twitcastingOverrides{endpoints?, patterns?}`: ツイキャス非公式経路(§4.5)の上書き。両方とも文字列→文字列のマップで、全項目が既定値(未指定・空文字・前後空白のみは既定を使用)。値が既定(両マップが空)なら JSON から省略し、旧 config.json も読める。チャンネルの Source を起動する時に読む。
+  - `twitcastingOverrides{endpoints?, patterns?}`: ツイキャス非公式経路(§4.5)の上書き。両方とも文字列→文字列のマップで、全項目が既定値(未指定・空文字・前後空白のみは既定を使用)。値が既定(両マップが空)なら JSON から省略し、旧 config.json も読める。チャンネルの Source を起動する時に読む。 保存は他の項目と同じく全体保存(`update_config` の `baseRevision` 照合)とインポートだけで、`commit_config` を通って revision を進める。Source が書き戻すことはない。
     - `endpoints`: `userPageBaseUrl`(既定 `https://twitcasting.tv/`、末尾に配信者 ID を連結)/ `eventPubsubUrl`(既定 `https://twitcasting.tv/eventpubsuburl.php`)/ `commentHistoryUrl`(既定 `https://twitcasting.tv/`、`<配信者 ID>/userajax.php` を連結)。
     - `patterns`(正規表現。キャプチャ 1 番目を使う): `movieId`(既定 `data-movie-id="(\d+)"`)/ `movieIdFallback`(既定 `var\s+movieid\s*=\s*"(\d+)"`、`movieId` で取れない時に試す)/ `isOnlive`(既定 `data-is-onlive="([^"]*)"`、`true` / `false` を ASCII の大文字小文字を区別せず判定し、未知値は Unreadable)。不正な正規表現は warn ログを出して既定へ戻す。
   - `credentials.twitcastingClientId`(任意): ツイキャス公開 ClientID の上書き。未設定は JSON から省略し、空欄なら既定値を使用する。トークンは資格情報一覧の `twitcasting-oauth-token` にのみ保存する(§1.3)。
