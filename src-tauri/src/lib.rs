@@ -31,7 +31,7 @@ mod templates;
 pub mod tts;
 mod update;
 
-use std::collections::{hash_map::Entry, HashMap};
+use std::collections::{hash_map::Entry, HashMap, VecDeque};
 use std::fs;
 use std::net::TcpStream;
 use std::path::PathBuf;
@@ -1089,35 +1089,37 @@ fn parse_oauth_attempt(attempt: &str) -> Result<Uuid, &'static str> {
     Uuid::parse_str(attempt).map_err(|_| "ログインの試行 ID が不正です")
 }
 
-enum OAuthAttempt {
-    CancelledBeforeBegin,
-    Running(CancellationToken),
+const MAX_OAUTH_CANCELLED_BEFORE_BEGIN: usize = 32;
+
+#[derive(Default)]
+struct OAuthAttempts {
+    running: HashMap<Uuid, CancellationToken>,
+    /// 試行が未登録だった時の取消を、受け付けた順に保持する。
+    cancelled_before_begin: VecDeque<Uuid>,
 }
 
 /// 1 サービスの OAuth ログインの開始順と、試行 ID ごとの取消を管理する。
 #[derive(Default)]
 struct OAuthLoginGate {
-    attempts: Mutex<HashMap<Uuid, OAuthAttempt>>,
+    attempts: Mutex<OAuthAttempts>,
     /// 設定の保存から認証側のセッション登録(ブラウザを開く直前)までを 1 件ずつ通す。
     order: tokio::sync::Mutex<()>,
 }
 
 impl OAuthLoginGate {
     fn is_active(&self) -> bool {
-        self.attempts
-            .lock()
-            .unwrap()
-            .values()
-            .any(|attempt| matches!(attempt, OAuthAttempt::Running(_)))
+        !self.attempts.lock().unwrap().running.is_empty()
     }
 
     fn cancel(&self, attempt: Uuid) {
         let mut attempts = self.attempts.lock().unwrap();
-        let state = attempts
-            .entry(attempt)
-            .or_insert(OAuthAttempt::CancelledBeforeBegin);
-        if let OAuthAttempt::Running(cancel) = state {
+        if let Some(cancel) = attempts.running.get(&attempt) {
             cancel.cancel();
+        } else if !attempts.cancelled_before_begin.contains(&attempt) {
+            if attempts.cancelled_before_begin.len() == MAX_OAUTH_CANCELLED_BEFORE_BEGIN {
+                attempts.cancelled_before_begin.pop_front();
+            }
+            attempts.cancelled_before_begin.push_back(attempt);
         }
     }
 
@@ -1125,14 +1127,14 @@ impl OAuthLoginGate {
         let cancel = CancellationToken::new();
         {
             let mut attempts = self.attempts.lock().unwrap();
-            match attempts.entry(attempt) {
-                Entry::Occupied(entry) => {
-                    if matches!(entry.get(), OAuthAttempt::CancelledBeforeBegin) {
-                        entry.remove();
-                    }
-                    return None;
-                }
-                Entry::Vacant(entry) => entry.insert(OAuthAttempt::Running(cancel.clone())),
+            let cancelled = &mut attempts.cancelled_before_begin;
+            if let Some(index) = cancelled.iter().position(|&id| id == attempt) {
+                cancelled.remove(index);
+                return None;
+            }
+            match attempts.running.entry(attempt) {
+                Entry::Occupied(_) => return None,
+                Entry::Vacant(entry) => entry.insert(cancel.clone()),
             };
         }
         let mut login = OAuthLogin {
@@ -1180,7 +1182,7 @@ impl OAuthLogin<'_> {
 
 impl Drop for OAuthLogin<'_> {
     fn drop(&mut self) {
-        self.gate.attempts.lock().unwrap().remove(&self.attempt);
+        self.gate.attempts.lock().unwrap().running.remove(&self.attempt);
     }
 }
 
@@ -1387,6 +1389,20 @@ fn stop_active_twitch_channels(state: &AppState) {
             token.cancel();
         }
     }
+}
+
+/// メイン画面の目標表示だけを最新の設定に反映する。
+#[tauri::command]
+async fn set_goals_show_in_app(state: State<'_, AppState>, show_in_app: bool) -> Result<(), String> {
+    let _write = state.config_write.lock().await;
+    let mut current = state.config.lock().unwrap();
+    let mut next = current.clone();
+    next.goals.show_in_app = show_in_app;
+    next.save(&state.config_dir)
+        .map_err(|_| "目標表示の設定を保存できませんでした".to_string())?;
+    *current = next.clone();
+    state.config_tx.send_replace(next);
+    Ok(())
 }
 
 /// チャンネルを1件追加して起動する。
@@ -3130,6 +3146,7 @@ pub fn run() {
             moderate_ban_user,
             moderate_unban_user,
             update_config,
+            set_goals_show_in_app,
             add_channel,
             remove_channel,
             hide_message,
@@ -3243,11 +3260,57 @@ mod followup_tests {
         let attempt = Uuid::new_v4();
         let begin = gate.begin(attempt);
         gate.cancel(attempt);
-        // その後に別の取消を受け付けても、まだ始まっていない試行の取消を失わない。
-        for _ in 0..32 {
+        // 合計 32 件までは、最初に受け付けた先行取消も残る。
+        for _ in 0..31 {
             gate.cancel(Uuid::new_v4());
         }
         assert!(begin.await.is_none());
+        assert!(!gate.is_active());
+    }
+
+    #[tokio::test]
+    async fn oauth_review_bounds_early_and_late_cancels_without_evicting_running() {
+        let gate = OAuthLoginGate::default();
+        let finished = Uuid::new_v4();
+        drop(gate.begin(finished).await.unwrap());
+        let running = Uuid::new_v4();
+        let mut login = gate.begin(running).await.unwrap();
+        login.open_browser(String::new(), |_| Ok(())).unwrap();
+
+        gate.cancel(finished);
+        let pending: Vec<_> = (0..32).map(|_| Uuid::new_v4()).collect();
+        for &attempt in &pending {
+            gate.cancel(attempt);
+            gate.cancel(attempt);
+        }
+
+        // 終了済み試行への遅い取消が最古なので、新しい 32 件を残して捨てる。
+        drop(gate.begin(finished).await.unwrap());
+        for attempt in pending {
+            assert!(gate.begin(attempt).await.is_none());
+        }
+        assert!(gate.is_active());
+        assert!(!login.cancelled());
+        gate.cancel(running);
+        assert!(login.cancelled());
+        drop(login);
+        assert!(!gate.is_active());
+    }
+
+    #[tokio::test]
+    async fn oauth_review_duplicate_begin_keeps_the_first_login() {
+        let gate = OAuthLoginGate::default();
+        let attempt = Uuid::new_v4();
+        let mut first = gate.begin(attempt).await.unwrap();
+        let duplicate = gate.begin(attempt);
+        tokio::pin!(duplicate);
+        assert!(matches!(futures_util::poll!(duplicate), std::task::Poll::Ready(None)));
+        assert!(gate.is_active());
+        assert!(!first.cancelled());
+        first.open_browser(String::new(), |_| Ok(())).unwrap();
+        gate.cancel(attempt);
+        assert!(first.cancelled());
+        drop(first);
         assert!(!gate.is_active());
     }
 

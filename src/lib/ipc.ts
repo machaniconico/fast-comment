@@ -624,6 +624,10 @@ export async function setConfig(config: AppConfig): Promise<UpdateConfigOutcome 
   return invoke<UpdateConfigOutcome>('update_config', { newConfig: config });
 }
 
+export async function setGoalsShowInApp(showInApp: boolean): Promise<void> {
+  await invoke<void>('set_goals_show_in_app', { showInApp });
+}
+
 export async function setTtsPaused(paused: boolean): Promise<void> {
   await invoke<void>('set_tts_paused', { paused });
 }

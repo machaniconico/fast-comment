@@ -41,7 +41,7 @@
   import type { MessageKind } from './lib/types';
   import {
     getConfig,
-    setConfig,
+    setGoalsShowInApp,
     getTtsQueueState,
     onTtsNotice,
     onTtsQueueState,
@@ -448,18 +448,9 @@
     goalsToggleError = '';
     const revision = configSync.importRevision;
     try {
-      const next = await getConfig();
-      if (configSync.importRevision !== revision || configSync.reloadRequired) return;
-      if (!next) throw new Error('設定を取得できませんでした');
-      next.goals.showInApp = checked;
-      const result = await setConfig(next);
-      if (configSync.importRevision !== revision) return;
-      if (result?.protectedOAuth.length) {
-        if (config) config.goals = next.goals;
-        const saved = await getConfig().catch(() => null);
-        if (saved && configSync.importRevision === revision) config = saved;
-      } else {
-        config = next;
+      await setGoalsShowInApp(checked);
+      if (config && configSync.importRevision === revision) {
+        config.goals.showInApp = checked;
       }
     } catch (e) {
       goalsToggleError = e instanceof Error ? e.message : String(e);

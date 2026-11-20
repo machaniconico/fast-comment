@@ -443,10 +443,16 @@
   // ログイン終了後に、接続コマンドが保存した Client ID・ポートを読み直す。
   // 読めなければ再読込を求める(フォームの値が保存側とずれたまま保存させない)。
   async function reloadOAuthConfig(service: OAuthService) {
+    if (destroyed) return;
     const revision = oauthConfigRevision[service];
-    const saved = await getConfig().catch(() => null);
+    let timeout: number | undefined;
+    const deadline = new Promise<null>(resolve => {
+      timeout = window.setTimeout(() => resolve(null), 10_000);
+    });
+    const saved = await Promise.race([getConfig().catch(() => null), deadline])
+      .finally(() => window.clearTimeout(timeout));
     // 読込中にインポートなどで設定を置き換えた場合は、その値を使う。
-    if (oauthConfigRevision[service] !== revision) return;
+    if (destroyed || oauthConfigRevision[service] !== revision) return;
     if (!saved) {
       configSync.reloadRequired = true;
       return;

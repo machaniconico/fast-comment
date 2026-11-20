@@ -250,6 +250,7 @@
   onDestroy(() => {
     if (timer) clearTimeout(timer);
     previewSeq++;
+    if (attempt) void cancelXPostLogin(attempt).catch(() => {});
   });
 
   function insertVariable(v: string) {

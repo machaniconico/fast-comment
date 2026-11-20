@@ -36,6 +36,8 @@ const mock = window.mock = {
   readsToFail: 0,
   heldReads: [],
   holdReads: false,
+  heldGoalsWrites: [],
+  holdGoalsWrites: false,
   login: {},
   cancels: [],
   callbacks: new Map(),
@@ -85,6 +87,12 @@ if (location.search === '?browser') {
           mock.saved = next;
           return { warnings: [], protectedOAuth };
         }
+        case 'set_goals_show_in_app':
+          if (mock.holdGoalsWrites) {
+            await new Promise(resolve => mock.heldGoalsWrites.push(resolve));
+          }
+          mock.saved.goals.showInApp = args.showInApp;
+          return null;
         case 'cancel_twitcasting_login':
         case 'cancel_x_post_login':
           mock.cancels.push({ command, attempt: args.attempt });

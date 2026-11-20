@@ -185,6 +185,29 @@ for (const service of services) {
     assert.equal(next[service.key].callbackPort, 40322);
   }));
 
+  test(service.name + ' times out an unanswered post-login read', async t => withSettings(t, async page => {
+    await start(page);
+    await accept(page);
+    await page.clock.install();
+    await page.evaluate(() => { window.mock.holdReads = true; });
+    await finish(page, { ...service.ready, clientId: 'new-client' });
+    await page.waitForFunction(() => window.mock.heldReads.length === 1);
+    assert.equal(await id(page).isDisabled(), true);
+
+    await page.clock.fastForward(10_000);
+    await page.getByText('設定を読み直してください', { exact: false }).first().waitFor();
+    assert.equal(await id(page).isEnabled(), true);
+    assert.equal(await port(page).isEnabled(), true);
+    assert.equal(await save(page).isDisabled(), true);
+    assert.equal(await page.evaluate(() => window.mock.heldReads.length), 1);
+
+    await page.evaluate(() => { window.mock.holdReads = false; });
+    await page.getByRole('button', { name: '設定を再読み込み', exact: true }).click();
+    const next = await saveSettings(page);
+    assert.equal(next.credentials[service.id], 'new-client');
+    assert.equal(next[service.key].callbackPort, 40321);
+  }));
+
   test(service.name + ' cancels the login attempt it started', async t => withSettings(t, async page => {
     await start(page);
     const attempt = await page.evaluate(key => window.mock.login[key].attempt, service.key);
@@ -211,6 +234,19 @@ for (const service of services) {
     assert.equal(await account.count(), 0);
   }));
 }
+
+test('X cancels its pending login when the settings tab closes', async t => withSettings(t, async page => {
+  await page.getByRole('tab', { name: '設定', exact: true }).click();
+  await page.locator('#xpost-client-id').fill('new-client');
+  await page.getByRole('button', { name: 'X に接続', exact: true }).click();
+  const attempt = await page.evaluate(() => window.mock.login.xPost.attempt);
+
+  await page.getByRole('tab', { name: 'コメント', exact: true }).click();
+  await page.waitForFunction(() => window.mock.cancels.length === 1);
+  assert.deepEqual(await page.evaluate(() => window.mock.cancels), [
+    { command: 'cancel_x_post_login', attempt },
+  ]);
+}, 'app'));
 
 test('ツイキャス treats a missing connect result as a failure', async t => withSettings(t, async page => {
   await page.locator('#twitcasting-client-id').fill('new-client');
@@ -261,4 +297,37 @@ test('the main window preserves OAuth settings when saving the goals toggle', as
   const config = await saved(page);
   assert.equal(config.credentials.twitcastingClientId, 'main-login');
   assert.equal(config.twitcasting.callbackPort, 43421);
+}, 'app'));
+
+test('the goals toggle preserves both OAuth settings committed before its save', async t => withSettings(t, async page => {
+  const toggle = page.getByRole('checkbox', { name: 'コメビュに表示' });
+  await toggle.waitFor();
+  await page.evaluate(() => {
+    window.mock.holdReads = true;
+    window.mock.holdGoalsWrites = true;
+  });
+  await toggle.click();
+  // Pause the old path after it snapshots A, or the field-specific path before it writes.
+  await page.waitForFunction(() => window.mock.heldReads.length + window.mock.heldGoalsWrites.length === 1);
+  await page.evaluate(async ({ services }) => {
+    for (const [key, command] of services) {
+      const login = window.__TAURI_INTERNALS__.invoke(command, {
+        attempt: crypto.randomUUID(), clientId: 'new-' + key, callbackPort: 43421,
+      });
+      window.mock.login[key].accept();
+      window.mock.login[key].finish(null);
+      await login;
+    }
+    window.mock.holdReads = false;
+    window.mock.holdGoalsWrites = false;
+    (window.mock.heldReads.shift() ?? window.mock.heldGoalsWrites.shift())();
+  }, { services: [['xPost', 'connect_x_post'], ['twitcasting', 'connect_twitcasting']] });
+
+  await page.waitForFunction(() => window.mock.saved.goals.showInApp === true);
+  assert.equal(await toggle.isChecked(), true);
+  const config = await saved(page);
+  for (const { key, id } of services) {
+    assert.equal(config.credentials[id], 'new-' + key);
+    assert.equal(config[key].callbackPort, 43421);
+  }
 }, 'app'));
