@@ -250,6 +250,8 @@ struct Movie {
     broadcaster_id: Option<String>,
     cursor: CommentCursor,
     mid_stream: bool,
+    // 非公式経路の枠を引き継いだが、公式 API ではまだ確認していない。
+    handed_off: bool,
     protected: bool,
     last_poll: Option<Instant>,
 }
@@ -261,6 +263,7 @@ impl Movie {
             broadcaster_id: None,
             cursor: CommentCursor::new(),
             mid_stream,
+            handed_off: false,
             protected: false,
             last_poll: None,
         }
@@ -348,7 +351,10 @@ impl<S: SecretStore> TwitcastingOfficialSource<S> {
         let mut auth = self.auth_state.clone();
         let mut user_id = None;
         let mut live = LiveState {
-            movie: self.initial_movie.clone().map(|id| Movie::new(id, true)),
+            movie: self.initial_movie.clone().map(|id| Movie {
+                handed_off: true,
+                ..Movie::new(id, true)
+            }),
             ..LiveState::default()
         };
         let mut carry_over = Some(&self.carry_over_ids);
@@ -527,12 +533,18 @@ impl<S: SecretStore> TwitcastingOfficialSource<S> {
 
         let new_movie = live.movie.as_ref().is_none_or(|movie| movie.id != movie_id);
         if new_movie {
+            let handed_off = live.movie.as_ref().is_some_and(|movie| movie.handed_off);
+            if handed_off {
+                self.send_live_ended();
+            }
             let recently_offline = live.observed_offline_at.take().is_some_and(|offline_at| {
                 offline_at.elapsed() <= self.tuning.offline.saturating_mul(2)
             });
-            live.movie = Some(Movie::new(movie_id, !recently_offline && live.movie.is_none()));
+            let mid_stream = !recently_offline && (live.movie.is_none() || handed_off);
+            live.movie = Some(Movie::new(movie_id, mid_stream));
         }
         let movie = live.movie.as_mut().expect("live snapshot has a movie");
+        movie.handed_off = false;
         movie.broadcaster_id = id_string(&snapshot["broadcaster"]["id"]);
         if !movie.protected {
             live.guard.get_or_insert_with(|| self.api.live_guard());
@@ -707,6 +719,11 @@ impl<S: SecretStore> Source for TwitcastingOfficialSource<S> {
 mod tests {
     use super::*;
     use crate::{
+        autopost::{
+            coordinator::{Action, AutopostSettings, Coordinator, Input},
+            ledger::Ledger,
+        },
+        config::{ChannelConfig, ChannelPlatform, XPostConfig},
         integrations::MemorySecretStore,
         sources::twitcasting_auth::{AuthOptions, TwitcastingAuth, TOKEN_KEY},
         TwitcastingEndpoints,
@@ -753,6 +770,15 @@ mod tests {
     }
 
     async fn start_source(router: Router, tuning: PollTuning, state: AuthState) -> RunningSource {
+        start_source_with_initial_movie(router, tuning, state, None).await
+    }
+
+    async fn start_source_with_initial_movie(
+        router: Router,
+        tuning: PollTuning,
+        state: AuthState,
+        initial_movie: Option<&str>,
+    ) -> RunningSource {
         let user_calls = Arc::new(AtomicUsize::new(0));
         let router = router.route(
             "/users/Alice",
@@ -810,7 +836,11 @@ mod tests {
             Some(metadata_tx),
             tuning,
         )
-        .with_live_tx(Some(live_tx));
+        .with_live_tx(Some(live_tx))
+        .with_initial_movie(initial_movie.map(str::to_owned))
+        .with_started_movies(Arc::new(std::sync::Mutex::new(
+            initial_movie.into_iter().map(str::to_owned).collect(),
+        )));
         let source = tokio::spawn(async move { official.poll(tx).await });
         RunningSource {
             api,
@@ -835,7 +865,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn first_offline_observation_precedes_started_for_normalized_channel() {
+    async fn first_offline_observation_allows_announcement_with_stale_minutes_zero() {
+        const CREATED: u64 = 1_800_000_000;
+        const START_MS: u64 = CREATED * 1000;
         let checks = Arc::new(AtomicUsize::new(0));
         let router = Router::new().route(
             "/users/1/current_live",
@@ -845,7 +877,10 @@ mod tests {
                     if check < 2 {
                         (StatusCode::NOT_FOUND, Json(Value::Null))
                     } else {
-                        (StatusCode::OK, Json(json!({ "movie": { "id": "42" } })))
+                        (
+                            StatusCode::OK,
+                            Json(json!({ "movie": { "id": "42", "created": CREATED } })),
+                        )
                     }
                 }
             }),
@@ -868,9 +903,123 @@ mod tests {
             LiveEvent::Started(stream)
                 if stream.stream_id == "42"
                     && stream.channel_identifier == "alice"
-                    && stream.started_at_ms.is_none()
+                    && stream.started_at_ms == Some(START_MS)
         ));
         assert!(!format!("{ended:?} {started:?}").contains("MARKER"));
+
+        let settings = AutopostSettings {
+            x_post: XPostConfig {
+                enabled: true,
+                intent_open: "auto".into(),
+                stale_minutes: 0,
+                delay_secs: 0,
+                ..Default::default()
+            },
+            channels: vec![ChannelConfig {
+                platform: ChannelPlatform::Twitcasting,
+                identifier: "https://twitcasting.tv/Alice#access_token=MARKER".into(),
+                enabled: true,
+                own_stream: true,
+            }],
+            connected: false,
+        };
+        let mut coordinator = Coordinator::new(Ledger::default(), settings);
+        coordinator.handle(Input::Live(ended), START_MS - 1000);
+        let actions = coordinator.handle(Input::Live(started), START_MS + 1000);
+        assert!(actions
+            .iter()
+            .any(|action| matches!(action, Action::OpenIntent { .. })));
+        assert!(!format!("{actions:?}").contains("MARKER"));
+    }
+
+    fn handoff_router(movie_id: &'static str) -> Router {
+        Router::new()
+            .route(
+                "/users/1/current_live",
+                get(move || async move { Json(json!({ "movie": { "id": movie_id } })) }),
+            )
+            .route(
+                &format!("/movies/{movie_id}/comments"),
+                get(
+                    |axum::extract::Query(params): axum::extract::Query<
+                        std::collections::HashMap<String, String>,
+                    >| async move {
+                        let ids = match (
+                            params.get("slice_id").map(String::as_str),
+                            params.get("offset").map(String::as_str),
+                        ) {
+                            (None, Some("0")) => (1..=50).rev().collect::<Vec<_>>(),
+                            (Some("50"), Some("0")) => vec![51],
+                            _ => Vec::new(),
+                        };
+                        let comments: Vec<_> = ids
+                            .into_iter()
+                            .map(|id| json!({ "id": id, "message": "chat", "from_user": { "id": "1" } }))
+                            .collect();
+                        Json(json!({ "comments": comments }))
+                    },
+                ),
+            )
+    }
+
+    async fn assert_handoff_comments(messages: &mut broadcast::Receiver<ChatMessage>) {
+        for id in 31..=50 {
+            let message = messages.recv().await.unwrap();
+            assert_eq!(message.id, format!("tc-{id}"));
+            assert!(message.skip_tts);
+        }
+        let next = messages.recv().await.unwrap();
+        assert_eq!(next.id, "tc-51");
+        assert!(!next.skip_tts);
+    }
+
+    #[tokio::test]
+    async fn handoff_to_different_movie_ends_old_movie_and_silences_history() {
+        let mut source = start_source_with_initial_movie(
+            handoff_router("43"),
+            test_tuning(),
+            AuthState::Ready,
+            Some("42"),
+        )
+        .await;
+        timeout(Duration::from_secs(5), async {
+            assert!(matches!(
+                source.live_events.recv().await,
+                Some(LiveEvent::Ended { channel_identifier, .. }) if channel_identifier == "alice"
+            ));
+            assert!(matches!(
+                source.live_events.recv().await,
+                Some(LiveEvent::Started(stream))
+                    if stream.stream_id == "43" && stream.channel_identifier == "alice"
+            ));
+            assert_handoff_comments(&mut source.messages).await;
+            assert!(matches!(
+                source.live_events.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn handoff_to_same_movie_keeps_polling_without_duplicate_live_events() {
+        let mut source = start_source_with_initial_movie(
+            handoff_router("42"),
+            test_tuning(),
+            AuthState::Ready,
+            Some("42"),
+        )
+        .await;
+        timeout(Duration::from_secs(5), async {
+            assert_handoff_comments(&mut source.messages).await;
+            assert!(matches!(
+                source.live_events.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

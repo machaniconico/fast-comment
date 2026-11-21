@@ -943,16 +943,15 @@ impl TwitcastingSource {
     }
 
     pub(crate) fn take_live_movie(&self) -> Option<String> {
-        self.live_movie.lock().unwrap().take()
+        self.live_movie
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
     }
 
     fn send_live_started(&self, screen_id: &str, movie_id: &str) {
-        {
-            let mut live_movie = self.live_movie.lock().unwrap();
-            if live_movie.as_deref() != Some(movie_id) {
-                *live_movie = Some(movie_id.to_string());
-            }
-        }
+        *self.live_movie.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(movie_id.to_string());
         let Some(tx) = &self.live_tx else { return };
         // 複数の Source が同じ配信を検知しても、照合から記録までを直列化する。
         let mut started = self
