@@ -1340,7 +1340,6 @@ async fn update_config(
         },
     );
     new_config.normalize_all();
-    drop_duplicate_channels(&mut new_config);
     validate_x_post_mode(&state, &new_config).await?;
     let (
         revision,
@@ -1636,12 +1635,6 @@ fn duplicate_key(ch: &ChannelConfig) -> String {
         }
     }
     AppState::channel_key(ch)
-}
-
-/// 設定の全体保存で入った重複行を、先頭を残して落とす。
-fn drop_duplicate_channels(config: &mut AppConfig) {
-    let mut seen = std::collections::HashSet::new();
-    config.channels.retain(|c| seen.insert(duplicate_key(c)));
 }
 
 /// チャンネルを1件削除して停止する。`key` は `twitch:name` / `youtube:videoId`。
@@ -3814,14 +3807,6 @@ mod followup_tests {
         let mut twitch = tc("alice");
         twitch.platform = config::ChannelPlatform::Twitch;
         assert_eq!(ensure_new_channel(&cfg, &twitch), Ok(()));
-
-        // 全体保存でも先頭を残して落とす。
-        let mut saved = AppConfig::default();
-        saved.channels = vec![tc("alice"), tc("bob"), tc("https://twitcasting.tv/ALICE"), twitch.clone()];
-        drop_duplicate_channels(&mut saved);
-        let ids: Vec<_> = saved.channels.iter().map(|c| c.identifier.as_str()).collect();
-        assert_eq!(ids, ["alice", "bob", "alice"]);
-        assert_eq!(saved.channels[2].platform, config::ChannelPlatform::Twitch);
     }
 
     #[test]
