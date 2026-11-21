@@ -8,6 +8,7 @@ pub mod niconico;
 pub mod twitcasting;
 pub mod twitcasting_api;
 pub mod twitcasting_auth;
+pub mod twitcasting_official;
 pub mod twitch;
 pub mod twitch_auth;
 pub mod twitch_helix;

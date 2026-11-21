@@ -108,7 +108,7 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
 pub fn capture_logs() -> (LogBuf, tracing::subscriber::DefaultGuard) {
     let buf = LogBuf::default();
     let subscriber = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::new("fast_comment_lib=trace"))
+        .with_env_filter(tracing_subscriber::EnvFilter::new("info,fast_comment_lib=trace"))
         .with_ansi(false)
         .with_writer(buf.clone())
         .finish();
