@@ -103,7 +103,8 @@
       return `https://live.nicovideo.jp/watch/${encodeURIComponent(ch.identifier)}`;
     }
     if (ch.platform === 'twitcasting') {
-      return `https://twitcasting.tv/${encodeURIComponent(ch.identifier)}`;
+      const id = extractTwitcastingScreenId(ch.identifier);
+      return id ? `https://twitcasting.tv/${encodeURIComponent(id)}` : null;
     }
     const id = ch.identifier;
     if (id.startsWith('@')) {
