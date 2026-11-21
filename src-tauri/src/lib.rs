@@ -11,6 +11,7 @@
 //!
 //! Tauri コマンドで設定取得/更新・チャンネル追加削除・コメント非表示・OBS URL 取得を公開。
 
+pub mod achievements;
 pub mod api;
 pub mod inject;
 pub mod integrations;
