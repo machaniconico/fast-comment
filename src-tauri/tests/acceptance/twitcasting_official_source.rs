@@ -857,24 +857,34 @@ async fn secrets_never_reach_logs_metadata_or_messages() {
 
 // ---------------------------------------------------------------- 空白後の追い上げ(§8)
 
-#[tokio::test]
-async fn resume_after_relogin_backlog_is_not_read_aloud() {
+/// 再ログインをまたいで 2..120 が溜まるサーバ。`created_of` と `date` で各応答の時刻を決める。
+/// 戻り値: 実行中の Source と受け皿(1 件目の後に 401 → 再ログイン → 2..120 が見える)。
+async fn relogin_backlog_run(
+    created_of: impl Fn(u64) -> u64 + Send + Sync + 'static,
+    date: Option<&'static str>,
+) -> (Running, Chan, Rig) {
     let (r, script, chan) = start_logged_in().await;
     live_switch(&script, true);
     // 0 = 1 件だけ / 1 = 401 / 2 = 2..120 が溜まった
     let mode = Arc::new(AtomicUsize::new(0));
+    let created_of = Arc::new(created_of);
     {
         let mode = mode.clone();
+        let dated = move |rep: Reply| match date {
+            Some(d) => rep.header("Date", d),
+            None => rep,
+        };
+        let c = created_of.clone();
         script.on_comments(move |req: &Req| match (req.slice_id().as_deref(), req.offset()) {
-            (None, 0) => comments_reply(&[1]),
+            (None, 0) => dated(page_reply_created(1, 1, |i| c(i))),
             (Some("1"), 0) => match mode.load(Ordering::SeqCst) {
                 1 => error_reply(401, 1000),
-                2 => page_reply(50, 2),
-                _ => empty_reply(),
+                2 => dated(page_reply_created(120, 71, |i| c(i))),
+                _ => dated(empty_reply()),
             },
-            (Some("1"), 50) if mode.load(Ordering::SeqCst) == 2 => page_reply(100, 51),
-            (Some("1"), 100) if mode.load(Ordering::SeqCst) == 2 => page_reply(120, 101),
-            _ => empty_reply(),
+            (Some("1"), 50) if mode.load(Ordering::SeqCst) == 2 => dated(page_reply_created(70, 21, |i| c(i))),
+            (Some("1"), 100) if mode.load(Ordering::SeqCst) == 2 => dated(page_reply_created(20, 2, |i| c(i))),
+            _ => dated(empty_reply()),
         });
     }
     let run = chan.run(official_source(&r, "alice", &chan, tuning()));
@@ -885,26 +895,67 @@ async fn resume_after_relogin_backlog_is_not_read_aloud() {
     login(&r.auth, r.port, TOK_B).await;
     wait_until("119 件", T15, || chan.msgs().len() >= 120).await;
     settle(100).await;
+    (run, chan, r)
+}
+
+#[tokio::test]
+async fn resume_after_relogin_backlog_is_not_read_aloud() {
+    // 2..110 は Date より 1 時間前(古い)、111..120 は 10 秒前(新しい)
+    let d = FIXED_DATE_EPOCH_S;
+    let (run, chan, _r) = relogin_backlog_run(move |i| if i <= 110 { d - 3600 + i } else { d - 10 }, Some(FIXED_DATE)).await;
     let msgs = chan.msgs();
     assert_eq!(ids_of(&msgs), tc_ids(1, 120));
-    assert!(msgs.iter().skip(1).all(|m| m.skip_tts), "空白後の追い上げは全件 skip_tts=true");
+    for m in msgs.iter().skip(1) {
+        let n: u64 = m.id.trim_start_matches("tc-").parse().unwrap();
+        assert_eq!(m.skip_tts, n <= 110, "{}: 60 秒より古いものだけ skip_tts=true のはず", m.id);
+    }
     run.stop().await;
 }
 
 #[tokio::test]
-async fn new_movie_after_logout_gap_is_mid_stream() {
+async fn fresh_comments_are_read_even_after_gap() {
+    // 空白(401 → 再ログイン)の後でも、60 秒以内のコメントは読み上げる
+    let d = FIXED_DATE_EPOCH_S;
+    let (run, chan, _r) = relogin_backlog_run(move |_| d - 10, Some(FIXED_DATE)).await;
+    let msgs = chan.msgs();
+    assert_eq!(ids_of(&msgs), tc_ids(1, 120));
+    assert!(msgs.iter().skip(1).all(|m| !m.skip_tts), "新しいコメントが skip_tts になった");
+    run.stop().await;
+}
+
+#[tokio::test]
+async fn missing_date_header_falls_back_to_local_now() {
+    // 読めない Date は PC の現在時刻と比べる(hyper は Date を自動で付けるので、読めない値で代用する)
+    let now = epoch_s();
+    let (run, chan, _r) =
+        relogin_backlog_run(move |i| if i <= 110 { now - 3600 } else { now }, Some("not a date")).await;
+    let msgs = chan.msgs();
+    assert_eq!(ids_of(&msgs), tc_ids(1, 120));
+    for m in msgs.iter().skip(1) {
+        let n: u64 = m.id.trim_start_matches("tc-").parse().unwrap();
+        assert_eq!(m.skip_tts, n <= 110, "{}", m.id);
+    }
+    run.stop().await;
+}
+
+#[tokio::test]
+async fn new_movie_after_logout_gap_uses_age_rule() {
     let (r, script, chan) = start_logged_in().await;
     let movie = Arc::new(Mutex::new("9".to_string()));
     {
         let movie = movie.clone();
         script.on_live(move |_: &Req| live_reply(&movie.lock().unwrap(), "t", 1));
     }
-    script.on_comments(|req: &Req| {
+    let d = FIXED_DATE_EPOCH_S;
+    script.on_comments(move |req: &Req| {
         let fresh = req.slice_id().is_none() && req.offset() == 0;
         match (req.movie_id().as_str(), fresh) {
-            ("9", true) => comments_reply(&[1]),
-            ("10", true) => page_reply(150, 101),
-            _ => empty_reply(),
+            ("9", true) => page_reply_created(1, 1, move |_| d - 10).header("Date", FIXED_DATE),
+            // 101..140 は Date の 1 時間前(40 件)、141..150 は 10 秒前(10 件)
+            ("10", true) => {
+                page_reply_created(150, 101, move |i| if i <= 140 { d - 3600 } else { d - 10 }).header("Date", FIXED_DATE)
+            }
+            _ => empty_reply().header("Date", FIXED_DATE),
         }
     });
     let run = chan.run(official_source(&r, "alice", &chan, tuning()));
@@ -914,11 +965,14 @@ async fn new_movie_after_logout_gap_is_mid_stream() {
     wait_until("ログイン案内", T5, || chan.has_notice(LOGIN_REQUIRED_NOTICE)).await;
     *movie.lock().unwrap() = "10".to_string();
     login(&r.auth, r.port, TOK_B).await;
-    wait_until("movie 10 の 20 件", T5, || chan.msgs().len() >= 21).await;
+    wait_until("movie 10 の 50 件", T5, || chan.msgs().len() >= 51).await;
     settle(200).await;
     let msgs = chan.msgs();
     let rest: Vec<_> = msgs.iter().skip(1).cloned().collect();
-    assert_eq!(ids_of(&rest), tc_ids(131, 150), "新しい 20 件だけ");
-    assert!(rest.iter().all(|m| m.skip_tts), "途中参加は skip_tts=true");
+    assert_eq!(ids_of(&rest), tc_ids(101, 150), "50 件すべてを古い順に表示する");
+    for m in &rest {
+        let n: u64 = m.id.trim_start_matches("tc-").parse().unwrap();
+        assert_eq!(m.skip_tts, n <= 140, "{}: 読み上げは 60 秒の古さ規則だけで決まる", m.id);
+    }
     run.stop().await;
 }
