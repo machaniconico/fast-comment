@@ -450,6 +450,11 @@ fn apply_metadata_update(
     if has_channel_metadata {
         merge_metadata_update(metadata, update);
         retain_enabled_metadata(metadata, config);
+    } else if update.notice.as_deref().is_some_and(|n| n.trim().is_empty()) {
+        // notice だけの明示的な消去。視聴者数などは触らず notice だけ消す。
+        if let Some(entry) = metadata.get_mut(&metadata_key(update.platform, &update.channel)) {
+            entry.notice = None;
+        }
     }
 }
 
@@ -1102,6 +1107,31 @@ mod tests {
         assert_eq!(metadata[&key].notice, None);
         merge_metadata_update(&mut metadata, upd(""));
         assert_eq!(metadata[&key].notice, None);
+    }
+
+    #[test]
+    fn notice_only_blank_update_clears_through_apply_metadata_update() {
+        let mut metadata = HashMap::new();
+        let mut reactions = 0;
+        let config = AppConfig {
+            channels: vec![
+                serde_json::from_value(serde_json::json!({"platform": "x", "identifier": "@a"})).unwrap(),
+            ],
+            ..AppConfig::default()
+        };
+        let upd = |live, notice: &str| YoutubeMetadataUpdate {
+            platform: Platform::X,
+            channel: "@a".to_string(),
+            live,
+            notice: Some(notice.to_string()),
+            ..YoutubeMetadataUpdate::default()
+        };
+        let key = metadata_key(Platform::X, "@a");
+        apply_metadata_update(&mut metadata, &mut reactions, upd(Some(false), "待機"), &config);
+        assert_eq!(metadata[&key].notice.as_deref(), Some("待機"));
+        apply_metadata_update(&mut metadata, &mut reactions, upd(None, " "), &config);
+        assert_eq!(metadata[&key].notice, None);
+        assert_eq!(metadata[&key].live, Some(false));
     }
 
     #[test]
