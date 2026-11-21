@@ -2,10 +2,13 @@ import type { ChannelConfig, ChannelOverrides, ChannelTtsVoice, ChannelsCommit, 
 
 export type TtsBackend = 'bouyomi' | 'voicevox' | 'webSpeech' | 'none';
 
-/** ダイアログの状態。`voice` は選択肢の value で、空文字は「全体に従う」。 */
+/**
+ * ダイアログの状態。`voice` は選択肢の value(棒読みちゃんは数値入力なので number か、消すと null)。
+ * 空文字・null・undefined は「全体に従う」。
+ */
 export interface OverridesForm {
   ttsDisabled: boolean;
-  voice: string;
+  voice: string | number | null | undefined;
 }
 
 export interface VoiceOption {
@@ -49,10 +52,11 @@ export function fromFormState(
   if (backend === 'voicevox') delete voice.voicevoxSpeaker;
   else if (backend === 'bouyomi') delete voice.bouyomiVoice;
   else if (backend === 'webSpeech') delete voice.webSpeechVoice;
-  if (form.voice !== '') {
-    if (backend === 'webSpeech') voice.webSpeechVoice = form.voice;
+  const raw = form.voice === null || form.voice === undefined ? '' : String(form.voice);
+  if (raw.trim() !== '') {
+    if (backend === 'webSpeech') voice.webSpeechVoice = raw;
     else {
-      const n = Number(form.voice);
+      const n = Number(raw);
       if (Number.isInteger(n)) {
         if (backend === 'voicevox') voice.voicevoxSpeaker = n;
         else if (backend === 'bouyomi') voice.bouyomiVoice = n;
@@ -61,6 +65,14 @@ export function fromFormState(
   }
   if (Object.keys(voice).length > 0) out.ttsVoice = voice;
   return out;
+}
+
+/**
+ * Stale で読み直した後の入力。利用者の未保存の選択を新しい基準の上に載せ直す(もう一度保存すれば
+ * それが新しい revision に対して保存される)。backend が変わった時は声の意味が変わるので声だけ基準に戻す。
+ */
+export function reapplyPendingForm(base: OverridesForm, pending: OverridesForm, backendChanged: boolean): OverridesForm {
+  return { ttsDisabled: pending.ttsDisabled, voice: backendChanged ? base.voice : pending.voice };
 }
 
 /** 棒読みちゃんは番号入力(空 = 全体に従う、0 = 棒読みちゃん既定)なので選択肢は先頭だけ。範囲は Rust が検証する。 */

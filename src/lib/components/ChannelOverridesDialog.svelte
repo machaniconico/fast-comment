@@ -4,6 +4,7 @@
   import { configChangedError, getConfigSnapshot, probeTtsEngine, setChannelOverrides } from '../ipc';
   import {
     fromFormState,
+    reapplyPendingForm,
     toFormState,
     voiceOptions,
     type OverridesForm,
@@ -39,10 +40,12 @@
 
   const options = $derived(voiceOptions(backend, { speakers, webVoices, saved: savedVoice }));
 
-  // 開いた時(と Stale 後)の revision を基準にする。値は画面の入力で上書きし直す。
-  async function load() {
+  // 開いた時(と Stale 後)の revision を基準にする。Stale 後は `pending`(利用者の未保存の入力)を
+  // 読み直した基準の上に載せ直すので、もう一度「保存」すれば選んだ値が新しい revision へ保存される。
+  async function load(pending?: OverridesForm) {
     const snap = await getConfigSnapshot();
     if (!snap) return;
+    const prevBackend = backend;
     revision = snap.revision;
     backend = snap.config.tts.backend;
     loaded = snap.config.channels.find((c) => `${c.platform}:${c.identifier}` === key) ?? null;
@@ -51,8 +54,9 @@
       error = '';
       return;
     }
-    form = toFormState(current.overrides, backend);
-    savedVoice = form.voice;
+    const base = toFormState(current.overrides, backend);
+    form = pending ? reapplyPendingForm(base, pending, prevBackend !== backend) : base;
+    savedVoice = form.voice === null || form.voice === undefined ? '' : String(form.voice);
     const o = snap.config.tts.options;
     if (backend === 'voicevox') {
       speakersFailed = false;
@@ -92,7 +96,7 @@
       const msg = e instanceof Error ? e.message : String(e);
       if (msg.includes(configChangedError)) {
         error = configChangedError;
-        await load();
+        await load({ ...form });
       } else {
         error = `保存に失敗しました: ${msg}`;
       }
