@@ -28,13 +28,16 @@
   let backend: TtsBackend = $state('none');
   let loaded: ChannelConfig | null = $state(null);
   const current = $derived(loaded ?? channel);
+  let missing = $state(false);
+  let speakersFailed = $state(false);
+  let savedVoice = $state('');
   let form: OverridesForm = $state({ ttsDisabled: false, voice: '' });
   let speakers: TtsEngineSpeaker[] = $state([]);
   let webVoices: string[] = $state([]);
   let error = $state('');
   let saving = $state(false);
 
-  const options = $derived(voiceOptions(backend, { speakers, webVoices }));
+  const options = $derived(voiceOptions(backend, { speakers, webVoices, saved: savedVoice }));
 
   // 開いた時(と Stale 後)の revision を基準にする。値は画面の入力で上書きし直す。
   async function load() {
@@ -42,26 +45,43 @@
     if (!snap) return;
     revision = snap.revision;
     backend = snap.config.tts.backend;
-    loaded = snap.config.channels.find((c) => `${c.platform}:${c.identifier}` === key) ?? channel;
+    loaded = snap.config.channels.find((c) => `${c.platform}:${c.identifier}` === key) ?? null;
+    missing = loaded === null;
+    if (missing) {
+      error = '';
+      return;
+    }
     form = toFormState(current.overrides, backend);
+    savedVoice = form.voice;
     const o = snap.config.tts.options;
     if (backend === 'voicevox') {
+      speakersFailed = false;
       try {
         speakers = (await probeTtsEngine(o.voicevoxEngine ?? 'voicevox', o.voicevoxUrl ?? '')).speakers;
       } catch {
         speakers = [];
+        speakersFailed = true;
       }
-    } else if (backend === 'webSpeech' && typeof window !== 'undefined' && 'speechSynthesis' in window) {
+    } else if (backend === 'webSpeech') {
+      refreshWebVoices();
+    }
+  }
+
+  function refreshWebVoices() {
+    if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
       webVoices = window.speechSynthesis.getVoices().map((v) => v.name);
     }
   }
 
   onMount(() => {
     void load();
+    const synth = typeof window !== 'undefined' && 'speechSynthesis' in window ? window.speechSynthesis : null;
+    synth?.addEventListener('voiceschanged', refreshWebVoices);
+    return () => synth?.removeEventListener('voiceschanged', refreshWebVoices);
   });
 
   async function save() {
-    if (revision === null || saving) return;
+    if (revision === null || saving || missing) return;
     saving = true;
     error = '';
     try {
@@ -104,10 +124,15 @@
     <h2 class="ov-title">この枠の設定</h2>
     <p class="ov-sub">{label}</p>
 
+    {#if missing}
+      <p class="ov-error" role="alert">この枠は削除または置き換えられました</p>
+    {/if}
+
     <label class="ov-row">
       <span>読み上げ</span>
       <select
         aria-label="読み上げ"
+        disabled={missing}
         value={form.ttsDisabled ? 'off' : 'follow'}
         onchange={(e) => (form.ttsDisabled = e.currentTarget.value === 'off')}
       >
@@ -118,18 +143,33 @@
 
     <label class="ov-row">
       <span>声</span>
-      <select aria-label="声" bind:value={form.voice} disabled={backend === 'none' || form.ttsDisabled}>
-        {#each options as o (o.value)}
-          <option value={o.value}>{o.label}</option>
-        {/each}
-      </select>
+      {#if backend === 'bouyomi'}
+        <input
+          type="number"
+          step="1"
+          aria-label="声"
+          placeholder="全体に従う"
+          title="空欄は全体に従う、0 は棒読みちゃん既定"
+          bind:value={form.voice}
+          disabled={missing || form.ttsDisabled}
+        />
+      {:else}
+        <select aria-label="声" bind:value={form.voice} disabled={missing || backend === 'none' || form.ttsDisabled}>
+          {#each options as o (o.value)}
+            <option value={o.value}>{o.label}</option>
+          {/each}
+        </select>
+      {/if}
     </label>
+    {#if backend === 'voicevox' && speakersFailed}
+      <p class="ov-error">話者一覧を取得できませんでした</p>
+    {/if}
 
     {#if error}<p class="ov-error" role="alert">{error}</p>{/if}
 
     <div class="ov-actions">
       <button type="button" class="ov-btn" onclick={onclose}>キャンセル</button>
-      <button type="button" class="ov-btn primary" disabled={revision === null || saving} onclick={save}>保存</button>
+      <button type="button" class="ov-btn primary" disabled={revision === null || saving || missing} onclick={save}>保存</button>
     </div>
   </div>
 </div>
@@ -156,7 +196,7 @@
   .ov-title { margin: 0 0 4px; font-size: 14px; }
   .ov-sub { margin: 0 0 12px; font-size: 12px; color: #999; overflow-wrap: anywhere; }
   .ov-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; font-size: 13px; }
-  .ov-row select {
+  .ov-row select, .ov-row input {
     flex: 1;
     max-width: 220px;
     background: rgba(255,255,255,0.07);

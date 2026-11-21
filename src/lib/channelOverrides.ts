@@ -16,10 +16,11 @@ export interface VoiceOption {
 export interface VoiceSources {
   speakers?: TtsEngineSpeaker[];
   webVoices?: string[];
+  /** 保存済みの声の value。一覧に無くても選択肢に残す。 */
+  saved?: string;
 }
 
 export const FOLLOW_GLOBAL_LABEL = '全体に従う';
-export const BOUYOMI_VOICE_COUNT = 8;
 
 function voiceValue(voice: ChannelTtsVoice | undefined, backend: TtsBackend): string {
   if (!voice) return '';
@@ -62,14 +63,21 @@ export function fromFormState(
   return out;
 }
 
+/** 棒読みちゃんは番号入力(空 = 全体に従う、0 = 棒読みちゃん既定)なので選択肢は先頭だけ。範囲は Rust が検証する。 */
 export function voiceOptions(backend: TtsBackend, sources: VoiceSources = {}): VoiceOption[] {
   const options: VoiceOption[] = [{ value: '', label: FOLLOW_GLOBAL_LABEL }];
+  const seen = new Set<string>(['']);
+  const add = (value: string, label: string) => {
+    if (seen.has(value)) return;
+    seen.add(value);
+    options.push({ value, label });
+  };
   if (backend === 'voicevox') {
-    for (const s of sources.speakers ?? []) options.push({ value: String(s.id), label: `${s.name}(${s.style})` });
-  } else if (backend === 'bouyomi') {
-    for (let n = 1; n <= BOUYOMI_VOICE_COUNT; n++) options.push({ value: String(n), label: `声 ${n}` });
+    for (const s of sources.speakers ?? []) add(String(s.id), `${s.name}(${s.style})`);
+    if (sources.saved) add(sources.saved, `話者 ${sources.saved}`);
   } else if (backend === 'webSpeech') {
-    for (const name of sources.webVoices ?? []) options.push({ value: name, label: name });
+    for (const name of sources.webVoices ?? []) add(name, name);
+    if (sources.saved) add(sources.saved, sources.saved);
   }
   return options;
 }

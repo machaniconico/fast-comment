@@ -42,9 +42,11 @@ test('voiceOptions_for_current_backend_has_follow_global_first', () => {
   const ws = voiceOptions('webSpeech', { webVoices: ['Haruka'] });
   assert.equal(ws[0].value, '');
   assert.deepEqual(ws[1], { value: 'Haruka', label: 'Haruka' });
-  const by = voiceOptions('bouyomi');
-  assert.equal(by[0].value, '');
-  assert.equal(by[1].value, '1');
+  assert.deepEqual(voiceOptions('bouyomi'), [{ value: '', label: '全体に従う' }]);
+  // 重複は 1 件、保存済みの値は一覧に無くても残る
+  assert.equal(voiceOptions('webSpeech', { webVoices: ['A', 'A'] }).length, 2);
+  assert.deepEqual(voiceOptions('voicevox', { speakers: [], saved: '7' })[1].value, '7');
+  assert.deepEqual(voiceOptions('webSpeech', { webVoices: [], saved: 'Gone' })[1].value, 'Gone');
   assert.deepEqual(voiceOptions('none'), [{ value: '', label: '全体に従う' }]);
 });
 
@@ -66,4 +68,13 @@ test('applyChannelsSaved_replaces_local_channels_from_response', () => {
   assert.equal(next.length, 1);
   assert.equal(next[0].ownStream, true);
   assert.deepEqual(next[0].overrides, { ttsEnabled: false });
+});
+
+test('bouyomi_voice_zero_is_distinct_from_follow_global', () => {
+  assert.equal(toFormState({ ttsVoice: { bouyomiVoice: 0 } }, 'bouyomi').voice, '0');
+  assert.deepEqual(fromFormState({ ttsDisabled: false, voice: '0' }, 'bouyomi'), { ttsVoice: { bouyomiVoice: 0 } });
+  assert.deepEqual(fromFormState({ ttsDisabled: false, voice: '10001' }, 'bouyomi'), {
+    ttsVoice: { bouyomiVoice: 10001 },
+  });
+  assert.deepEqual(fromFormState({ ttsDisabled: false, voice: '' }, 'bouyomi'), {});
 });
