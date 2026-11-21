@@ -307,8 +307,7 @@ impl<S: SecretStore> TwitcastingApi<S> {
         let date_ms = headers
             .get(DATE)
             .and_then(|v| v.to_str().ok())
-            .and_then(|v| chrono::DateTime::parse_from_rfc2822(v.trim()).ok())
-            .map(|date| date.timestamp_millis());
+            .and_then(http_date_ms);
         {
             let mut budget = self.budget.lock().unwrap();
             let now_ms = epoch_ms();
@@ -357,6 +356,21 @@ impl<S: SecretStore> TwitcastingApi<S> {
     }
 }
 
+/// HTTP-date(RFC 7231 §7.1.1.1 の IMF-fixdate・RFC 850・asctime)を epoch ミリ秒にする。
+fn http_date_ms(value: &str) -> Option<i64> {
+    const FORMATS: [&str; 3] = [
+        "%a, %d %b %Y %H:%M:%S GMT",
+        "%A, %d-%b-%y %H:%M:%S GMT",
+        "%a %b %e %H:%M:%S %Y",
+    ];
+    let value = value.trim();
+    FORMATS.iter().find_map(|format| {
+        chrono::NaiveDateTime::parse_from_str(value, format)
+            .ok()
+            .map(|date| date.and_utc().timestamp_millis())
+    })
+}
+
 pub struct LiveGuard(Arc<AtomicUsize>);
 
 impl Drop for LiveGuard {
@@ -389,6 +403,17 @@ fn epoch_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn http_date_accepts_all_three_rfc7231_forms() {
+        let expected = Some(784_111_777_000);
+        assert_eq!(http_date_ms("Sun, 06 Nov 1994 08:49:37 GMT"), expected);
+        assert_eq!(http_date_ms("Sunday, 06-Nov-94 08:49:37 GMT"), expected);
+        assert_eq!(http_date_ms("Sun Nov  6 08:49:37 1994"), expected);
+        assert_eq!(http_date_ms("Wed, 31 Dec 1969 23:59:59 GMT"), Some(-1000));
+        assert_eq!(http_date_ms("not a date"), None);
+        assert_eq!(http_date_ms(""), None);
+    }
     use crate::{
         integrations::MemorySecretStore,
         sources::twitcasting_auth::{AuthOptions, AuthState, TOKEN_KEY},

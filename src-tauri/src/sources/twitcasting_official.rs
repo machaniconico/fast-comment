@@ -37,6 +37,8 @@ const HISTORY_LIMIT: usize = 20;
 const STARTED_MOVIES_LIMIT: usize = 256;
 const COMMENT_UNIT: Duration = Duration::from_secs(2);
 const STALE_COMMENT_MS: i64 = 60_000;
+// 取得時に決めた古さ。写像では読まれず、外へは出ない。
+const STALE_FIELD: &str = "_fcStale";
 
 #[derive(Default)]
 pub struct CommentCursor {
@@ -60,7 +62,6 @@ impl CommentCursor {
             pages: 0,
             ended_on_empty: false,
             entries: Vec::new(),
-            stale_ids: HashSet::new(),
         }
     }
 
@@ -136,7 +137,6 @@ pub struct PollBatch {
     pages: u32,
     ended_on_empty: bool,
     entries: Vec<Value>,
-    stale_ids: HashSet<String>,
 }
 
 impl PollBatch {
@@ -220,19 +220,51 @@ fn local_now_ms() -> i64 {
 
 /// 応答の Date(サーバ時刻。無い・読めない時は PC の現在時刻)より 60 秒超古いコメントは
 /// 読み上げない。`created` が無い・0 のコメントは読み上げる。
+/// 未来の `created` は新しい扱い(読み上げる)。
 fn is_stale_comment(created: &Value, server_now_ms: Option<i64>) -> bool {
     let now_ms = server_now_ms.unwrap_or_else(local_now_ms);
-    timestamp_ms(created).is_some_and(|created| now_ms - created > STALE_COMMENT_MS)
+    timestamp_ms(created).is_some_and(|created| now_ms.saturating_sub(created) > STALE_COMMENT_MS)
+}
+
+/// 各コメントに、その応答の Date で決めた古さを持たせる。重複 ID はカーソルが採った
+/// エントリの判定がそのまま使われる。
+fn mark_staleness(page: &mut [Value], server_now_ms: Option<i64>, channel: &str) {
+    if server_now_ms.is_none() {
+        tracing::debug!(
+            channel,
+            "ツイキャス公式の応答に読める Date が無いため、PC の時刻でコメントの古さを判定"
+        );
+    }
+    for comment in page {
+        let stale = is_stale_comment(&comment["created"], server_now_ms);
+        if let Some(fields) = comment.as_object_mut() {
+            fields.insert(STALE_FIELD.to_owned(), Value::Bool(stale));
+        }
+    }
 }
 
 fn timestamp_ms(value: &Value) -> Option<i64> {
-    let n = value
+    let integer = value
         .as_i64()
-        .or_else(|| value.as_str()?.trim().parse().ok())?;
-    match n {
-        1..=999_999_999_999 => Some(n * 1000),
-        1_000_000_000_000.. => Some(n),
-        _ => None,
+        .or_else(|| value.as_str()?.trim().parse().ok());
+    if let Some(n) = integer {
+        return match n {
+            1..=999_999_999_999 => Some(n * 1000),
+            1_000_000_000_000.. => Some(n),
+            _ => None,
+        };
+    }
+    // 小数の秒(例 1479579471.5)も受ける。
+    let n = value
+        .as_f64()
+        .or_else(|| value.as_str()?.trim().parse().ok())
+        .filter(|n: &f64| n.is_finite())?;
+    if (1.0..1e12).contains(&n) {
+        Some((n * 1000.0).round() as i64)
+    } else if n >= 1e12 {
+        Some(n as i64)
+    } else {
+        None
     }
 }
 
@@ -577,11 +609,10 @@ impl<S: SecretStore> TwitcastingOfficialSource<S> {
     fn publish_comments(
         &self,
         movie: &mut Movie,
-        mut batch: PollBatch,
+        batch: PollBatch,
         skip_ids: Option<&HashSet<String>>,
         tx: &broadcast::Sender<ChatMessage>,
     ) {
-        let stale_ids = std::mem::take(&mut batch.stale_ids);
         let history = std::mem::take(&mut movie.mid_stream);
         let entries = if history {
             movie.cursor.commit_mid_stream(batch)
@@ -594,7 +625,7 @@ impl<S: SecretStore> TwitcastingOfficialSource<S> {
             now_ms: local_now_ms(),
         };
         for (mut message, stale) in entries.iter().filter_map(|v| {
-            let stale = id_string(&v["id"]).is_some_and(|id| stale_ids.contains(&id));
+            let stale = v[STALE_FIELD].as_bool() == Some(true);
             Some((official_comment_to_chat(v, &context)?, stale))
         }) {
             if skip_ids.is_some_and(|ids| ids.contains(&message.id)) {
@@ -608,12 +639,8 @@ impl<S: SecretStore> TwitcastingOfficialSource<S> {
     async fn fetch_comments(&self, movie: &Movie) -> Result<PollBatch, ApiError> {
         let mut batch = movie.cursor.begin_poll();
         while let Some(query) = batch.next_query() {
-            let (page, date_ms) = self.api.comments_with_date(&movie.id, query).await?;
-            batch.stale_ids.extend(
-                page.iter()
-                    .filter(|v| is_stale_comment(&v["created"], date_ms))
-                    .filter_map(|v| id_string(&v["id"])),
-            );
+            let (mut page, date_ms) = self.api.comments_with_date(&movie.id, query).await?;
+            mark_staleness(&mut page, date_ms, &self.channel);
             batch.push_page(page);
             if movie.mid_stream {
                 break;
@@ -1218,6 +1245,83 @@ mod tests {
                 "{created}"
             );
         }
+    }
+
+    #[test]
+    fn extreme_or_future_created_does_not_overflow_and_is_read_aloud() {
+        // Date "Wed, 31 Dec 1969 23:59:59 GMT" = -1000 ms.
+        assert!(!is_stale_comment(&json!(i64::MAX), Some(-1000)));
+        assert!(!is_stale_comment(&json!(i64::MAX), Some(i64::MIN)));
+        assert!(is_stale_comment(&json!(1), Some(i64::MAX)));
+        let server_ms = 1_800_000_000_000;
+        assert!(!is_stale_comment(
+            &json!(server_ms / 1000 + 3600),
+            Some(server_ms)
+        ));
+    }
+
+    #[test]
+    fn decimal_created_is_parsed_as_seconds_or_milliseconds() {
+        assert_eq!(timestamp_ms(&json!(1479579471.0)), Some(1_479_579_471_000));
+        assert_eq!(
+            timestamp_ms(&json!("1479579471.5")),
+            Some(1_479_579_471_500)
+        );
+        assert_eq!(
+            timestamp_ms(&json!(1479579471500.0)),
+            Some(1_479_579_471_500)
+        );
+        assert_eq!(
+            timestamp_ms(&json!("1479579471500.0")),
+            Some(1_479_579_471_500)
+        );
+        assert_eq!(timestamp_ms(&json!(0.0)), None);
+        assert_eq!(timestamp_ms(&json!("-1.5")), None);
+        assert_eq!(timestamp_ms(&json!("NaN")), None);
+        let server_ms = 1_479_579_471_000 + 61_000;
+        assert!(is_stale_comment(&json!(1479579471.0), Some(server_ms)));
+        assert!(!is_stale_comment(
+            &json!("1479579471.5"),
+            Some(server_ms - 2000)
+        ));
+    }
+
+    #[test]
+    fn duplicate_id_keeps_the_staleness_of_the_adopted_entry() {
+        let server_ms = 1_800_000_000_000;
+        let server_s = server_ms / 1000;
+        let mut fresh = vec![json!({ "id": 5, "message": "a", "created": server_s - 1 })];
+        let mut old = vec![json!({ "id": 5, "message": "b", "created": server_s - 600 })];
+        mark_staleness(&mut fresh, Some(server_ms), "alice");
+        mark_staleness(&mut old, Some(server_ms), "alice");
+        let mut cursor = CommentCursor::new();
+        let mut batch = cursor.begin_poll();
+        batch.push_page(fresh);
+        batch.push_page(old);
+        let adopted = cursor.commit(batch);
+        assert_eq!(adopted.len(), 1);
+        assert_eq!(adopted[0]["message"], "a");
+        assert_eq!(adopted[0][STALE_FIELD], json!(false));
+    }
+
+    #[test]
+    fn missing_date_logs_one_debug_line_with_channel_only() {
+        let sink = crate::log_filter_tests::Sink::default();
+        tracing::subscriber::with_default(
+            crate::log_subscriber(Some("debug"), sink.clone()),
+            || {
+                mark_staleness(&mut [json!({ "id": 1 })], None, "alice");
+                mark_staleness(&mut [json!({ "id": 2 })], Some(1), "alice");
+            },
+        );
+        let output = sink.output();
+        let lines: Vec<_> = output
+            .lines()
+            .filter(|line| line.contains("Date"))
+            .collect();
+        assert_eq!(lines.len(), 1, "{output}");
+        assert!(lines[0].contains("alice"));
+        assert!(!output.contains("http"));
     }
 
     #[test]
