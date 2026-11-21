@@ -125,6 +125,7 @@ pub struct AppState {
     mod_tx: mpsc::Sender<ModerationEvent>,
     /// 配信開始/終了イベント Source → X 自動告知の bounded 送信端(満杯なら Source 側で破棄する)。
     live_tx: mpsc::Sender<LiveEvent>,
+    twitcasting_started_movies: sources::twitcasting::StartedMovies,
     /// UI 操作(取消・承認・再試行)→ X 自動告知の駆動タスク。
     autopost_user_tx: mpsc::Sender<AutopostCommand>,
     /// X 自動告知の現在状態(駆動タスクが変化時だけ更新する)。
@@ -256,6 +257,7 @@ impl AppState {
             config::ChannelPlatform::Youtube => "youtube",
             config::ChannelPlatform::X => "x",
             config::ChannelPlatform::Niconico => "niconico",
+            config::ChannelPlatform::Twitcasting => "twitcasting",
         };
         format!("{p}:{}", ch.identifier)
     }
@@ -2508,6 +2510,7 @@ fn participant_platform(platform: Platform) -> &'static str {
         Platform::Youtube => "youtube",
         Platform::X => "x",
         Platform::Niconico => "niconico",
+        Platform::Twitcasting => "twitcasting",
     }
 }
 
@@ -2814,7 +2817,7 @@ fn spawn_one_channel(_app: &AppHandle, state: &AppState, ch: &ChannelConfig) {
         return;
     }
     let key = AppState::channel_key(ch);
-    let (overrides, youtube_api_key, x_overrides, x_auth, niconico_overrides, twitch_viewer_auth) = {
+    let (overrides, youtube_api_key, x_overrides, x_auth, niconico_overrides, twitcasting_overrides, twitch_viewer_auth) = {
         let config = state.config.lock().unwrap();
         // X の名前解決 cookie は auth_token / ct0 の両方が揃って初めて有効。
         let x_auth = {
@@ -2840,6 +2843,7 @@ fn spawn_one_channel(_app: &AppHandle, state: &AppState, ch: &ChannelConfig) {
             config.x_overrides.clone(),
             x_auth,
             config.niconico_overrides.clone(),
+            config.twitcasting_overrides.clone(),
             twitch_viewer_auth,
         )
     };
@@ -2867,10 +2871,12 @@ fn spawn_one_channel(_app: &AppHandle, state: &AppState, ch: &ChannelConfig) {
             x_overrides,
             x_auth,
             niconico_overrides,
+            twitcasting_overrides,
             Some(state.metadata_tx.clone()),
             Some(state.reaction_tx.clone()),
             Some(state.mod_tx.clone()),
         )
+        .with_twitcasting_started_movies(state.twitcasting_started_movies.clone())
         .with_live_tx(Some(state.live_tx.clone()));
         manager.spawn_channel(ch)
     };
@@ -3028,14 +3034,41 @@ fn resolve_templates_dir(app: &AppHandle) -> PathBuf {
     cwd.join("templates")
 }
 
+fn log_subscriber<W>(env: Option<&str>, writer: W) -> impl tracing::Subscriber + Send + Sync
+where
+    W: for<'writer> tracing_subscriber::fmt::MakeWriter<'writer> + Send + Sync + 'static,
+{
+    use tracing_subscriber::{filter::filter_fn, prelude::*, EnvFilter};
+
+    let env_filter = env
+        .and_then(|value| EnvFilter::try_new(value).ok())
+        .unwrap_or_else(|| EnvFilter::new("info"));
+    // WS ハンドシェイクの TRACE にはトークン付きリクエスト行が含まれる。
+    let ws_ceiling = filter_fn(|meta| {
+        let ws_target = ["tungstenite", "tokio_tungstenite"]
+            .into_iter()
+            .any(|target| {
+                meta.target() == target
+                    || meta
+                        .target()
+                        .strip_prefix(target)
+                        .is_some_and(|suffix| suffix.starts_with("::"))
+            });
+        !ws_target || *meta.level() <= tracing::Level::INFO
+    });
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(writer)
+                .with_filter(ws_ceiling),
+        )
+}
+
 /// Tauri アプリを構築して実行する(desktop only)。
 pub fn run() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    use tracing_subscriber::util::SubscriberInitExt;
+    log_subscriber(std::env::var("RUST_LOG").ok().as_deref(), std::io::stdout).init();
 
     let builder = tauri::Builder::default();
     // 単一インスタンス(SPEC「単一インスタンス」)。最初に登録する。2 つ目の起動は
@@ -3198,6 +3231,7 @@ pub fn run() {
                         reaction_tx,
                         mod_tx,
                         live_tx,
+                        twitcasting_started_movies: Default::default(),
                         autopost_user_tx,
                         autopost_status: autopost_status.clone(),
                         config_write: tokio::sync::Mutex::new(()),
@@ -4115,5 +4149,119 @@ mod followup_tests {
     fn build_injected_test_messages_rejects_bad_input() {
         assert!(build_injected_test_messages("bogus", "", "", None, None, None).is_err());
         assert!(build_injected_test_messages("x", "", "", Some("bogus"), None, None).is_err());
+    }
+}
+
+#[cfg(test)]
+mod log_filter_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    pub(crate) struct Sink(Arc<Mutex<Vec<u8>>>);
+
+    impl Sink {
+        pub(crate) fn output(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    impl std::io::Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+        type Writer = Sink;
+        fn make_writer(&'a self) -> Sink {
+            self.clone()
+        }
+    }
+
+    fn logged(env: Option<&str>) -> String {
+        let sink = Sink::default();
+        let subscriber = log_subscriber(env, sink.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::trace!(target: "tungstenite::handshake::client", "GET /events?token=SECRET");
+            tracing::trace!(target: "tokio_tungstenite", "GET /events?token=SECRET");
+            tracing::debug!(target: "tungstenite::handshake::client", "GET /events?token=SECRET");
+            tracing::debug!(target: "tokio_tungstenite::handshake", "GET /events?token=SECRET");
+            tracing::info!(target: "tungstenite::handshake::client", "ws-client-info");
+            tracing::info!(target: "tokio_tungstenite", "ws-info");
+            tracing::info!(target: "fast_comment_lib", "kept");
+            tracing::debug!(target: "fast_comment_lib", "debug-line");
+        });
+        sink.output()
+    }
+
+    #[test]
+    fn ws_handshake_url_never_reaches_the_log_even_with_trace_env() {
+        for env in [
+            "tungstenite=trace",
+            "tungstenite::handshake::client=trace",
+            "tokio_tungstenite::handshake=debug",
+            "trace",
+            "tokio_tungstenite=trace,tungstenite=trace",
+            "debug",
+        ] {
+            assert!(!logged(Some(env)).contains("SECRET"), "RUST_LOG={env}");
+        }
+        let specific = logged(Some("tungstenite::handshake::client=trace"));
+        assert!(specific.contains("ws-client-info"));
+        assert!(!specific.contains("ws-info"));
+    }
+
+    #[test]
+    fn ws_filter_does_not_raise_rust_log_levels() {
+        assert!(logged(Some("off")).is_empty());
+        assert!(logged(Some("warn")).is_empty());
+        let info = logged(Some("info"));
+        assert!(info.contains("ws-client-info"));
+        assert!(info.contains("ws-info"));
+    }
+
+    #[tokio::test]
+    async fn tungstenite_client_handshake_keeps_token_out_of_bridged_logs() {
+        use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+        use tracing_subscriber::util::SubscriberInitExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = async {
+            let (socket, _) = listener.accept().await.unwrap();
+            tokio_tungstenite::accept_hdr_async(socket, |request: &Request, response: Response| {
+                assert_eq!(request.method(), "GET");
+                assert_eq!(request.uri(), "/events?token=SECRET");
+                Ok(response)
+            })
+            .await
+            .unwrap();
+        };
+        let sink = Sink::default();
+        let _guard = log_subscriber(Some("tungstenite::handshake::client=trace"), sink.clone())
+            .set_default();
+        let url = format!("ws://127.0.0.1:{port}/events?token=SECRET");
+        let client = async { tokio_tungstenite::connect_async(&url).await.unwrap() };
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(client, server);
+        })
+        .await
+        .unwrap();
+        assert!(!sink.output().contains("SECRET"));
+    }
+
+    #[test]
+    fn default_and_other_targets_keep_their_levels() {
+        let default = logged(None);
+        assert!(default.contains("kept"));
+        assert!(!default.contains("debug-line"));
+        assert!(logged(Some("debug")).contains("debug-line"));
+        // 不正な値は既定 info に戻る。
+        assert!(logged(Some("=[")).contains("kept"));
     }
 }

@@ -291,7 +291,7 @@ async fn test_comments_missing_or_unknown_platform_is_400() {
         assert_eq!(r.status, StatusCode::BAD_REQUEST, "body: {body}");
         assert_eq!(r.error_code(), "invalid_request", "body: {body}");
     }
-    for p in ["twitch", "youtube", "x", "niconico"] {
+    for p in ["twitch", "youtube", "x", "niconico", "twitcasting"] {
         let r = env.inject(&format!(r#"{{"platform":"{p}"}}"#)).await;
         assert_eq!(r.status, StatusCode::ACCEPTED, "platform: {p}");
     }
