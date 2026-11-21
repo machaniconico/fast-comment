@@ -26,7 +26,15 @@
   const CTX_MENU_HEIGHT = 44;
   const CTX_MENU_MARGIN = 8;
 
+  // stats の identifier は Rust の channel_name(識別子)と同じ規則で作られる。ツイキャスは
+  // 小文字の screen_id、解釈できない識別子は生で出さない固定名 twitcasting-invalid。
+  const TWITCASTING_INVALID_CHANNEL = 'twitcasting-invalid';
+
   function chipKey(platform: string, identifier: string): string {
+    if (platform === 'twitcasting') {
+      const id = extractTwitcastingScreenId(identifier)?.toLowerCase() ?? TWITCASTING_INVALID_CHANNEL;
+      return `${platform}:${id}`;
+    }
     return `${platform}:${identifier}`;
   }
 
@@ -95,7 +103,8 @@
       return `https://live.nicovideo.jp/watch/${encodeURIComponent(ch.identifier)}`;
     }
     if (ch.platform === 'twitcasting') {
-      return `https://twitcasting.tv/${encodeURIComponent(ch.identifier)}`;
+      const id = extractTwitcastingScreenId(ch.identifier);
+      return id ? `https://twitcasting.tv/${encodeURIComponent(id)}` : null;
     }
     const id = ch.identifier;
     if (id.startsWith('@')) {
@@ -223,7 +232,7 @@
     addError = '';
     const next = !ch.ownStream;
     try {
-      await setChannelOwnStream(chipKey(ch.platform, ch.identifier), next);
+      await setChannelOwnStream(`${ch.platform}:${ch.identifier}`, next);
       channels = channels.map((c) => (sameChannel(c, ch) ? { ...c, ownStream: next } : c));
     } catch (e) {
       addError = `印の保存に失敗しました: ${e instanceof Error ? e.message : String(e)}`;

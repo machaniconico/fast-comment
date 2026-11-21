@@ -24,6 +24,18 @@ mod webhook_url;
 
 // PR1(ツイキャス): OAuth と保存(設計書 twitcasting §5.2)
 mod twitcasting_auth;
+mod twitcasting_config_mode;
+
+// PR3'(ツイキャス): 公式 API ポーリングと mode 切替(.omc/plans/pr3-acceptance.md)
+mod twitcasting_common;
+mod twitcasting_api;
+mod twitcasting_budget;
+mod twitcasting_common_official;
+mod twitcasting_cursor;
+mod twitcasting_official_map;
+mod twitcasting_official_source;
+mod twitcasting_mode;
+mod twitcasting_identifier_secrecy;
 
 #[test]
 fn acceptance_harness_runs() {}

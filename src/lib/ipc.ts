@@ -7,7 +7,7 @@
  * - Safe to import in a plain browser (Tauri absent): all calls are no-ops.
  */
 
-import type { ChatMessage, ListenerRecord, ListenerUpdate, ModerationEvent, TtsVoiceOverride, YoutubeReaction } from './types';
+import type { ChatMessage, ListenerRecord, ListenerUpdate, ModerationEvent, TtsVoiceOverride, TwitcastingMode, YoutubeReaction } from './types';
 import { Channel, invoke as tauriInvoke } from '@tauri-apps/api/core';
 import { emit, listen } from '@tauri-apps/api/event';
 import { getCurrentWindow, primaryMonitor } from '@tauri-apps/api/window';
@@ -437,6 +437,8 @@ export interface AppConfig {
 
 export interface TwitcastingConfig {
   callbackPort: number;
+  /** 取得経路。古い config.json には無い(未指定は auto)。 */
+  mode?: TwitcastingMode;
 }
 
 export interface XPostConfig {

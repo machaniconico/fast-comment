@@ -70,11 +70,47 @@ static HTML_ATTRIBUTES: LazyLock<Regex> = LazyLock::new(|| {
         .expect("static attribute pattern")
 });
 
-const NOT_FOUND_NOTICE: &str = "ツイキャスのユーザーが見つかりません";
-const UNAVAILABLE_NOTICE: &str = "この配信は非公開のため取得できません";
+pub const NOT_FOUND_NOTICE: &str = "ツイキャスのユーザーが見つかりません";
+pub const UNAVAILABLE_NOTICE: &str = "この配信は非公開のため取得できません";
 const UNREADABLE_LOG: &str =
     "視聴ページから配信状態を読み取れません(仕様変更の可能性)。30 秒後に再確認します";
-const INVALID_ID_NOTICE: &str = "ツイキャスの配信者 ID を解釈できません";
+pub const INVALID_ID_NOTICE: &str = "ツイキャスの配信者 ID を解釈できません";
+/// 解釈できない識別子の channel 名。入力(URL やトークンでありうる)を生で出さない。
+pub const INVALID_CHANNEL_LABEL: &str = "twitcasting-invalid";
+
+/// 非公式 Source の待ち時間。既定は従来の定数と同じ。テストで短くする。
+#[derive(Clone)]
+pub struct UnofficialTuning {
+    /// 未配信・限定配信の HTML 再取得間隔(`jitter` 時は ±20%)。
+    pub offline: Duration,
+    /// 読めない HTML・eventpubsuburl の 3xx/4xx の再確認間隔。
+    pub unreadable_recheck: Duration,
+    /// 存在しないユーザーの再試行間隔。
+    pub not_found_retry: Duration,
+    pub jitter: bool,
+}
+
+impl Default for UnofficialTuning {
+    fn default() -> Self {
+        UnofficialTuning {
+            offline: OFFLINE_INTERVAL,
+            unreadable_recheck: OFFLINE_INTERVAL,
+            not_found_retry: NOT_FOUND_RETRY,
+            jitter: true,
+        }
+    }
+}
+
+/// 非公式経路の構造が読めたか(公式への切替カウンタ用)。結末・notice とは別に出す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnofficialSignal {
+    /// HTML・eventpubsuburl の 2xx 本文・WS の最初のフレームの構造が読めない。
+    Unreadable,
+    /// 明示的な未配信ページ、または接続ごとの最初の WS 配列フレーム。
+    Healthy,
+    /// 到達性の問題や限定配信など。数えず、リセットもしない。
+    Neutral,
+}
 
 /// ツイキャスの非公式経路で使うエンドポイント・正規表現の上書き。
 ///
@@ -454,15 +490,20 @@ pub struct MapContext<'a> {
 
 /// WS テキストフレーム(JSON 配列)の要素を取り出す。壊れていれば空。
 pub fn parse_ws_entries(text: &str) -> Vec<Value> {
+    parse_ws_array(text).unwrap_or_default()
+}
+
+/// WS フレームを 1 回だけ解析する。配列なら要素、それ以外は None(信号と処理で同じ結果を使う)。
+fn parse_ws_array(text: &str) -> Option<Vec<Value>> {
     match serde_json::from_str::<Value>(text.trim()) {
-        Ok(Value::Array(items)) => items,
+        Ok(Value::Array(items)) => Some(items),
         Ok(_) => {
             tracing::debug!("twitcasting: WS フレームが配列ではないため無視");
-            Vec::new()
+            None
         }
         Err(_) => {
             tracing::debug!("twitcasting: WS フレームが JSON ではないため無視");
-            Vec::new()
+            None
         }
     }
 }
@@ -817,10 +858,11 @@ impl Default for CommentDedup {
 }
 
 /// 設定の identifier から ChatMessage.channel / 集計キーに使う正規化名を作る。
+/// 解釈できない識別子は生で出さず `INVALID_CHANNEL_LABEL` にする。
 pub fn channel_name(identifier: &str) -> String {
     extract_screen_id(identifier)
-        .unwrap_or_else(|| identifier.trim().to_string())
-        .to_ascii_lowercase()
+        .map(|id| id.to_ascii_lowercase())
+        .unwrap_or_else(|| INVALID_CHANNEL_LABEL.to_string())
 }
 
 /// アプリ内の全 Source で共有し、送信に成功した movie_id を古い順に保持する。
@@ -828,7 +870,6 @@ pub(crate) type StartedMovies = Arc<Mutex<VecDeque<String>>>;
 
 /// ツイキャス1チャンネルを購読する Source。
 pub struct TwitcastingSource {
-    /// 設定の identifier(LiveStream.channel_identifier の照合キー)。
     identifier: String,
     screen_id: Option<String>,
     overrides: TwitcastingOverrides,
@@ -836,6 +877,18 @@ pub struct TwitcastingSource {
     /// 配信開始/終了イベント(X 自動告知用)。
     live_tx: Option<mpsc::Sender<LiveEvent>>,
     started_movies: StartedMovies,
+    live_movie: Mutex<Option<String>>,
+    tuning: UnofficialTuning,
+    signal_tx: Option<mpsc::UnboundedSender<UnofficialSignal>>,
+}
+
+/// identifier は URL やトークンでありうるので、正規化した channel 名だけを出す。
+impl fmt::Debug for TwitcastingSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TwitcastingSource")
+            .field("channel", &self.channel_name())
+            .finish_non_exhaustive()
+    }
 }
 
 impl TwitcastingSource {
@@ -852,6 +905,30 @@ impl TwitcastingSource {
             metadata_tx,
             live_tx: None,
             started_movies: Default::default(),
+            live_movie: Mutex::new(None),
+            tuning: UnofficialTuning::default(),
+            signal_tx: None,
+        }
+    }
+
+    pub fn with_tuning(mut self, tuning: UnofficialTuning) -> Self {
+        self.tuning = tuning;
+        self
+    }
+
+    /// 構造が読めたかの信号を受け取る。信号は 1 セッションに数件なので無制限で落とさず、
+    /// 送信で待たないので Source の待ち時間は変えない。
+    pub(crate) fn with_signal_tx(
+        mut self,
+        signal_tx: mpsc::UnboundedSender<UnofficialSignal>,
+    ) -> Self {
+        self.signal_tx = Some(signal_tx);
+        self
+    }
+
+    fn send_signal(&self, signal: UnofficialSignal) {
+        if let Some(tx) = &self.signal_tx {
+            let _ = tx.send(signal);
         }
     }
 
@@ -865,7 +942,16 @@ impl TwitcastingSource {
         self
     }
 
+    pub(crate) fn take_live_movie(&self) -> Option<String> {
+        self.live_movie
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+    }
+
     fn send_live_started(&self, screen_id: &str, movie_id: &str) {
+        *self.live_movie.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(movie_id.to_string());
         let Some(tx) = &self.live_tx else { return };
         // 複数の Source が同じ配信を検知しても、照合から記録までを直列化する。
         let mut started = self
@@ -879,7 +965,7 @@ impl TwitcastingSource {
             tx,
             LiveEvent::Started(LiveStream {
                 platform: Platform::Twitcasting,
-                channel_identifier: self.identifier.clone(),
+                channel_identifier: self.channel_name(),
                 stream_id: movie_id.to_string(),
                 title: None,
                 url: format!("{USER_PAGE_BASE_URL}{screen_id}/movie/{movie_id}"),
@@ -894,12 +980,13 @@ impl TwitcastingSource {
     }
 
     fn send_live_ended(&self) {
+        let _ = self.take_live_movie();
         let Some(tx) = &self.live_tx else { return };
         super::send_live_event(
             tx,
             LiveEvent::Ended {
                 platform: Platform::Twitcasting,
-                channel_identifier: self.identifier.clone(),
+                channel_identifier: self.channel_name(),
             },
         );
     }
@@ -995,7 +1082,7 @@ impl Source for TwitcastingSource {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + '_>> {
         Box::pin(async move {
             let Some(screen_id) = self.screen_id.clone() else {
-                tracing::warn!("twitcasting:{} 配信者 ID を解釈できません", self.identifier);
+                tracing::warn!("twitcasting: {INVALID_ID_NOTICE}");
                 self.send_notice(INVALID_ID_NOTICE).await;
                 cancel.cancelled().await;
                 return Ok(());
@@ -1036,6 +1123,9 @@ impl Source for TwitcastingSource {
                     )
                     .await;
 
+                if let Some(signal) = outcome_signal(outcome) {
+                    self.send_signal(signal);
+                }
                 let repeated = is_repeated_quiet(&mut last_quiet, outcome);
                 match outcome {
                     SessionOutcome::Cancelled => return Ok(()),
@@ -1074,7 +1164,8 @@ impl Source for TwitcastingSource {
                         self.send_live_state(false).await;
                     }
                 }
-                let Some(delay) = outcome_delay(outcome, &mut backoff, &mut jitter) else {
+                let Some(delay) = outcome_delay_for(outcome, &self.tuning, &mut backoff, &mut jitter)
+                else {
                     return Ok(());
                 };
 
@@ -1316,6 +1407,8 @@ impl TwitcastingSource {
             }
             EventPubsub::Malformed => {
                 tracing::warn!("twitcasting:{screen_id} eventpubsuburl の応答を解析できません");
+                // 2xx で本文の構造が読めない(H6)。結末は従来どおり Disconnected。
+                self.send_signal(UnofficialSignal::Unreadable);
                 Err(SessionOutcome::Disconnected { stable: false })
             }
         }
@@ -1364,6 +1457,9 @@ impl TwitcastingSource {
         let (mut write, mut read) = ws_stream.split();
         let connected_at = tokio::time::Instant::now();
         let mut received = false;
+        // 接続ごとに、最初の配列フレームまで構造を確かめる(H11/H12 は各 1 回)。
+        let mut array_seen = false;
+        let mut unreadable_sent = false;
         let mut last_frame = tokio::time::Instant::now();
 
         loop {
@@ -1404,7 +1500,17 @@ impl TwitcastingSource {
                     match msg {
                         WsMessage::Text(text) => {
                             received = true;
-                            let entries = seen.admit(parse_ws_entries(&text));
+                            let parsed = parse_ws_array(&text);
+                            if !array_seen {
+                                if parsed.is_some() {
+                                    array_seen = true;
+                                    self.send_signal(UnofficialSignal::Healthy);
+                                } else if !unreadable_sent {
+                                    unreadable_sent = true;
+                                    self.send_signal(UnofficialSignal::Unreadable);
+                                }
+                            }
+                            let entries = seen.admit(parsed.unwrap_or_default());
                             let ctx = MapContext {
                                 channel,
                                 broadcaster_id: Some(screen_id),
@@ -1484,9 +1590,33 @@ fn classify_eventpubsub_status(status: reqwest::StatusCode) -> Option<SessionOut
     }
 }
 
-/// 各 outcome の待機時間。ディレイの計算を純粋にして状態遷移をテストできる。
+/// セッションの結末から切替カウンタ用の信号を導く(§2 の表)。H6・H11・H12 は発生箇所で出す。
+fn outcome_signal(outcome: SessionOutcome) -> Option<UnofficialSignal> {
+    match outcome {
+        SessionOutcome::Cancelled => None,
+        SessionOutcome::Offline => Some(UnofficialSignal::Healthy),
+        SessionOutcome::Unreadable => Some(UnofficialSignal::Unreadable),
+        SessionOutcome::NotFound
+        | SessionOutcome::Unavailable
+        | SessionOutcome::Recheck
+        | SessionOutcome::Disconnected { .. } => Some(UnofficialSignal::Neutral),
+    }
+}
+
+/// 既定の待ち時間での各 outcome の待機時間。
+#[cfg(test)]
 fn outcome_delay(
     outcome: SessionOutcome,
+    backoff: &mut Backoff,
+    jitter_seed: &mut u64,
+) -> Option<Duration> {
+    outcome_delay_for(outcome, &UnofficialTuning::default(), backoff, jitter_seed)
+}
+
+/// 各 outcome の待機時間。ディレイの計算を純粋にして状態遷移をテストできる。
+fn outcome_delay_for(
+    outcome: SessionOutcome,
+    tuning: &UnofficialTuning,
     backoff: &mut Backoff,
     jitter_seed: &mut u64,
 ) -> Option<Duration> {
@@ -1494,16 +1624,20 @@ fn outcome_delay(
         SessionOutcome::Cancelled => None,
         SessionOutcome::Offline | SessionOutcome::Unavailable => {
             backoff.reset();
-            Some(jittered(OFFLINE_INTERVAL, 20, jitter_seed))
+            if tuning.jitter {
+                Some(jittered(tuning.offline, 20, jitter_seed))
+            } else {
+                Some(tuning.offline)
+            }
         }
         SessionOutcome::Recheck | SessionOutcome::Unreadable => {
             // 連続失敗でも 30 秒を下回らない。
             backoff.reset();
-            Some(OFFLINE_INTERVAL)
+            Some(tuning.unreadable_recheck)
         }
         SessionOutcome::NotFound => {
             backoff.reset();
-            Some(NOT_FOUND_RETRY)
+            Some(tuning.not_found_retry)
         }
         SessionOutcome::Disconnected { stable } => {
             if stable {
@@ -2067,6 +2201,30 @@ mod tests {
     }
 
     #[test]
+    fn live_events_use_normalized_screen_id_without_url_fragment() {
+        let (live_tx, mut live_rx) = mpsc::channel(2);
+        let source = TwitcastingSource::new(
+            "https://twitcasting.tv/Alice#access_token=MARKER".into(),
+            Default::default(),
+            None,
+        )
+        .with_live_tx(Some(live_tx));
+        source.send_live_started(source.screen_id.as_deref().unwrap(), "42");
+        source.send_live_ended();
+        let started = live_rx.try_recv().unwrap();
+        let ended = live_rx.try_recv().unwrap();
+        assert!(matches!(
+            &started,
+            LiveEvent::Started(stream) if stream.channel_identifier == "alice"
+        ));
+        assert!(matches!(
+            &ended,
+            LiveEvent::Ended { channel_identifier, .. } if channel_identifier == "alice"
+        ));
+        assert!(!format!("{started:?} {ended:?}").contains("MARKER"));
+    }
+
+    #[test]
     fn started_evicts_oldest_successful_movie_at_capacity() {
         let (live_tx, mut live_rx) = mpsc::channel(1);
         let source = TwitcastingSource::new("alice".into(), Default::default(), None)
@@ -2552,5 +2710,454 @@ mod tests {
             id_string(items[0].get("id")).as_deref(),
             Some("34006263354")
         );
+    }
+
+    // ---- PR3' B3: 既存の結末から導く UnofficialSignal(§2 の表) ----
+
+    const LIVE_HTML: &str =
+        r#"<html><body data-is-onlive="true"><div data-movie-id="42"></div></body></html>"#;
+
+    /// 経路で応答を分ける最小の HTTP サーバー。POST は eventpubsuburl、userajax は listall、
+    /// それ以外は視聴ページ。リクエストは本文まで読んでから返す。
+    async fn serve_routes(html: (u16, &'static str), pubsub: (u16, String)) -> u16 {
+        serve_pages(&[], html, pubsub).await
+    }
+
+    /// 視聴ページの n 回目に `first[n]` を返し、尽きたら `html` を返す。
+    async fn serve_pages(
+        first: &'static [(u16, &'static str)],
+        html: (u16, &'static str),
+        pubsub: (u16, String),
+    ) -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let pubsub = std::sync::Arc::new(pubsub);
+        let page_hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let pubsub = pubsub.clone();
+                let page_hits = page_hits.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    let head_end = loop {
+                        let Ok(n) = sock.read(&mut chunk).await else { return };
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break i + 4;
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&buf[..head_end]).to_ascii_lowercase();
+                    let length = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    while buf.len() < head_end + length {
+                        let Ok(n) = sock.read(&mut chunk).await else { return };
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                    }
+                    let (status, body): (u16, &str) = if head.starts_with("post") {
+                        (pubsub.0, pubsub.1.as_str())
+                    } else if head.contains("userajax") {
+                        (200, "[]")
+                    } else {
+                        let n = page_hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        first.get(n).copied().unwrap_or(html)
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status} X\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(response.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        port
+    }
+
+    /// 接続ごとに frames を Text で送って閉じる WS サーバー。
+    async fn serve_ws(frames: &'static [&'static str]) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((sock, _)) = listener.accept().await else { return };
+                tokio::spawn(async move {
+                    let Ok(mut ws) = tokio_tungstenite::accept_async(sock).await else { return };
+                    for frame in frames {
+                        if ws.send(WsMessage::Text(frame.to_string().into())).await.is_err() {
+                            return;
+                        }
+                    }
+                    let _ = ws.close(None).await;
+                });
+            }
+        });
+        port
+    }
+
+    fn short_tuning() -> UnofficialTuning {
+        UnofficialTuning {
+            offline: Duration::from_millis(20),
+            unreadable_recheck: Duration::from_millis(20),
+            not_found_retry: Duration::from_millis(20),
+            jitter: false,
+        }
+    }
+
+    fn signal_source(
+        base: &str,
+    ) -> (
+        TwitcastingSource,
+        mpsc::UnboundedReceiver<UnofficialSignal>,
+        mpsc::Receiver<YoutubeMetadataUpdate>,
+    ) {
+        let overrides = TwitcastingOverrides {
+            endpoints: HashMap::from([
+                ("userPageBaseUrl".to_string(), format!("{base}/")),
+                ("eventPubsubUrl".to_string(), format!("{base}/eventpubsub")),
+                ("commentHistoryUrl".to_string(), format!("{base}/")),
+            ]),
+            ..TwitcastingOverrides::default()
+        };
+        let (signal_tx, signal_rx) = mpsc::unbounded_channel();
+        let (metadata_tx, metadata_rx) = mpsc::channel(256);
+        let source = TwitcastingSource::new("alice".to_string(), overrides, Some(metadata_tx))
+            .with_tuning(short_tuning())
+            .with_signal_tx(signal_tx);
+        (source, signal_rx, metadata_rx)
+    }
+
+    /// Source を走らせ、`done` が真になるまで信号を集めて止める。notice も返す。
+    async fn collect_signals(
+        base: String,
+        done: impl Fn(&[UnofficialSignal]) -> bool,
+    ) -> (Vec<UnofficialSignal>, Vec<String>) {
+        let (source, mut signal_rx, mut metadata_rx) = signal_source(&base);
+        let (tx, _rx) = broadcast::channel(64);
+        let cancel = CancellationToken::new();
+        let runner = {
+            let cancel = cancel.clone();
+            tokio::spawn(async move { source.run(tx, cancel).await })
+        };
+        let mut signals = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(10), async {
+            while !done(&signals) {
+                match signal_rx.recv().await {
+                    Some(signal) => signals.push(signal),
+                    None => return,
+                }
+            }
+        })
+        .await;
+        cancel.cancel();
+        let _ = runner.await;
+        let mut notices = Vec::new();
+        while let Ok(update) = metadata_rx.try_recv() {
+            notices.extend(update.notice);
+        }
+        (signals, notices)
+    }
+
+    async fn signals_for_page(html: &'static str, n: usize) -> (Vec<UnofficialSignal>, Vec<String>) {
+        let port = serve_routes((200, html), (200, "{}".into())).await;
+        collect_signals(format!("http://127.0.0.1:{port}"), |s| s.len() >= n).await
+    }
+
+    fn until_neutral(signals: &[UnofficialSignal]) -> bool {
+        signals.last() == Some(&UnofficialSignal::Neutral)
+    }
+
+    #[tokio::test]
+    async fn signal_h1_no_data_page_is_unreadable() {
+        let (signals, notices) =
+            signals_for_page("<html><body><p>maintenance</p></body></html>", 3).await;
+        assert_eq!(signals, vec![UnofficialSignal::Unreadable; 3]);
+        assert!(notices.is_empty(), "{notices:?}");
+    }
+
+    #[tokio::test]
+    async fn signal_h2_live_without_movie_id_is_unreadable() {
+        let (signals, notices) =
+            signals_for_page(r#"<html><body data-is-onlive="true"></body></html>"#, 3).await;
+        assert_eq!(signals, vec![UnofficialSignal::Unreadable; 3]);
+        assert!(notices.is_empty(), "{notices:?}");
+    }
+
+    #[tokio::test]
+    async fn signal_h3_garbage_onlive_is_unreadable() {
+        let (signals, notices) = signals_for_page(
+            r#"<html><body data-is-onlive="maybe"><div data-movie-id="42"></div></body></html>"#,
+            3,
+        )
+        .await;
+        assert_eq!(signals, vec![UnofficialSignal::Unreadable; 3]);
+        assert!(notices.is_empty(), "{notices:?}");
+    }
+
+    #[tokio::test]
+    async fn signal_h4_explicit_offline_is_healthy() {
+        let (signals, notices) =
+            signals_for_page(r#"<html><body data-is-onlive="false"></body></html>"#, 2).await;
+        assert_eq!(signals, vec![UnofficialSignal::Healthy; 2]);
+        assert!(notices.is_empty(), "{notices:?}");
+    }
+
+    #[tokio::test]
+    async fn signal_h5_eventpubsub_private_is_neutral() {
+        for body in [r#"{}"#, r#"{"url":null}"#, r#"{"url":""}"#] {
+            let port = serve_routes((200, LIVE_HTML), (200, body.into())).await;
+            let (signals, notices) =
+                collect_signals(format!("http://127.0.0.1:{port}"), |s| s.len() >= 2).await;
+            assert_eq!(signals, vec![UnofficialSignal::Neutral; 2], "{body}");
+            assert!(notices.iter().all(|n| n == UNAVAILABLE_NOTICE), "{body}: {notices:?}");
+            assert!(!notices.is_empty(), "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn signal_h6_eventpubsub_malformed_2xx_is_unreadable() {
+        for body in ["not json", "[1]", r#"{"url":1}"#] {
+            let port = serve_routes((200, LIVE_HTML), (200, body.into())).await;
+            let (signals, notices) =
+                collect_signals(format!("http://127.0.0.1:{port}"), until_neutral).await;
+            // 結末は従来どおり Disconnected(Neutral)。その前に Unreadable が 1 回出る。
+            assert_eq!(
+                signals,
+                vec![UnofficialSignal::Unreadable, UnofficialSignal::Neutral],
+                "{body}"
+            );
+            assert!(notices.is_empty(), "{body}: {notices:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn signal_h7_h8_eventpubsub_status_is_neutral() {
+        // 3xx/4xx は 20ms の Recheck で繰り返すので数回見る。5xx は Backoff なので最初の 1 回。
+        for (status, n) in [(302, 3), (404, 3), (500, 1), (503, 1)] {
+            let port = serve_routes((200, LIVE_HTML), (status, "{}".into())).await;
+            let (signals, notices) =
+                collect_signals(format!("http://127.0.0.1:{port}"), |s| s.len() >= n).await;
+            assert_eq!(signals, vec![UnofficialSignal::Neutral; n], "HTTP {status}");
+            assert!(notices.is_empty(), "HTTP {status}: {notices:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn signal_h9_h10_network_and_not_found_are_neutral() {
+        let port = serve_routes((500, "oops"), (200, "{}".into())).await;
+        let (signals, notices) =
+            collect_signals(format!("http://127.0.0.1:{port}"), |s| !s.is_empty()).await;
+        assert_eq!(signals, vec![UnofficialSignal::Neutral], "HTML 5xx");
+        assert!(notices.is_empty(), "{notices:?}");
+
+        let (signals, notices) =
+            collect_signals("http://127.0.0.1:1".into(), |s| !s.is_empty()).await;
+        assert_eq!(signals, vec![UnofficialSignal::Neutral], "接続拒否");
+        assert!(notices.is_empty(), "{notices:?}");
+
+        let port = serve_routes((404, "no"), (200, "{}".into())).await;
+        let (signals, notices) =
+            collect_signals(format!("http://127.0.0.1:{port}"), |s| s.len() >= 2).await;
+        assert_eq!(signals, vec![UnofficialSignal::Neutral; 2], "404");
+        assert!(notices.iter().all(|n| n == NOT_FOUND_NOTICE), "{notices:?}");
+        assert!(!notices.is_empty());
+    }
+
+    async fn ws_signals(frames: &'static [&'static str]) -> Vec<UnofficialSignal> {
+        let ws_port = serve_ws(frames).await;
+        let pubsub = format!(r#"{{"url":"ws://127.0.0.1:{ws_port}/"}}"#);
+        let port = serve_routes((200, LIVE_HTML), (200, pubsub)).await;
+        collect_signals(format!("http://127.0.0.1:{port}"), until_neutral).await.0
+    }
+
+    #[tokio::test]
+    async fn signal_h11_first_array_frame_is_healthy_once() {
+        let signals = ws_signals(&["[]", r#"[{"type":"unknown"}]"#, "[]"]).await;
+        // 切断は Neutral。配列フレームが何枚でも Healthy は接続ごとに 1 回。
+        assert_eq!(signals, vec![UnofficialSignal::Healthy, UnofficialSignal::Neutral]);
+    }
+
+    #[tokio::test]
+    async fn signal_h12_non_array_frame_before_first_array_is_unreadable_once() {
+        let signals = ws_signals(&[r#"{"x":1}"#, "ping", "[]"]).await;
+        assert_eq!(
+            signals,
+            vec![
+                UnofficialSignal::Unreadable,
+                UnofficialSignal::Healthy,
+                UnofficialSignal::Neutral
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn signal_h12b_non_array_frame_after_array_is_neutral() {
+        let signals = ws_signals(&["[]", r#"{"x":1}"#, "ping"]).await;
+        assert_eq!(signals, vec![UnofficialSignal::Healthy, UnofficialSignal::Neutral]);
+    }
+
+    #[tokio::test]
+    async fn ws_signal_and_entries_come_from_one_parse() {
+        // 前後の空白(NBSP)は既存の処理が trim して配列として読む。信号も同じ結果で Healthy。
+        let signals = ws_signals(&["\u{00A0}[]\u{00A0}"]).await;
+        assert_eq!(signals, vec![UnofficialSignal::Healthy, UnofficialSignal::Neutral]);
+        assert_eq!(parse_ws_array("\u{00A0}[1]\u{00A0}"), Some(vec![json!(1)]));
+        assert_eq!(parse_ws_entries("\u{00A0}[1]\u{00A0}"), vec![json!(1)]);
+    }
+
+    #[tokio::test]
+    async fn signals_are_not_lost_while_the_receiver_is_not_read() {
+        // H12 → H11 の接続の後、HTML が読めなくなる(H1×2)。受け手が読まずに溜めても
+        // 間の Healthy が落ちない(切替カウンタが実際のリセットを見落とさない)。
+        let ws_port = serve_ws(&[r#"{"x":1}"#, "[]"]).await;
+        let pubsub = format!(r#"{{"url":"ws://127.0.0.1:{ws_port}/"}}"#);
+        let port = serve_pages(
+            &[(200, LIVE_HTML)],
+            (200, "<html><body><p>maintenance</p></body></html>"),
+            (200, pubsub),
+        )
+        .await;
+        let (source, mut signal_rx, _metadata_rx) = signal_source(&format!("http://127.0.0.1:{port}"));
+        let (tx, _rx) = broadcast::channel(64);
+        let cancel = CancellationToken::new();
+        let runner = {
+            let cancel = cancel.clone();
+            tokio::spawn(async move { source.run(tx, cancel).await })
+        };
+        // 受け手は読まない。Backoff 1 秒の後、20ms ごとに Unreadable が溜まる。
+        let mut signals = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while signals.iter().filter(|s| **s == UnofficialSignal::Unreadable).count() < 3
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            while let Ok(signal) = signal_rx.try_recv() {
+                signals.push(signal);
+            }
+        }
+        cancel.cancel();
+        let _ = runner.await;
+        assert_eq!(
+            signals[..5],
+            [
+                UnofficialSignal::Unreadable,
+                UnofficialSignal::Healthy,
+                UnofficialSignal::Neutral,
+                UnofficialSignal::Unreadable,
+                UnofficialSignal::Unreadable,
+            ],
+            "{signals:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn signal_channel_keeps_more_than_64_unread_signals_in_order() {
+        // 受け手が読まないまま 64 件を超えて溜めても、落とさず順序も保つ(有界 64 では通らない)。
+        let (signal_tx, mut signal_rx) = mpsc::unbounded_channel();
+        let source = TwitcastingSource::new("alice".to_string(), TwitcastingOverrides::default(), None)
+            .with_signal_tx(signal_tx);
+        let mut sent = Vec::new();
+        for i in 0..100 {
+            let signal = match i % 3 {
+                0 => UnofficialSignal::Unreadable,
+                1 => UnofficialSignal::Neutral,
+                _ => UnofficialSignal::Unreadable,
+            };
+            source.send_signal(signal);
+            sent.push(signal);
+        }
+        source.send_signal(UnofficialSignal::Healthy);
+        sent.push(UnofficialSignal::Healthy);
+        let mut received = Vec::new();
+        while let Ok(signal) = signal_rx.try_recv() {
+            received.push(signal);
+        }
+        assert_eq!(received.len(), 101);
+        assert_eq!(received.last(), Some(&UnofficialSignal::Healthy));
+        assert_eq!(received, sent);
+    }
+
+    #[test]
+    fn default_unofficial_tuning_matches_previous_constants() {
+        let tuning = UnofficialTuning::default();
+        assert_eq!(tuning.offline, OFFLINE_INTERVAL);
+        assert_eq!(tuning.offline, Duration::from_secs(30));
+        assert_eq!(tuning.unreadable_recheck, Duration::from_secs(30));
+        assert_eq!(tuning.not_found_retry, NOT_FOUND_RETRY);
+        assert_eq!(tuning.not_found_retry, Duration::from_secs(300));
+        assert!(tuning.jitter);
+        // 既定の待ち時間で with_tuning 無しと同じ遅延になる。
+        let mut backoff = Backoff::new();
+        let mut seed = 7;
+        assert_eq!(
+            outcome_delay_for(SessionOutcome::Unreadable, &tuning, &mut backoff, &mut seed),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(
+            outcome_delay_for(SessionOutcome::NotFound, &tuning, &mut backoff, &mut seed),
+            Some(Duration::from_secs(300))
+        );
+        let (mut a, mut b) = (11, 11);
+        assert_eq!(
+            outcome_delay_for(SessionOutcome::Offline, &tuning, &mut backoff, &mut a),
+            outcome_delay(SessionOutcome::Offline, &mut Backoff::new(), &mut b)
+        );
+    }
+
+    // ---- PR3' B2: 解釈できない識別子を生で出さない ----
+
+    #[test]
+    fn invalid_identifier_channel_name_is_fixed_label() {
+        assert_eq!(channel_name("https://invalid.example/?token=MARKER"), INVALID_CHANNEL_LABEL);
+        assert_eq!(channel_name("x:bad"), INVALID_CHANNEL_LABEL);
+        assert_eq!(channel_name("https://twitcasting.tv/Alice"), "alice");
+    }
+
+    #[tokio::test]
+    async fn invalid_identifier_warn_does_not_include_identifier() {
+        use tracing::instrument::WithSubscriber;
+
+        let (metadata_tx, mut metadata_rx) = mpsc::channel(8);
+        let source = TwitcastingSource::new(
+            "https://invalid.example/?token=MARKER".to_string(),
+            TwitcastingOverrides::default(),
+            Some(metadata_tx),
+        );
+        let debug = format!("{source:?}");
+        let name = source.name();
+        let sink = crate::log_filter_tests::Sink::default();
+        let (tx, _rx) = broadcast::channel(8);
+        let cancel = CancellationToken::new();
+        let runner = {
+            let cancel = cancel.clone();
+            let subscriber = crate::log_subscriber(Some("trace"), sink.clone());
+            tokio::spawn(async move { source.run(tx, cancel).with_subscriber(subscriber).await })
+        };
+        let update = tokio::time::timeout(Duration::from_secs(5), metadata_rx.recv())
+            .await
+            .expect("notice が届く")
+            .expect("channel open");
+        cancel.cancel();
+        let _ = runner.await;
+
+        assert_eq!(update.notice.as_deref(), Some(INVALID_ID_NOTICE));
+        assert_eq!(update.channel, INVALID_CHANNEL_LABEL);
+        let output = sink.output();
+        assert!(output.contains(INVALID_ID_NOTICE), "{output}");
+        for text in [output, format!("{update:?}"), debug, name] {
+            assert!(!text.contains("MARKER"), "{text}");
+            assert!(!text.contains("invalid.example"), "{text}");
+        }
     }
 }

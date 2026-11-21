@@ -6,7 +6,10 @@
 
 pub mod niconico;
 pub mod twitcasting;
+pub mod twitcasting_api;
 pub mod twitcasting_auth;
+pub mod twitcasting_mode;
+pub mod twitcasting_official;
 pub mod twitch;
 pub mod twitch_auth;
 pub mod twitch_helix;
@@ -18,12 +21,13 @@ pub mod youtube;
 pub mod youtube_moderation;
 pub mod youtube_send;
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{ChannelConfig, ChannelPlatform};
+use crate::config::{ChannelConfig, ChannelPlatform, TwitcastingMode};
+use crate::integrations::KeyringSecretStore;
 use crate::model::{ChatMessage, LiveEvent, ModerationEvent, YoutubeReaction};
 use crate::stats::YoutubeMetadataUpdate;
 
@@ -94,6 +98,11 @@ impl Default for Backoff {
     }
 }
 
+type TwitcastingConnection = (
+    Arc<twitcasting_api::TwitcastingApi<KeyringSecretStore>>,
+    watch::Receiver<twitcasting_auth::AuthState>,
+);
+
 /// 設定された各チャンネルに対して Source を起動するマネージャ。
 ///
 /// 起動したタスクは `CancellationToken` の子トークンで管理し、
@@ -119,6 +128,8 @@ pub struct SourceManager {
     /// ツイキャス非公式経路の overrides スナップショット。
     twitcasting_overrides: twitcasting::TwitcastingOverrides,
     twitcasting_started_movies: twitcasting::StartedMovies,
+    twitcasting: Option<TwitcastingConnection>,
+    twitcasting_mode: TwitcastingMode,
 }
 
 impl SourceManager {
@@ -148,6 +159,8 @@ impl SourceManager {
             niconico_overrides,
             twitcasting_overrides,
             twitcasting_started_movies: Default::default(),
+            twitcasting: None,
+            twitcasting_mode: TwitcastingMode::default(),
         }
     }
 
@@ -162,6 +175,20 @@ impl SourceManager {
         started_movies: twitcasting::StartedMovies,
     ) -> Self {
         self.twitcasting_started_movies = started_movies;
+        self
+    }
+
+    pub fn with_twitcasting(
+        mut self,
+        api: Arc<twitcasting_api::TwitcastingApi<KeyringSecretStore>>,
+        auth_state: watch::Receiver<twitcasting_auth::AuthState>,
+    ) -> Self {
+        self.twitcasting = Some((api, auth_state));
+        self
+    }
+
+    pub(crate) fn with_twitcasting_mode(mut self, mode: TwitcastingMode) -> Self {
+        self.twitcasting_mode = mode;
         self
     }
 
@@ -226,16 +253,41 @@ impl SourceManager {
                 });
             }
             ChannelPlatform::Twitcasting => {
-                let src = twitcasting::TwitcastingSource::new(
-                    identifier,
+                let unofficial = twitcasting::TwitcastingSource::new(
+                    identifier.clone(),
                     self.twitcasting_overrides.clone(),
-                    metadata_tx,
+                    metadata_tx.clone(),
                 )
-                .with_started_movies(self.twitcasting_started_movies.clone())
                 .with_live_tx(self.live_tx.clone());
-                tauri::async_runtime::spawn(async move {
-                    run_with_logging(&src, tx, child).await;
-                });
+                if let Some((api, auth_state)) = &self.twitcasting {
+                    let official = twitcasting_official::TwitcastingOfficialSource::new(
+                        identifier,
+                        api.clone(),
+                        auth_state.clone(),
+                        metadata_tx.clone(),
+                        Default::default(),
+                    )
+                    .with_live_tx(self.live_tx.clone());
+                    let src = twitcasting_mode::TwitcastingRoutedSource::new_with_started_movies(
+                        self.twitcasting_mode,
+                        unofficial,
+                        official,
+                        auth_state.clone(),
+                        metadata_tx,
+                        self.twitcasting_started_movies.clone(),
+                    );
+                    tauri::async_runtime::spawn(async move {
+                        run_with_logging(&src, tx, child).await;
+                    });
+                } else if self.twitcasting_mode != TwitcastingMode::Official {
+                    let src =
+                        unofficial.with_started_movies(self.twitcasting_started_movies.clone());
+                    tauri::async_runtime::spawn(async move {
+                        run_with_logging(&src, tx, child).await;
+                    });
+                } else {
+                    tracing::error!("ツイキャス公式経路の依存関係が初期化されていません");
+                }
             }
         }
 
