@@ -5,8 +5,8 @@
 //! 設定は「重い処理は Rust 側」原則のもと、Source/TTS/Bus/Moderation の
 //! 全層から参照される単一の設定ソースとなる。
 
-use std::fs::File;
-use std::io::Write as _;
+use std::fs::{File, OpenOptions};
+use std::io::{ErrorKind, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -239,31 +239,27 @@ pub fn replace_channels_in(
     Ok(())
 }
 
-/// 元ファイルを読み切ってから一時ファイルへ書き、既存名を上書きしない hard link で `.broken-*` に確定する。
-/// 読込・書込の途中で失敗しても空や途中までの `.broken-*` は残らない。名前は空くまで連番を進める。
+/// 元ファイルを読み切ってから、空いている連番の `.broken-*` を排他的に作成する。
+/// 書き込みや同期に失敗したら、ファイルを閉じてから作成した退避先を削除する。
 fn preserve_broken_config(path: &Path, now_ms: u128) -> std::io::Result<PathBuf> {
     let bytes = std::fs::read(path)?;
-    let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
-    let tmp = path.with_file_name(format!("{name}.broken-{now_ms}.tmp"));
-    let result = (|| {
-        {
-            let mut file = File::create(&tmp)?;
-            file.write_all(&bytes)?;
-            file.sync_all()?;
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    for n in 0u64.. {
+        let suffix = if n == 0 { String::new() } else { format!("-{n}") };
+        let backup = path.with_file_name(format!("{name}.broken-{now_ms}{suffix}"));
+        let mut file = match OpenOptions::new().write(true).create_new(true).open(&backup) {
+            Ok(file) => file,
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        };
+        let result = file.write_all(&bytes).and_then(|()| file.sync_all());
+        drop(file);
+        if result.is_err() {
+            let _ = std::fs::remove_file(&backup);
         }
-        for n in 0u64.. {
-            let suffix = if n == 0 { String::new() } else { format!("-{n}") };
-            let backup = path.with_file_name(format!("{name}.broken-{now_ms}{suffix}"));
-            match std::fs::hard_link(&tmp, &backup) {
-                Ok(()) => return Ok(backup),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(e) => return Err(e),
-            }
-        }
-        Err(std::io::ErrorKind::AlreadyExists.into())
-    })();
-    let _ = std::fs::remove_file(&tmp);
-    result
+        return result.map(|()| backup);
+    }
+    Err(ErrorKind::AlreadyExists.into())
 }
 
 /// 退避できなかった設定ディレクトリ。元の config.json を既定値で上書きしないよう保存を止める。
@@ -1279,11 +1275,12 @@ impl AppConfig {
     /// パース失敗時はエラーを返す(壊れた設定で黙って初期化しないため)。
     pub fn load(dir: &Path) -> anyhow::Result<AppConfig> {
         let path = Self::path_in(dir);
-        if !path.exists() {
-            return Ok(AppConfig::default());
+        let text = match path.try_exists() {
+            Ok(false) => return Ok(AppConfig::default()),
+            Ok(true) => std::fs::read_to_string(&path),
+            Err(e) => Err(e),
         }
-        let text = std::fs::read_to_string(&path)
-            .map_err(|e| anyhow::anyhow!("設定ファイル読込失敗 {}: {e}", path.display()))?;
+        .map_err(|e| anyhow::anyhow!("設定ファイル読込失敗 {}: {e}", path.display()))?;
         // serde の文面は不正な値をそのまま含む(トークン等が紛れうる)ので、項目と位置だけ出す。
         let mut deserializer = serde_json::Deserializer::from_str(&text);
         let mut cfg: AppConfig =
@@ -2715,6 +2712,30 @@ mod tests {
     }
 
     #[test]
+    fn backup_preserves_all_bytes_and_leaves_existing_files_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = AppConfig::path_in(dir.path());
+        let bytes = b"\xff\0broken config".repeat(4096);
+        std::fs::write(&path, &bytes).unwrap();
+        let old_backup = dir.path().join("config.json.broken-42");
+        let old_tmp = dir.path().join("config.json.broken-42.tmp");
+        std::fs::write(&old_backup, b"older backup").unwrap();
+        std::fs::write(&old_tmp, b"older temporary file").unwrap();
+
+        assert_eq!(
+            AppConfig::load_or_preserve_at(dir.path(), 42),
+            (AppConfig::default(), false)
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(
+            std::fs::read(dir.path().join("config.json.broken-42-1")).unwrap(),
+            bytes
+        );
+        assert_eq!(std::fs::read(&old_backup).unwrap(), b"older backup");
+        assert_eq!(std::fs::read(&old_tmp).unwrap(), b"older temporary file");
+    }
+
+    #[test]
     fn missing_or_valid_config_is_not_preserved() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(AppConfig::load_or_preserve_at(dir.path(), 1), (AppConfig::default(), false));
@@ -2725,6 +2746,23 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         assert!(names.iter().all(|n| !n.contains(".broken-")), "{names:?}");
+    }
+
+    #[test]
+    fn config_metadata_error_blocks_saves() {
+        let dir = tempfile::tempdir().unwrap();
+        let invalid_dir = dir.path().join("invalid\0name");
+        assert_eq!(
+            std::fs::metadata(AppConfig::path_in(&invalid_dir)).unwrap_err().kind(),
+            ErrorKind::InvalidInput
+        );
+        assert!(AppConfig::load(&invalid_dir).is_err());
+        assert_eq!(
+            AppConfig::load_or_preserve_at(&invalid_dir, 42),
+            (AppConfig::default(), true)
+        );
+        let err = AppConfig::default().save(&invalid_dir).unwrap_err();
+        assert_eq!(err.to_string(), CONFIG_SAVE_BLOCKED_ERROR);
     }
 
     #[test]

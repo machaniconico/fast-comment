@@ -298,13 +298,7 @@ fn try_enqueue_tts_message(
 /// 読み上げ OFF の枠の未読み上げコメントを捨てる。設定ロック中(保存の直後)に呼び、
 /// true が返ったらロックを放してから `emit_queue_state` する。
 fn purge_disabled_channel_tts(cfg: &AppConfig, queue: &TtsShared) -> bool {
-    let keys: Vec<String> = cfg
-        .channels
-        .iter()
-        .filter(|ch| !tts::overrides_allow_tts(Some(&ch.overrides)))
-        .map(config::channel_key)
-        .collect();
-    queue.remove_channels(&keys) > 0
+    queue.remove_disabled_channels(cfg) > 0
 }
 
 fn emit_bouyomi_launch_notice(app: &AppHandle, outcome: bouyomi::LaunchOutcome) {
@@ -4766,6 +4760,37 @@ mod followup_tests {
         assert!(purge_disabled_channel_tts(&cfg, &queue));
         drop(cfg);
         assert_eq!(queue.snapshot().depth, 0);
+    }
+
+    #[test]
+    fn full_config_save_keeps_queued_comment_when_first_duplicate_allows_tts() {
+        let (dir, revision, tx, mut current) = commit_parts();
+        for tts_enabled in [true, false] {
+            current.channels.push(ChannelConfig {
+                platform: ChannelPlatform::Twitch,
+                identifier: "a".into(),
+                enabled: true,
+                own_stream: false,
+                overrides: ChannelOverrides {
+                    tts_enabled: Some(tts_enabled),
+                    ..Default::default()
+                },
+            });
+        }
+        let config = Mutex::new(current);
+        let queue = TtsShared::default();
+        try_enqueue_tts_message(&NullSink, &config, &queue, tts_message("q", Some("twitch:a")));
+        assert_eq!(queue.snapshot().depth, 1);
+
+        let mut cfg = config.lock().unwrap();
+        let mut json = serde_json::to_value(&*cfg).unwrap();
+        json["goals"]["showInApp"] = serde_json::json!(true);
+        let mut next = AppConfig::from_config_update(json).unwrap();
+        next.normalize_all();
+        commit_config(dir.path(), &revision, &tx, &mut cfg, next, Some(0)).unwrap();
+        assert!(cfg.goals.show_in_app);
+        assert!(!purge_disabled_channel_tts(&cfg, &queue));
+        assert_eq!(queue.snapshot().depth, 1);
     }
 
     #[test]

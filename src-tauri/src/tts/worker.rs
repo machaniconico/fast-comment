@@ -8,10 +8,11 @@ use tokio_util::sync::CancellationToken;
 
 use super::queue::{PushResult, TtsJob, TtsQueueCore};
 use super::{
-    SpeakContext, SpeechOutput, TtsDispatcher, TtsQueueItem, TtsQueueStatePayload, TtsSink,
+    channel_allows_tts, SpeakContext, SpeechOutput, TtsDispatcher, TtsQueueItem, TtsQueueStatePayload,
+    TtsSink,
 };
 use crate::{
-    config::TtsConfig,
+    config::{AppConfig, TtsConfig},
     model::{ChatMessage, ModerationEvent},
 };
 
@@ -165,16 +166,11 @@ impl TtsShared {
 
     /// 読み上げを切った枠のコメントを未読み上げキューから除き、除いた件数を返す。
     /// 通知は出さない(呼び出し側が設定ロックを放してから `emit_queue_state` する)。
-    pub fn remove_channels(&self, origin_keys: &[String]) -> usize {
-        if origin_keys.is_empty() {
-            return 0;
-        }
-        self.core.lock().unwrap().remove_where(|msg| {
-            msg.route
-                .origin_key
-                .as_deref()
-                .is_some_and(|key| origin_keys.iter().any(|k| k == key))
-        })
+    pub(crate) fn remove_disabled_channels(&self, cfg: &AppConfig) -> usize {
+        self.core
+            .lock()
+            .unwrap()
+            .remove_where(|msg| !channel_allows_tts(cfg, msg))
     }
 
     pub fn snapshot(&self) -> TtsQueueStatePayload {
