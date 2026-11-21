@@ -10,7 +10,10 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use reqwest::{header::ACCEPT, Client, StatusCode, Url};
+use reqwest::{
+    header::{ACCEPT, DATE},
+    Client, StatusCode, Url,
+};
 use serde_json::Value;
 use tracing::instrument::WithSubscriber;
 
@@ -204,6 +207,17 @@ impl<S: SecretStore> TwitcastingApi<S> {
         movie_id: &str,
         query: CommentsQuery,
     ) -> Result<Vec<Value>, ApiError> {
+        self.comments_with_date(movie_id, query)
+            .await
+            .map(|(comments, _)| comments)
+    }
+
+    /// Also returns the response `Date` header as epoch milliseconds, when it parses.
+    pub async fn comments_with_date(
+        &self,
+        movie_id: &str,
+        query: CommentsQuery,
+    ) -> Result<(Vec<Value>, Option<i64>), ApiError> {
         let offset = query.offset.to_string();
         let limit = PAGE_LIMIT.to_string();
         let mut params = vec![("offset", offset.as_str()), ("limit", limit.as_str())];
@@ -211,11 +225,14 @@ impl<S: SecretStore> TwitcastingApi<S> {
             params.push(("slice_id", slice_id));
         }
 
-        let mut value = self.get(&["movies", movie_id, "comments"], &params).await?;
-        match value.get_mut("comments").map(Value::take) {
-            Some(Value::Array(comments)) => Ok(comments),
-            _ => Ok(Vec::new()),
-        }
+        let (mut value, date_ms) = self
+            .get_with_date(&["movies", movie_id, "comments"], &params)
+            .await?;
+        let comments = match value.get_mut("comments").map(Value::take) {
+            Some(Value::Array(comments)) => comments,
+            _ => Vec::new(),
+        };
+        Ok((comments, date_ms))
     }
 
     pub fn live_guard(self: &Arc<Self>) -> LiveGuard {
@@ -228,6 +245,16 @@ impl<S: SecretStore> TwitcastingApi<S> {
     }
 
     async fn get(&self, segments: &[&str], params: &[(&str, &str)]) -> Result<Value, ApiError> {
+        self.get_with_date(segments, params)
+            .await
+            .map(|(value, _)| value)
+    }
+
+    async fn get_with_date(
+        &self,
+        segments: &[&str],
+        params: &[(&str, &str)],
+    ) -> Result<(Value, Option<i64>), ApiError> {
         loop {
             let delay = self.budget.lock().unwrap().delay_before_next(epoch_ms());
             if delay.is_zero() {
@@ -277,6 +304,11 @@ impl<S: SecretStore> TwitcastingApi<S> {
             .get("X-RateLimit-Reset")
             .and_then(|v| v.to_str().ok());
         let reset_epoch_s = reset.and_then(|value| value.parse::<u64>().ok());
+        let date_ms = headers
+            .get(DATE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| chrono::DateTime::parse_from_rfc2822(v.trim()).ok())
+            .map(|date| date.timestamp_millis());
         {
             let mut budget = self.budget.lock().unwrap();
             let now_ms = epoch_ms();
@@ -291,6 +323,7 @@ impl<S: SecretStore> TwitcastingApi<S> {
                 .json()
                 .with_subscriber(tracing::subscriber::NoSubscriber::default())
                 .await
+                .map(|value| (value, date_ms))
                 .map_err(|error| {
                     if error.is_decode() {
                         ApiError::Other

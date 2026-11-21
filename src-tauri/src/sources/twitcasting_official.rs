@@ -36,6 +36,7 @@ const PAGE_SIZE: u32 = 50;
 const HISTORY_LIMIT: usize = 20;
 const STARTED_MOVIES_LIMIT: usize = 256;
 const COMMENT_UNIT: Duration = Duration::from_secs(2);
+const STALE_COMMENT_MS: i64 = 60_000;
 
 #[derive(Default)]
 pub struct CommentCursor {
@@ -59,6 +60,7 @@ impl CommentCursor {
             pages: 0,
             ended_on_empty: false,
             entries: Vec::new(),
+            stale_ids: HashSet::new(),
         }
     }
 
@@ -134,6 +136,7 @@ pub struct PollBatch {
     pages: u32,
     ended_on_empty: bool,
     entries: Vec<Value>,
+    stale_ids: HashSet<String>,
 }
 
 impl PollBatch {
@@ -208,6 +211,20 @@ fn id_string(value: &Value) -> Option<String> {
     }
 }
 
+fn local_now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
+/// 応答の Date(サーバ時刻。無い・読めない時は PC の現在時刻)より 60 秒超古いコメントは
+/// 読み上げない。`created` が無い・0 のコメントは読み上げる。
+fn is_stale_comment(created: &Value, server_now_ms: Option<i64>) -> bool {
+    let now_ms = server_now_ms.unwrap_or_else(local_now_ms);
+    timestamp_ms(created).is_some_and(|created| now_ms - created > STALE_COMMENT_MS)
+}
+
 fn timestamp_ms(value: &Value) -> Option<i64> {
     let n = value
         .as_i64()
@@ -249,7 +266,6 @@ struct Movie {
     handed_off: bool,
     protected: bool,
     last_poll: Option<Instant>,
-    last_successful_poll: Option<SuccessfulPoll>,
 }
 
 impl Movie {
@@ -262,14 +278,7 @@ impl Movie {
             handed_off: false,
             protected: false,
             last_poll: None,
-            last_successful_poll: None,
         }
-    }
-
-    fn poll_gap_exceeded(&self) -> bool {
-        self.last_successful_poll
-            .as_ref()
-            .is_some_and(|poll| poll.completed_at.elapsed() > poll.interval.saturating_mul(3))
     }
 
     fn comment_due(&self, next_comment: Instant, interval: Duration) -> Instant {
@@ -278,25 +287,11 @@ impl Movie {
     }
 }
 
-struct SuccessfulPoll {
-    completed_at: Instant,
-    interval: Duration,
-}
-
-#[derive(Default, PartialEq, Eq)]
-enum CommentGap {
-    #[default]
-    None,
-    NeedsRefresh,
-    MovieConfirmed,
-}
-
 #[derive(Default)]
 struct LiveState {
     movie: Option<Movie>,
     guard: Option<LiveGuard>,
     observed_offline_at: Option<Instant>,
-    comment_gap: CommentGap,
 }
 
 pub struct TwitcastingOfficialSource<S: SecretStore> {
@@ -390,16 +385,7 @@ impl<S: SecretStore> TwitcastingOfficialSource<S> {
         let mut jitter = super::jitter_seed();
 
         loop {
-            let (state, auth_changed) = {
-                let observed = auth.borrow_and_update();
-                (*observed, observed.has_changed())
-            };
-            // An unseen update can represent a gap even if Ready was restored
-            // before the source woke up.
-            if auth_changed || state != AuthState::Ready {
-                live.comment_gap = CommentGap::NeedsRefresh;
-                next_live = Instant::now();
-            }
+            let state = *auth.borrow_and_update();
             if state != AuthState::Ready {
                 live.guard = None;
                 let notice = match state {
@@ -414,19 +400,13 @@ impl<S: SecretStore> TwitcastingOfficialSource<S> {
                     }
                     auth_notice = notice;
                 }
-                if auth.clone().changed().await.is_err() {
+                if auth.changed().await.is_err() {
                     return;
                 }
+                next_live = Instant::now();
                 continue;
             }
             auth_notice = None;
-
-            if live.comment_gap == CommentGap::None
-                && live.movie.as_ref().is_some_and(Movie::poll_gap_exceeded)
-            {
-                live.comment_gap = CommentGap::NeedsRefresh;
-                next_live = Instant::now();
-            }
 
             let interval = self.comment_interval();
             let comment_due = live
@@ -434,8 +414,7 @@ impl<S: SecretStore> TwitcastingOfficialSource<S> {
                 .as_ref()
                 .filter(|_| live.guard.is_some())
                 .map(|movie| movie.comment_due(next_comment, interval));
-            let refresh_live = live.comment_gap == CommentGap::NeedsRefresh
-                || comment_due.is_none_or(|due| next_live <= due);
+            let refresh_live = comment_due.is_none_or(|due| next_live <= due);
             let due = if refresh_live {
                 next_live
             } else {
@@ -443,9 +422,8 @@ impl<S: SecretStore> TwitcastingOfficialSource<S> {
             };
             let due = due.max(request_after);
             if due > Instant::now() {
-                let mut auth_change = auth.clone();
                 tokio::select! {
-                    changed = auth_change.changed() => {
+                    changed = auth.changed() => {
                         if changed.is_err() { return; }
                     }
                     _ = time::sleep_until(due) => {}
@@ -455,7 +433,9 @@ impl<S: SecretStore> TwitcastingOfficialSource<S> {
 
             let result = if let Some(id) = user_id.as_deref() {
                 if refresh_live {
-                    let result = self.refresh_movie(&screen_id, id, &mut live, &auth).await;
+                    let result = self
+                        .refresh_movie(&screen_id, id, &mut live, &mut auth)
+                        .await;
                     let interval = if live.movie.is_some() {
                         self.tuning.live_refresh
                     } else {
@@ -470,31 +450,18 @@ impl<S: SecretStore> TwitcastingOfficialSource<S> {
                     })
                 } else {
                     let movie = live.movie.as_mut().expect("comment poll needs a movie");
-                    let result = while_ready(&auth, self.fetch_comments(movie)).await;
+                    let result = while_ready(&mut auth, self.fetch_comments(movie)).await;
                     // A poll delayed by the shared budget still leaves a full interval
                     // before the next poll.
-                    let completed_at = Instant::now();
-                    movie.last_poll = Some(completed_at);
+                    movie.last_poll = Some(Instant::now());
                     result.map(|batch| {
-                        if !matches!(auth.has_changed(), Ok(false)) {
-                            return;
+                        if *auth.borrow() == AuthState::Ready {
+                            self.publish_comments(movie, batch, carry_over.take(), &tx);
                         }
-                        if live.comment_gap == CommentGap::None && movie.poll_gap_exceeded() {
-                            live.comment_gap = CommentGap::NeedsRefresh;
-                            next_live = completed_at;
-                            return;
-                        }
-                        let skip_tts =
-                            std::mem::take(&mut live.comment_gap) == CommentGap::MovieConfirmed;
-                        movie.last_successful_poll = Some(SuccessfulPoll {
-                            completed_at,
-                            interval: self.comment_interval(),
-                        });
-                        self.publish_comments(movie, batch, skip_tts, carry_over.take(), &tx);
                     })
                 }
             } else {
-                while_ready(&auth, self.api.user(&screen_id))
+                while_ready(&mut auth, self.api.user(&screen_id))
                     .await
                     .and_then(|user| {
                         user_id = id_string(&user["user"]["id"]);
@@ -507,7 +474,6 @@ impl<S: SecretStore> TwitcastingOfficialSource<S> {
             } else {
                 (&mut next_comment, &mut comment_backoff)
             };
-            let failed = result.is_err();
             match result {
                 Ok(()) => {
                     backoff.reset();
@@ -554,20 +520,6 @@ impl<S: SecretStore> TwitcastingOfficialSource<S> {
                     *next = (*next).max(Instant::now() + backoff.next_delay());
                 }
             }
-            if failed && !refresh_live {
-                live.comment_gap = CommentGap::NeedsRefresh;
-                if let Some(movie) = &live.movie {
-                    next_live = next_live.min(movie.comment_due(next_comment, interval));
-                }
-            } else if failed {
-                if comment_due.is_some_and(|due| request_after > due) {
-                    // Connection backoff and app-disabled waits can delay both requests.
-                    live.comment_gap = CommentGap::NeedsRefresh;
-                    next_live = next_live.min(request_after);
-                } else if live.guard.is_none() && comment_due.is_some_and(|due| next_live > due) {
-                    live.comment_gap = CommentGap::NeedsRefresh;
-                }
-            }
         }
     }
 
@@ -576,12 +528,9 @@ impl<S: SecretStore> TwitcastingOfficialSource<S> {
         screen_id: &str,
         user_id: &str,
         live: &mut LiveState,
-        auth: &watch::Receiver<AuthState>,
+        auth: &mut watch::Receiver<AuthState>,
     ) -> Result<bool, ApiError> {
         let snapshot = while_ready(auth, self.api.current_live(user_id)).await?;
-        if !matches!(auth.has_changed(), Ok(false)) {
-            return Err(ApiError::Unauthorized);
-        }
         let movie_id = snapshot.as_ref().and_then(|v| id_string(&v["movie"]["id"]));
         let Some((snapshot, movie_id)) = snapshot.as_ref().zip(movie_id) else {
             // 初回が未配信の場合も、自動告知に開始前の観測として伝える。
@@ -589,7 +538,6 @@ impl<S: SecretStore> TwitcastingOfficialSource<S> {
                 self.send_live_ended();
             }
             live.guard = None;
-            live.comment_gap = CommentGap::None;
             live.observed_offline_at = Some(Instant::now());
             self.send_metadata(false, None, None).await;
             return Ok(false);
@@ -604,13 +552,8 @@ impl<S: SecretStore> TwitcastingOfficialSource<S> {
             let recently_offline = live.observed_offline_at.take().is_some_and(|offline_at| {
                 offline_at.elapsed() <= self.tuning.offline.saturating_mul(2)
             });
-            let mid_stream = live.comment_gap != CommentGap::None
-                || live.movie.as_ref().is_some_and(Movie::poll_gap_exceeded)
-                || (!recently_offline && (live.movie.is_none() || handed_off));
+            let mid_stream = !recently_offline && (live.movie.is_none() || handed_off);
             live.movie = Some(Movie::new(movie_id, mid_stream));
-        }
-        if live.comment_gap == CommentGap::NeedsRefresh {
-            live.comment_gap = CommentGap::MovieConfirmed;
         }
         let movie = live.movie.as_mut().expect("live snapshot has a movie");
         movie.handed_off = false;
@@ -634,34 +577,30 @@ impl<S: SecretStore> TwitcastingOfficialSource<S> {
     fn publish_comments(
         &self,
         movie: &mut Movie,
-        batch: PollBatch,
-        skip_tts: bool,
+        mut batch: PollBatch,
         skip_ids: Option<&HashSet<String>>,
         tx: &broadcast::Sender<ChatMessage>,
     ) {
+        let stale_ids = std::mem::take(&mut batch.stale_ids);
         let history = std::mem::take(&mut movie.mid_stream);
         let entries = if history {
             movie.cursor.commit_mid_stream(batch)
         } else {
             movie.cursor.commit(batch)
         };
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64;
         let context = OfficialMapContext {
             channel: &self.channel,
             broadcaster_id: movie.broadcaster_id.as_deref(),
-            now_ms,
+            now_ms: local_now_ms(),
         };
-        for mut message in entries
-            .iter()
-            .filter_map(|v| official_comment_to_chat(v, &context))
-        {
+        for (mut message, stale) in entries.iter().filter_map(|v| {
+            let stale = id_string(&v["id"]).is_some_and(|id| stale_ids.contains(&id));
+            Some((official_comment_to_chat(v, &context)?, stale))
+        }) {
             if skip_ids.is_some_and(|ids| ids.contains(&message.id)) {
                 continue;
             }
-            message.skip_tts = history || skip_tts;
+            message.skip_tts = history || stale;
             let _ = tx.send(message);
         }
     }
@@ -669,7 +608,13 @@ impl<S: SecretStore> TwitcastingOfficialSource<S> {
     async fn fetch_comments(&self, movie: &Movie) -> Result<PollBatch, ApiError> {
         let mut batch = movie.cursor.begin_poll();
         while let Some(query) = batch.next_query() {
-            batch.push_page(self.api.comments(&movie.id, query).await?);
+            let (page, date_ms) = self.api.comments_with_date(&movie.id, query).await?;
+            batch.stale_ids.extend(
+                page.iter()
+                    .filter(|v| is_stale_comment(&v["created"], date_ms))
+                    .filter_map(|v| id_string(&v["id"])),
+            );
+            batch.push_page(page);
             if movie.mid_stream {
                 break;
             }
@@ -769,13 +714,11 @@ impl<S: SecretStore> TwitcastingOfficialSource<S> {
     }
 }
 
-// Stop budget waits and requests when credentials are unavailable. A clone
-// leaves any watch updates visible to the scheduling loop.
+// Also stop waiting for a request's rate budget when credentials become unavailable.
 async fn while_ready<T>(
-    auth: &watch::Receiver<AuthState>,
+    auth: &mut watch::Receiver<AuthState>,
     request: impl Future<Output = Result<T, ApiError>>,
 ) -> Result<T, ApiError> {
-    let mut auth = auth.clone();
     tokio::select! {
         biased;
         _ = auth.wait_for(|state| *state != AuthState::Ready) => Err(ApiError::Unauthorized),
@@ -817,13 +760,7 @@ mod tests {
         sources::twitcasting_auth::{AuthOptions, TwitcastingAuth, TOKEN_KEY},
         TwitcastingEndpoints,
     };
-    use axum::{
-        body::{Body, Bytes},
-        http::StatusCode,
-        response::{IntoResponse, Response},
-        routing::get,
-        Json, Router,
-    };
+    use axum::{http::StatusCode, routing::get, Json, Router};
     use serde_json::json;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::{sync::Notify, task::JoinHandle, time::timeout};
@@ -1240,31 +1177,47 @@ mod tests {
         live_count_after_comment_error(2001, APP_DISABLED_NOTICE, None, 1).await;
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn gap_threshold_uses_the_interval_recorded_with_the_last_successful_poll() {
-        let mut movie = Movie::new("9".into(), false);
-        let previous_interval = comment_interval(5);
-        let current_interval = comment_interval(1);
-        let completed_at = Instant::now();
-        assert!(!movie.poll_gap_exceeded());
-        movie.last_successful_poll = Some(SuccessfulPoll {
-            completed_at,
-            interval: previous_interval,
-        });
-        movie.last_poll = Some(completed_at);
-
-        time::advance(current_interval * 3 + Duration::from_millis(1)).await;
-        assert!(movie.comment_due(completed_at, current_interval) < Instant::now());
-        assert!(!movie.poll_gap_exceeded());
-
-        time::advance(previous_interval * 3 - completed_at.elapsed()).await;
-        assert!(!movie.poll_gap_exceeded());
-        time::advance(Duration::from_millis(1)).await;
-        assert!(movie.poll_gap_exceeded());
-    }
-
     fn comment(id: u32) -> Value {
         json!({ "id": id, "message": "chat", "from_user": { "screen_id": "alice" } })
+    }
+
+    #[test]
+    fn comment_older_than_sixty_seconds_is_not_read_aloud() {
+        let server_ms = 1_800_000_000_000;
+        let server_s = server_ms / 1000;
+        assert!(!is_stale_comment(&json!(server_s - 59), Some(server_ms)));
+        assert!(!is_stale_comment(&json!(server_s - 60), Some(server_ms)));
+        assert!(is_stale_comment(&json!(server_s - 61), Some(server_ms)));
+        // ミリ秒の created もそのまま比べる。
+        assert!(!is_stale_comment(
+            &json!(server_ms - 59_000),
+            Some(server_ms)
+        ));
+        assert!(is_stale_comment(
+            &json!(server_ms - 61_000),
+            Some(server_ms)
+        ));
+        assert!(is_stale_comment(
+            &json!((server_s - 61).to_string()),
+            Some(server_ms)
+        ));
+    }
+
+    #[test]
+    fn missing_date_compares_with_local_now() {
+        let now_s = local_now_ms() / 1000;
+        assert!(!is_stale_comment(&json!(now_s - 30), None));
+        assert!(is_stale_comment(&json!(now_s - 120), None));
+    }
+
+    #[test]
+    fn comment_without_created_is_read_aloud() {
+        for created in [json!(0), Value::Null, json!(""), json!("abc"), json!(-5)] {
+            assert!(
+                !is_stale_comment(&created, Some(1_800_000_000_000)),
+                "{created}"
+            );
+        }
     }
 
     #[test]
@@ -1330,39 +1283,6 @@ mod tests {
         assert!(refresh_calls.load(Ordering::SeqCst) >= 2);
     }
 
-    #[tokio::test]
-    async fn coalesced_relogin_rechecks_movie_and_silences_backlog() {
-        let refresh_calls = Arc::new(AtomicUsize::new(0));
-        let router = Router::new()
-            .route(
-                "/users/1/current_live",
-                get({
-                    let refresh_calls = Arc::clone(&refresh_calls);
-                    move || async move {
-                        refresh_calls.fetch_add(1, Ordering::SeqCst);
-                        Json(json!({ "movie": { "id": "9" } }))
-                    }
-                }),
-            )
-            .merge(incremental_comments());
-        let mut source = start_source(
-            router,
-            PollTuning {
-                live_refresh: Duration::from_secs(10),
-                comment_unit: Duration::from_millis(200),
-                ..test_tuning()
-            },
-            AuthState::Ready,
-        )
-        .await;
-        assert_next_comment(&mut source, 1, true).await;
-        source.auth.send(AuthState::ReloginRequired).unwrap();
-        source.auth.send(AuthState::Ready).unwrap();
-        assert_next_comment(&mut source, 2, true).await;
-        assert_eq!(refresh_calls.load(Ordering::SeqCst), 2);
-        assert_next_comment(&mut source, 3, false).await;
-    }
-
     fn incremental_comments() -> Router {
         Router::new().route(
             "/movies/9/comments",
@@ -1392,153 +1312,6 @@ mod tests {
             .unwrap();
         assert_eq!(message.id, format!("tc-{id}"));
         assert_eq!(message.skip_tts, skip_tts, "comment {id}");
-    }
-
-    #[tokio::test]
-    async fn failed_movie_refresh_blocks_old_comment_retry_after_gap() {
-        let old_poll_calls = Arc::new(AtomicUsize::new(0));
-        let failed_refresh = Arc::new(AtomicBool::new(false));
-        let router = Router::new()
-            .route(
-                "/users/1/current_live",
-                get({
-                    let old_poll_calls = Arc::clone(&old_poll_calls);
-                    let failed_refresh = Arc::clone(&failed_refresh);
-                    move || async move {
-                        let id = if old_poll_calls.load(Ordering::SeqCst) < 2 {
-                            "9"
-                        } else if !failed_refresh.swap(true, Ordering::SeqCst) {
-                            return (StatusCode::SERVICE_UNAVAILABLE, Json(Value::Null));
-                        } else {
-                            "10"
-                        };
-                        (StatusCode::OK, Json(json!({ "movie": { "id": id } })))
-                    }
-                }),
-            )
-            .route(
-                "/movies/9/comments",
-                get({
-                    let old_poll_calls = Arc::clone(&old_poll_calls);
-                    move || async move {
-                        match old_poll_calls.fetch_add(1, Ordering::SeqCst) {
-                            0 => (StatusCode::OK, Json(json!({ "comments": [comment(1)] }))),
-                            1 => (StatusCode::SERVICE_UNAVAILABLE, Json(Value::Null)),
-                            _ => (StatusCode::OK, Json(json!({ "comments": [] }))),
-                        }
-                    }
-                }),
-            )
-            .route(
-                "/movies/10/comments",
-                get(
-                    |axum::extract::Query(params): axum::extract::Query<
-                        std::collections::HashMap<String, String>,
-                    >| async move {
-                        let entries = if !params.contains_key("slice_id") {
-                            (101..=150).rev().map(comment).collect::<Vec<_>>()
-                        } else {
-                            Vec::new()
-                        };
-                        Json(json!({ "comments": entries }))
-                    },
-                ),
-            );
-        let mut source = start_source(
-            router,
-            PollTuning {
-                live_refresh: Duration::from_secs(2),
-                comment_unit: Duration::from_millis(100),
-                ..test_tuning()
-            },
-            AuthState::Ready,
-        )
-        .await;
-        assert_next_comment(&mut source, 1, true).await;
-        for id in 131..=150 {
-            assert_next_comment(&mut source, id, true).await;
-        }
-        assert!(failed_refresh.load(Ordering::SeqCst));
-        assert_eq!(old_poll_calls.load(Ordering::SeqCst), 2);
-    }
-
-    async fn assert_comment_resume_after_error(error_response: fn() -> Response) {
-        let fail_once = Arc::new(AtomicBool::new(true));
-        let router = Router::new()
-            .route(
-                "/users/1/current_live",
-                get(|| async { Json(json!({ "movie": { "id": "9" } })) }),
-            )
-            .route(
-                "/movies/9/comments",
-                get(
-                    move |axum::extract::Query(params): axum::extract::Query<
-                        std::collections::HashMap<String, String>,
-                    >| {
-                        let fail_once = Arc::clone(&fail_once);
-                        async move {
-                            let id = match (
-                                params.get("slice_id").map(String::as_str),
-                                params.get("offset").map(String::as_str),
-                            ) {
-                                (None, Some("0")) => 1,
-                                (Some("1"), Some("0"))
-                                    if fail_once.swap(false, Ordering::Relaxed) =>
-                                {
-                                    return error_response();
-                                }
-                                (Some("1"), Some("0")) => 2,
-                                (Some("2"), Some("0")) => 3,
-                                _ => return Json(json!({ "comments": [] })).into_response(),
-                            };
-                            Json(json!({ "comments": [comment(id)] })).into_response()
-                        }
-                    },
-                ),
-            );
-        let tuning = PollTuning {
-            live_refresh: Duration::from_millis(250),
-            comment_unit: Duration::from_millis(500),
-            ..test_tuning()
-        };
-        let mut source = start_source(router, tuning, AuthState::Ready).await;
-        timeout(Duration::from_secs(5), async {
-            for (id, skip_tts) in [(1, true), (2, true), (3, false)] {
-                let message = source.messages.recv().await.unwrap();
-                assert_eq!(message.id, format!("tc-{id}"));
-                assert_eq!(message.skip_tts, skip_tts, "comment {id}");
-            }
-        })
-        .await
-        .unwrap();
-    }
-
-    #[tokio::test]
-    async fn server_backoff_silences_only_the_resumed_poll() {
-        assert_comment_resume_after_error(|| StatusCode::SERVICE_UNAVAILABLE.into_response()).await;
-    }
-
-    #[tokio::test]
-    async fn network_backoff_silences_only_the_resumed_poll() {
-        assert_comment_resume_after_error(|| {
-            let body = Body::from_stream(futures_util::stream::once(async {
-                Err::<Bytes, _>(std::io::Error::from(std::io::ErrorKind::ConnectionReset))
-            }));
-            Response::new(body)
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    async fn app_disabled_wait_silences_only_the_resumed_poll() {
-        assert_comment_resume_after_error(|| {
-            (
-                StatusCode::FORBIDDEN,
-                Json(json!({ "error": { "code": 2001 } })),
-            )
-                .into_response()
-        })
-        .await;
     }
 
     #[test]
