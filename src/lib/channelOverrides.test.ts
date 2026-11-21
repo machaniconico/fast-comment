@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   applyChannelsSaved,
   chipBadge,
+  replacedChannelKeys,
   fromFormState,
   toFormState,
   voiceOptions,
@@ -77,4 +78,18 @@ test('bouyomi_voice_zero_is_distinct_from_follow_global', () => {
     ttsVoice: { bouyomiVoice: 10001 },
   });
   assert.deepEqual(fromFormState({ ttsDisabled: false, voice: '' }, 'bouyomi'), {});
+});
+
+test('replacedChannelKeys_lists_every_old_row_of_same_platform_for_x_and_niconico', () => {
+  const channels = [
+    { platform: 'niconico', identifier: 'lv1', enabled: true },
+    { platform: 'twitch', identifier: 'alice', enabled: true },
+    { platform: 'niconico', identifier: 'lv2', enabled: true },
+    { platform: 'niconico', identifier: 'lv3', enabled: true },
+  ] as const;
+  assert.deepEqual(
+    replacedChannelKeys([...channels], { platform: 'niconico', identifier: 'lv3', enabled: true }),
+    ['niconico:lv1', 'niconico:lv2'],
+  );
+  assert.deepEqual(replacedChannelKeys([...channels], { platform: 'twitch', identifier: 'bob', enabled: true }), []);
 });

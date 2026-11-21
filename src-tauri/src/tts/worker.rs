@@ -146,6 +146,13 @@ impl TtsShared {
         }
     }
 
+    /// 読み上げを切った枠のコメントを未読み上げキューから除く。
+    pub fn remove_channel(&self, sink: &dyn TtsSink, origin_key: &str) {
+        let mut core = self.core.lock().unwrap();
+        core.remove_where(|msg| msg.route.origin_key.as_deref() == Some(origin_key));
+        sink.queue_state(core.snapshot());
+    }
+
     pub fn snapshot(&self) -> TtsQueueStatePayload {
         self.core.lock().unwrap().snapshot()
     }

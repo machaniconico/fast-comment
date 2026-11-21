@@ -32,7 +32,7 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 
-use crate::config::{AppConfig, ChannelTtsVoice, TtsBackendKind, TtsConfig, TtsDictEntry, TtsOptions};
+use crate::config::{AppConfig, ChannelOverrides, ChannelTtsVoice, TtsBackendKind, TtsConfig, TtsDictEntry, TtsOptions};
 use crate::listeners::TtsVoiceOverride;
 use crate::model::{ChatMessage, Fragment, MessageKind};
 
@@ -271,7 +271,6 @@ impl TtsDispatcher {
 
         // TOCTOU と二重往復を避けるため、speak パスでは available() プローブを
         // 行わず直接合成を試み、Err なら Web Speech へフォールバックする。
-        // 枠の声は全体で選んだバックエンドにだけ適用する。
         let listener_voice = msg
             .listener
             .as_ref()
@@ -296,6 +295,7 @@ impl TtsDispatcher {
                                 "棒読みちゃんで読み上げできないため Web Speech に切り替えました: {e}"
                             ),
                         );
+                        // 枠の声は全体で選んだバックエンドにだけ適用する。
                         self.webspeech(&text, listener_voice)
                     }
                 }
@@ -328,6 +328,7 @@ impl TtsDispatcher {
                                 "VOICEVOXで読み上げできないため Web Speech に切り替えました: {e}"
                             ),
                         );
+                        // 枠の声は全体で選んだバックエンドにだけ適用する。
                         self.webspeech(&text, listener_voice)
                     }
                 }
@@ -477,24 +478,23 @@ impl CompiledDictionary {
     }
 }
 
+/// 発信元の枠の上書き。発信元が無い・枠が消えていれば None。
+pub fn origin_overrides<'a>(cfg: &'a AppConfig, msg: &ChatMessage) -> Option<&'a ChannelOverrides> {
+    msg.route.origin_key.as_deref().and_then(|key| cfg.channel_overrides(key))
+}
+
 /// 発信元の枠が読み上げを無効にしている場合だけ false を返す。
 pub fn channel_allows_tts(cfg: &AppConfig, msg: &ChatMessage) -> bool {
-    msg.route
-        .origin_key
-        .as_deref()
-        .and_then(|key| cfg.channel_overrides(key))
-        .and_then(|overrides| overrides.tts_enabled)
-        != Some(false)
+    overrides_allow_tts(origin_overrides(cfg, msg))
+}
+
+pub fn overrides_allow_tts(overrides: Option<&ChannelOverrides>) -> bool {
+    overrides.and_then(|overrides| overrides.tts_enabled) != Some(false)
 }
 
 /// キュー投入時点の枠の声をメッセージに記録する。
 pub fn stamp_channel_voice(cfg: &AppConfig, msg: &mut ChatMessage) {
-    msg.route.channel_tts_voice = msg
-        .route
-        .origin_key
-        .as_deref()
-        .and_then(|key| cfg.channel_overrides(key))
-        .and_then(|overrides| overrides.tts_voice.clone());
+    msg.route.channel_tts_voice = origin_overrides(cfg, msg).and_then(|o| o.tts_voice.clone());
 }
 
 /// 声の各項目はリスナー、枠の順に優先する。速度と音程はリスナー設定を使う。
@@ -1313,5 +1313,62 @@ mod tests {
         assert!((body["pitchScale"].as_f64().unwrap() - 0.075).abs() < 1e-6);
         // 未設定のパラメータはエンジン値のまま。
         assert_eq!(body["intonationScale"], serde_json::json!(1.0));
+    }
+    #[tokio::test]
+    async fn channel_bouyomi_voice_reaches_bouyomi_packet() {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut config = TtsConfig {
+            backend: TtsBackendKind::Bouyomi,
+            ..TtsConfig::default()
+        };
+        config.options.bouyomi_host = "127.0.0.1".into();
+        config.options.bouyomi_port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut packet = Vec::new();
+            stream.read_to_end(&mut packet).unwrap();
+            packet
+        });
+        let mut dispatcher = TtsDispatcher::new(config);
+        let mut msg = message("太郎", "こんにちは");
+        let channel = ChannelTtsVoice {
+            bouyomi_voice: Some(3),
+            ..Default::default()
+        };
+        assert_eq!(effective_voice(Some(&channel), None).unwrap().bouyomi_voice, Some(3));
+        msg.route.channel_tts_voice = Some(channel);
+
+        assert!(matches!(
+            dispatcher.speak(&msg, SpeakContext::default()).await,
+            SpeechOutput::Sent
+        ));
+        let packet = server.join().unwrap();
+        assert_eq!(i16::from_le_bytes([packet[8], packet[9]]), 3);
+    }
+
+    #[tokio::test]
+    async fn channel_voicevox_speaker_reaches_fake_engine() {
+        let fake = voicevox::test_support::spawn_fake_engine().await;
+        let mut config = TtsConfig {
+            backend: TtsBackendKind::Voicevox,
+            ..TtsConfig::default()
+        };
+        config.options.voicevox_url = fake.url.clone();
+        config.options.voicevox_speaker = 3;
+        let mut dispatcher = TtsDispatcher::new(config);
+        let mut msg = message("太郎", "こんにちは");
+        msg.route.channel_tts_voice = Some(ChannelTtsVoice {
+            voicevox_speaker: Some(5),
+            ..Default::default()
+        });
+
+        assert!(matches!(
+            dispatcher.speak(&msg, SpeakContext::default()).await,
+            SpeechOutput::Audio { .. }
+        ));
+        let g = fake.state.lock().unwrap();
+        assert_eq!(g.queries[0].1, "5");
+        assert_eq!(g.syntheses[0].0, "5");
     }
 }
