@@ -32,6 +32,7 @@
   let missing = $state(false);
   let speakersFailed = $state(false);
   let savedVoice = $state('');
+  let baseForm = toFormState(undefined, 'none');
   let form: OverridesForm = $state({ ttsDisabled: false, voice: '' });
   let speakers: TtsEngineSpeaker[] = $state([]);
   let webVoices: string[] = $state([]);
@@ -55,7 +56,8 @@
       return;
     }
     const base = toFormState(current.overrides, backend);
-    form = pending ? reapplyPendingForm(base, pending, prevBackend !== backend) : base;
+    form = pending ? reapplyPendingForm(baseForm, pending, base, prevBackend !== backend) : { ...base };
+    baseForm = base;
     savedVoice = form.voice === null || form.voice === undefined ? '' : String(form.voice);
     const o = snap.config.tts.options;
     if (backend === 'voicevox') {

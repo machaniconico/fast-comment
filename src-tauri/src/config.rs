@@ -286,6 +286,26 @@ fn read_with_retry<T>(
     })
 }
 
+fn read_config_text(
+    path: &Path,
+    delay: std::time::Duration,
+    mut exists: impl FnMut(&Path) -> std::io::Result<bool>,
+    mut read: impl FnMut(&Path) -> std::io::Result<String>,
+) -> std::io::Result<Option<String>> {
+    let mut found = false;
+    read_with_retry(path, delay, |path| {
+        // 存在確認済みなら、読込に失敗しても初回起動扱いにはしない。
+        if !found {
+            found = exists(path)?;
+        }
+        if found {
+            read(path).map(Some)
+        } else {
+            Ok(None)
+        }
+    })
+}
+
 /// 残す `config.json.broken-*` の数。
 const MAX_BROKEN_BACKUPS: usize = 5;
 
@@ -293,14 +313,16 @@ const MAX_BROKEN_BACKUPS: usize = 5;
 fn broken_backup_order(file_name: &str, name: &str) -> Option<(u128, u64)> {
     let rest = file_name.strip_prefix(name)?.strip_prefix(".broken-")?;
     let (ms, n) = match rest.split_once('-') {
-        Some((ms, n)) => (ms, n),
-        None => (rest, "0"),
+        Some((ms, n)) if !n.starts_with('0') && n.bytes().all(|b| b.is_ascii_digit()) => {
+            (ms, n.parse().ok()?)
+        }
+        Some(_) => return None,
+        None => (rest, 0),
     };
-    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
-    if !digits(ms) || !digits(n) {
+    if (ms.len() > 1 && ms.starts_with('0')) || !ms.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    Some((ms.parse().ok()?, n.parse().ok()?))
+    Some((ms.parse().ok()?, n))
 }
 
 /// 新しい退避を作れた後に呼ぶ。新しい順に `MAX_BROKEN_BACKUPS` 件(作ったばかりの物を含む)だけ残す。
@@ -1364,12 +1386,13 @@ impl AppConfig {
     /// パース失敗時はエラーを返す(壊れた設定で黙って初期化しないため)。
     pub fn load(dir: &Path) -> anyhow::Result<AppConfig> {
         let path = Self::path_in(dir);
-        let text = match path.try_exists() {
-            Ok(false) => return Ok(AppConfig::default()),
-            Ok(true) => read_with_retry(&path, READ_RETRY_DELAY, |p| std::fs::read_to_string(p)),
-            Err(e) => Err(e),
-        }
-        .map_err(|e| anyhow::anyhow!("設定ファイル読込失敗 {}: {e}", path.display()))?;
+        let Some(text) = read_config_text(&path, READ_RETRY_DELAY, Path::try_exists, |p| {
+            std::fs::read_to_string(p)
+        })
+        .map_err(|e| anyhow::anyhow!("設定ファイル読込失敗 {}: {e}", path.display()))?
+        else {
+            return Ok(AppConfig::default());
+        };
         // serde の文面は不正な値をそのまま含む(トークン等が紛れうる)ので、項目と位置だけ出す。
         let mut deserializer = serde_json::Deserializer::from_str(&text);
         let mut cfg: AppConfig =
@@ -2911,6 +2934,51 @@ mod tests {
     }
 
     #[test]
+    fn pruning_ignores_noncanonical_names_and_nonregular_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = AppConfig::path_in(dir.path());
+        std::fs::write(&path, b"{ broken").unwrap();
+        let backups = [20, 30, 40, 50].map(|ms| {
+            let backup = dir.path().join(format!("config.json.broken-{ms}"));
+            std::fs::write(&backup, b"old").unwrap();
+            backup
+        });
+        let unrelated = ["1-0", "01", "2-01", "+3", "4-+1", "5-"].map(|suffix| {
+            let backup = dir.path().join(format!("config.json.broken-{suffix}"));
+            std::fs::write(&backup, b"unrelated").unwrap();
+            backup
+        });
+        let directory = dir.path().join("config.json.broken-90");
+        std::fs::create_dir(&directory).unwrap();
+        let link = dir.path().join("config.json.broken-100");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        #[cfg(windows)]
+        if let Err(err) = std::os::windows::fs::symlink_file(&path, &link) {
+            // Windows では開発者モードまたはシンボリックリンク作成権限が必要。
+            assert_eq!(err.raw_os_error(), Some(1314), "{err}");
+        }
+        let link_existed = link.is_symlink();
+
+        assert_eq!(
+            AppConfig::load_or_preserve_at(dir.path(), 60).1,
+            ConfigLoadOutcome::BackedUp
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("config.json.broken-60")).unwrap(),
+            b"{ broken"
+        );
+        for backup in backups {
+            assert_eq!(std::fs::read(backup).unwrap(), b"old");
+        }
+        for backup in unrelated {
+            assert_eq!(std::fs::read(backup).unwrap(), b"unrelated");
+        }
+        assert!(directory.is_dir());
+        assert_eq!(link.is_symlink(), link_existed);
+    }
+
+    #[test]
     fn failed_backup_does_not_prune_old_backups() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(AppConfig::path_in(dir.path())).unwrap();
@@ -2947,6 +3015,41 @@ mod tests {
         });
         assert_eq!(err.unwrap_err().kind(), ErrorKind::PermissionDenied);
         assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn config_existence_error_is_retried_once() {
+        let path = Path::new("config.json");
+        let delay = std::time::Duration::ZERO;
+        let mut checks = 0;
+        let text = read_config_text(
+            path,
+            delay,
+            |_| {
+                checks += 1;
+                if checks == 1 {
+                    Err(ErrorKind::PermissionDenied.into())
+                } else {
+                    Ok(true)
+                }
+            },
+            |_| Ok("{}".to_owned()),
+        );
+        assert_eq!(text.unwrap().as_deref(), Some("{}"));
+        assert_eq!(checks, 2);
+
+        let mut checks = 0;
+        let err = read_config_text(
+            path,
+            delay,
+            |_| {
+                checks += 1;
+                Err(ErrorKind::PermissionDenied.into())
+            },
+            |_| panic!("存在を確認できないファイルを読み込んだ"),
+        );
+        assert_eq!(err.unwrap_err().kind(), ErrorKind::PermissionDenied);
+        assert_eq!(checks, 2);
     }
 
     #[test]

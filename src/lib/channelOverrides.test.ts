@@ -108,9 +108,32 @@ test('fromFormState_treats_cleared_bouyomi_number_input_as_follow_global', () =>
 });
 
 test('reapplyPendingForm_keeps_user_input_after_stale_reload', () => {
-  const base = { ttsDisabled: false, voice: '1' };
+  const previousBase = { ttsDisabled: false, voice: '1' };
   const pending = { ttsDisabled: true, voice: '7' };
-  assert.deepEqual(reapplyPendingForm(base, pending, false), { ttsDisabled: true, voice: '7' });
+  const nextBase = { ttsDisabled: false, voice: '2' };
+  assert.deepEqual(reapplyPendingForm(previousBase, pending, nextBase, false), { ttsDisabled: true, voice: '7' });
   // backend が変わったら声だけ新しい基準に戻す
-  assert.deepEqual(reapplyPendingForm(base, pending, true), { ttsDisabled: true, voice: '1' });
+  assert.deepEqual(reapplyPendingForm(previousBase, pending, nextBase, true), { ttsDisabled: true, voice: '2' });
+});
+
+test('reapplyPendingForm_keeps_the_latest_voice_when_only_tts_was_edited', () => {
+  const previousBase = toFormState({ ttsVoice: { voicevoxSpeaker: 1 } }, 'voicevox');
+  const nextOverrides = { ttsVoice: { voicevoxSpeaker: 2 } };
+  const nextBase = toFormState(nextOverrides, 'voicevox');
+  const pending = { ...previousBase, ttsDisabled: true };
+  const reapplied = reapplyPendingForm(previousBase, pending, nextBase, false);
+  assert.deepEqual(fromFormState(reapplied, 'voicevox', nextOverrides), {
+    ttsEnabled: false,
+    ttsVoice: { voicevoxSpeaker: 2 },
+  });
+});
+
+test('reapplyPendingForm_preserves_latest_tts_flag_and_handles_number_input_values', () => {
+  const previousBase = { ttsDisabled: false, voice: '0' };
+  const nextBase = { ttsDisabled: true, voice: '2' };
+  assert.deepEqual(reapplyPendingForm(previousBase, { ...previousBase, voice: 0 }, nextBase, false), nextBase);
+  assert.deepEqual(reapplyPendingForm(previousBase, { ...previousBase, voice: null }, nextBase, false), {
+    ttsDisabled: true,
+    voice: null,
+  });
 });

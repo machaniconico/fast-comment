@@ -71,8 +71,17 @@ export function fromFormState(
  * Stale で読み直した後の入力。利用者の未保存の選択を新しい基準の上に載せ直す(もう一度保存すれば
  * それが新しい revision に対して保存される)。backend が変わった時は声の意味が変わるので声だけ基準に戻す。
  */
-export function reapplyPendingForm(base: OverridesForm, pending: OverridesForm, backendChanged: boolean): OverridesForm {
-  return { ttsDisabled: pending.ttsDisabled, voice: backendChanged ? base.voice : pending.voice };
+export function reapplyPendingForm(
+  previousBase: OverridesForm,
+  pending: OverridesForm,
+  nextBase: OverridesForm,
+  backendChanged: boolean,
+): OverridesForm {
+  const voiceChanged = String(pending.voice ?? '') !== String(previousBase.voice ?? '');
+  return {
+    ttsDisabled: pending.ttsDisabled !== previousBase.ttsDisabled ? pending.ttsDisabled : nextBase.ttsDisabled,
+    voice: voiceChanged && !backendChanged ? pending.voice : nextBase.voice,
+  };
 }
 
 /** 棒読みちゃんは番号入力(空 = 全体に従う、0 = 棒読みちゃん既定)なので選択肢は先頭だけ。範囲は Rust が検証する。 */
