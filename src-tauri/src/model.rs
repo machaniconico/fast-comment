@@ -246,6 +246,21 @@ fn is_false(v: &bool) -> bool {
     !*v
 }
 
+/// 内部の配線情報。シリアライズしない。
+#[derive(Clone, Default, PartialEq)]
+pub struct MessageRoute {
+    /// 発生元の行のキー。手動・注入では None。
+    pub origin_key: Option<String>,
+    /// キューに入れた時点の枠の声。
+    pub channel_tts_voice: Option<crate::config::ChannelTtsVoice>,
+}
+
+impl std::fmt::Debug for MessageRoute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MessageRoute").finish_non_exhaustive()
+    }
+}
+
 /// 正規化済みコメント。Source → Bus → UI/OBS を一貫して流れる単一型。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -276,6 +291,8 @@ pub struct ChatMessage {
     /// 内部制御用: inject_test_comment が注入したテストコメント。シリアライズしない。
     #[serde(skip)]
     pub injected_test: bool,
+    #[serde(skip)]
+    pub route: MessageRoute,
 }
 
 impl ChatMessage {

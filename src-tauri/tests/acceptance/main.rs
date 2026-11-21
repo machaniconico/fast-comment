@@ -37,5 +37,12 @@ mod twitcasting_official_source;
 mod twitcasting_mode;
 mod twitcasting_identifier_secrecy;
 
+// 枠ごとの設定上書き (OV-001)
+mod channel_overrides_common;
+mod channel_overrides_config;
+mod channel_overrides_commit;
+mod channel_overrides_relay;
+mod channel_overrides_tts;
+
 #[test]
 fn acceptance_harness_runs() {}

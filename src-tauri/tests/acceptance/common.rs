@@ -183,5 +183,6 @@ pub fn msg(id: &str) -> ChatMessage {
         raw: None,
         skip_tts: false,
         injected_test: false,
+        route: Default::default(),
     }
 }
