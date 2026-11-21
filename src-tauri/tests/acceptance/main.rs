@@ -30,6 +30,10 @@ mod twitcasting_config_mode;
 mod twitcasting_common;
 mod twitcasting_api;
 mod twitcasting_budget;
+mod twitcasting_common_official;
+mod twitcasting_cursor;
+mod twitcasting_official_map;
+mod twitcasting_official_source;
 
 #[test]
 fn acceptance_harness_runs() {}
