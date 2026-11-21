@@ -6,6 +6,7 @@
 #![allow(dead_code)]
 
 use crate::twitcasting_common::*;
+use crate::twitcasting_common_official::*;
 use fast_comment_lib::config::TwitcastingMode;
 use fast_comment_lib::sources::twitcasting::{channel_name, INVALID_CHANNEL_LABEL, INVALID_ID_NOTICE};
 use fast_comment_lib::sources::twitcasting_mode::TwitcastingRoutedSource;
@@ -18,6 +19,7 @@ const LEAKS: [&str; 2] = ["MARKER", "invalid.example"];
 async fn invalid_identifier_never_leaks_marker() {
     let (logs, _guard) = capture_logs();
     let r = rig_logged_in().await;
+    logs.clear();
     Script::new().install(&r.fake);
     let site = FakeApi::start().await;
     let mut chans: Vec<Chan> = Vec::new();

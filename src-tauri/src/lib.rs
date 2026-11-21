@@ -3757,6 +3757,36 @@ mod followup_tests {
     }
 
     #[test]
+    fn twitcasting_login_protection_does_not_revert_mode() {
+        let mut current = AppConfig::default();
+        current.credentials.twitcasting_client_id = Some("current-tc".into());
+        current.twitcasting.callback_port = 41322;
+        let mut incoming = current.clone();
+        incoming.credentials.twitcasting_client_id = Some("backup-tc".into());
+        incoming.twitcasting.callback_port = 42322;
+        incoming.twitcasting.mode = config::TwitcastingMode::Official;
+
+        let protected = protect_oauth_config(&current, &mut incoming, |service| {
+            service == OAuthService::Twitcasting
+        });
+
+        assert_eq!(protected, [OAuthService::Twitcasting]);
+        assert_eq!(
+            incoming.credentials.twitcasting_client_id.as_deref(),
+            Some("current-tc")
+        );
+        assert_eq!(incoming.twitcasting.callback_port, 41322);
+        assert_eq!(incoming.twitcasting.mode, config::TwitcastingMode::Official);
+
+        // mode だけの変更は保護の対象にならず、そのまま通る。
+        let mut incoming = current.clone();
+        incoming.twitcasting.mode = config::TwitcastingMode::Unofficial;
+        let protected = protect_oauth_config(&current, &mut incoming, |_| true);
+        assert!(protected.is_empty());
+        assert_eq!(incoming.twitcasting.mode, config::TwitcastingMode::Unofficial);
+    }
+
+    #[test]
     fn oauth_review_connect_callback_port_errors_omit_the_json_value() {
         const PUBLIC_ERROR: &str = "待受ポートは 1024〜65535 の整数にしてください";
         for value in [

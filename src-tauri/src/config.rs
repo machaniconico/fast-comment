@@ -838,12 +838,37 @@ impl Default for XPostConfig {
 pub struct TwitcastingConfig {
     /// ログイン待受(ループバック)のポート。X の `callbackPort` と同じく 0 はログイン時に拒否する。
     pub callback_port: u16,
+    /// 取得経路。チャンネル Source の起動時に読む(稼働中の Source は作り直さない)。
+    #[serde(default)]
+    pub mode: TwitcastingMode,
+}
+
+/// ツイキャスの取得経路。未知の値・型違い・null は `Auto` に寛容に読む。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TwitcastingMode {
+    #[default]
+    Auto,
+    Unofficial,
+    Official,
+}
+
+impl<'de> Deserialize<'de> for TwitcastingMode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        Ok(match value.as_str() {
+            Some("unofficial") => TwitcastingMode::Unofficial,
+            Some("official") => TwitcastingMode::Official,
+            _ => TwitcastingMode::Auto,
+        })
+    }
 }
 
 impl Default for TwitcastingConfig {
     fn default() -> Self {
         TwitcastingConfig {
             callback_port: crate::sources::twitcasting_auth::CALLBACK_PORT,
+            mode: TwitcastingMode::Auto,
         }
     }
 }
@@ -1241,6 +1266,7 @@ mod tests {
         assert_eq!(cfg.x_post.callback_port, 47821);
         assert_eq!(cfg.twitcasting, TwitcastingConfig::default());
         assert_eq!(cfg.twitcasting.callback_port, 39822);
+        assert_eq!(cfg.twitcasting.mode, TwitcastingMode::Auto);
     }
 
     #[test]
@@ -1351,8 +1377,14 @@ mod tests {
         let cfg: AppConfig =
             serde_json::from_str(r#"{"twitcasting":{"callbackPort":40123}}"#).expect("twitcasting");
         assert_eq!(cfg.twitcasting.callback_port, 40123);
+        assert_eq!(cfg.twitcasting.mode, TwitcastingMode::Auto);
         let cfg: AppConfig = serde_json::from_str(r#"{"twitcasting":{}}"#).expect("empty twitcasting");
         assert_eq!(cfg.twitcasting.callback_port, 39822);
+        assert_eq!(cfg.twitcasting.mode, TwitcastingMode::Auto);
+        let cfg: AppConfig =
+            serde_json::from_str(r#"{"twitcasting":{"callbackPort":40123,"mode":"official"}}"#)
+                .expect("twitcasting mode");
+        assert_eq!(cfg.twitcasting.mode, TwitcastingMode::Official);
     }
 
     #[test]
@@ -1559,6 +1591,7 @@ mod tests {
         assert_eq!(json["credentials"]["xPostClientId"].as_str(), Some("x-post-client"));
         assert_eq!(json["xPost"]["callbackPort"].as_u64(), Some(47821));
         assert_eq!(json["twitcasting"]["callbackPort"].as_u64(), Some(39822));
+        assert_eq!(json["twitcasting"]["mode"].as_str(), Some("auto"));
         assert_eq!(json["obs"]["template"].as_str(), Some("compact"));
         assert_eq!(json["obs"]["fontScalePct"].as_u64(), Some(125));
         assert_eq!(json["obs"]["danmakuFontSize"].as_u64(), Some(42));

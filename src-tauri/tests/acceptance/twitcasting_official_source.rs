@@ -6,6 +6,7 @@
 #![allow(dead_code)]
 
 use crate::twitcasting_common::*;
+use crate::twitcasting_common_official::*;
 use fast_comment_lib::model::LiveEvent;
 use fast_comment_lib::sources::twitcasting::{channel_name, NOT_FOUND_NOTICE, UNAVAILABLE_NOTICE};
 use fast_comment_lib::sources::twitcasting_auth::AuthState;
@@ -251,6 +252,7 @@ async fn poll_sequence_c2_503_mid_loop_retries_without_loss_or_duplicate() {
 async fn poll_sequence_c4_caps_at_5_pages() {
     let (logs, _guard) = capture_logs();
     let (r, script, chan) = start_logged_in().await;
+    logs.clear();
     let live = live_switch(&script, false);
     script.on_comments(|req: &Req| match (req.slice_id().as_deref(), req.offset()) {
         (None, 0) => comments_reply(&[100]),
@@ -770,11 +772,13 @@ fn check_outputs(chan: &Chan, hosts: &[String]) {
 async fn secrets_never_reach_logs_metadata_or_messages() {
     let (logs, _guard) = capture_logs();
     let mut hosts: Vec<String> = Vec::new();
+    let mut log = String::new();
     let mut chans: Vec<Chan> = Vec::new();
 
     // 成功
     {
         let (r, script, chan) = start_logged_in().await;
+        logs.clear();
         hosts.push(r.fake.host());
         live_switch(&script, true);
         script.on_comments(|req: &Req| {
@@ -787,31 +791,37 @@ async fn secrets_never_reach_logs_metadata_or_messages() {
         let run = chan.run(official_source(&r, "alice", &chan, tuning()));
         wait_until("成功: コメント 1 件", T5, || !chan.msgs().is_empty()).await;
         run.stop().await;
+        log.push_str(&logs.take());
         chans.push(chan);
     }
     // 現世代の 401
     {
         let (r, script, chan) = start_logged_in().await;
+        logs.clear();
         hosts.push(r.fake.host());
         live_switch(&script, true);
         script.on_comments(|_: &Req| error_reply(401, 1000));
         let run = chan.run(official_source(&r, "alice", &chan, tuning()));
         wait_until("401: 再ログイン案内", T5, || chan.has_notice(RELOGIN_REQUIRED_NOTICE)).await;
         run.stop().await;
+        log.push_str(&logs.take());
         chans.push(chan);
     }
     // 世代違いの 401
     {
         let (r, _script, chan) = start_logged_in().await;
+        logs.clear();
         hosts.push(r.fake.host());
         let (run, _) = late_401_scenario(&r, &chan).await;
         wait_until("世代違い 401: コメント", T5, || !chan.msgs().is_empty()).await;
         run.stop().await;
+        log.push_str(&logs.take());
         chans.push(chan);
     }
     // 429(最初の要求だけ)
     {
         let (r, script, chan) = start_logged_in().await;
+        logs.clear();
         hosts.push(r.fake.host());
         live_switch(&script, true);
         script.on_comments(|req: &Req| {
@@ -832,10 +842,10 @@ async fn secrets_never_reach_logs_metadata_or_messages() {
         let run = chan.run(official_source(&r, "alice", &chan, tuning()));
         wait_until("429 の後に再開してコメント", Duration::from_secs(8), || !chan.msgs().is_empty()).await;
         run.stop().await;
+        log.push_str(&logs.take());
         chans.push(chan);
     }
 
-    let log = logs.text();
     assert_absent("ログ", &log, &[TOK_A, TOK_B, TOK_C, "Bearer", "BODY-MARKER"]);
     for h in &hosts {
         assert_absent("ログ", &log, &[h.as_str()]);
