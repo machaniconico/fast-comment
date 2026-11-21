@@ -260,7 +260,7 @@ fn timestamp_ms(value: &Value) -> Option<i64> {
         .or_else(|| value.as_str()?.trim().parse().ok())
         .filter(|n: &f64| n.is_finite())?;
     if (1.0..1e12).contains(&n) {
-        Some((n * 1000.0).round() as i64)
+        Some((n * 1000.0).floor() as i64)
     } else if n >= 1e12 {
         Some(n as i64)
     } else {
@@ -1284,6 +1284,13 @@ mod tests {
             &json!("1479579471.5"),
             Some(server_ms - 2000)
         ));
+    }
+
+    #[test]
+    fn fractional_created_just_over_60s_is_stale() {
+        // 60.0004 秒前: 切り捨てで 60001 ms 差になり、四捨五入で 60 秒ちょうどに丸めない
+        assert!(is_stale_comment(&json!(1799999939.9996), Some(1_800_000_000_000)));
+        assert!(!is_stale_comment(&json!(1799999940.0), Some(1_800_000_000_000)));
     }
 
     #[test]
