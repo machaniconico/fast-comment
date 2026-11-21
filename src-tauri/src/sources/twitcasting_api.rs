@@ -18,6 +18,7 @@ use super::twitcasting_auth::{TwitcastingAuth, TwitcastingEndpoints};
 use crate::{config::AppConfig, integrations::SecretStore};
 
 const WINDOW_MS: u64 = 60_000;
+const MAX_WAIT_MS: u64 = 120_000;
 const PAGE_LIMIT: u32 = 50;
 
 pub fn official_endpoints(_config: &AppConfig) -> TwitcastingEndpoints {
@@ -96,14 +97,15 @@ impl RateBudget {
         if delay_ms == 0 {
             self.requests.push_back(now_ms);
         }
-        Duration::from_millis(delay_ms)
+        // 壁時計が逆行しても、期限は維持しつつ 120 秒以内に再判定する。
+        Duration::from_millis(delay_ms.min(MAX_WAIT_MS))
     }
 
     pub fn observe_headers(&mut self, remaining: Option<&str>, reset: Option<&str>, now_ms: u64) {
         let remaining = remaining.and_then(|value| value.parse::<u64>().ok());
-        let reset_epoch_s = reset.and_then(|value| value.parse::<u64>().ok());
-        if let (Some(0..=2), Some(reset_epoch_s)) = (remaining, reset_epoch_s) {
-            self.penalize(Some(reset_epoch_s), now_ms);
+        if matches!(remaining, Some(0..=2)) {
+            let reset_epoch_s = reset.and_then(|value| value.parse::<u64>().ok());
+            self.penalize(reset_epoch_s, now_ms);
         }
     }
 
@@ -113,7 +115,7 @@ impl RateBudget {
                 .saturating_add(1)
                 .saturating_mul(1_000)
                 .saturating_sub(now_ms)
-                .clamp(1_000, 120_000)
+                .clamp(1_000, MAX_WAIT_MS)
         });
         self.paused_until_ms = self.paused_until_ms.max(now_ms.saturating_add(delay_ms));
     }
@@ -183,10 +185,7 @@ impl<S: SecretStore> TwitcastingApi<S> {
     }
 
     pub async fn current_live(&self, user_id: &str) -> Result<Option<Value>, ApiError> {
-        let value = match self
-            .get(&["users", user_id, "current_live"], &[("live", "false")])
-            .await
-        {
+        let value = match self.get(&["users", user_id, "current_live"], &[]).await {
             Ok(value) => value,
             Err(ApiError::NotFound) => return Ok(None),
             Err(error) => return Err(error),
@@ -244,14 +243,13 @@ impl<S: SecretStore> TwitcastingApi<S> {
             .ok_or(ApiError::Unauthorized)?;
 
         // HTTP ライブラリの TRACE にも接続先やヘッダを流さない。
-        async {
+        let response = async {
             let mut url = self.api_base.clone()?;
             url.path_segments_mut()
                 .map_err(|_| ApiError::Other)?
                 .pop_if_empty()
                 .extend(segments.iter().copied());
-            let response = self
-                .http
+            self.http
                 .as_ref()
                 .map_err(Clone::clone)?
                 .get(url)
@@ -261,60 +259,68 @@ impl<S: SecretStore> TwitcastingApi<S> {
                 .header(ACCEPT, "application/json")
                 .send()
                 .await
-                .map_err(|_| ApiError::Network)?;
+                .map_err(|_| ApiError::Network)
+        }
+        .with_subscriber(tracing::subscriber::NoSubscriber::default())
+        .await?;
 
-            let status = response.status();
-            if status == StatusCode::UNAUTHORIZED {
-                self.auth.report_unauthorized_for(generation);
+        let status = response.status();
+        if status == StatusCode::UNAUTHORIZED {
+            self.auth.report_unauthorized_for(generation);
+        }
+
+        let headers = response.headers();
+        let remaining = headers
+            .get("X-RateLimit-Remaining")
+            .and_then(|v| v.to_str().ok());
+        let reset = headers
+            .get("X-RateLimit-Reset")
+            .and_then(|v| v.to_str().ok());
+        let reset_epoch_s = reset.and_then(|value| value.parse::<u64>().ok());
+        {
+            let mut budget = self.budget.lock().unwrap();
+            let now_ms = epoch_ms();
+            budget.observe_headers(remaining, reset, now_ms);
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                budget.penalize(reset_epoch_s, now_ms);
             }
+        }
 
-            let headers = response.headers();
-            let remaining = headers
-                .get("X-RateLimit-Remaining")
-                .and_then(|v| v.to_str().ok());
-            let reset = headers
-                .get("X-RateLimit-Reset")
-                .and_then(|v| v.to_str().ok());
-            let reset_epoch_s = reset.and_then(|value| value.parse::<u64>().ok());
-            {
-                let mut budget = self.budget.lock().unwrap();
-                let now_ms = epoch_ms();
-                budget.observe_headers(remaining, reset, now_ms);
-                if status == StatusCode::TOO_MANY_REQUESTS {
-                    budget.penalize(reset_epoch_s, now_ms);
-                }
-            }
-
-            if status.is_success() {
-                return response.json().await.map_err(|error| {
+        if status.is_success() {
+            return response
+                .json()
+                .with_subscriber(tracing::subscriber::NoSubscriber::default())
+                .await
+                .map_err(|error| {
                     if error.is_decode() {
                         ApiError::Other
                     } else {
                         ApiError::Network
                     }
                 });
-            }
-
-            let code = if status == StatusCode::FORBIDDEN {
-                response
-                    .json::<Value>()
-                    .await
-                    .ok()
-                    .and_then(|value| value.pointer("/error/code").and_then(Value::as_u64))
-            } else {
-                None
-            };
-            let error = classify_status(status, code, reset_epoch_s);
-            if status == StatusCode::FORBIDDEN && code == Some(2000) {
-                self.budget
-                    .lock()
-                    .unwrap()
-                    .penalize(reset_epoch_s, epoch_ms());
-            }
-            Err(error)
         }
-        .with_subscriber(tracing::subscriber::NoSubscriber::default())
-        .await
+
+        let code = if status == StatusCode::FORBIDDEN {
+            response
+                .json::<Value>()
+                .with_subscriber(tracing::subscriber::NoSubscriber::default())
+                .await
+                .ok()
+                .and_then(|value| {
+                    let code = value.pointer("/error/code")?;
+                    code.as_u64().or_else(|| code.as_str()?.parse::<u64>().ok())
+                })
+        } else {
+            None
+        };
+        let error = classify_status(status, code, reset_epoch_s);
+        if status == StatusCode::FORBIDDEN && code == Some(2000) {
+            self.budget
+                .lock()
+                .unwrap()
+                .penalize(reset_epoch_s, epoch_ms());
+        }
+        Err(error)
     }
 }
 
@@ -350,6 +356,137 @@ fn epoch_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        integrations::MemorySecretStore,
+        sources::twitcasting_auth::{AuthOptions, AuthState, TOKEN_KEY},
+    };
+    use axum::{extract::OriginalUri, routing::get, Json, Router};
+    use serde_json::json;
+
+    async fn serve_api(
+        router: Router,
+    ) -> (
+        Arc<TwitcastingApi<MemorySecretStore>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoints = TwitcastingEndpoints {
+            api_base: format!("http://{}", listener.local_addr().unwrap()),
+            ..TwitcastingEndpoints::default()
+        };
+        let store = MemorySecretStore::new();
+        let now_ms = epoch_ms();
+        store
+            .put(
+                TOKEN_KEY,
+                &json!({
+                    "clientId": "test-client",
+                    "accessToken": "test-token",
+                    "userId": "1",
+                    "screenId": "alice",
+                    "name": "Alice",
+                    "expiresAtMs": null,
+                    "obtainedAtMs": now_ms
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        let auth = TwitcastingAuth::new(store, endpoints.clone(), AuthOptions::default());
+        auth.load(Some("test-client"), now_ms).await;
+        assert_eq!(*auth.subscribe().borrow(), AuthState::Ready);
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let api = TwitcastingApi::new(auth, endpoints, Arc::new(|| Some("test-client".into())));
+        (api, server)
+    }
+
+    #[test]
+    fn backwards_clock_caps_wait_for_full_window_and_pause_deadline() {
+        let now_ms = 3_600_000;
+        let earlier_ms = 0;
+        let max_wait = Duration::from_secs(120);
+
+        let mut budget = RateBudget::new();
+        for _ in 0..54 {
+            assert_eq!(budget.delay_before_next(now_ms), Duration::ZERO);
+        }
+        assert_eq!(budget.delay_before_next(earlier_ms), max_wait);
+        assert_eq!(budget.delay_before_next(now_ms), Duration::from_secs(60));
+        assert_eq!(budget.delay_before_next(now_ms + WINDOW_MS), Duration::ZERO);
+
+        let mut budget = RateBudget::new();
+        budget.penalize(None, now_ms);
+        assert_eq!(budget.delay_before_next(earlier_ms), max_wait);
+        assert_eq!(budget.delay_before_next(now_ms), Duration::from_secs(60));
+        assert_eq!(budget.delay_before_next(now_ms + WINDOW_MS), Duration::ZERO);
+    }
+
+    #[test]
+    fn low_remaining_without_valid_reset_pauses_for_one_minute() {
+        let now_ms = 10_000;
+        for remaining in ["0", "1", "2"] {
+            for reset in [None, Some(""), Some("-1"), Some("invalid")] {
+                let mut budget = RateBudget::new();
+                budget.observe_headers(Some(remaining), reset, now_ms);
+                assert_eq!(budget.delay_before_next(now_ms), Duration::from_secs(60));
+                assert_eq!(budget.delay_before_next(now_ms + WINDOW_MS), Duration::ZERO);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn current_live_sends_no_query_parameters() {
+        let router = Router::new().route(
+            "/users/1/current_live",
+            get(|OriginalUri(uri): OriginalUri| async move {
+                Json(json!({ "movie": { "id": "9" }, "query": uri.query() }))
+            }),
+        );
+        let (api, server) = serve_api(router).await;
+        let movie = api.current_live("1").await;
+        server.abort();
+        assert_eq!(
+            movie,
+            Ok(Some(json!({ "movie": { "id": "9" }, "query": null })))
+        );
+    }
+
+    #[tokio::test]
+    async fn unauthorized_invalidates_auth_and_observes_rate_limit_headers() {
+        let router = Router::new().route(
+            "/users/alice",
+            get(|| async { (StatusCode::UNAUTHORIZED, [("X-RateLimit-Remaining", "2")]) }),
+        );
+        let (api, server) = serve_api(router).await;
+        let result = api.user("alice").await;
+        server.abort();
+        assert_eq!(result, Err(ApiError::Unauthorized));
+        assert_eq!(*api.auth.subscribe().borrow(), AuthState::ReloginRequired);
+        assert!(api.budget.lock().unwrap().paused_until_ms > 0);
+    }
+
+    #[tokio::test]
+    async fn forbidden_with_string_rate_limit_code_pauses_budget() {
+        let router = Router::new().route(
+            "/users/alice",
+            get(|| async {
+                (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({ "error": { "code": "2000" } })),
+                )
+            }),
+        );
+        let (api, server) = serve_api(router).await;
+        let result = api.user("alice").await;
+        server.abort();
+        assert_eq!(
+            result,
+            Err(ApiError::RateLimited {
+                reset_epoch_s: None
+            })
+        );
+        assert!(api.budget.lock().unwrap().paused_until_ms > 0);
+    }
 
     #[test]
     fn classify_status_table() {
