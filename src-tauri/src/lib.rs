@@ -345,7 +345,19 @@ fn try_enqueue_tts_message(
     sink: &dyn tts::TtsSink,
     config: &Mutex<AppConfig>,
     queue: &TtsShared,
+    msg: ChatMessage,
+) {
+    enqueue_tts_inner(sink, config, queue, msg, false);
+}
+
+/// `skip_when_backend_none` は実績の読み上げ用。バックエンドの確認を投入と同じ設定ロック内で行い、
+/// 確認後に OFF へ変わっても待ちを押し出さないようにする。
+fn enqueue_tts_inner(
+    sink: &dyn tts::TtsSink,
+    config: &Mutex<AppConfig>,
+    queue: &TtsShared,
     mut msg: ChatMessage,
+    skip_when_backend_none: bool,
 ) {
     if !listeners::allows_tts(&msg) {
         return;
@@ -354,6 +366,9 @@ fn try_enqueue_tts_message(
     // UI への通知はロックを放してから出す。
     let result = {
         let config = config.lock().unwrap();
+        if skip_when_backend_none && config.tts.backend == TtsBackendKind::None {
+            return;
+        }
         let overrides = tts::origin_overrides(&config, &msg);
         if !tts::overrides_allow_tts(overrides) {
             return;
@@ -372,10 +387,7 @@ fn try_enqueue_achievement_tts(
     queue: &TtsShared,
     msg: ChatMessage,
 ) {
-    if config.lock().unwrap().tts.backend == TtsBackendKind::None {
-        return;
-    }
-    try_enqueue_tts_message(sink, config, queue, msg);
+    enqueue_tts_inner(sink, config, queue, msg, true);
 }
 
 /// 読み上げ OFF の枠の未読み上げコメントを捨てる。設定ロック中(保存の直後)に呼び、
