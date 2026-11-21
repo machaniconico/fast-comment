@@ -854,3 +854,71 @@ async fn secrets_never_reach_logs_metadata_or_messages() {
         check_outputs(chan, &hosts);
     }
 }
+
+// ---------------------------------------------------------------- 空白後の追い上げ(§8)
+
+#[tokio::test]
+async fn resume_after_relogin_backlog_is_not_read_aloud() {
+    let (r, script, chan) = start_logged_in().await;
+    live_switch(&script, true);
+    // 0 = 1 件だけ / 1 = 401 / 2 = 2..120 が溜まった
+    let mode = Arc::new(AtomicUsize::new(0));
+    {
+        let mode = mode.clone();
+        script.on_comments(move |req: &Req| match (req.slice_id().as_deref(), req.offset()) {
+            (None, 0) => comments_reply(&[1]),
+            (Some("1"), 0) => match mode.load(Ordering::SeqCst) {
+                1 => error_reply(401, 1000),
+                2 => page_reply(50, 2),
+                _ => empty_reply(),
+            },
+            (Some("1"), 50) if mode.load(Ordering::SeqCst) == 2 => page_reply(100, 51),
+            (Some("1"), 100) if mode.load(Ordering::SeqCst) == 2 => page_reply(120, 101),
+            _ => empty_reply(),
+        });
+    }
+    let run = chan.run(official_source(&r, "alice", &chan, tuning()));
+    wait_until("1 件目", T5, || chan.msgs().len() >= 1).await;
+    mode.store(1, Ordering::SeqCst);
+    wait_until("再ログイン案内", T5, || chan.has_notice(RELOGIN_REQUIRED_NOTICE)).await;
+    mode.store(2, Ordering::SeqCst);
+    login(&r.auth, r.port, TOK_B).await;
+    wait_until("119 件", T15, || chan.msgs().len() >= 120).await;
+    settle(100).await;
+    let msgs = chan.msgs();
+    assert_eq!(ids_of(&msgs), tc_ids(1, 120));
+    assert!(msgs.iter().skip(1).all(|m| m.skip_tts), "空白後の追い上げは全件 skip_tts=true");
+    run.stop().await;
+}
+
+#[tokio::test]
+async fn new_movie_after_logout_gap_is_mid_stream() {
+    let (r, script, chan) = start_logged_in().await;
+    let movie = Arc::new(Mutex::new("9".to_string()));
+    {
+        let movie = movie.clone();
+        script.on_live(move |_: &Req| live_reply(&movie.lock().unwrap(), "t", 1));
+    }
+    script.on_comments(|req: &Req| {
+        let fresh = req.slice_id().is_none() && req.offset() == 0;
+        match (req.movie_id().as_str(), fresh) {
+            ("9", true) => comments_reply(&[1]),
+            ("10", true) => page_reply(150, 101),
+            _ => empty_reply(),
+        }
+    });
+    let run = chan.run(official_source(&r, "alice", &chan, tuning()));
+    wait_until("movie 9 の 1 件", T5, || chan.msgs().len() >= 1).await;
+    // ログアウトの空白の間に movie が替わる
+    assert!(r.auth.disconnect().await.is_ok());
+    wait_until("ログイン案内", T5, || chan.has_notice(LOGIN_REQUIRED_NOTICE)).await;
+    *movie.lock().unwrap() = "10".to_string();
+    login(&r.auth, r.port, TOK_B).await;
+    wait_until("movie 10 の 20 件", T5, || chan.msgs().len() >= 21).await;
+    settle(200).await;
+    let msgs = chan.msgs();
+    let rest: Vec<_> = msgs.iter().skip(1).cloned().collect();
+    assert_eq!(ids_of(&rest), tc_ids(131, 150), "新しい 20 件だけ");
+    assert!(rest.iter().all(|m| m.skip_tts), "途中参加は skip_tts=true");
+    run.stop().await;
+}
