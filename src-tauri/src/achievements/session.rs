@@ -89,8 +89,9 @@ impl Sessions {
                 let key = format!("{}:{}", platform_key(platform), stream.stream_id);
                 let identifier = channel_key(stream.platform, &stream.channel_identifier);
                 // A new stream on the same channel supersedes a missing Ended event.
+                // Compare channel names only: a stream ID must not supersede another channel.
                 self.active.retain(|other, session| {
-                    other == &key || !matches_channel(other, session, platform, &identifier)
+                    other == &key || !matches_channel_name(other, session, platform, &identifier)
                 });
                 let session = self.active.entry(key.clone()).or_insert(Session {
                     last_activity_ms: now_ms,
@@ -180,12 +181,18 @@ fn matches_channel(key: &str, session: &Session, platform: Platform, identifier:
     };
     session_platform == platform_key(platform)
         && ((platform != Platform::Twitcasting && stream_id == identifier)
-            || session.channel_identifier.as_ref().is_some_and(|channel| {
-                if platform == Platform::Twitcasting {
-                    return channel == identifier;
-                }
-                channel.eq_ignore_ascii_case(identifier)
-                    || ((!channel.is_ascii() || !identifier.is_ascii())
-                        && channel.to_lowercase() == identifier.to_lowercase())
-            }))
+            || matches_channel_name(key, session, platform, identifier))
+}
+
+fn matches_channel_name(key: &str, session: &Session, platform: Platform, identifier: &str) -> bool {
+    key.split_once(':')
+        .is_some_and(|(session_platform, _)| session_platform == platform_key(platform))
+        && session.channel_identifier.as_ref().is_some_and(|channel| {
+            if platform == Platform::Twitcasting {
+                return channel == identifier;
+            }
+            channel.eq_ignore_ascii_case(identifier)
+                || ((!channel.is_ascii() || !identifier.is_ascii())
+                    && channel.to_lowercase() == identifier.to_lowercase())
+        })
 }

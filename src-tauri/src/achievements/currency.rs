@@ -11,14 +11,19 @@ pub struct ParsedAmount {
 
 pub fn parse_display_amount(text: &str) -> Option<ParsedAmount> {
     let first_digit = text.find(is_decimal_digit)?;
-    let last_digit = text.rfind(is_decimal_digit)?;
-    let prefix = &text[..first_digit];
-    let suffix = text[last_digit..].trim_start_matches(is_decimal_digit);
-    let currency_prefix = prefix.trim_end_matches(is_amount_separator);
-    let currency_suffix = suffix.trim_start_matches(is_amount_separator);
-    let currency = format!("{}{}", currency_prefix.trim(), currency_suffix.trim());
-    let number_end = text.len() - currency_suffix.len();
-    let number: String = text[currency_prefix.len()..number_end]
+    // Allow fractional forms like `$.50` or `CHF .50`. A mark attached to a
+    // currency abbreviation belongs to the label, as in `kr.50` and `kr. 50`.
+    let number_start = text[..first_digit]
+        .strip_suffix(is_decimal_mark)
+        .filter(|prefix| !prefix.ends_with(char::is_alphabetic))
+        .map_or(first_digit, str::len);
+    let number_end = text.trim_end_matches(|c| !is_decimal_digit(c)).len();
+    let currency = format!(
+        "{}{}",
+        text[..number_start].trim_matches(is_group_spacing),
+        text[number_end..].trim_matches(is_group_spacing),
+    );
+    let number: String = text[number_start..number_end]
         .chars()
         .filter_map(|c| match c {
             '.' | '．' | '٫' => Some('.'),
@@ -75,8 +80,12 @@ fn decimal_digit(c: char) -> Option<char> {
     Some(char::from(b'0' + ((c as u32 - block_start) % 10) as u8))
 }
 
-fn is_amount_separator(c: char) -> bool {
-    c.is_whitespace() || matches!(c, '．' | '，' | '٫' | '٬' | '.' | ',' | '\'' | '’')
+fn is_decimal_mark(c: char) -> bool {
+    matches!(c, '.' | ',' | '．' | '，' | '٫')
+}
+
+fn is_group_spacing(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '٬' | '\'' | '’')
 }
 
 fn decimal_position(number: &str) -> Option<usize> {
@@ -191,6 +200,18 @@ fn clamp_milli(total: i128) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_amount_preserves_currency_punctuation() {
+        for input in ["kr. 50", "kr.50", "50 kr."] {
+            let parsed = parse_display_amount(input).unwrap();
+            assert_eq!(parsed.currency, "kr.");
+            assert_eq!(parsed.milli, 50_000);
+        }
+        let parsed = parse_display_amount("$.50").unwrap();
+        assert_eq!(parsed.currency, "$");
+        assert_eq!(parsed.milli, 500);
+    }
 
     #[test]
     fn display_amount_counts_mixed_unicode_decimal_digits() {

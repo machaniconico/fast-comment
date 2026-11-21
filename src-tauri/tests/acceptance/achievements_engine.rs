@@ -654,6 +654,17 @@ fn twitcasting_message_maps_to_movie_session() {
     assert_eq!(e.session_for(&other), None);
 }
 
+#[test]
+fn started_on_channel_named_like_other_stream_id_keeps_that_stream() {
+    let dir = tempfile::tempdir().unwrap();
+    let e = open(dir.path(), vec![viewer_count("c100", Metric::Comments, 100.0)], T0);
+    e.on_live_event(&started(Platform::Twitch, "alice", "42"), T0);
+    // チャンネル名 "42" は alice の配信 ID と同じ文字列だが別チャンネル。
+    e.on_live_event(&started(Platform::Twitch, "42", "99"), T0 + 10);
+    let m = chat("a1", Platform::Twitch, "alice", "tw:bob");
+    assert_eq!(e.session_for(&m), Some("twitch:42".to_string()));
+}
+
 // ---------------- 定義の変更(D9) ----------------
 
 #[test]
