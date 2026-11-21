@@ -15,12 +15,12 @@ use super::twitcasting::{
     channel_name, extract_screen_id, StartedMovies, INVALID_ID_NOTICE, NOT_FOUND_NOTICE,
     UNAVAILABLE_NOTICE,
 };
-use super::twitcasting_api::{ApiError, CommentsQuery, LiveGuard, TwitcastingApi};
+use super::twitcasting_api::{comment_interval, ApiError, CommentsQuery, LiveGuard, TwitcastingApi};
 use super::twitcasting_auth::AuthState;
 use super::{send_live_event, Backoff, Source};
 use crate::integrations::SecretStore;
 use crate::model::{
-    Author, ChatMessage, Fragment, LiveEvent, LiveStream, MessageKind, Platform, Roles,
+    Author, Badge, ChatMessage, Fragment, LiveEvent, LiveStream, MessageKind, Platform, Roles,
 };
 use crate::stats::{ViewerCountKind, YoutubeMetadataUpdate};
 
@@ -29,10 +29,12 @@ pub const DEDUPE_CAPACITY: usize = 4096;
 pub const LOGIN_REQUIRED_NOTICE: &str = "ツイキャスにログインしてください";
 pub const RELOGIN_REQUIRED_NOTICE: &str = "ツイキャスに再ログインしてください";
 pub const APP_DISABLED_NOTICE: &str = "このアプリはツイキャスで無効化されています";
+const LOAD_FAILED_NOTICE: &str = "ツイキャスのログイン情報を読み込めませんでした。再ログインしてください";
 
 const PAGE_SIZE: u32 = 50;
 const HISTORY_LIMIT: usize = 20;
 const STARTED_MOVIES_LIMIT: usize = 256;
+const COMMENT_UNIT: Duration = Duration::from_secs(2);
 
 #[derive(Default)]
 pub struct CommentCursor {
@@ -163,12 +165,22 @@ pub fn official_comment_to_chat(v: &Value, ctx: &OfficialMapContext<'_>) -> Opti
     let id = id_string(&v["id"])?;
     let message = v["message"].as_str().filter(|s| !s.trim().is_empty())?;
     let user = &v["from_user"];
-    let author_id = id_string(&user["id"])?;
+    let screen_id = id_string(&user["screen_id"])?;
+    // twitcasting::is_anonymous と同じ規則を公式の screen_id に適用する。
+    let normalized_id = screen_id.to_ascii_lowercase();
+    let anonymous = v["isAnonymous"]
+        .as_bool()
+        .or_else(|| user["isAnonymous"].as_bool())
+        .unwrap_or(false)
+        || normalized_id == "twitcastinguest"
+        || normalized_id.strip_prefix("c:tw").is_some_and(|rest| {
+            !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())
+        });
     let name = user["name"]
         .as_str()
         .filter(|s| !s.trim().is_empty())
-        .or_else(|| user["screen_id"].as_str())
-        .unwrap_or_default();
+        .unwrap_or(&screen_id)
+        .to_string();
     let avatar_url = user["image"].as_str().and_then(|image| {
         if image.starts_with("//") {
             Some(format!("https:{image}"))
@@ -187,13 +199,28 @@ pub fn official_comment_to_chat(v: &Value, ctx: &OfficialMapContext<'_>) -> Opti
             nickname: None,
             avatar_url,
             roles: Roles {
-                broadcaster: ctx.broadcaster_id == Some(author_id.as_str()),
+                broadcaster: !anonymous
+                    && ctx
+                        .broadcaster_id
+                        .is_some_and(|id| id.eq_ignore_ascii_case(&screen_id)),
                 ..Default::default()
             },
-            id: author_id,
-            name: name.to_string(),
+            id: if anonymous {
+                "tc:anonymous".into()
+            } else {
+                screen_id
+            },
+            name,
             display_color: None,
-            badges: Vec::new(),
+            badges: if anonymous {
+                vec![Badge {
+                    kind: "anonymous".into(),
+                    label: "匿名".into(),
+                    image_url: None,
+                }]
+            } else {
+                Vec::new()
+            },
         },
         fragments: vec![Fragment::text(message)],
         kind: MessageKind::Normal,
@@ -238,7 +265,7 @@ impl Default for PollTuning {
         Self {
             offline: Duration::from_secs(30),
             live_refresh: Duration::from_secs(30),
-            comment_unit: Duration::from_secs(2),
+            comment_unit: COMMENT_UNIT,
             not_found_retry: Duration::from_secs(300),
             jitter: true,
         }
@@ -254,6 +281,7 @@ struct Movie {
     handed_off: bool,
     protected: bool,
     last_poll: Option<Instant>,
+    last_successful_poll: Option<Instant>,
 }
 
 impl Movie {
@@ -266,7 +294,13 @@ impl Movie {
             handed_off: false,
             protected: false,
             last_poll: None,
+            last_successful_poll: None,
         }
+    }
+
+    fn poll_gap_exceeded(&self, interval: Duration) -> bool {
+        self.last_successful_poll
+            .is_some_and(|last| last.elapsed() > interval.saturating_mul(3))
     }
 }
 
@@ -275,6 +309,7 @@ struct LiveState {
     movie: Option<Movie>,
     guard: Option<LiveGuard>,
     observed_offline_at: Option<Instant>,
+    comment_gap: bool,
 }
 
 pub struct TwitcastingOfficialSource<S: SecretStore> {
@@ -371,9 +406,11 @@ impl<S: SecretStore> TwitcastingOfficialSource<S> {
             let state = *auth.borrow_and_update();
             if state != AuthState::Ready {
                 live.guard = None;
+                live.comment_gap = true;
                 let notice = match state {
                     AuthState::Loading => None,
                     AuthState::ReloginRequired => Some(RELOGIN_REQUIRED_NOTICE),
+                    AuthState::LoadFailed => Some(LOAD_FAILED_NOTICE),
                     _ => Some(LOGIN_REQUIRED_NOTICE),
                 };
                 if notice != auth_notice {
@@ -390,14 +427,12 @@ impl<S: SecretStore> TwitcastingOfficialSource<S> {
             }
             auth_notice = None;
 
+            let interval = self.comment_interval();
             let comment_due = live
                 .movie
                 .as_ref()
                 .filter(|_| live.guard.is_some())
                 .map(|movie| {
-                    let live_count =
-                        u32::try_from(self.api.live_count().max(2)).unwrap_or(u32::MAX);
-                    let interval = self.tuning.comment_unit.saturating_mul(live_count);
                     movie
                         .last_poll
                         .map_or(next_comment, |last| next_comment.max(last + interval))
@@ -422,7 +457,7 @@ impl<S: SecretStore> TwitcastingOfficialSource<S> {
             let result = if let Some(id) = user_id.as_deref() {
                 if refresh_live {
                     let result = self
-                        .refresh_movie(&screen_id, id, &mut live, &mut auth)
+                        .refresh_movie(&screen_id, id, &mut live, &mut auth, interval)
                         .await;
                     let interval = if live.movie.is_some() {
                         self.tuning.live_refresh
@@ -438,18 +473,25 @@ impl<S: SecretStore> TwitcastingOfficialSource<S> {
                     })
                 } else {
                     let movie = live.movie.as_mut().expect("comment poll needs a movie");
-                    let result = while_ready(&mut auth, self.fetch_comments(movie)).await;
+                    let result =
+                        while_ready(&mut auth, &mut live.comment_gap, self.fetch_comments(movie))
+                            .await;
                     // A poll delayed by the shared budget still leaves a full interval
                     // before the next poll.
                     movie.last_poll = Some(Instant::now());
                     result.map(|batch| {
                         if *auth.borrow() == AuthState::Ready {
-                            self.publish_comments(movie, batch, carry_over.take(), &tx);
+                            let skip_tts = std::mem::take(&mut live.comment_gap)
+                                || movie.poll_gap_exceeded(interval);
+                            movie.last_successful_poll = movie.last_poll;
+                            self.publish_comments(movie, batch, skip_tts, carry_over.take(), &tx);
+                        } else {
+                            live.comment_gap = true;
                         }
                     })
                 }
             } else {
-                while_ready(&mut auth, self.api.user(&screen_id))
+                while_ready(&mut auth, &mut live.comment_gap, self.api.user(&screen_id))
                     .await
                     .and_then(|user| {
                         user_id = id_string(&user["user"]["id"]);
@@ -462,6 +504,9 @@ impl<S: SecretStore> TwitcastingOfficialSource<S> {
             } else {
                 (&mut next_comment, &mut comment_backoff)
             };
+            if let Err(error) = &result {
+                live.comment_gap |= is_comment_gap_error(error);
+            }
             match result {
                 Ok(()) => {
                     backoff.reset();
@@ -517,8 +562,10 @@ impl<S: SecretStore> TwitcastingOfficialSource<S> {
         user_id: &str,
         live: &mut LiveState,
         auth: &mut watch::Receiver<AuthState>,
+        comment_interval: Duration,
     ) -> Result<bool, ApiError> {
-        let snapshot = while_ready(auth, self.api.current_live(user_id)).await?;
+        let snapshot =
+            while_ready(auth, &mut live.comment_gap, self.api.current_live(user_id)).await?;
         let movie_id = snapshot.as_ref().and_then(|v| id_string(&v["movie"]["id"]));
         let Some((snapshot, movie_id)) = snapshot.as_ref().zip(movie_id) else {
             // 初回が未配信の場合も、自動告知に開始前の観測として伝える。
@@ -526,6 +573,7 @@ impl<S: SecretStore> TwitcastingOfficialSource<S> {
                 self.send_live_ended();
             }
             live.guard = None;
+            live.comment_gap = false;
             live.observed_offline_at = Some(Instant::now());
             self.send_metadata(false, None, None).await;
             return Ok(false);
@@ -540,13 +588,23 @@ impl<S: SecretStore> TwitcastingOfficialSource<S> {
             let recently_offline = live.observed_offline_at.take().is_some_and(|offline_at| {
                 offline_at.elapsed() <= self.tuning.offline.saturating_mul(2)
             });
-            let mid_stream = !recently_offline && (live.movie.is_none() || handed_off);
+            let mid_stream = live.comment_gap
+                || live
+                    .movie
+                    .as_ref()
+                    .is_some_and(|movie| movie.poll_gap_exceeded(comment_interval))
+                || (!recently_offline && (live.movie.is_none() || handed_off));
             live.movie = Some(Movie::new(movie_id, mid_stream));
         }
         let movie = live.movie.as_mut().expect("live snapshot has a movie");
         movie.handed_off = false;
-        movie.broadcaster_id = id_string(&snapshot["broadcaster"]["id"]);
-        if !movie.protected {
+        movie.broadcaster_id = id_string(&snapshot["broadcaster"]["screen_id"]);
+        if let Some(protected) = snapshot["movie"]["is_protected"].as_bool() {
+            movie.protected = protected;
+        }
+        if movie.protected {
+            live.guard = None;
+        } else {
             live.guard.get_or_insert_with(|| self.api.live_guard());
         }
 
@@ -561,6 +619,7 @@ impl<S: SecretStore> TwitcastingOfficialSource<S> {
         &self,
         movie: &mut Movie,
         batch: PollBatch,
+        skip_tts: bool,
         skip_ids: Option<&HashSet<String>>,
         tx: &broadcast::Sender<ChatMessage>,
     ) {
@@ -586,7 +645,7 @@ impl<S: SecretStore> TwitcastingOfficialSource<S> {
             if skip_ids.is_some_and(|ids| ids.contains(&message.id)) {
                 continue;
             }
-            message.skip_tts = history;
+            message.skip_tts = history || skip_tts;
             let _ = tx.send(message);
         }
     }
@@ -606,6 +665,18 @@ impl<S: SecretStore> TwitcastingOfficialSource<S> {
             );
         }
         Ok(batch)
+    }
+
+    fn comment_interval(&self) -> Duration {
+        let interval = comment_interval(self.api.live_count());
+        if self.tuning.comment_unit == COMMENT_UNIT {
+            return interval;
+        }
+        // Preserve the canonical interval's channel scaling for custom units.
+        let units = interval.as_secs() / COMMENT_UNIT.as_secs();
+        self.tuning
+            .comment_unit
+            .saturating_mul(u32::try_from(units).unwrap_or(u32::MAX))
     }
 
     fn refresh_delay(&self, delay: Duration, seed: &mut u64) -> Duration {
@@ -682,14 +753,25 @@ impl<S: SecretStore> TwitcastingOfficialSource<S> {
     }
 }
 
+fn is_comment_gap_error(error: &ApiError) -> bool {
+    matches!(
+        error,
+        ApiError::Network | ApiError::Server | ApiError::AppDisabled
+    )
+}
+
 // Also stop waiting for a request's rate budget when credentials become unavailable.
 async fn while_ready<T>(
     auth: &mut watch::Receiver<AuthState>,
+    comment_gap: &mut bool,
     request: impl Future<Output = Result<T, ApiError>>,
 ) -> Result<T, ApiError> {
     tokio::select! {
         biased;
-        _ = auth.wait_for(|state| *state != AuthState::Ready) => Err(ApiError::Unauthorized),
+        _ = auth.wait_for(|state| *state != AuthState::Ready) => {
+            *comment_gap = true;
+            Err(ApiError::Unauthorized)
+        }
         result = request => result,
     }
 }
@@ -730,7 +812,7 @@ mod tests {
     };
     use axum::{http::StatusCode, routing::get, Json, Router};
     use serde_json::json;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::{sync::Notify, task::JoinHandle, time::timeout};
 
     struct RunningSource {
@@ -954,7 +1036,7 @@ mod tests {
                         };
                         let comments: Vec<_> = ids
                             .into_iter()
-                            .map(|id| json!({ "id": id, "message": "chat", "from_user": { "id": "1" } }))
+                            .map(|id| json!({ "id": id, "message": "chat", "from_user": { "screen_id": "alice" } }))
                             .collect();
                         Json(json!({ "comments": comments }))
                     },
@@ -1063,7 +1145,7 @@ mod tests {
 
         source.auth.send(AuthState::LoadFailed).unwrap();
         source
-            .metadata_matching(|update| update.notice.as_deref() == Some(LOGIN_REQUIRED_NOTICE))
+            .metadata_matching(|update| update.notice.as_deref() == Some(LOAD_FAILED_NOTICE))
             .await;
         assert_eq!(source.user_calls.load(Ordering::Relaxed), 0);
 
@@ -1077,13 +1159,26 @@ mod tests {
     async fn live_count_after_comment_error(
         code: u32,
         notice: &str,
+        protection_after_error: Option<bool>,
         expected_after_refresh: usize,
     ) {
         let release_error = Arc::new(Notify::new());
+        let sent_error = Arc::new(AtomicBool::new(false));
         let router = Router::new()
             .route(
                 "/users/1/current_live",
-                get(|| async { Json(json!({ "movie": { "id": "9" } })) }),
+                get({
+                    let sent_error = Arc::clone(&sent_error);
+                    move || async move {
+                        let mut movie = json!({ "id": "9" });
+                        if let Some(protected) = protection_after_error
+                            .filter(|_| sent_error.load(Ordering::Relaxed))
+                        {
+                            movie["is_protected"] = json!(protected);
+                        }
+                        Json(json!({ "movie": movie }))
+                    }
+                }),
             )
             .route(
                 "/movies/9/comments",
@@ -1091,6 +1186,7 @@ mod tests {
                     let release_error = Arc::clone(&release_error);
                     move || async move {
                         release_error.notified().await;
+                        sent_error.store(true, Ordering::Relaxed);
                         (
                             StatusCode::FORBIDDEN,
                             Json(json!({ "error": { "code": code } })),
@@ -1118,12 +1214,93 @@ mod tests {
 
     #[tokio::test]
     async fn protected_movie_stays_out_of_live_count_after_refresh() {
-        live_count_after_comment_error(2002, UNAVAILABLE_NOTICE, 0).await;
+        live_count_after_comment_error(2002, UNAVAILABLE_NOTICE, Some(true), 0).await;
+    }
+
+    #[tokio::test]
+    async fn protected_movie_resumes_when_refresh_reports_unprotected() {
+        live_count_after_comment_error(2002, UNAVAILABLE_NOTICE, Some(false), 1).await;
     }
 
     #[tokio::test]
     async fn app_disabled_movie_leaves_live_count_until_refresh_recovers() {
-        live_count_after_comment_error(2001, APP_DISABLED_NOTICE, 1).await;
+        live_count_after_comment_error(2001, APP_DISABLED_NOTICE, None, 1).await;
+    }
+
+    #[test]
+    fn network_backoff_breaks_comment_continuity() {
+        assert!(is_comment_gap_error(&ApiError::Network));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn successful_poll_gap_must_exceed_three_comment_intervals() {
+        let mut movie = Movie::new("9".into(), false);
+        let interval = comment_interval(3);
+        assert!(!movie.poll_gap_exceeded(interval));
+        movie.last_successful_poll = Some(Instant::now());
+        time::advance(interval * 3).await;
+        assert!(!movie.poll_gap_exceeded(interval));
+        time::advance(Duration::from_millis(1)).await;
+        assert!(movie.poll_gap_exceeded(interval));
+    }
+
+    async fn assert_comment_resume_after_error(status: StatusCode, code: u32) {
+        let fail_once = Arc::new(AtomicBool::new(true));
+        let router = Router::new()
+            .route(
+                "/users/1/current_live",
+                get(|| async { Json(json!({ "movie": { "id": "9" } })) }),
+            )
+            .route(
+                "/movies/9/comments",
+                get(move |axum::extract::Query(params): axum::extract::Query<
+                    std::collections::HashMap<String, String>,
+                >| {
+                    let fail_once = Arc::clone(&fail_once);
+                    async move {
+                        let id = match (
+                            params.get("slice_id").map(String::as_str),
+                            params.get("offset").map(String::as_str),
+                        ) {
+                            (None, Some("0")) => 1,
+                            (Some("1"), Some("0")) if fail_once.swap(false, Ordering::Relaxed) => {
+                                return (status, Json(json!({ "error": { "code": code } })));
+                            }
+                            (Some("1"), Some("0")) => 2,
+                            (Some("2"), Some("0")) => 3,
+                            _ => return (StatusCode::OK, Json(json!({ "comments": [] }))),
+                        };
+                        (StatusCode::OK, Json(json!({ "comments": [{
+                            "id": id, "message": "chat", "from_user": { "screen_id": "alice" }
+                        }] })))
+                    }
+                }),
+            );
+        let tuning = PollTuning {
+            live_refresh: Duration::from_millis(250),
+            comment_unit: Duration::from_millis(500),
+            ..test_tuning()
+        };
+        let mut source = start_source(router, tuning, AuthState::Ready).await;
+        timeout(Duration::from_secs(5), async {
+            for (id, skip_tts) in [(1, true), (2, true), (3, false)] {
+                let message = source.messages.recv().await.unwrap();
+                assert_eq!(message.id, format!("tc-{id}"));
+                assert_eq!(message.skip_tts, skip_tts, "comment {id}");
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn server_backoff_silences_only_the_resumed_poll() {
+        assert_comment_resume_after_error(StatusCode::SERVICE_UNAVAILABLE, 0).await;
+    }
+
+    #[tokio::test]
+    async fn app_disabled_wait_silences_only_the_resumed_poll() {
+        assert_comment_resume_after_error(StatusCode::FORBIDDEN, 2001).await;
     }
 
     #[test]
@@ -1163,7 +1340,7 @@ mod tests {
             }))
             .route("/movies/9/comments", get(|axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>| async move {
                 let comments: Vec<_> = if !params.contains_key("slice_id") && params.get("offset").is_some_and(|offset| offset == "0") {
-                    (101..=150).rev().map(|id| json!({ "id": id, "message": "chat", "from_user": { "id": "1" } })).collect()
+                    (101..=150).rev().map(|id| json!({ "id": id, "message": "chat", "from_user": { "screen_id": "alice" } })).collect()
                 } else {
                     Vec::new()
                 };
