@@ -523,6 +523,7 @@ fn tts_speak_text(app: AppHandle, state: State<'_, AppState>, text: String) -> R
         raw: None,
         skip_tts: false,
         injected_test: false,
+        route: Default::default(),
     };
 
     try_enqueue_tts_message(&app, &state, msg);
@@ -2926,25 +2927,25 @@ fn spawn_one_channel(state: &AppState, config: &AppConfig, ch: &ChannelConfig) -
             twitch_viewer_auth,
         )
     };
-    let token = if ch.platform == ChannelPlatform::Youtube
+    let token = CancellationToken::new();
+    let source_tx = channel_source_sender(ch, &state.source_tx, &token);
+    if ch.platform == ChannelPlatform::Youtube
         && sources::youtube::is_channel_identifier(&ch.identifier)
     {
-        let token = CancellationToken::new();
         sources::youtube::live_resolve::spawn_live_resolve_poller(
             ch.identifier.clone(),
             overrides.clone(),
             youtube_api_key.clone(),
-            state.source_tx.clone(),
+            source_tx,
             state.metadata_tx.clone(),
             state.reaction_tx.clone(),
             state.mod_tx.clone(),
             Some(state.live_tx.clone()),
             token.clone(),
         );
-        token
     } else {
         let manager = SourceManager::new(
-            state.source_tx.clone(),
+            source_tx,
             overrides.clone(),
             youtube_api_key,
             x_overrides,
@@ -2959,8 +2960,8 @@ fn spawn_one_channel(state: &AppState, config: &AppConfig, ch: &ChannelConfig) -
         .with_twitcasting_mode(twitcasting_mode)
         .with_twitcasting_started_movies(state.twitcasting_started_movies.clone())
         .with_live_tx(Some(state.live_tx.clone()));
-        manager.spawn_channel(ch)
-    };
+        manager.spawn_channel_with_cancel(ch, token.clone());
+    }
     let app_cancel = state.app_cancel.clone();
     let token_for_app_cancel = token.clone();
     tauri::async_runtime::spawn(relay_channel_cancel(app_cancel, token_for_app_cancel));
@@ -2986,6 +2987,18 @@ fn spawn_one_channel(state: &AppState, config: &AppConfig, ch: &ChannelConfig) -
         );
     }
     token
+}
+
+fn channel_source_sender(
+    ch: &ChannelConfig,
+    upstream: &broadcast::Sender<ChatMessage>,
+    cancel: &CancellationToken,
+) -> broadcast::Sender<ChatMessage> {
+    sources::origin_relay::spawn_origin_relay(
+        config::channel_key(ch),
+        upstream.clone(),
+        cancel.child_token(),
+    )
 }
 
 async fn relay_channel_cancel(app: CancellationToken, channel: CancellationToken) {
@@ -3023,9 +3036,9 @@ fn apply_platform_moderation(app: &AppHandle, events: &[ModerationEvent]) {
 /// - Highlight: ハイライトバッジを付けて bus へ流す + TTS
 /// - Show   : そのまま bus へ流す + TTS
 fn spawn_pipeline(app: AppHandle, cancel: CancellationToken) {
+    let mut rx = app.state::<AppState>().source_tx.subscribe();
     tauri::async_runtime::spawn(async move {
         let state = app.state::<AppState>();
-        let mut rx = state.source_tx.subscribe();
         let bus = state.bus.clone();
 
         loop {
@@ -3193,7 +3206,7 @@ pub fn run() {
             let obs_port = config.obs.port;
 
             // 内部 source broadcast(Source → パイプライン)。
-            let (source_tx, _source_rx) = broadcast::channel::<ChatMessage>(4096);
+            let (source_tx, _source_rx) = broadcast::channel::<ChatMessage>(sources::SOURCE_CAPACITY);
 
             let tts = Arc::new(TtsShared::default());
 
@@ -3537,6 +3550,50 @@ pub fn run() {
                 }
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn spawned_channel_messages_reach_pipeline_with_origin_key() {
+        let ch = ChannelConfig {
+            platform: ChannelPlatform::Youtube,
+            identifier: "@fixture".into(),
+            enabled: true,
+            own_stream: false,
+            overrides: Default::default(),
+        };
+        let (upstream, mut pipeline_rx) = broadcast::channel(sources::SOURCE_CAPACITY);
+        let cancel = CancellationToken::new();
+        let source_tx = channel_source_sender(&ch, &upstream, &cancel);
+        let message: ChatMessage = serde_json::from_value(serde_json::json!({
+            "id": "first",
+            "platform": "youtube",
+            "channel": "ABCDEFGHIJK",
+            "author": { "id": "u1", "name": "viewer" },
+            "fragments": [],
+            "kind": "normal",
+            "timestampMs": 1
+        }))
+        .unwrap();
+        source_tx.send(message.clone()).unwrap();
+        let received = tokio::time::timeout(Duration::from_secs(2), pipeline_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut expected = message;
+        expected.route.origin_key = Some(config::channel_key(&ch));
+        assert_eq!(received, expected);
+
+        cancel.cancel();
+        drop(upstream);
+        let closed = tokio::time::timeout(Duration::from_secs(2), pipeline_rx.recv())
+            .await
+            .unwrap();
+        assert!(matches!(closed, Err(broadcast::error::RecvError::Closed)));
+    }
 }
 
 #[cfg(test)]

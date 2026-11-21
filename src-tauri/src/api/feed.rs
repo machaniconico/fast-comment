@@ -140,6 +140,7 @@ impl ApiFeed {
                 native_id: false,
                 skip_tts: false,
                 injected_test: false,
+                route: Default::default(),
             },
         });
         if state.history.len() == state.capacity {
