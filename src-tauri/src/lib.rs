@@ -1602,11 +1602,7 @@ fn add_channel(
 ) -> Result<ConfigCommit<ChannelsSaved>, String> {
     let commit = {
         let mut cfg = state.config.lock().unwrap();
-        // 既存の同一キーがあれば重複追加しない。
-        let key = AppState::channel_key(&channel);
-        if cfg.channels.iter().any(|c| AppState::channel_key(c) == key) {
-            return Err(format!("チャンネルは既に存在します: {key}"));
-        }
+        ensure_new_channel(&cfg, &channel)?;
         let mut next = cfg.clone();
         next.channels.push(channel.clone());
         let revision = state.commit_config(&mut cfg, next).map_err(|e| e.to_string())?;
@@ -1615,6 +1611,15 @@ fn add_channel(
 
     spawn_one_channel(&app, &state, &channel);
     Ok(commit)
+}
+
+/// 既存の同一キーがあれば重複追加しない。キーは URL やトークンでありうるのでエラー文に入れない。
+fn ensure_new_channel(cfg: &AppConfig, channel: &ChannelConfig) -> Result<(), String> {
+    let key = AppState::channel_key(channel);
+    if cfg.channels.iter().any(|c| AppState::channel_key(c) == key) {
+        return Err("チャンネルは既に存在します".into());
+    }
+    Ok(())
 }
 
 /// チャンネルを1件削除して停止する。`key` は `twitch:name` / `youtube:videoId`。
@@ -1660,7 +1665,7 @@ fn set_own_stream_in(cfg: &mut AppConfig, key: &str, own: bool) -> Result<(), St
         .channels
         .iter_mut()
         .find(|c| AppState::channel_key(c) == key)
-        .ok_or_else(|| format!("チャンネルが見つかりません: {key}"))?;
+        .ok_or_else(|| "チャンネルが見つかりません".to_string())?;
     row.own_stream = own;
     Ok(())
 }
@@ -3753,6 +3758,27 @@ mod followup_tests {
             assert_eq!(incoming.twitcasting.callback_port, expected_tc.1);
             assert_ne!(incoming.x_post.enabled, current.x_post.enabled);
             assert_ne!(incoming.goals.show_in_app, current.goals.show_in_app);
+        }
+    }
+
+    #[test]
+    fn channel_errors_do_not_include_the_identifier() {
+        let mut cfg = AppConfig::default();
+        let channel: ChannelConfig = serde_json::from_value(serde_json::json!({
+            "platform": "twitcasting",
+            "identifier": "https://invalid.example/?token=MARKER",
+        }))
+        .unwrap();
+        assert_eq!(ensure_new_channel(&cfg, &channel), Ok(()));
+        cfg.channels.push(channel.clone());
+        let duplicate = ensure_new_channel(&cfg, &channel).unwrap_err();
+        assert_eq!(duplicate, "チャンネルは既に存在します");
+        let missing =
+            set_own_stream_in(&mut cfg, "twitcasting:https://other.example/?token=MARKER", true)
+                .unwrap_err();
+        assert_eq!(missing, "チャンネルが見つかりません");
+        for text in [duplicate, missing] {
+            assert!(!text.contains("MARKER") && !text.contains("example"), "{text}");
         }
     }
 
