@@ -49,6 +49,7 @@ fn open_fixture() -> (Fixture, String) {
 
 fn sample_message(id: &str) -> ChatMessage {
     ChatMessage {
+        route: Default::default(),
         listener: None,
         id: id.to_string(),
         native_id: false,

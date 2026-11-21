@@ -51,7 +51,10 @@ use crate::autopost::{
 };
 use crate::bus::{spawn_moderation_ui_forwarder, spawn_reaction_ui_forwarder, Bus};
 use crate::templates::{TemplateInfo, TemplateRef, TemplateStore};
-use crate::config::{commit_config, ConfigCommitError, CONFIG_CHANGED_ERROR};
+use crate::config::{
+    commit_channel_overrides, commit_config, replace_channels_in, ChannelEditError, ChannelOverrides,
+    ConfigCommitError, ConfigLoadOutcome, CONFIG_CHANGED_ERROR,
+};
 use crate::config::{AppConfig, ChannelConfig, ChannelPlatform, TtsBackendKind, VoicevoxEngineKind};
 use crate::model::{
     Author, Badge, ChatMessage, Fragment, LiveEvent, LiveStream, MessageKind, ModerationEvent, Participant,
@@ -84,6 +87,8 @@ pub struct AppState {
     webhook: webhook::WebhookRuntime<integrations::KeyringSecretStore, webhook::ReqwestSender>,
     /// 現在の設定。
     config: Mutex<AppConfig>,
+    /// メイン画面からの通知取得を待つ起動時ロード結果。
+    startup_config_outcome: Mutex<Option<ConfigLoadOutcome>>,
     /// 設定の revision。`config` のロック内で、保存に成功するたびに `commit_config` が 1 進める。
     /// プロセス内だけの値で永続化しない。全体保存の楽観的排他に使う。
     config_revision: AtomicU64,
@@ -253,14 +258,7 @@ struct ObsServerControl {
 impl AppState {
     /// チャンネルの一意キー(プラットフォーム + 識別子)。
     fn channel_key(ch: &ChannelConfig) -> String {
-        let p = match ch.platform {
-            config::ChannelPlatform::Twitch => "twitch",
-            config::ChannelPlatform::Youtube => "youtube",
-            config::ChannelPlatform::X => "x",
-            config::ChannelPlatform::Niconico => "niconico",
-            config::ChannelPlatform::Twitcasting => "twitcasting",
-        };
-        format!("{p}:{}", ch.identifier)
+        config::channel_key(ch)
     }
 }
 
@@ -275,12 +273,34 @@ fn current_tts_queue_state(state: &AppState) -> TtsQueueStatePayload {
     state.tts.snapshot()
 }
 
-fn try_enqueue_tts_message(app: &AppHandle, state: &AppState, msg: ChatMessage) {
+fn try_enqueue_tts_message(
+    sink: &dyn tts::TtsSink,
+    config: &Mutex<AppConfig>,
+    queue: &TtsShared,
+    mut msg: ChatMessage,
+) {
     if !listeners::allows_tts(&msg) {
         return;
     }
-    let max_pending = state.config.lock().unwrap().tts.options.queue.max_pending as usize;
-    state.tts.enqueue(app, msg, max_pending);
+    // 設定ロックを持ったまま投入する。枠の読み上げ OFF の保存(キューから除く)と順序を揃えるため。
+    // UI への通知はロックを放してから出す。
+    let result = {
+        let config = config.lock().unwrap();
+        let overrides = tts::origin_overrides(&config, &msg);
+        if !tts::overrides_allow_tts(overrides) {
+            return;
+        }
+        msg.route.channel_tts_voice = overrides.and_then(|o| o.tts_voice.clone());
+        let max_pending = config.tts.options.queue.max_pending as usize;
+        queue.enqueue_silent(msg, max_pending)
+    };
+    queue.after_enqueue(sink, &result);
+}
+
+/// 読み上げ OFF の枠の未読み上げコメントを捨てる。設定ロック中(保存の直後)に呼び、
+/// true が返ったらロックを放してから `emit_queue_state` する。
+fn purge_disabled_channel_tts(cfg: &AppConfig, queue: &TtsShared) -> bool {
+    queue.remove_disabled_channels(cfg) > 0
 }
 
 fn emit_bouyomi_launch_notice(app: &AppHandle, outcome: bouyomi::LaunchOutcome) {
@@ -425,6 +445,20 @@ fn get_config(state: State<'_, AppState>) -> Result<ConfigSnapshot, String> {
     })
 }
 
+/// 通知の購読準備ができた画面へ、起動時の結果に対応する通知を一度だけ返す。
+#[tauri::command]
+fn take_startup_config_notice(state: State<'_, AppState>) -> Option<TtsNoticePayload> {
+    take_config_load_notice(&state.startup_config_outcome)
+}
+
+fn take_config_load_notice(outcome: &Mutex<Option<ConfigLoadOutcome>>) -> Option<TtsNoticePayload> {
+    let message = outcome.lock().unwrap().take()?.notice()?;
+    Some(TtsNoticePayload {
+        level: "warn",
+        message: message.to_owned(),
+    })
+}
+
 /// TTS 読み上げを一時停止/再開する。paused 中に届いたメッセージは保持せず破棄する。
 #[tauri::command]
 fn set_tts_paused(app: AppHandle, state: State<'_, AppState>, paused: bool) {
@@ -527,9 +561,10 @@ fn tts_speak_text(app: AppHandle, state: State<'_, AppState>, text: String) -> R
         raw: None,
         skip_tts: false,
         injected_test: false,
+        route: Default::default(),
     };
 
-    try_enqueue_tts_message(&app, &state, msg);
+    try_enqueue_tts_message(&app, &state.config, &state.tts, msg);
     Ok(())
 }
 
@@ -1347,6 +1382,7 @@ async fn update_config(
         youtube_oauth_client_changed,
         x_source_config_changed,
         twitch_viewer_auth_changed,
+        tts_purged,
     ) = {
         let mut current = state.config.lock().unwrap();
         let changes = (
@@ -1380,8 +1416,12 @@ async fn update_config(
             base_revision,
         )
         .map_err(|e| e.to_string())?;
-        (revision, changes.0, changes.1, changes.2, changes.3)
+        let purged = purge_disabled_channel_tts(&current, &state.tts);
+        (revision, changes.0, changes.1, changes.2, changes.3, purged)
     };
+    if tts_purged {
+        state.tts.emit_queue_state(&app);
+    }
 
     // moderation 反映。
     state
@@ -1596,32 +1636,120 @@ async fn set_moderation(
     update_moderation(&state, |rules| *rules = moderation)
 }
 
-/// チャンネルを1件追加して起動する。
+/// チャンネルを1件追加または置き換え、有効なら起動する。
 #[tauri::command]
 fn add_channel(
     state: State<'_, AppState>,
-    channel: ChannelConfig,
+    channel: serde_json::Value,
+    replaces: Option<serde_json::Value>,
 ) -> Result<ConfigCommit<ChannelsSaved>, String> {
+    let channel: ChannelConfig = from_ipc_value(channel, "チャンネル")?;
+    let replaces = parse_replaces(replaces)?;
     let mut cfg = state.config.lock().unwrap();
-    ensure_new_channel(&cfg, &channel)?;
+    add_channel_and_commit(
+        &mut cfg,
+        &state.channels,
+        channel,
+        &replaces,
+        |current, next| state.commit_config(current, next),
+        |cfg, ch| spawn_one_channel(&state, cfg, ch),
+    )
+}
+
+fn add_channel_and_commit(
+    cfg: &mut AppConfig,
+    channels: &Mutex<HashMap<String, CancellationToken>>,
+    mut channel: ChannelConfig,
+    replaces: &[String],
+    commit: impl FnOnce(&mut AppConfig, AppConfig) -> Result<u64, ConfigCommitError>,
+    spawn: impl FnOnce(&AppConfig, &ChannelConfig) -> CancellationToken,
+) -> Result<ConfigCommit<ChannelsSaved>, String> {
+    channel.overrides.normalize();
+    let key = AppState::channel_key(&channel);
     let mut next = cfg.clone();
-    next.channels.push(channel.clone());
-    let revision = state.commit_config(&mut cfg, next).map_err(|e| e.to_string())?;
+    if !replaces.is_empty() {
+        replace_channels_in(&mut next, replaces, channel.clone()).map_err(|e| e.to_string())?;
+        ensure_new_channel(&next, &channel, Some(&key))?;
+    } else {
+        ensure_new_channel(cfg, &channel, None)?;
+        next.channels.push(channel.clone());
+    }
+    let revision = commit(cfg, next).map_err(|e| e.to_string())?;
+    let mut active = channels.lock().unwrap();
+    for token in replaces.iter().filter_map(|old_key| active.remove(old_key)) {
+        token.cancel();
+    }
     if channel.enabled {
-        let token = spawn_one_channel(&state, &cfg, &channel);
-        let key = AppState::channel_key(&channel);
-        if let Some(old) = state.channels.lock().unwrap().insert(key, token) {
+        let saved_channel = cfg
+            .channels
+            .iter()
+            .find(|ch| ch.platform == channel.platform && ch.identifier == channel.identifier)
+            .expect("コミットした行が見つかる");
+        let token = spawn(cfg, saved_channel);
+        if let Some(old) = active.insert(key, token) {
             old.cancel();
         }
     }
-    Ok(channels_commit(&cfg, revision))
+    Ok(channels_commit(cfg, revision))
+}
+
+/// IPC 入力を型に変換する。serde の文面は入力値を含みうるので、固定文と項目名だけ返す。
+fn from_ipc_value<T: serde::de::DeserializeOwned>(value: serde_json::Value, what: &str) -> Result<T, String> {
+    serde_path_to_error::deserialize(value).map_err(|e| {
+        format!("{what}の形式が不正です (項目 {})", ipc_error_path(e.path()))
+    })
+}
+
+/// 構造体のフィールド名だけを辿る。配列要素や英数字以外のキーには進まない。
+fn ipc_error_path(path: &serde_path_to_error::Path) -> String {
+    let mut names = Vec::new();
+    for segment in path {
+        match segment {
+            serde_path_to_error::Segment::Map { key }
+                if key.len() <= 32 && !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') =>
+            {
+                names.push(key.as_str())
+            }
+            _ => break,
+        }
+    }
+    if names.is_empty() {
+        ".".to_owned()
+    } else {
+        names.join(".")
+    }
+}
+
+/// `replaces` は 1 件の key(従来形)か key の配列。どちらも 1 回の保存で置き換える。
+fn parse_replaces(value: Option<serde_json::Value>) -> Result<Vec<String>, String> {
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(Vec::new()),
+        Some(serde_json::Value::String(key)) => Ok(vec![key]),
+        Some(value) => {
+            let keys: Vec<String> = from_ipc_value(value, "置き換え対象")?;
+            let mut unique = Vec::with_capacity(keys.len());
+            for key in keys {
+                if !unique.contains(&key) {
+                    unique.push(key);
+                }
+            }
+            Ok(unique)
+        }
+    }
 }
 
 /// 既存の同一キーがあれば重複追加しない。キーは URL やトークンでありうるのでエラー文に入れない。
-fn ensure_new_channel(cfg: &AppConfig, channel: &ChannelConfig) -> Result<(), String> {
+fn ensure_new_channel(
+    cfg: &AppConfig,
+    channel: &ChannelConfig,
+    exclude: Option<&str>,
+) -> Result<(), String> {
     let key = duplicate_key(channel);
-    if cfg.channels.iter().any(|c| duplicate_key(c) == key) {
-        return Err("チャンネルは既に存在します".into());
+    if cfg.channels.iter().any(|c| {
+        duplicate_key(c) == key
+            && !exclude.is_some_and(|excluded| AppState::channel_key(c) == excluded)
+    }) {
+        return Err(ChannelEditError::Duplicate.to_string());
     }
     Ok(())
 }
@@ -1664,6 +1792,39 @@ fn set_channel_own_stream(
     Ok(channels_commit(&cfg, revision))
 }
 
+/// 行の上書きだけを保存する。実行中の Source はそのまま使う。
+#[tauri::command]
+async fn set_channel_overrides(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    key: serde_json::Value,
+    overrides: serde_json::Value,
+    base_revision: serde_json::Value,
+) -> Result<ConfigCommit<ChannelsSaved>, String> {
+    let key: String = from_ipc_value(key, "枠のキー")?;
+    let overrides: ChannelOverrides = from_ipc_value(overrides, "上書き設定")?;
+    let base_revision: u64 = from_ipc_value(base_revision, "基準 revision")?;
+    let _write = state.config_write.lock().await;
+    let (commit, purged) = {
+        let mut cfg = state.config.lock().unwrap();
+        let revision = commit_channel_overrides(
+            &state.config_dir,
+            &state.config_revision,
+            &state.config_tx,
+            &mut cfg,
+            &key,
+            overrides,
+            base_revision,
+        )
+        .map_err(|e| e.to_string())?;
+        (channels_commit(&cfg, revision), purge_disabled_channel_tts(&cfg, &state.tts))
+    };
+    if purged {
+        state.tts.emit_queue_state(&app);
+    }
+    Ok(commit)
+}
+
 #[derive(Clone, Serialize)]
 struct ChannelsSaved {
     channels: Vec<ChannelConfig>,
@@ -1678,7 +1839,7 @@ fn set_own_stream_in(cfg: &mut AppConfig, key: &str, own: bool) -> Result<(), St
         .channels
         .iter_mut()
         .find(|c| AppState::channel_key(c) == key)
-        .ok_or_else(|| "チャンネルが見つかりません".to_string())?;
+        .ok_or_else(|| ChannelEditError::NotFound.to_string())?;
     row.own_stream = own;
     Ok(())
 }
@@ -2866,25 +3027,25 @@ fn spawn_one_channel(state: &AppState, config: &AppConfig, ch: &ChannelConfig) -
             twitch_viewer_auth,
         )
     };
-    let token = if ch.platform == ChannelPlatform::Youtube
+    let token = CancellationToken::new();
+    let source_tx = channel_source_sender(ch, &state.source_tx, &token);
+    if ch.platform == ChannelPlatform::Youtube
         && sources::youtube::is_channel_identifier(&ch.identifier)
     {
-        let token = CancellationToken::new();
         sources::youtube::live_resolve::spawn_live_resolve_poller(
             ch.identifier.clone(),
             overrides.clone(),
             youtube_api_key.clone(),
-            state.source_tx.clone(),
+            source_tx,
             state.metadata_tx.clone(),
             state.reaction_tx.clone(),
             state.mod_tx.clone(),
             Some(state.live_tx.clone()),
             token.clone(),
         );
-        token
     } else {
         let manager = SourceManager::new(
-            state.source_tx.clone(),
+            source_tx,
             overrides.clone(),
             youtube_api_key,
             x_overrides,
@@ -2899,8 +3060,8 @@ fn spawn_one_channel(state: &AppState, config: &AppConfig, ch: &ChannelConfig) -
         .with_twitcasting_mode(twitcasting_mode)
         .with_twitcasting_started_movies(state.twitcasting_started_movies.clone())
         .with_live_tx(Some(state.live_tx.clone()));
-        manager.spawn_channel(ch)
-    };
+        manager.spawn_channel_with_cancel(ch, token.clone());
+    }
     let app_cancel = state.app_cancel.clone();
     let token_for_app_cancel = token.clone();
     tauri::async_runtime::spawn(relay_channel_cancel(app_cancel, token_for_app_cancel));
@@ -2926,6 +3087,18 @@ fn spawn_one_channel(state: &AppState, config: &AppConfig, ch: &ChannelConfig) -
         );
     }
     token
+}
+
+fn channel_source_sender(
+    ch: &ChannelConfig,
+    upstream: &broadcast::Sender<ChatMessage>,
+    cancel: &CancellationToken,
+) -> broadcast::Sender<ChatMessage> {
+    sources::origin_relay::spawn_origin_relay(
+        config::channel_key(ch),
+        upstream.clone(),
+        cancel.child_token(),
+    )
 }
 
 async fn relay_channel_cancel(app: CancellationToken, channel: CancellationToken) {
@@ -2963,9 +3136,9 @@ fn apply_platform_moderation(app: &AppHandle, events: &[ModerationEvent]) {
 /// - Highlight: ハイライトバッジを付けて bus へ流す + TTS
 /// - Show   : そのまま bus へ流す + TTS
 fn spawn_pipeline(app: AppHandle, cancel: CancellationToken) {
+    let mut rx = app.state::<AppState>().source_tx.subscribe();
     tauri::async_runtime::spawn(async move {
         let state = app.state::<AppState>();
-        let mut rx = state.source_tx.subscribe();
         let bus = state.bus.clone();
 
         loop {
@@ -3004,7 +3177,7 @@ fn spawn_pipeline(app: AppHandle, cancel: CancellationToken) {
                     register_participant_if_needed(&app, &state, &msg);
 
                     // 同期 I/O やネットワーク待ちをせず、有界キューに投入する。
-                    try_enqueue_tts_message(&app, &state, msg.clone());
+                    try_enqueue_tts_message(&app, &state.config, &state.tts, msg.clone());
 
                     // 下流(UI/OBS)へ。
                     bus.publish(msg);
@@ -3124,16 +3297,14 @@ pub fn run() {
                 .clone()
                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
-            // 設定ロード(失敗時は既定値で続行)。
-            let config = AppConfig::load(&config_dir).unwrap_or_else(|e| {
-                tracing::error!("設定ロード失敗・既定値で続行: {e}");
-                AppConfig::default()
-            });
+            // 設定ロード(失敗時は壊れたファイルを退避して既定値で続行)。
+            // 退避できなかった時は config.json への保存を止める。ロード結果は UI が取得するまで保持する。
+            let (config, load_outcome) = AppConfig::load_or_preserve(&config_dir);
 
             let obs_port = config.obs.port;
 
             // 内部 source broadcast(Source → パイプライン)。
-            let (source_tx, _source_rx) = broadcast::channel::<ChatMessage>(4096);
+            let (source_tx, _source_rx) = broadcast::channel::<ChatMessage>(sources::SOURCE_CAPACITY);
 
             let tts = Arc::new(TtsShared::default());
 
@@ -3241,6 +3412,7 @@ pub fn run() {
                         listeners: Arc::new(listeners::ListenerStore::load(&config_dir)),
                         chatlog: chatlog::ChatLog::start(&config_dir, config.log.clone()),
                         config: Mutex::new(config.clone()),
+                        startup_config_outcome: Mutex::new(Some(load_outcome)),
                         config_revision: AtomicU64::new(0),
                         config_tx,
                         timer_tx,
@@ -3395,6 +3567,7 @@ pub fn run() {
             list_listeners,
             delete_listener,
             get_config,
+            take_startup_config_notice,
             get_comment_log_dir,
             open_comment_log_dir,
             get_tts_queue_state,
@@ -3423,6 +3596,7 @@ pub fn run() {
             append_moderation_value,
             set_moderation,
             add_channel,
+            set_channel_overrides,
             remove_channel,
             hide_message,
             unhide_message,
@@ -3476,6 +3650,119 @@ pub fn run() {
                 }
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn startup_config_notice_can_be_taken_only_once() {
+        for outcome in [
+            ConfigLoadOutcome::BackedUp,
+            ConfigLoadOutcome::SavesBlocked,
+            ConfigLoadOutcome::Loaded,
+        ] {
+            let stored = Mutex::new(Some(outcome));
+            assert_eq!(
+                take_config_load_notice(&stored),
+                outcome.notice().map(|message| TtsNoticePayload {
+                    level: "warn",
+                    message: message.to_owned(),
+                })
+            );
+            assert_eq!(*stored.lock().unwrap(), None);
+            assert_eq!(take_config_load_notice(&stored), None);
+        }
+    }
+
+    #[test]
+    fn tts_disabled_channel_message_is_dropped_before_enqueue() {
+        struct Sink;
+        impl tts::TtsSink for Sink {
+            fn audio(&self, _: String) {}
+            fn web_speech(&self, _: tts::WebSpeechPayload) {}
+            fn cancel(&self) {}
+            fn notice(&self, _: &'static str, _: String) {}
+            fn queue_state(&self, _: TtsQueueStatePayload) {}
+        }
+
+        let channel = ChannelConfig {
+            platform: ChannelPlatform::Twitch,
+            identifier: "fixture".into(),
+            enabled: true,
+            own_stream: false,
+            overrides: ChannelOverrides {
+                tts_enabled: Some(false),
+                ..Default::default()
+            },
+        };
+        let key = config::channel_key(&channel);
+        let mut config = AppConfig::default();
+        config.channels.push(channel);
+        config.tts.options.queue.max_pending = 1;
+        let config = Mutex::new(config);
+        let queue = TtsShared::default();
+        let allowed: ChatMessage = serde_json::from_value(serde_json::json!({
+            "id": "allowed",
+            "platform": "twitch",
+            "channel": "fixture",
+            "author": { "id": "u1", "name": "viewer" },
+            "fragments": [],
+            "kind": "normal",
+            "timestampMs": 1
+        }))
+        .unwrap();
+        let mut disabled = allowed.clone();
+        disabled.id = "disabled".into();
+        disabled.route.origin_key = Some(key);
+
+        try_enqueue_tts_message(&Sink, &config, &queue, allowed);
+        try_enqueue_tts_message(&Sink, &config, &queue, disabled);
+
+        let snapshot = queue.snapshot();
+        assert_eq!(snapshot.depth, 1);
+        assert_eq!(snapshot.items[0].id, "allowed");
+    }
+
+    #[tokio::test]
+    async fn spawned_channel_messages_reach_pipeline_with_origin_key() {
+        let ch = ChannelConfig {
+            platform: ChannelPlatform::Youtube,
+            identifier: "@fixture".into(),
+            enabled: true,
+            own_stream: false,
+            overrides: Default::default(),
+        };
+        let (upstream, mut pipeline_rx) = broadcast::channel(sources::SOURCE_CAPACITY);
+        let cancel = CancellationToken::new();
+        let source_tx = channel_source_sender(&ch, &upstream, &cancel);
+        let message: ChatMessage = serde_json::from_value(serde_json::json!({
+            "id": "first",
+            "platform": "youtube",
+            "channel": "ABCDEFGHIJK",
+            "author": { "id": "u1", "name": "viewer" },
+            "fragments": [],
+            "kind": "normal",
+            "timestampMs": 1
+        }))
+        .unwrap();
+        source_tx.send(message.clone()).unwrap();
+        let received = tokio::time::timeout(Duration::from_secs(2), pipeline_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut expected = message;
+        expected.route.origin_key = Some(config::channel_key(&ch));
+        assert_eq!(received, expected);
+
+        cancel.cancel();
+        drop(upstream);
+        let closed = tokio::time::timeout(Duration::from_secs(2), pipeline_rx.recv())
+            .await
+            .unwrap();
+        assert!(matches!(closed, Err(broadcast::error::RecvError::Closed)));
+    }
 }
 
 #[cfg(test)]
@@ -3797,16 +4084,16 @@ mod followup_tests {
         cfg.channels.push(tc("alice"));
         for dup in ["https://twitcasting.tv/alice", "ALICE", "https://twitcasting.tv/Alice/movie/1"] {
             assert_eq!(
-                ensure_new_channel(&cfg, &tc(dup)).unwrap_err(),
+                ensure_new_channel(&cfg, &tc(dup), None).unwrap_err(),
                 "チャンネルは既に存在します",
                 "{dup}"
             );
         }
-        assert_eq!(ensure_new_channel(&cfg, &tc("bob")), Ok(()));
+        assert_eq!(ensure_new_channel(&cfg, &tc("bob"), None), Ok(()));
         // 他のプラットフォームは従来どおり生の識別子で比べる。
         let mut twitch = tc("alice");
         twitch.platform = config::ChannelPlatform::Twitch;
-        assert_eq!(ensure_new_channel(&cfg, &twitch), Ok(()));
+        assert_eq!(ensure_new_channel(&cfg, &twitch, None), Ok(()));
     }
 
     #[test]
@@ -3817,9 +4104,9 @@ mod followup_tests {
             "identifier": "https://invalid.example/?token=MARKER",
         }))
         .unwrap();
-        assert_eq!(ensure_new_channel(&cfg, &channel), Ok(()));
+        assert_eq!(ensure_new_channel(&cfg, &channel, None), Ok(()));
         cfg.channels.push(channel.clone());
-        let duplicate = ensure_new_channel(&cfg, &channel).unwrap_err();
+        let duplicate = ensure_new_channel(&cfg, &channel, None).unwrap_err();
         assert_eq!(duplicate, "チャンネルは既に存在します");
         let missing =
             set_own_stream_in(&mut cfg, "twitcasting:https://other.example/?token=MARKER", true)
@@ -4005,12 +4292,14 @@ mod followup_tests {
                 identifier: "mine".into(),
                 enabled: true,
                 own_stream: false,
+                overrides: ChannelOverrides::default(),
             },
             ChannelConfig {
                 platform: ChannelPlatform::Youtube,
                 identifier: "@other".into(),
                 enabled: true,
                 own_stream: false,
+                overrides: ChannelOverrides::default(),
             },
         ];
         let before = cfg.channels.clone();
@@ -4116,6 +4405,104 @@ mod followup_tests {
         (dir, AtomicU64::new(0), tx, AppConfig::default())
     }
 
+    #[test]
+    fn set_channel_overrides_does_not_restart_source() {
+        let (dir, revision, tx, mut current) = commit_parts();
+        let channel = ChannelConfig {
+            platform: ChannelPlatform::Twitch,
+            identifier: "active".into(),
+            enabled: true,
+            own_stream: false,
+            overrides: ChannelOverrides::default(),
+        };
+        let key = AppState::channel_key(&channel);
+        current.channels.push(channel);
+        let config = Mutex::new(current);
+        let token = CancellationToken::new();
+        let active = Mutex::new(HashMap::from([(key.clone(), token.clone())]));
+        let overrides = ChannelOverrides {
+            tts_enabled: Some(false),
+            ..Default::default()
+        };
+        {
+            let mut current = config.lock().unwrap();
+            assert_eq!(
+                commit_channel_overrides(dir.path(), &revision, &tx, &mut current, &key, overrides.clone(), 0)
+                    .unwrap(),
+                1
+            );
+            assert_eq!(current.channel_overrides(&key), Some(&overrides));
+        }
+        let mut starts = 0;
+        apply_channel_diff(&config, &active, |_, _| {
+            starts += 1;
+            CancellationToken::new()
+        });
+        assert_eq!(starts, 0);
+        assert!(!token.is_cancelled());
+        assert!(active.lock().unwrap().contains_key(&key));
+    }
+
+    #[test]
+    fn add_channel_with_replaces_commits_once_and_inherits_overrides() {
+        for enabled in [true, false] {
+            let (dir, revision, tx, mut current) = commit_parts();
+            let overrides = ChannelOverrides {
+                tts_enabled: Some(false),
+                ..Default::default()
+            };
+            let old = ChannelConfig {
+                platform: ChannelPlatform::Niconico,
+                identifier: "lv1".into(),
+                enabled: true,
+                own_stream: true,
+                overrides: overrides.clone(),
+            };
+            let new = ChannelConfig {
+                identifier: "lv2".into(),
+                enabled,
+                own_stream: false,
+                overrides: ChannelOverrides::default(),
+                ..old.clone()
+            };
+            let old_key = AppState::channel_key(&old);
+            let new_key = AppState::channel_key(&new);
+            current.channels.push(old);
+            let old_token = CancellationToken::new();
+            let active = Mutex::new(HashMap::from([(old_key.clone(), old_token.clone())]));
+            let mut starts = 0;
+
+            let saved = add_channel_and_commit(
+                &mut current,
+                &active,
+                new,
+                std::slice::from_ref(&old_key),
+                |cfg, next| commit_config(dir.path(), &revision, &tx, cfg, next, None),
+                |cfg, ch| {
+                    assert!(old_token.is_cancelled());
+                    assert_eq!(&cfg.channels[0], ch);
+                    assert_eq!(ch.overrides, overrides);
+                    starts += 1;
+                    CancellationToken::new()
+                },
+            )
+            .unwrap();
+            assert_eq!(saved.revision, Some(1));
+            assert_eq!(revision.load(Ordering::SeqCst), 1);
+            assert_eq!(saved.saved.channels, current.channels);
+            assert_eq!(current.channels.len(), 1);
+            assert_eq!(current.channel_overrides(&new_key), Some(&overrides));
+            assert!(!current.channels[0].own_stream);
+            assert_eq!(tx.borrow().channels, current.channels);
+            assert_eq!(AppConfig::load(dir.path()).unwrap().channels, current.channels);
+            assert!(old_token.is_cancelled());
+            assert_eq!(starts, usize::from(enabled));
+            let active = active.lock().unwrap();
+            assert!(!active.contains_key(&old_key));
+            assert_eq!(active.contains_key(&new_key), enabled);
+        }
+    }
+
     #[tokio::test]
     async fn channel_deleted_after_config_save_is_not_restarted_by_diff() {
         let (dir, revision, tx, initial) = commit_parts();
@@ -4134,6 +4521,7 @@ mod followup_tests {
                         identifier: identifier.into(),
                         enabled: true,
                         own_stream: false,
+                        overrides: ChannelOverrides::default(),
                     })
                     .collect();
                 commit_config(dir.path(), &revision, &tx, &mut current, next, Some(0)).unwrap();
@@ -4319,6 +4707,302 @@ mod followup_tests {
     fn build_injected_test_messages_rejects_bad_input() {
         assert!(build_injected_test_messages("bogus", "", "", None, None, None).is_err());
         assert!(build_injected_test_messages("x", "", "", Some("bogus"), None, None).is_err());
+    }
+
+    struct NullSink;
+    impl tts::TtsSink for NullSink {
+        fn audio(&self, _: String) {}
+        fn web_speech(&self, _: tts::WebSpeechPayload) {}
+        fn cancel(&self) {}
+        fn notice(&self, _: &'static str, _: String) {}
+        fn queue_state(&self, _: TtsQueueStatePayload) {}
+    }
+
+    fn tts_message(id: &str, origin_key: Option<&str>) -> ChatMessage {
+        let mut msg: ChatMessage = serde_json::from_value(serde_json::json!({
+            "id": id,
+            "platform": "twitch",
+            "channel": "fixture",
+            "author": { "id": "u1", "name": "viewer" },
+            "fragments": [],
+            "kind": "normal",
+            "timestampMs": 1
+        }))
+        .unwrap();
+        msg.route.origin_key = origin_key.map(str::to_owned);
+        msg
+    }
+
+    #[test]
+    fn disabling_channel_tts_drops_its_queued_comments() {
+        let (dir, revision, tx, mut current) = commit_parts();
+        for identifier in ["off", "on"] {
+            current.channels.push(ChannelConfig {
+                platform: ChannelPlatform::Twitch,
+                identifier: identifier.into(),
+                enabled: true,
+                own_stream: false,
+                overrides: ChannelOverrides::default(),
+            });
+        }
+        current.tts.options.queue.max_pending = 100;
+        let config = Mutex::new(current);
+        let queue = TtsShared::default();
+        for i in 0..20 {
+            try_enqueue_tts_message(&NullSink, &config, &queue, tts_message(&format!("off{i}"), Some("twitch:off")));
+        }
+        try_enqueue_tts_message(&NullSink, &config, &queue, tts_message("on", Some("twitch:on")));
+        assert_eq!(queue.snapshot().depth, 21);
+
+        {
+            let mut cfg = config.lock().unwrap();
+            let off = ChannelOverrides {
+                tts_enabled: Some(false),
+                ..Default::default()
+            };
+            commit_channel_overrides(dir.path(), &revision, &tx, &mut cfg, "twitch:off", off, 0).unwrap();
+            assert!(purge_disabled_channel_tts(&cfg, &queue));
+        }
+        try_enqueue_tts_message(&NullSink, &config, &queue, tts_message("late", Some("twitch:off")));
+
+        let mut spoken = Vec::new();
+        let mut core = queue.core.lock().unwrap();
+        while let (Some(popped), _) = core.pop_fresh(std::time::Instant::now(), None) {
+            spoken.push(popped.job.msg.id.clone());
+        }
+        assert_eq!(spoken, ["on"]);
+    }
+
+    #[test]
+    fn full_config_save_turning_channel_off_purges_its_queue() {
+        let (dir, revision, tx, mut current) = commit_parts();
+        current.channels.push(ChannelConfig {
+            platform: ChannelPlatform::Twitch,
+            identifier: "full".into(),
+            enabled: true,
+            own_stream: false,
+            overrides: ChannelOverrides::default(),
+        });
+        let config = Mutex::new(current);
+        let queue = TtsShared::default();
+        try_enqueue_tts_message(&NullSink, &config, &queue, tts_message("q", Some("twitch:full")));
+        assert_eq!(queue.snapshot().depth, 1);
+
+        // update_config と同じく、画面の全体設定 JSON を解析して保存し、同じロック内で捨てる。
+        let mut json = serde_json::to_value(&*config.lock().unwrap()).unwrap();
+        json["channels"][0]["overrides"] = serde_json::json!({ "ttsEnabled": false });
+        let mut next = AppConfig::from_config_update(json).unwrap();
+        next.normalize_all();
+        let mut cfg = config.lock().unwrap();
+        commit_config(dir.path(), &revision, &tx, &mut cfg, next, Some(0)).unwrap();
+        assert!(purge_disabled_channel_tts(&cfg, &queue));
+        drop(cfg);
+        assert_eq!(queue.snapshot().depth, 0);
+    }
+
+    #[test]
+    fn full_config_save_keeps_queued_comment_when_first_duplicate_allows_tts() {
+        let (dir, revision, tx, mut current) = commit_parts();
+        for tts_enabled in [true, false] {
+            current.channels.push(ChannelConfig {
+                platform: ChannelPlatform::Twitch,
+                identifier: "a".into(),
+                enabled: true,
+                own_stream: false,
+                overrides: ChannelOverrides {
+                    tts_enabled: Some(tts_enabled),
+                    ..Default::default()
+                },
+            });
+        }
+        let config = Mutex::new(current);
+        let queue = TtsShared::default();
+        try_enqueue_tts_message(&NullSink, &config, &queue, tts_message("q", Some("twitch:a")));
+        assert_eq!(queue.snapshot().depth, 1);
+
+        let mut cfg = config.lock().unwrap();
+        let mut json = serde_json::to_value(&*cfg).unwrap();
+        json["goals"]["showInApp"] = serde_json::json!(true);
+        let mut next = AppConfig::from_config_update(json).unwrap();
+        next.normalize_all();
+        commit_config(dir.path(), &revision, &tx, &mut cfg, next, Some(0)).unwrap();
+        assert!(cfg.goals.show_in_app);
+        assert!(!purge_disabled_channel_tts(&cfg, &queue));
+        assert_eq!(queue.snapshot().depth, 1);
+    }
+
+    #[test]
+    fn tts_queue_state_is_emitted_after_config_lock_is_released() {
+        struct LockProbe<'a> {
+            config: &'a Mutex<AppConfig>,
+            locked: Mutex<Vec<bool>>,
+        }
+        impl tts::TtsSink for LockProbe<'_> {
+            fn audio(&self, _: String) {}
+            fn web_speech(&self, _: tts::WebSpeechPayload) {}
+            fn cancel(&self) {}
+            fn notice(&self, _: &'static str, _: String) {}
+            fn queue_state(&self, _: TtsQueueStatePayload) {
+                self.locked.lock().unwrap().push(self.config.try_lock().is_ok());
+            }
+        }
+        let mut cfg = AppConfig::default();
+        cfg.channels.push(ChannelConfig {
+            platform: ChannelPlatform::Twitch,
+            identifier: "probe".into(),
+            enabled: true,
+            own_stream: false,
+            overrides: ChannelOverrides::default(),
+        });
+        let config = Mutex::new(cfg);
+        let sink = LockProbe { config: &config, locked: Mutex::new(Vec::new()) };
+        let queue = TtsShared::default();
+        try_enqueue_tts_message(&sink, &config, &queue, tts_message("a", Some("twitch:probe")));
+        let purged = {
+            let mut cfg = config.lock().unwrap();
+            cfg.channels[0].overrides.tts_enabled = Some(false);
+            purge_disabled_channel_tts(&cfg, &queue)
+        };
+        assert!(purged);
+        queue.emit_queue_state(&sink);
+        assert_eq!(*sink.locked.lock().unwrap(), [true, true]);
+    }
+
+    #[test]
+    fn replaces_dedupes_keys_and_replaces_every_row_sharing_a_key() {
+        let (dir, revision, tx, mut current) = commit_parts();
+        let row = |identifier: &str| ChannelConfig {
+            platform: ChannelPlatform::X,
+            identifier: identifier.into(),
+            enabled: true,
+            own_stream: false,
+            overrides: ChannelOverrides::default(),
+        };
+        current.channels = vec![row("a"), row("a")];
+        let keep = CancellationToken::new();
+        let old = CancellationToken::new();
+        let active = Mutex::new(HashMap::from([
+            ("x:a".to_string(), old.clone()),
+            ("x:other".to_string(), keep.clone()),
+        ]));
+        let replaces = parse_replaces(Some(serde_json::json!(["x:a", "x:a"]))).unwrap();
+        assert_eq!(replaces, ["x:a"]);
+        add_channel_and_commit(
+            &mut current,
+            &active,
+            row("b"),
+            &replaces,
+            |cfg, next| commit_config(dir.path(), &revision, &tx, cfg, next, None),
+            |_, _| CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(current.channels, vec![row("b")]);
+        assert!(old.is_cancelled());
+        assert!(!keep.is_cancelled());
+        let mut keys: Vec<_> = active.lock().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, ["x:b", "x:other"]);
+    }
+
+    #[test]
+    fn set_channel_overrides_scalar_args_hide_values_in_errors() {
+        for value in [serde_json::json!("SECRET_REV_MARK"), serde_json::json!(-1), serde_json::json!(1.5)] {
+            let err = from_ipc_value::<u64>(value, "基準 revision").unwrap_err();
+            assert_eq!(err, "基準 revisionの形式が不正です (項目 .)");
+        }
+        let err = from_ipc_value::<String>(serde_json::json!(123456789), "枠のキー").unwrap_err();
+        assert!(!err.contains("123456789"), "{err}");
+    }
+
+    #[test]
+    fn enqueued_message_carries_channel_voice() {
+        let voice = config::ChannelTtsVoice {
+            bouyomi_voice: Some(3),
+            ..Default::default()
+        };
+        let mut cfg = AppConfig::default();
+        cfg.channels.push(ChannelConfig {
+            platform: ChannelPlatform::Twitch,
+            identifier: "voiced".into(),
+            enabled: true,
+            own_stream: false,
+            overrides: ChannelOverrides {
+                tts_voice: Some(voice.clone()),
+                ..Default::default()
+            },
+        });
+        let config = Mutex::new(cfg);
+        let queue = TtsShared::default();
+        try_enqueue_tts_message(&NullSink, &config, &queue, tts_message("m", Some("twitch:voiced")));
+        let mut core = queue.core.lock().unwrap();
+        let (popped, _) = core.pop_fresh(std::time::Instant::now(), None);
+        assert_eq!(popped.unwrap().job.msg.route.channel_tts_voice, Some(voice));
+    }
+
+    #[test]
+    fn ipc_inputs_accept_single_or_many_replaces_and_hide_values_in_errors() {
+        assert_eq!(parse_replaces(None).unwrap(), Vec::<String>::new());
+        assert_eq!(parse_replaces(Some(serde_json::Value::Null)).unwrap(), Vec::<String>::new());
+        assert_eq!(parse_replaces(Some(serde_json::json!("x:a"))).unwrap(), ["x:a"]);
+        assert_eq!(parse_replaces(Some(serde_json::json!(["x:a", "x:b"]))).unwrap(), ["x:a", "x:b"]);
+        let err = parse_replaces(Some(serde_json::json!([1, "SECRET_KEY_MARK"]))).unwrap_err();
+        assert!(!err.contains("SECRET"), "{err}");
+
+        let err = from_ipc_value::<ChannelConfig>(
+            serde_json::json!({ "platform": "SECRET_PLATFORM_MARK", "identifier": "SECRET_ID_MARK" }),
+            "チャンネル",
+        )
+        .unwrap_err();
+        assert!(!err.contains("SECRET"), "{err}");
+        assert!(err.contains("platform"), "{err}");
+        let err = from_ipc_value::<ChannelOverrides>(
+            serde_json::json!({ "ttsVoice": { "webSpeechVoice": ["SECRET_VOICE_MARK"] } }),
+            "上書き設定",
+        )
+        .unwrap_err();
+        assert!(!err.contains("SECRET"), "{err}");
+        assert!(err.starts_with("上書き設定の形式が不正です"), "{err}");
+    }
+
+    #[test]
+    fn add_channel_replaces_every_old_row_in_one_commit() {
+        let (dir, revision, tx, mut current) = commit_parts();
+        let overrides = ChannelOverrides {
+            tts_enabled: Some(false),
+            ..Default::default()
+        };
+        let row = |identifier: &str, overrides: ChannelOverrides| ChannelConfig {
+            platform: ChannelPlatform::Niconico,
+            identifier: identifier.into(),
+            enabled: true,
+            own_stream: false,
+            overrides,
+        };
+        current.channels = vec![row("lv1", overrides.clone()), row("lv2", ChannelOverrides::default())];
+        let keys: Vec<String> = current.channels.iter().map(AppState::channel_key).collect();
+        let tokens: Vec<_> = keys.iter().map(|_| CancellationToken::new()).collect();
+        let active = Mutex::new(keys.iter().cloned().zip(tokens.iter().cloned()).collect::<HashMap<_, _>>());
+        let mut commits = 0;
+
+        let saved = add_channel_and_commit(
+            &mut current,
+            &active,
+            row("lv3", ChannelOverrides::default()),
+            &keys,
+            |cfg, next| {
+                commits += 1;
+                commit_config(dir.path(), &revision, &tx, cfg, next, None)
+            },
+            |_, _| CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(commits, 1);
+        assert_eq!(saved.revision, Some(1));
+        assert_eq!(current.channels, vec![row("lv3", overrides)]);
+        assert_eq!(AppConfig::load(dir.path()).unwrap().channels, current.channels);
+        assert!(tokens.iter().all(CancellationToken::is_cancelled));
+        let active = active.lock().unwrap();
+        assert_eq!(active.keys().collect::<Vec<_>>(), ["niconico:lv3"]);
     }
 }
 

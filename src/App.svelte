@@ -44,6 +44,7 @@
     setGoalsShowInApp,
     getTtsQueueState,
     onTtsNotice,
+    takeStartupConfigNotice,
     onTtsQueueState,
     setTtsPaused,
     toggleDanmakuOverlay,
@@ -201,7 +202,15 @@
     {
       const fn = await onTtsNotice(showTtsNotice);
       if (destroyed) fn();
-      else unlistenTtsNotice = fn;
+      else {
+        unlistenTtsNotice = fn;
+        try {
+          const notice = await takeStartupConfigNotice();
+          if (!destroyed && notice) showTtsNotice(notice);
+        } catch {
+          console.warn('[config] startup notice load failed');
+        }
+      }
     }
     try {
       const current = await getTtsQueueState();

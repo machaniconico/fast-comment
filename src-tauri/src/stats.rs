@@ -687,6 +687,7 @@ mod tests {
             raw: None,
             skip_tts: false,
             injected_test: false,
+            route: Default::default(),
         }
     }
 
@@ -810,12 +811,14 @@ mod tests {
                     identifier: "yt123".to_string(),
                     enabled: true,
                     own_stream: false,
+                    overrides: Default::default(),
                 },
                 ChannelConfig {
                     platform: ChannelPlatform::Twitch,
                     identifier: "twlogin".to_string(),
                     enabled: true,
                     own_stream: false,
+                    overrides: Default::default(),
                 },
             ],
             ..AppConfig::default()
@@ -867,12 +870,14 @@ mod tests {
                     identifier: "yt123".to_string(),
                     enabled: true,
                     own_stream: false,
+                    overrides: Default::default(),
                 },
                 ChannelConfig {
                     platform: ChannelPlatform::Niconico,
                     identifier: "lv123".to_string(),
                     enabled: true,
                     own_stream: false,
+                    overrides: Default::default(),
                 },
             ],
             ..AppConfig::default()
@@ -1063,6 +1068,7 @@ mod tests {
                 identifier: identifier.to_string(),
                 enabled: true,
                 own_stream: false,
+                overrides: Default::default(),
             }],
             ..AppConfig::default()
         }
@@ -1142,6 +1148,7 @@ mod tests {
                 identifier: "https://twitcasting.tv/Alice_1/movie/9".to_string(),
                 enabled: true,
                 own_stream: false,
+                overrides: Default::default(),
             }],
             ..AppConfig::default()
         };
