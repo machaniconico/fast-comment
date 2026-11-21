@@ -490,15 +490,20 @@ pub struct MapContext<'a> {
 
 /// WS テキストフレーム(JSON 配列)の要素を取り出す。壊れていれば空。
 pub fn parse_ws_entries(text: &str) -> Vec<Value> {
+    parse_ws_array(text).unwrap_or_default()
+}
+
+/// WS フレームを 1 回だけ解析する。配列なら要素、それ以外は None(信号と処理で同じ結果を使う)。
+fn parse_ws_array(text: &str) -> Option<Vec<Value>> {
     match serde_json::from_str::<Value>(text.trim()) {
-        Ok(Value::Array(items)) => items,
+        Ok(Value::Array(items)) => Some(items),
         Ok(_) => {
             tracing::debug!("twitcasting: WS フレームが配列ではないため無視");
-            Vec::new()
+            None
         }
         Err(_) => {
             tracing::debug!("twitcasting: WS フレームが JSON ではないため無視");
-            Vec::new()
+            None
         }
     }
 }
@@ -874,7 +879,7 @@ pub struct TwitcastingSource {
     live_tx: Option<mpsc::Sender<LiveEvent>>,
     started_movies: StartedMovies,
     tuning: UnofficialTuning,
-    signal_tx: Option<mpsc::Sender<UnofficialSignal>>,
+    signal_tx: Option<mpsc::UnboundedSender<UnofficialSignal>>,
 }
 
 /// identifier は URL やトークンでありうるので、正規化した channel 名だけを出す。
@@ -910,15 +915,19 @@ impl TwitcastingSource {
         self
     }
 
-    /// 構造が読めたかの信号を受け取る。満杯なら落とし、Source の待ち時間は変えない。
-    pub(crate) fn with_signal_tx(mut self, signal_tx: mpsc::Sender<UnofficialSignal>) -> Self {
+    /// 構造が読めたかの信号を受け取る。信号は 1 セッションに数件なので無制限で落とさず、
+    /// 送信で待たないので Source の待ち時間は変えない。
+    pub(crate) fn with_signal_tx(
+        mut self,
+        signal_tx: mpsc::UnboundedSender<UnofficialSignal>,
+    ) -> Self {
         self.signal_tx = Some(signal_tx);
         self
     }
 
     fn send_signal(&self, signal: UnofficialSignal) {
         if let Some(tx) = &self.signal_tx {
-            let _ = tx.try_send(signal);
+            let _ = tx.send(signal);
         }
     }
 
@@ -1480,10 +1489,9 @@ impl TwitcastingSource {
                     match msg {
                         WsMessage::Text(text) => {
                             received = true;
+                            let parsed = parse_ws_array(&text);
                             if !array_seen {
-                                let is_array = serde_json::from_str::<Value>(&text)
-                                    .is_ok_and(|v| v.is_array());
-                                if is_array {
+                                if parsed.is_some() {
                                     array_seen = true;
                                     self.send_signal(UnofficialSignal::Healthy);
                                 } else if !unreadable_sent {
@@ -1491,7 +1499,7 @@ impl TwitcastingSource {
                                     self.send_signal(UnofficialSignal::Unreadable);
                                 }
                             }
-                            let entries = seen.admit(parse_ws_entries(&text));
+                            let entries = seen.admit(parsed.unwrap_or_default());
                             let ctx = MapContext {
                                 channel,
                                 broadcaster_id: Some(screen_id),
@@ -2677,14 +2685,25 @@ mod tests {
     /// 経路で応答を分ける最小の HTTP サーバー。POST は eventpubsuburl、userajax は listall、
     /// それ以外は視聴ページ。リクエストは本文まで読んでから返す。
     async fn serve_routes(html: (u16, &'static str), pubsub: (u16, String)) -> u16 {
+        serve_pages(&[], html, pubsub).await
+    }
+
+    /// 視聴ページの n 回目に `first[n]` を返し、尽きたら `html` を返す。
+    async fn serve_pages(
+        first: &'static [(u16, &'static str)],
+        html: (u16, &'static str),
+        pubsub: (u16, String),
+    ) -> u16 {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let pubsub = std::sync::Arc::new(pubsub);
+        let page_hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         tokio::spawn(async move {
             loop {
                 let Ok((mut sock, _)) = listener.accept().await else { return };
                 let pubsub = pubsub.clone();
+                let page_hits = page_hits.clone();
                 tokio::spawn(async move {
                     let mut buf = Vec::new();
                     let mut chunk = [0u8; 4096];
@@ -2716,7 +2735,8 @@ mod tests {
                     } else if head.contains("userajax") {
                         (200, "[]")
                     } else {
-                        html
+                        let n = page_hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        first.get(n).copied().unwrap_or(html)
                     };
                     let response = format!(
                         "HTTP/1.1 {status} X\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -2764,7 +2784,7 @@ mod tests {
         base: &str,
     ) -> (
         TwitcastingSource,
-        mpsc::Receiver<UnofficialSignal>,
+        mpsc::UnboundedReceiver<UnofficialSignal>,
         mpsc::Receiver<YoutubeMetadataUpdate>,
     ) {
         let overrides = TwitcastingOverrides {
@@ -2775,7 +2795,7 @@ mod tests {
             ]),
             ..TwitcastingOverrides::default()
         };
-        let (signal_tx, signal_rx) = mpsc::channel(64);
+        let (signal_tx, signal_rx) = mpsc::unbounded_channel();
         let (metadata_tx, metadata_rx) = mpsc::channel(256);
         let source = TwitcastingSource::new("alice".to_string(), overrides, Some(metadata_tx))
             .with_tuning(short_tuning())
@@ -2950,6 +2970,60 @@ mod tests {
     async fn signal_h12b_non_array_frame_after_array_is_neutral() {
         let signals = ws_signals(&["[]", r#"{"x":1}"#, "ping"]).await;
         assert_eq!(signals, vec![UnofficialSignal::Healthy, UnofficialSignal::Neutral]);
+    }
+
+    #[tokio::test]
+    async fn ws_signal_and_entries_come_from_one_parse() {
+        // 前後の空白(NBSP)は既存の処理が trim して配列として読む。信号も同じ結果で Healthy。
+        let signals = ws_signals(&["\u{00A0}[]\u{00A0}"]).await;
+        assert_eq!(signals, vec![UnofficialSignal::Healthy, UnofficialSignal::Neutral]);
+        assert_eq!(parse_ws_array("\u{00A0}[1]\u{00A0}"), Some(vec![json!(1)]));
+        assert_eq!(parse_ws_entries("\u{00A0}[1]\u{00A0}"), vec![json!(1)]);
+    }
+
+    #[tokio::test]
+    async fn signals_are_not_lost_while_the_receiver_is_not_read() {
+        // H12 → H11 の接続の後、HTML が読めなくなる(H1×2)。受け手が読まずに溜めても
+        // 間の Healthy が落ちない(切替カウンタが実際のリセットを見落とさない)。
+        let ws_port = serve_ws(&[r#"{"x":1}"#, "[]"]).await;
+        let pubsub = format!(r#"{{"url":"ws://127.0.0.1:{ws_port}/"}}"#);
+        let port = serve_pages(
+            &[(200, LIVE_HTML)],
+            (200, "<html><body><p>maintenance</p></body></html>"),
+            (200, pubsub),
+        )
+        .await;
+        let (source, mut signal_rx, _metadata_rx) = signal_source(&format!("http://127.0.0.1:{port}"));
+        let (tx, _rx) = broadcast::channel(64);
+        let cancel = CancellationToken::new();
+        let runner = {
+            let cancel = cancel.clone();
+            tokio::spawn(async move { source.run(tx, cancel).await })
+        };
+        // 受け手は読まない。Backoff 1 秒の後、20ms ごとに Unreadable が溜まる。
+        let mut signals = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while signals.iter().filter(|s| **s == UnofficialSignal::Unreadable).count() < 3
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            while let Ok(signal) = signal_rx.try_recv() {
+                signals.push(signal);
+            }
+        }
+        cancel.cancel();
+        let _ = runner.await;
+        assert_eq!(
+            signals[..5],
+            [
+                UnofficialSignal::Unreadable,
+                UnofficialSignal::Healthy,
+                UnofficialSignal::Neutral,
+                UnofficialSignal::Unreadable,
+                UnofficialSignal::Unreadable,
+            ],
+            "{signals:?}"
+        );
     }
 
     #[test]
