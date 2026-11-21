@@ -253,6 +253,8 @@ pub struct MessageRoute {
     pub origin_key: Option<String>,
     /// キューに入れた時点の枠の声。
     pub channel_tts_voice: Option<crate::config::ChannelTtsVoice>,
+    /// 履歴・バックフィル・ギフトコンボ更新は実績に計上しない。
+    pub uncounted: bool,
 }
 
 impl std::fmt::Debug for MessageRoute {

@@ -3,12 +3,14 @@ use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::currency::RateTable;
+use super::engine::Progress;
 use super::model::{presets, reset_to_preset, validate_all, Achievement, ValidationError};
 
 pub const DEFS_FILE: &str = "achievements.json";
@@ -252,6 +254,93 @@ pub(crate) fn write_json<T: Serialize>(
     let bytes = serde_json::to_vec_pretty(data).map_err(|_| CommitError::Io)?;
     io.write_atomic(path, &bytes).map_err(|_| CommitError::Io)?;
     Ok(bytes)
+}
+
+// Each open progress snapshot can save until another handle commits to the same file.
+// The generation check runs alongside the atomic write without rereading the file.
+static PROGRESS_GENERATIONS: Mutex<BTreeMap<PathBuf, Weak<Mutex<u64>>>> =
+    Mutex::new(BTreeMap::new());
+
+pub(super) struct ProgressFile {
+    path: PathBuf,
+    io: Arc<dyn StoreIo>,
+    generation: Arc<Mutex<u64>>,
+    loaded_generation: AtomicU64,
+    save_refused: bool,
+}
+
+impl ProgressFile {
+    pub fn open(dir: &Path, now_ms: u64, io: Arc<dyn StoreIo>) -> (Self, Option<Progress>) {
+        let canonical_dir = dir.canonicalize().unwrap_or_else(|_| dir.to_owned());
+        let path = canonical_dir.join(PROGRESS_FILE);
+        let generation = {
+            let mut generations = PROGRESS_GENERATIONS.lock().unwrap_or_else(|e| e.into_inner());
+            generations.retain(|_, entry| entry.strong_count() != 0);
+            let entry = generations.entry(path.clone()).or_default();
+            if let Some(generation) = entry.upgrade() {
+                generation
+            } else {
+                let generation = Arc::new(Mutex::new(0));
+                *entry = Arc::downgrade(&generation);
+                generation
+            }
+        };
+        let current = generation.lock().unwrap_or_else(|e| e.into_inner());
+        let loaded_generation = AtomicU64::new(*current);
+        let (progress, save_refused) =
+            match load_versioned(&path, now_ms, io.as_ref(), |_: &Progress| true) {
+                Ok((progress, _)) => (progress, false),
+                Err(_) => (None, true),
+            };
+        drop(current);
+        (
+            Self { path, io, generation, loaded_generation, save_refused },
+            progress,
+        )
+    }
+
+    pub fn save(&self, progress: &Progress) -> Result<(), CommitError> {
+        self.commit(Some(progress))
+    }
+
+    fn commit(&self, progress: Option<&Progress>) -> Result<(), CommitError> {
+        if self.save_refused {
+            return Err(CommitError::SaveRefused);
+        }
+        let mut current = self.generation.lock().unwrap_or_else(|e| e.into_inner());
+        if *current != self.loaded_generation.load(Ordering::Relaxed) {
+            return Err(CommitError::Io);
+        }
+        let next = current.checked_add(1).ok_or(CommitError::Io)?;
+        if let Some(progress) = progress {
+            write_json(self.io.as_ref(), &self.path, progress)?;
+        }
+        *current = next;
+        self.loaded_generation.store(next, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+/// Remove a viewer's achievements when there is no active engine.
+pub fn delete_listener_progress(
+    dir: &Path,
+    platform: &str,
+    author_id: &str,
+) -> anyhow::Result<bool> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static DELETE_TRANSACTION: Mutex<()> = Mutex::new(());
+    let _transaction = DELETE_TRANSACTION.lock().unwrap_or_else(|e| e.into_inner());
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let (file, mut progress) = ProgressFile::open(dir, now_ms, Arc::new(FsIo));
+    let subject = format!("{platform}:{author_id}");
+    let removed = progress.as_mut().is_some_and(|progress| progress.remove_listener(&subject));
+    // Even when the file has no matching row, an older engine may have pending counters.
+    file.commit(progress.as_ref().filter(|_| removed))?;
+    Ok(removed)
 }
 
 #[cfg(test)]
