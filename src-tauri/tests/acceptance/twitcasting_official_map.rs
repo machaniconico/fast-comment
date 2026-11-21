@@ -67,7 +67,7 @@ fn whitespace_only_message_is_skipped() {
 }
 
 #[test]
-fn missing_from_user_id_is_skipped() {
+fn missing_from_user_screen_id_is_skipped() {
     // 鍵は screen_id なので、screen_id が無いコメントを捨てる
     let mut v = base();
     v["from_user"].as_object_mut().unwrap().remove("screen_id");
