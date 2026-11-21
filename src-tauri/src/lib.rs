@@ -3282,8 +3282,16 @@ pub fn run() {
                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
             // 設定ロード(失敗時は壊れたファイルを退避して既定値で続行)。
-            // 退避できなかった時は config.json への保存を止め、保存操作は固定文のエラーで利用者に伝わる。
-            let (config, _saves_blocked) = AppConfig::load_or_preserve(&config_dir);
+            // 退避できなかった時は config.json への保存を止める。どちらも固定文の通知で利用者に知らせる
+            // (UI の通知購読が済むまで少し待ってから出す。パス・内容は出さない)。
+            let (config, load_outcome) = AppConfig::load_or_preserve(&config_dir);
+            if let Some(message) = load_outcome.notice() {
+                let handle = handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    emit_tts_notice(&handle, "warn", message.to_string());
+                });
+            }
 
             let obs_port = config.obs.port;
 

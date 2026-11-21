@@ -5,6 +5,7 @@ import {
   chipBadge,
   replacedChannelKeys,
   fromFormState,
+  reapplyPendingForm,
   toFormState,
   voiceOptions,
 } from './channelOverrides.ts';
@@ -92,4 +93,24 @@ test('replacedChannelKeys_lists_every_old_row_of_same_platform_for_x_and_niconic
     ['niconico:lv1', 'niconico:lv2'],
   );
   assert.deepEqual(replacedChannelKeys([...channels], { platform: 'twitch', identifier: 'bob', enabled: true }), []);
+});
+
+test('fromFormState_treats_cleared_bouyomi_number_input_as_follow_global', () => {
+  // <input type="number" bind:value> は消すと null になる。0(棒読みちゃん既定)として保存しない。
+  assert.deepEqual(fromFormState({ ttsDisabled: false, voice: null }, 'bouyomi'), {});
+  assert.deepEqual(fromFormState({ ttsDisabled: false, voice: undefined }, 'bouyomi'), {});
+  assert.deepEqual(
+    fromFormState({ ttsDisabled: false, voice: null }, 'bouyomi', { ttsVoice: { bouyomiVoice: 3, voicevoxSpeaker: 2 } }),
+    { ttsVoice: { voicevoxSpeaker: 2 } },
+  );
+  // 明示の 0 は保存する
+  assert.deepEqual(fromFormState({ ttsDisabled: false, voice: 0 }, 'bouyomi'), { ttsVoice: { bouyomiVoice: 0 } });
+});
+
+test('reapplyPendingForm_keeps_user_input_after_stale_reload', () => {
+  const base = { ttsDisabled: false, voice: '1' };
+  const pending = { ttsDisabled: true, voice: '7' };
+  assert.deepEqual(reapplyPendingForm(base, pending, false), { ttsDisabled: true, voice: '7' });
+  // backend が変わったら声だけ新しい基準に戻す
+  assert.deepEqual(reapplyPendingForm(base, pending, true), { ttsDisabled: true, voice: '1' });
 });
