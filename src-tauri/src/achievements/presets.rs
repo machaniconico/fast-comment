@@ -163,6 +163,25 @@ fn preset(
         builtin_id: Some(id.to_owned()),
         edited: false,
         condition,
-        announce: Announce::default(),
+        announce: Announce {
+            tts: tier == Tier::Platinum,
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn presets_platinum_announces_by_default() {
+        let presets = presets();
+        let platinum: Vec<_> = presets.iter().filter(|a| a.tier == Tier::Platinum).collect();
+        assert_eq!(platinum.len(), 2);
+        assert!(platinum.iter().all(|a| a.announce.tts));
+        assert!(presets
+            .iter()
+            .filter(|a| a.tier != Tier::Platinum)
+            .all(|a| !a.announce.tts));
     }
 }

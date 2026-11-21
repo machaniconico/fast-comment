@@ -24,6 +24,7 @@
   import ShortcutHelp from './lib/components/ShortcutHelp.svelte';
   import UserCard from './lib/UserCard.svelte';
   import Notifier from './lib/components/Notifier.svelte';
+  import AchievementToast from './lib/components/AchievementToast.svelte';
   import ConfirmDialog from './lib/components/ConfirmDialog.svelte';
   import { moderation } from './lib/moderation.svelte';
   import TtsQueuePanel from './lib/components/TtsQueuePanel.svelte';
@@ -960,6 +961,7 @@
     </div>
   {/if}
   <Notifier />
+  <AchievementToast />
 </div>
 
 <style>

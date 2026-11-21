@@ -48,6 +48,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::achievements::{
+    announce::announce_message,
     engine::{AchievementEngine, AchievementUnlocked},
     store::{AchievementDefs, DefsStore},
 };
@@ -55,7 +56,9 @@ use crate::autopost::{
     AutopostStatus, KeyringTokenStore, UserCommand as AutopostCommand, XEndpoints, XPostAuth,
     XPostError, XPostErrorCode, XPostStatus,
 };
-use crate::bus::{spawn_moderation_ui_forwarder, spawn_reaction_ui_forwarder, Bus};
+use crate::bus::{
+    spawn_achievement_ui_forwarder, spawn_moderation_ui_forwarder, spawn_reaction_ui_forwarder, Bus,
+};
 use crate::templates::{TemplateInfo, TemplateRef, TemplateStore};
 use crate::config::{
     commit_channel_overrides, commit_config, replace_channels_in, ChannelEditError, ChannelOverrides,
@@ -2942,6 +2945,41 @@ async fn regenerate_webhook_signing_secret(
 }
 
 /// Bus 購読は有効な送り先が存在する間だけ。状態 emit は差分がある時に最大毎秒 1 回。
+/// `announce.tts` の実績解除だけを TTS キューへ入れる。視聴者の `tts_muted` は listeners で引く。
+/// 取りこぼし(Lagged)は件数だけ warn に出して続ける。
+fn spawn_achievement_tts_forwarder(
+    mut rx: broadcast::Receiver<AchievementUnlocked>,
+    app: AppHandle,
+    cancel: CancellationToken,
+) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                incoming = rx.recv() => match incoming {
+                    Ok(unlock) => {
+                        let state = app.state::<AppState>();
+                        let defs = state.achievement_defs.current();
+                        let message = announce_message(&unlock, &defs, |platform, author_id| {
+                            state
+                                .listeners
+                                .get(participant_platform(platform), author_id)
+                                .is_some_and(|record| record.tts_muted)
+                        });
+                        if let Some(message) = message {
+                            try_enqueue_tts_message(&app, &state.config, &state.tts, message);
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(lagged = n, "実績の読み上げ通知を取りこぼしました");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                },
+            }
+        }
+    });
+}
+
 fn spawn_webhook_forwarder(app: AppHandle, cancel: CancellationToken) {
     tauri::async_runtime::spawn(async move {
         let (runtime, bus) = {
@@ -3500,7 +3538,7 @@ pub fn run() {
                     let achievement_engine = defs.enabled.then(|| {
                         Arc::new(AchievementEngine::open(&config_dir, defs, now_ms))
                     });
-                    let (achievement_unlock_tx, _) = broadcast::channel(64);
+                    let achievement_unlock_tx = bus.achievement_sender();
                     let state = AppState {
                         webhook,
                         integrations,
@@ -3622,6 +3660,16 @@ pub fn run() {
             // Bus の UI forwarder と OBS サーバを起動。
             bus.spawn_ui_forwarder(handle.clone(), app_cancel.clone());
             spawn_reaction_ui_forwarder(reaction_rx, handle.clone(), app_cancel.clone());
+            spawn_achievement_ui_forwarder(
+                bus.achievement_sender().subscribe(),
+                handle.clone(),
+                app_cancel.clone(),
+            );
+            spawn_achievement_tts_forwarder(
+                bus.achievement_sender().subscribe(),
+                handle.clone(),
+                app_cancel.clone(),
+            );
             {
                 let app_for_mod = handle.clone();
                 spawn_moderation_ui_forwarder(

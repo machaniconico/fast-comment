@@ -249,3 +249,32 @@ export interface TwitcastingAuthError {
   code: 'notConfigured' | 'portInUse' | 'loginTimeout' | 'cancelled' | 'denied' | 'clientMismatch' | 'tokenStore' | 'network' | 'other';
   message: string;
 }
+
+// ---------------------------------------------------------------------------
+// Achievements ('achievements' event; camelCase, mirrors achievements/engine.rs)
+// ---------------------------------------------------------------------------
+
+export type AchievementTier = 'bronze' | 'silver' | 'gold' | 'platinum';
+export type AchievementSubjectKind = 'viewer' | 'streamer';
+
+export interface AchievementUnlockSubject {
+  kind: AchievementSubjectKind;
+  platform?: Platform | null;
+  authorId?: string | null;
+  name?: string | null;
+}
+
+export interface AchievementUnlocked {
+  id: string;
+  achievementId: string;
+  name: string;
+  description: string;
+  tier: AchievementTier;
+  icon: string;
+  subject: AchievementUnlockSubject;
+  valueMilli: number;
+  thresholdMilli: number;
+  currency?: string | null;
+  windowKey: string;
+  unlockedAtMs: number;
+}

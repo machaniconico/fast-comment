@@ -1174,6 +1174,24 @@ mod tests {
     }
 
     #[test]
+    fn trophy_template_is_builtin_readonly() {
+        let root = std::env::temp_dir()
+            .join(format!("fast-comment-trophy-{}", uuid::Uuid::new_v4()));
+        let builtin = Path::new(env!("CARGO_MANIFEST_DIR")).join("../templates");
+        let store = TemplateStore::new(builtin.clone(), root.join("config/templates"));
+        let t = TemplateRef::parse("trophy").unwrap();
+        assert!(matches!(t, TemplateRef::Builtin(_)));
+        assert!(builtin.join("trophy/index.html").is_file());
+        let before = store.read(&t, "style.css").ok();
+        let err = store.write(&t, "style.css", "change").unwrap_err();
+        assert!(err.contains("読み取り専用") && err.contains("複製"));
+        assert!(store.delete(&t).is_err());
+        assert!(builtin.join("trophy/index.html").is_file());
+        assert_eq!(store.read(&t, "style.css").ok(), before);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn delete_removes_custom() {
         let f = Fixture::new();
         let t = f.template(true, "foo");
