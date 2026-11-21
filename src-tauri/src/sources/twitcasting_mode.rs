@@ -55,7 +55,7 @@ pub struct TwitcastingRoutedSource<S: SecretStore> {
     mode: TwitcastingMode,
     channel: String,
     // A SourceManager task owns one connection lifetime. Taking the routes lets
-    // auto pass the final carry-over IDs to the official source on handoff.
+    // auto pass the active movie and carry-over IDs to the official source on handoff.
     routes: Mutex<Option<Routes<S>>>,
     auth_state: watch::Receiver<AuthState>,
     metadata_tx: Option<mpsc::Sender<YoutubeMetadataUpdate>>,
@@ -198,6 +198,7 @@ impl<S: SecretStore> TwitcastingRoutedSource<S> {
         let ids: HashSet<_> = recent_ids.into_iter().collect();
         routes
             .official
+            .with_initial_movie(unofficial.take_live_movie())
             .with_carry_over_ids(ids)
             .run(tx, cancel)
             .await
@@ -278,19 +279,55 @@ impl<S: SecretStore> Source for TwitcastingRoutedSource<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::integrations::MemorySecretStore;
+    use crate::{integrations::MemorySecretStore, model::LiveEvent};
     use crate::sources::twitcasting::{TwitcastingOverrides, UnofficialTuning};
     use crate::sources::twitcasting_api::TwitcastingApi;
     use crate::sources::twitcasting_auth::{
         AuthOptions, TwitcastingAuth, TwitcastingEndpoints, TOKEN_KEY,
     };
-    use axum::{response::Html, routing::get, Router};
+    use crate::sources::twitcasting_official::PollTuning;
+    use axum::{
+        http::StatusCode,
+        response::Html,
+        routing::{get, post},
+        Json, Router,
+    };
+    use serde_json::json;
     use std::sync::{
         atomic::{AtomicU32, Ordering},
         Arc,
     };
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tokio::{net::TcpListener, sync::Notify, time::timeout};
+
+    async fn logged_in_api(
+        endpoints: TwitcastingEndpoints,
+    ) -> Arc<TwitcastingApi<MemorySecretStore>> {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let store = MemorySecretStore::new();
+        store
+            .put(
+                TOKEN_KEY,
+                &serde_json::json!({
+                    "clientId": "test-client", "accessToken": "test-token", "userId": "1",
+                    "screenId": "alice", "name": "Alice", "obtainedAtMs": now_ms
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        let credentials = TwitcastingAuth::new(store, endpoints.clone(), AuthOptions::default());
+        credentials.load(Some("test-client"), now_ms).await;
+        assert_eq!(*credentials.subscribe().borrow(), AuthState::Ready);
+        TwitcastingApi::new(
+            credentials,
+            endpoints,
+            Arc::new(|| Some("test-client".into())),
+        )
+    }
 
     #[tokio::test]
     async fn loading_then_ready_switches_without_blocked_notice() {
@@ -300,6 +337,113 @@ mod tests {
     #[tokio::test]
     async fn loading_then_logged_out_shows_notice_and_ready_clears_it_before_official_metadata() {
         check_loading_handoff(true).await;
+    }
+
+    #[tokio::test]
+    async fn auto_handoff_ends_unofficial_movie_once_when_official_is_offline() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let pages = Arc::new(AtomicU32::new(0));
+        let router = Router::new()
+            .route(
+                "/alice",
+                get(move || {
+                    let page = pages.fetch_add(1, Ordering::Relaxed);
+                    async move {
+                        if page == 0 {
+                            Html(r#"<body data-is-onlive="true" data-movie-id="42"></body>"#)
+                        } else {
+                            Html("<html><body>maintenance</body></html>")
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/eventpubsub",
+                post(move || async move {
+                    // The unavailable WS triggers a reconnect and the unreadable HTML.
+                    Json(json!({ "url": format!("ws://{addr}/ws") }))
+                }),
+            )
+            .route(
+                "/users/alice",
+                get(|| async { Json(json!({ "user": { "id": "1" } })) }),
+            )
+            .route(
+                "/users/1/current_live",
+                get(|| async { StatusCode::NOT_FOUND }),
+            );
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let api_base = format!("http://{addr}");
+        let api = logged_in_api(TwitcastingEndpoints {
+            api_base: api_base.clone(),
+            ..Default::default()
+        })
+        .await;
+        let (_auth, auth_rx) = watch::channel(AuthState::Ready);
+        let (live_tx, mut events) = mpsc::channel(8);
+        let unofficial = TwitcastingSource::new(
+            "alice".into(),
+            TwitcastingOverrides {
+                endpoints: [
+                    ("userPageBaseUrl".into(), format!("{api_base}/")),
+                    ("commentHistoryUrl".into(), format!("{api_base}/")),
+                    ("eventPubsubUrl".into(), format!("{api_base}/eventpubsub")),
+                ]
+                .into(),
+                ..Default::default()
+            },
+            None,
+        )
+        .with_tuning(UnofficialTuning {
+            unreadable_recheck: Duration::from_millis(10),
+            jitter: false,
+            ..Default::default()
+        })
+        .with_live_tx(Some(live_tx.clone()));
+        let (metadata_tx, mut metadata) = mpsc::channel(8);
+        let official = TwitcastingOfficialSource::new(
+            "alice".into(),
+            api,
+            auth_rx.clone(),
+            Some(metadata_tx),
+            PollTuning {
+                offline: Duration::from_millis(25),
+                jitter: false,
+                ..Default::default()
+            },
+        )
+        .with_live_tx(Some(live_tx));
+        let routed =
+            TwitcastingRoutedSource::new(TwitcastingMode::Auto, unofficial, official, auth_rx, None);
+        let (bus, _) = broadcast::channel(16);
+        let cancel = CancellationToken::new();
+        let run = tokio::spawn({
+            let cancel = cancel.clone();
+            async move { routed.run(bus, cancel).await.unwrap() }
+        });
+        timeout(Duration::from_secs(5), async {
+            assert!(matches!(
+                events.recv().await,
+                Some(LiveEvent::Started(stream)) if stream.stream_id == "42"
+            ));
+            assert!(matches!(
+                events.recv().await,
+                Some(LiveEvent::Ended { channel_identifier, .. }) if channel_identifier == "alice"
+            ));
+            for _ in 0..3 {
+                assert_eq!(metadata.recv().await.unwrap().live, Some(false));
+            }
+            assert!(matches!(
+                events.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+        })
+        .await
+        .unwrap();
+        cancel.cancel();
+        run.await.unwrap();
+        server.abort();
     }
 
     async fn check_loading_handoff(resolve_logged_out: bool) {
@@ -345,30 +489,7 @@ mod tests {
             api_base: api_base.clone(),
             ..Default::default()
         };
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
-        let store = MemorySecretStore::new();
-        store
-            .put(
-                TOKEN_KEY,
-                &serde_json::json!({
-                    "clientId": "test-client", "accessToken": "test-token", "userId": "1",
-                    "screenId": "alice", "name": "Alice", "obtainedAtMs": now_ms
-                })
-                .to_string(),
-            )
-            .await
-            .unwrap();
-        let credentials = TwitcastingAuth::new(store, endpoints.clone(), AuthOptions::default());
-        credentials.load(Some("test-client"), now_ms).await;
-        assert_eq!(*credentials.subscribe().borrow(), AuthState::Ready);
-        let api = TwitcastingApi::new(
-            credentials,
-            endpoints,
-            Arc::new(|| Some("test-client".into())),
-        );
+        let api = logged_in_api(endpoints).await;
 
         let (auth, auth_rx) = watch::channel(AuthState::Loading);
         let (metadata_tx, mut metadata) = mpsc::channel(8);

@@ -254,6 +254,19 @@ struct Movie {
     last_poll: Option<Instant>,
 }
 
+impl Movie {
+    fn new(id: String, mid_stream: bool) -> Self {
+        Self {
+            id,
+            broadcaster_id: None,
+            cursor: CommentCursor::new(),
+            mid_stream,
+            protected: false,
+            last_poll: None,
+        }
+    }
+}
+
 #[derive(Default)]
 struct LiveState {
     movie: Option<Movie>,
@@ -269,6 +282,7 @@ pub struct TwitcastingOfficialSource<S: SecretStore> {
     metadata_tx: Option<mpsc::Sender<YoutubeMetadataUpdate>>,
     live_tx: Option<mpsc::Sender<LiveEvent>>,
     started_movies: StartedMovies,
+    initial_movie: Option<String>,
     carry_over_ids: HashSet<String>,
     tuning: PollTuning,
 }
@@ -297,6 +311,7 @@ impl<S: SecretStore> TwitcastingOfficialSource<S> {
             metadata_tx,
             live_tx: None,
             started_movies: Default::default(),
+            initial_movie: None,
             carry_over_ids: HashSet::new(),
             tuning,
         }
@@ -317,6 +332,11 @@ impl<S: SecretStore> TwitcastingOfficialSource<S> {
         self
     }
 
+    pub(crate) fn with_initial_movie(mut self, movie: Option<String>) -> Self {
+        self.initial_movie = movie;
+        self
+    }
+
     async fn poll(&self, tx: broadcast::Sender<ChatMessage>) {
         let Some(screen_id) = extract_screen_id(&self.identifier) else {
             self.send_metadata(false, Some(INVALID_ID_NOTICE), None)
@@ -327,7 +347,10 @@ impl<S: SecretStore> TwitcastingOfficialSource<S> {
 
         let mut auth = self.auth_state.clone();
         let mut user_id = None;
-        let mut live = LiveState::default();
+        let mut live = LiveState {
+            movie: self.initial_movie.clone().map(|id| Movie::new(id, true)),
+            ..LiveState::default()
+        };
         let mut carry_over = Some(&self.carry_over_ids);
         let mut auth_notice = None;
         let mut next_live = Instant::now();
@@ -492,7 +515,8 @@ impl<S: SecretStore> TwitcastingOfficialSource<S> {
         let snapshot = while_ready(auth, self.api.current_live(user_id)).await?;
         let movie_id = snapshot.as_ref().and_then(|v| id_string(&v["movie"]["id"]));
         let Some((snapshot, movie_id)) = snapshot.as_ref().zip(movie_id) else {
-            if live.movie.take().is_some() {
+            // 初回が未配信の場合も、自動告知に開始前の観測として伝える。
+            if live.movie.take().is_some() || live.observed_offline_at.is_none() {
                 self.send_live_ended();
             }
             live.guard = None;
@@ -506,14 +530,7 @@ impl<S: SecretStore> TwitcastingOfficialSource<S> {
             let recently_offline = live.observed_offline_at.take().is_some_and(|offline_at| {
                 offline_at.elapsed() <= self.tuning.offline.saturating_mul(2)
             });
-            live.movie = Some(Movie {
-                id: movie_id,
-                broadcaster_id: None,
-                cursor: CommentCursor::new(),
-                mid_stream: !recently_offline && live.movie.is_none(),
-                protected: false,
-                last_poll: None,
-            });
+            live.movie = Some(Movie::new(movie_id, !recently_offline && live.movie.is_none()));
         }
         let movie = live.movie.as_mut().expect("live snapshot has a movie");
         movie.broadcaster_id = id_string(&snapshot["broadcaster"]["id"]);
@@ -626,7 +643,7 @@ impl<S: SecretStore> TwitcastingOfficialSource<S> {
             .extend([screen_id, "movie", movie_id]);
         let event = LiveEvent::Started(LiveStream {
             platform: Platform::Twitcasting,
-            channel_identifier: self.identifier.clone(),
+            channel_identifier: self.channel.clone(),
             stream_id: movie_id.to_string(),
             title: movie["title"].as_str().map(str::to_string),
             url: url.to_string(),
@@ -646,7 +663,7 @@ impl<S: SecretStore> TwitcastingOfficialSource<S> {
                 tx,
                 LiveEvent::Ended {
                     platform: Platform::Twitcasting,
-                    channel_identifier: self.identifier.clone(),
+                    channel_identifier: self.channel.clone(),
                 },
             );
         }
@@ -704,6 +721,7 @@ mod tests {
         auth: watch::Sender<AuthState>,
         metadata: mpsc::Receiver<YoutubeMetadataUpdate>,
         messages: broadcast::Receiver<ChatMessage>,
+        live_events: mpsc::Receiver<LiveEvent>,
         user_calls: Arc<AtomicUsize>,
         source: JoinHandle<()>,
         server: JoinHandle<()>,
@@ -737,7 +755,7 @@ mod tests {
     async fn start_source(router: Router, tuning: PollTuning, state: AuthState) -> RunningSource {
         let user_calls = Arc::new(AtomicUsize::new(0));
         let router = router.route(
-            "/users/alice",
+            "/users/Alice",
             get({
                 let user_calls = Arc::clone(&user_calls);
                 move || async move {
@@ -784,19 +802,22 @@ mod tests {
         let (auth, auth_rx) = watch::channel(state);
         let (metadata_tx, metadata) = mpsc::channel(32);
         let (tx, messages) = broadcast::channel(256);
+        let (live_tx, live_events) = mpsc::channel(8);
         let official = TwitcastingOfficialSource::new(
-            "alice".into(),
+            "https://twitcasting.tv/Alice#access_token=MARKER".into(),
             Arc::clone(&api),
             auth_rx,
             Some(metadata_tx),
             tuning,
-        );
+        )
+        .with_live_tx(Some(live_tx));
         let source = tokio::spawn(async move { official.poll(tx).await });
         RunningSource {
             api,
             auth,
             metadata,
             messages,
+            live_events,
             user_calls,
             source,
             server,
@@ -811,6 +832,45 @@ mod tests {
             not_found_retry: Duration::from_millis(250),
             jitter: false,
         }
+    }
+
+    #[tokio::test]
+    async fn first_offline_observation_precedes_started_for_normalized_channel() {
+        let checks = Arc::new(AtomicUsize::new(0));
+        let router = Router::new().route(
+            "/users/1/current_live",
+            get(move || {
+                let check = checks.fetch_add(1, Ordering::Relaxed);
+                async move {
+                    if check < 2 {
+                        (StatusCode::NOT_FOUND, Json(Value::Null))
+                    } else {
+                        (StatusCode::OK, Json(json!({ "movie": { "id": "42" } })))
+                    }
+                }
+            }),
+        );
+        let mut source = start_source(router, test_tuning(), AuthState::Ready).await;
+        let ended = timeout(Duration::from_secs(5), source.live_events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            &ended,
+            LiveEvent::Ended { channel_identifier, .. } if channel_identifier == "alice"
+        ));
+        let started = timeout(Duration::from_secs(5), source.live_events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            &started,
+            LiveEvent::Started(stream)
+                if stream.stream_id == "42"
+                    && stream.channel_identifier == "alice"
+                    && stream.started_at_ms.is_none()
+        ));
+        assert!(!format!("{ended:?} {started:?}").contains("MARKER"));
     }
 
     #[tokio::test]

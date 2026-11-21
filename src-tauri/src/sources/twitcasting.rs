@@ -870,7 +870,6 @@ pub(crate) type StartedMovies = Arc<Mutex<VecDeque<String>>>;
 
 /// ツイキャス1チャンネルを購読する Source。
 pub struct TwitcastingSource {
-    /// 設定の identifier(LiveStream.channel_identifier の照合キー)。
     identifier: String,
     screen_id: Option<String>,
     overrides: TwitcastingOverrides,
@@ -878,6 +877,7 @@ pub struct TwitcastingSource {
     /// 配信開始/終了イベント(X 自動告知用)。
     live_tx: Option<mpsc::Sender<LiveEvent>>,
     started_movies: StartedMovies,
+    live_movie: Mutex<Option<String>>,
     tuning: UnofficialTuning,
     signal_tx: Option<mpsc::UnboundedSender<UnofficialSignal>>,
 }
@@ -905,6 +905,7 @@ impl TwitcastingSource {
             metadata_tx,
             live_tx: None,
             started_movies: Default::default(),
+            live_movie: Mutex::new(None),
             tuning: UnofficialTuning::default(),
             signal_tx: None,
         }
@@ -941,7 +942,17 @@ impl TwitcastingSource {
         self
     }
 
+    pub(crate) fn take_live_movie(&self) -> Option<String> {
+        self.live_movie.lock().unwrap().take()
+    }
+
     fn send_live_started(&self, screen_id: &str, movie_id: &str) {
+        {
+            let mut live_movie = self.live_movie.lock().unwrap();
+            if live_movie.as_deref() != Some(movie_id) {
+                *live_movie = Some(movie_id.to_string());
+            }
+        }
         let Some(tx) = &self.live_tx else { return };
         // 複数の Source が同じ配信を検知しても、照合から記録までを直列化する。
         let mut started = self
@@ -955,7 +966,7 @@ impl TwitcastingSource {
             tx,
             LiveEvent::Started(LiveStream {
                 platform: Platform::Twitcasting,
-                channel_identifier: self.identifier.clone(),
+                channel_identifier: self.channel_name(),
                 stream_id: movie_id.to_string(),
                 title: None,
                 url: format!("{USER_PAGE_BASE_URL}{screen_id}/movie/{movie_id}"),
@@ -970,12 +981,13 @@ impl TwitcastingSource {
     }
 
     fn send_live_ended(&self) {
+        let _ = self.take_live_movie();
         let Some(tx) = &self.live_tx else { return };
         super::send_live_event(
             tx,
             LiveEvent::Ended {
                 platform: Platform::Twitcasting,
-                channel_identifier: self.identifier.clone(),
+                channel_identifier: self.channel_name(),
             },
         );
     }
@@ -2187,6 +2199,30 @@ mod tests {
             live_rx.try_recv().unwrap_err(),
             mpsc::error::TryRecvError::Empty
         );
+    }
+
+    #[test]
+    fn live_events_use_normalized_screen_id_without_url_fragment() {
+        let (live_tx, mut live_rx) = mpsc::channel(2);
+        let source = TwitcastingSource::new(
+            "https://twitcasting.tv/Alice#access_token=MARKER".into(),
+            Default::default(),
+            None,
+        )
+        .with_live_tx(Some(live_tx));
+        source.send_live_started(source.screen_id.as_deref().unwrap(), "42");
+        source.send_live_ended();
+        let started = live_rx.try_recv().unwrap();
+        let ended = live_rx.try_recv().unwrap();
+        assert!(matches!(
+            &started,
+            LiveEvent::Started(stream) if stream.channel_identifier == "alice"
+        ));
+        assert!(matches!(
+            &ended,
+            LiveEvent::Ended { channel_identifier, .. } if channel_identifier == "alice"
+        ));
+        assert!(!format!("{started:?} {ended:?}").contains("MARKER"));
     }
 
     #[test]
