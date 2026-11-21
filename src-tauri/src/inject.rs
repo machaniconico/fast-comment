@@ -79,6 +79,7 @@ pub fn build_test_messages(req: &TestCommentRequest) -> Result<Vec<ChatMessage>,
             raw: None,
             skip_tts: false,
             injected_test: true,
+            route: Default::default(),
         });
     }
     Ok(messages)

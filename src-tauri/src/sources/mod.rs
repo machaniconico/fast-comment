@@ -5,6 +5,7 @@
 //! 正規化済み `ChatMessage` を `broadcast::Sender` へ流す。
 
 pub mod niconico;
+pub mod origin_relay;
 pub mod twitcasting;
 pub mod twitcasting_api;
 pub mod twitcasting_auth;
@@ -30,6 +31,8 @@ use crate::config::{ChannelConfig, ChannelPlatform, TwitcastingMode};
 use crate::integrations::KeyringSecretStore;
 use crate::model::{ChatMessage, LiveEvent, ModerationEvent, YoutubeReaction};
 use crate::stats::YoutubeMetadataUpdate;
+
+pub(crate) const SOURCE_CAPACITY: usize = 4096;
 
 /// 接続元の共通インタフェース。
 ///
@@ -197,12 +200,16 @@ impl SourceManager {
     /// 呼び出し側は返ったトークンを保持し、チャンネル削除時に `cancel()` する。
     pub fn spawn_channel(&self, ch: &ChannelConfig) -> CancellationToken {
         let cancel = CancellationToken::new();
+        self.spawn_channel_with_cancel(ch, cancel.clone());
+        cancel
+    }
+
+    pub(crate) fn spawn_channel_with_cancel(&self, ch: &ChannelConfig, child: CancellationToken) {
         if !ch.enabled {
-            return cancel;
+            return;
         }
 
         let tx = self.tx.clone();
-        let child = cancel.clone();
         let identifier = ch.identifier.clone();
         let overrides = self.youtube_overrides.clone();
         let youtube_api_key = self.youtube_api_key.clone();
@@ -290,8 +297,6 @@ impl SourceManager {
                 }
             }
         }
-
-        cancel
     }
 }
 

@@ -687,6 +687,7 @@ mod tests {
             raw: None,
             skip_tts: false,
             injected_test: false,
+            route: Default::default(),
         }
     }
 
