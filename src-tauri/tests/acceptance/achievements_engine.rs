@@ -728,7 +728,7 @@ fn platinum_unlocks_when_all_lifetime_unlocked() {
         ],
         T0,
     );
-    assert_eq!(ids(&e.observe(&cm("m1"), T0 + 1)), vec!["a"], "b が残っているので plat はまだ");
+    assert_eq!(ids(&e.observe(&chat("m1", Platform::Youtube, "UCchan", "u1"), T0 + 1)), vec!["a"], "b が残っているので plat はまだ");
     let got = e.observe(&super_chat("m2", "u1", 100.0, "¥"), T0 + 2);
     let mut want = vec!["b".to_string(), "plat".to_string()];
     want.sort();
