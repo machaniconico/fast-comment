@@ -271,12 +271,24 @@ fn current_tts_queue_state(state: &AppState) -> TtsQueueStatePayload {
     state.tts.snapshot()
 }
 
-fn try_enqueue_tts_message(app: &AppHandle, state: &AppState, msg: ChatMessage) {
+fn try_enqueue_tts_message(
+    sink: &dyn tts::TtsSink,
+    config: &Mutex<AppConfig>,
+    queue: &TtsShared,
+    mut msg: ChatMessage,
+) {
     if !listeners::allows_tts(&msg) {
         return;
     }
-    let max_pending = state.config.lock().unwrap().tts.options.queue.max_pending as usize;
-    state.tts.enqueue(app, msg, max_pending);
+    let max_pending = {
+        let config = config.lock().unwrap();
+        if !tts::channel_allows_tts(&config, &msg) {
+            return;
+        }
+        tts::stamp_channel_voice(&config, &mut msg);
+        config.tts.options.queue.max_pending as usize
+    };
+    queue.enqueue(sink, msg, max_pending);
 }
 
 fn emit_bouyomi_launch_notice(app: &AppHandle, outcome: bouyomi::LaunchOutcome) {
@@ -526,7 +538,7 @@ fn tts_speak_text(app: AppHandle, state: State<'_, AppState>, text: String) -> R
         route: Default::default(),
     };
 
-    try_enqueue_tts_message(&app, &state, msg);
+    try_enqueue_tts_message(&app, &state.config, &state.tts, msg);
     Ok(())
 }
 
@@ -3077,7 +3089,7 @@ fn spawn_pipeline(app: AppHandle, cancel: CancellationToken) {
                     register_participant_if_needed(&app, &state, &msg);
 
                     // 同期 I/O やネットワーク待ちをせず、有界キューに投入する。
-                    try_enqueue_tts_message(&app, &state, msg.clone());
+                    try_enqueue_tts_message(&app, &state.config, &state.tts, msg.clone());
 
                     // 下流(UI/OBS)へ。
                     bus.publish(msg);
@@ -3555,6 +3567,55 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tts_disabled_channel_message_is_dropped_before_enqueue() {
+        struct Sink;
+        impl tts::TtsSink for Sink {
+            fn audio(&self, _: String) {}
+            fn web_speech(&self, _: tts::WebSpeechPayload) {}
+            fn cancel(&self) {}
+            fn notice(&self, _: &'static str, _: String) {}
+            fn queue_state(&self, _: TtsQueueStatePayload) {}
+        }
+
+        let channel = ChannelConfig {
+            platform: ChannelPlatform::Twitch,
+            identifier: "fixture".into(),
+            enabled: true,
+            own_stream: false,
+            overrides: ChannelOverrides {
+                tts_enabled: Some(false),
+                ..Default::default()
+            },
+        };
+        let key = config::channel_key(&channel);
+        let mut config = AppConfig::default();
+        config.channels.push(channel);
+        config.tts.options.queue.max_pending = 1;
+        let config = Mutex::new(config);
+        let queue = TtsShared::default();
+        let allowed: ChatMessage = serde_json::from_value(serde_json::json!({
+            "id": "allowed",
+            "platform": "twitch",
+            "channel": "fixture",
+            "author": { "id": "u1", "name": "viewer" },
+            "fragments": [],
+            "kind": "normal",
+            "timestampMs": 1
+        }))
+        .unwrap();
+        let mut disabled = allowed.clone();
+        disabled.id = "disabled".into();
+        disabled.route.origin_key = Some(key);
+
+        try_enqueue_tts_message(&Sink, &config, &queue, allowed);
+        try_enqueue_tts_message(&Sink, &config, &queue, disabled);
+
+        let snapshot = queue.snapshot();
+        assert_eq!(snapshot.depth, 1);
+        assert_eq!(snapshot.items[0].id, "allowed");
+    }
 
     #[tokio::test]
     async fn spawned_channel_messages_reach_pipeline_with_origin_key() {
