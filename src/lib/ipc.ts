@@ -589,7 +589,24 @@ export interface ChannelConfig {
   identifier: string; // Twitch: channel name, YouTube: videoId, X: broadcast URL/ID, niconico: lv番組ID/URL, twitcasting: 配信者ID/URL
   enabled: boolean; // Rust ChannelConfig.enabled (serde default true)
   ownStream?: boolean; // 「自分の配信」の印(X 自動告知の対象)。serde default false
+  overrides?: ChannelOverrides; // 枠ごとの上書き。無ければ全体に従う
 }
+
+/** Rust `ChannelTtsVoice`。backend ごとに該当の 1 つだけ使う。 */
+export interface ChannelTtsVoice {
+  voicevoxSpeaker?: number;
+  bouyomiVoice?: number;
+  webSpeechVoice?: string;
+}
+
+/** Rust `ChannelOverrides`。`ttsEnabled` は false(この枠は読まない)だけ保存される。 */
+export interface ChannelOverrides {
+  ttsEnabled?: boolean;
+  ttsVoice?: ChannelTtsVoice;
+}
+
+/** 行を書き換える IPC の応答(保存後の行一覧)。 */
+export type ChannelsCommit = ConfigCommit<{ channels: ChannelConfig[] }>;
 
 export interface InjectTestCommentOptions {
   platform: 'twitch' | 'youtube' | 'x' | 'niconico' | 'twitcasting';
@@ -789,8 +806,9 @@ export async function probeTtsEngine(engine: VoicevoxEngineKind, url: string): P
   return res;
 }
 
-export async function addChannel(channel: ChannelConfig): Promise<void> {
-  await invoke<void>('add_channel', { channel });
+/** `replaces` を渡すと、その key の行を 1 回の保存で置き換える(上書き設定は Rust が引き継ぐ)。 */
+export async function addChannel(channel: ChannelConfig, replaces?: string): Promise<ChannelsCommit | null> {
+  return invoke<ChannelsCommit>('add_channel', { channel, replaces: replaces ?? null });
 }
 
 export async function removeChannel(key: string): Promise<void> {
@@ -1212,8 +1230,17 @@ export async function sendXTestPost(): Promise<XTestPostResult | null> {
 }
 
 /** 行の「自分の配信」印だけを保存する(Source は再起動しない)。key は `${platform}:${identifier}`。 */
-export async function setChannelOwnStream(key: string, own: boolean): Promise<void> {
-  await invoke<void>('set_channel_own_stream', { key, own });
+export async function setChannelOwnStream(key: string, own: boolean): Promise<ChannelsCommit | null> {
+  return invoke<ChannelsCommit>('set_channel_own_stream', { key, own });
+}
+
+/** 行の上書きだけを保存する。`baseRevision` が古ければ `configChangedError` で拒否される。 */
+export async function setChannelOverrides(
+  key: string,
+  overrides: ChannelOverrides,
+  baseRevision: number,
+): Promise<ChannelsCommit | null> {
+  return invoke<ChannelsCommit>('set_channel_overrides', { key, overrides, baseRevision });
 }
 
 

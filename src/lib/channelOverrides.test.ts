@@ -1,0 +1,69 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import {
+  applyChannelsSaved,
+  chipBadge,
+  fromFormState,
+  toFormState,
+  voiceOptions,
+} from './channelOverrides.ts';
+
+test('toFormState_maps_absent_overrides_to_follow_global', () => {
+  assert.deepEqual(toFormState(undefined, 'voicevox'), { ttsDisabled: false, voice: '' });
+  assert.deepEqual(toFormState({}, 'webSpeech'), { ttsDisabled: false, voice: '' });
+  assert.deepEqual(toFormState({ ttsEnabled: false, ttsVoice: { voicevoxSpeaker: 3 } }, 'voicevox'), {
+    ttsDisabled: true,
+    voice: '3',
+  });
+  assert.equal(toFormState({ ttsVoice: { voicevoxSpeaker: 3 } }, 'bouyomi').voice, '');
+});
+
+test('fromFormState_omits_empty_voice_and_true_flag', () => {
+  assert.deepEqual(fromFormState({ ttsDisabled: false, voice: '' }, 'voicevox'), {});
+  assert.deepEqual(fromFormState({ ttsDisabled: true, voice: '' }, 'voicevox'), { ttsEnabled: false });
+  assert.deepEqual(fromFormState({ ttsDisabled: false, voice: '2' }, 'voicevox'), {
+    ttsVoice: { voicevoxSpeaker: 2 },
+  });
+  // 他 backend の声は残し、今の backend の声だけ「全体に従う」で消える
+  assert.deepEqual(
+    fromFormState({ ttsDisabled: false, voice: '' }, 'voicevox', {
+      ttsVoice: { voicevoxSpeaker: 2, bouyomiVoice: 4 },
+    }),
+    { ttsVoice: { bouyomiVoice: 4 } },
+  );
+  assert.deepEqual(fromFormState({ ttsDisabled: false, voice: 'abc' }, 'bouyomi'), {});
+});
+
+test('voiceOptions_for_current_backend_has_follow_global_first', () => {
+  const speakers = [{ id: 1, name: 'ずんだもん', style: 'ノーマル' }];
+  const vv = voiceOptions('voicevox', { speakers });
+  assert.deepEqual(vv[0], { value: '', label: '全体に従う' });
+  assert.deepEqual(vv[1], { value: '1', label: 'ずんだもん(ノーマル)' });
+  const ws = voiceOptions('webSpeech', { webVoices: ['Haruka'] });
+  assert.equal(ws[0].value, '');
+  assert.deepEqual(ws[1], { value: 'Haruka', label: 'Haruka' });
+  const by = voiceOptions('bouyomi');
+  assert.equal(by[0].value, '');
+  assert.equal(by[1].value, '1');
+  assert.deepEqual(voiceOptions('none'), [{ value: '', label: '全体に従う' }]);
+});
+
+test('chipBadge_shows_tts_off_only_when_disabled', () => {
+  const base = { platform: 'twitch', identifier: 'a', enabled: true } as const;
+  assert.equal(chipBadge({ ...base }), null);
+  assert.equal(chipBadge({ ...base, overrides: {} }), null);
+  assert.equal(chipBadge({ ...base, overrides: { ttsVoice: { bouyomiVoice: 2 } } }), null);
+  assert.equal(chipBadge({ ...base, overrides: { ttsEnabled: false } }), '読まない');
+});
+
+test('applyChannelsSaved_replaces_local_channels_from_response', () => {
+  const local = [{ platform: 'x', identifier: '1', enabled: true, ownStream: false }] as const;
+  const saved = {
+    revision: 5,
+    channels: [{ platform: 'x', identifier: '1', enabled: true, ownStream: true, overrides: { ttsEnabled: false } }],
+  } as const;
+  const next = applyChannelsSaved([...local], { channels: [...saved.channels] });
+  assert.equal(next.length, 1);
+  assert.equal(next[0].ownStream, true);
+  assert.deepEqual(next[0].overrides, { ttsEnabled: false });
+});

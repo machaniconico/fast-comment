@@ -1,6 +1,8 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
   import type { ChannelConfig, ChannelStatus } from '../ipc';
+  import ChannelOverridesDialog from './ChannelOverridesDialog.svelte';
+  import { applyChannelsSaved, chipBadge } from '../channelOverrides';
   import { addChannel, removeChannel, getConfig, onStats, openUrl, setChannelOwnStream } from '../ipc';
   import { ownStreamBlockedReason } from '../xAutopost';
   import { extractTwitcastingScreenId, isPrefixedTwitcastingId, isTwitcastingUrl } from '../twitcastingId';
@@ -19,11 +21,12 @@
   let channelStatus: Map<string, ChannelStatus> = $state(new Map());
   let ctxMenu: { ch: ChannelConfig; x: number; y: number } | null = $state(null);
   let ctxMenuEl: HTMLDivElement | null = $state(null);
+  let overridesFor: ChannelConfig | null = $state(null);
   let unlistenStats: (() => void) | null = null;
   let cleanupCtxMenuListeners: (() => void) | null = null;
   let destroyed = false;
   const CTX_MENU_WIDTH = 180;
-  const CTX_MENU_HEIGHT = 44;
+  const CTX_MENU_HEIGHT = 76;
   const CTX_MENU_MARGIN = 8;
 
   // stats の identifier は Rust の channel_name(識別子)と同じ規則で作られる。ツイキャスは
@@ -232,11 +235,18 @@
     addError = '';
     const next = !ch.ownStream;
     try {
-      await setChannelOwnStream(`${ch.platform}:${ch.identifier}`, next);
-      channels = channels.map((c) => (sameChannel(c, ch) ? { ...c, ownStream: next } : c));
+      const commit = await setChannelOwnStream(`${ch.platform}:${ch.identifier}`, next);
+      channels = commit
+        ? applyChannelsSaved(channels, commit)
+        : channels.map((c) => (sameChannel(c, ch) ? { ...c, ownStream: next } : c));
     } catch (e) {
       addError = `印の保存に失敗しました: ${e instanceof Error ? e.message : String(e)}`;
     }
+  }
+
+  function openOverrides(ch: ChannelConfig) {
+    ctxMenu = null;
+    overridesFor = ch;
   }
 
   async function onRemove(ch: ChannelConfig) {
@@ -605,9 +615,16 @@
     }
 
     const ch: ChannelConfig = { platform, identifier, enabled: true };
+    // X/ニコ生は配信ごとに URL を貼る運用なので、新しい配信は同じプラットフォームの前の接続を置き換える(1 回の保存)。
+    const [replaced, ...extra] =
+      platform === 'x' || platform === 'niconico'
+        ? channels.filter((c) => c.platform === platform && !sameChannel(c, ch))
+        : [];
     try {
-      await addChannel(ch);
-      if (!channels.some((c) => sameChannel(c, ch))) {
+      const commit = await addChannel(ch, replaced && `${replaced.platform}:${replaced.identifier}`);
+      if (commit) {
+        channels = applyChannelsSaved(channels, commit);
+      } else if (!channels.some((c) => sameChannel(c, ch))) {
         channels = [...channels, ch];
       }
       onAdded?.(ch);
@@ -617,16 +634,14 @@
       return;
     }
 
-    // X/ニコ生は配信ごとに URL を貼る運用なので、新しい配信を追加したら同じプラットフォームの前の接続は置き換える。
-    if (platform === 'x' || platform === 'niconico') {
-      const label = platform === 'x' ? 'X' : 'ニコ生';
-      for (const old of channels.filter((c) => c.platform === platform && !sameChannel(c, ch))) {
-        try {
-          await removeChannel(`${old.platform}:${old.identifier}`);
-          channels = channels.filter((c) => !sameChannel(c, old));
-        } catch (e) {
-          addError = `前の ${label} 接続の削除に失敗しました: ${e instanceof Error ? e.message : String(e)}`;
-        }
+    // 2 件以上残っていた場合だけ、余りを削除する。
+    const label = platform === 'x' ? 'X' : 'ニコ生';
+    for (const old of extra) {
+      try {
+        await removeChannel(`${old.platform}:${old.identifier}`);
+        channels = channels.filter((c) => !sameChannel(c, old));
+      } catch (e) {
+        addError = `前の ${label} 接続の削除に失敗しました: ${e instanceof Error ? e.message : String(e)}`;
       }
     }
   }
@@ -693,6 +708,7 @@
           <span class="chip-dot" aria-hidden="true"></span>
           {#if isLive}<span class="live-badge">LIVE</span>{/if}
           <span class="chip-id">{bodyText}</span>
+          {#if chipBadge(ch)}<span class="chip-ov" title="この枠は読み上げません">{chipBadge(ch)}</span>{/if}
           <button
             type="button"
             class="chip-own"
@@ -750,7 +766,28 @@
       >
         配信ページを開く
       </button>
+      <button
+        type="button"
+        class="ctx-menu-item"
+        role="menuitem"
+        onclick={(e) => {
+          e.stopPropagation();
+          const current = ctxMenu;
+          if (current) openOverrides(current.ch);
+        }}
+      >
+        この枠の設定…
+      </button>
     </div>
+  {/if}
+  {#if overridesFor}
+    {@const target = overridesFor}
+    <ChannelOverridesDialog
+      channel={target}
+      label={titles.get(chipKey(target.platform, target.identifier)) ?? target.identifier}
+      onclose={() => (overridesFor = null)}
+      onsaved={(commit) => (channels = applyChannelsSaved(channels, commit))}
+    />
   {/if}
 </div>
 
@@ -942,6 +979,14 @@
   .chip-own:hover:not(:disabled) { color: #ddd; }
   .chip-own.on { color: #fff; background: #1da1f2; border-color: #1da1f2; }
   .chip-own.warn { background: #f57c00; border-color: #f57c00; }
+  .chip-ov {
+    font-size: 10px;
+    padding: 0 5px;
+    border-radius: 3px;
+    background: rgba(255,255,255,0.14);
+    color: #ddd;
+    flex-shrink: 0;
+  }
   .chip-own:disabled { opacity: 0.35; cursor: not-allowed; }
 
   .ctx-menu {
