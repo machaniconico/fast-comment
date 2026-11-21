@@ -16,7 +16,7 @@ function block() {
 
 function load() {
   const factory = new Function(
-    `${block()}\nreturn { TROPHY_DEFAULT_DURATION_MS, trophyDurationMs, trophyFrameUnlocks, trophyViewerLabel, trophyCreateQueue };`,
+    `${block()}\nreturn { TROPHY_DEFAULT_DURATION_MS, trophyDurationMs, trophyFrameUnlocks, trophyViewerLabel, trophyCreateQueue, trophyWsUrl };`,
   );
   return factory();
 }
@@ -71,6 +71,23 @@ test('viewer label: streamer, named viewer, blank name', () => {
   assert.equal(trophyViewerLabel({ kind: 'viewer', name: '   ' }), '視聴者');
   assert.equal(trophyViewerLabel({ kind: 'viewer' }), '視聴者');
   assert.equal(trophyViewerLabel(null), '視聴者');
+});
+
+test('ws url: follows the page host and port unless ?ws overrides it', () => {
+  const { trophyWsUrl } = load();
+  const at = (href) => {
+    const u = new URL(href);
+    return { protocol: u.protocol, host: u.host, href };
+  };
+  assert.equal(
+    trophyWsUrl(null, at('http://127.0.0.1:12345/templates/trophy/index.html')),
+    'ws://127.0.0.1:12345/ws?achievementEvents=1',
+  );
+  assert.equal(trophyWsUrl('', at('https://example.test/x')), 'wss://example.test/ws?achievementEvents=1');
+  assert.equal(
+    trophyWsUrl('ws://127.0.0.1:11180/ws', at('http://127.0.0.1:12345/x')),
+    'ws://127.0.0.1:11180/ws?achievementEvents=1',
+  );
 });
 
 test('opt-in, no innerHTML, and no external assets', () => {

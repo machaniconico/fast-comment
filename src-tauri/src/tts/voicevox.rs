@@ -139,7 +139,14 @@ enum SynthError {
     #[error("HTTP {0}")]
     Client(reqwest::StatusCode),
     #[error(transparent)]
-    Other(#[from] reqwest::Error),
+    Other(reqwest::Error),
+}
+
+/// 読み上げ文は URL のクエリに載るため、エラーから URL を外して警告・画面通知へ出さない。
+impl From<reqwest::Error> for SynthError {
+    fn from(e: reqwest::Error) -> Self {
+        SynthError::Other(e.without_url())
+    }
 }
 
 fn check(resp: reqwest::Response) -> Result<reqwest::Response, SynthError> {
@@ -338,6 +345,18 @@ mod tests {
     use super::test_support::spawn_fake_engine;
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn synth_error_text_omits_request_url_and_query() {
+        let err = Client::new()
+            .get("http://127.0.0.1:1/audio_query?text=SECRET-VIEWER")
+            .send()
+            .await
+            .unwrap_err();
+        let text = SynthError::from(err).to_string();
+        assert!(!text.contains("SECRET-VIEWER"), "{text}");
+        assert!(!text.contains("text="), "{text}");
+    }
 
     fn empty_params() -> ResolvedVoiceParams {
         ResolvedVoiceParams {

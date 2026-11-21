@@ -4,7 +4,7 @@
  *
  * URL params:
  *   ?template=trophy
- *   ?ws=ws://127.0.0.1:11180/ws   override WS endpoint
+ *   ?ws=ws://127.0.0.1:11180/ws   override WS endpoint (default: this page's host)
  *   ?duration=<seconds>           how long one unlock stays visible (default 5)
  *
  * Only `{"achievements":[…]}` frames are used. Chat batches are ignored.
@@ -75,11 +75,20 @@
       },
     };
   }
+
+  // ws パラメータが無ければ、ページ自身の host(= このアプリの配信ポート)へ繋ぐ。
+  function trophyWsUrl(wsParam, loc) {
+    const scheme = loc.protocol === 'https:' ? 'wss:' : 'ws:';
+    const url = new URL(wsParam || `${scheme}//${loc.host}/ws`, loc.href);
+    // 実績解除の {"achievements":[…]} フレームを受け取る(opt-in)。
+    url.searchParams.set('achievementEvents', '1');
+    return url.toString();
+  }
   // ---- fc-trophy:end ----
 
   const params = new URLSearchParams(location.search);
   const ITEM_DURATION_MS = trophyDurationMs(params.get('duration'));
-  const WS_URL = buildWsUrl(params.get('ws') || 'ws://127.0.0.1:11180/ws');
+  const WS_URL = trophyWsUrl(params.get('ws'), location);
 
   const overlay = document.getElementById('overlay');
   const queue = trophyCreateQueue();
@@ -194,13 +203,6 @@
         showNext();
       }, LEAVE_MS);
     }, durationMs);
-  }
-
-  function buildWsUrl(base) {
-    const url = new URL(base, location.href);
-    // 実績解除の {"achievements":[…]} フレームを受け取る(opt-in)。
-    url.searchParams.set('achievementEvents', '1');
-    return url.toString();
   }
 
   // ---- Start ----

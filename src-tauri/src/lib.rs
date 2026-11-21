@@ -50,7 +50,7 @@ use uuid::Uuid;
 use crate::achievements::{
     announce::announce_message,
     engine::{AchievementEngine, AchievementUnlocked},
-    store::{AchievementDefs, DefsStore},
+    store::DefsStore,
 };
 use crate::autopost::{
     AutopostStatus, KeyringTokenStore, UserCommand as AutopostCommand, XEndpoints, XPostAuth,
@@ -363,6 +363,19 @@ fn try_enqueue_tts_message(
         queue.enqueue_silent(msg, max_pending)
     };
     queue.after_enqueue(sink, &result);
+}
+
+/// 実績の読み上げ。TTS バックエンドが `None` の時はキューにも通知にも触れない。
+fn try_enqueue_achievement_tts(
+    sink: &dyn tts::TtsSink,
+    config: &Mutex<AppConfig>,
+    queue: &TtsShared,
+    msg: ChatMessage,
+) {
+    if config.lock().unwrap().tts.backend == TtsBackendKind::None {
+        return;
+    }
+    try_enqueue_tts_message(sink, config, queue, msg);
 }
 
 /// 読み上げ OFF の枠の未読み上げコメントを捨てる。設定ロック中(保存の直後)に呼び、
@@ -2967,7 +2980,7 @@ fn spawn_achievement_tts_forwarder(
                                 .is_some_and(|record| record.tts_muted)
                         });
                         if let Some(message) = message {
-                            try_enqueue_tts_message(&app, &state.config, &state.tts, message);
+                            try_enqueue_achievement_tts(&app, &state.config, &state.tts, message);
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -3823,6 +3836,7 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use achievements::store::AchievementDefs;
 
     #[test]
     fn deleting_listener_from_disabled_engine_preserves_future_unlocks() {
@@ -4958,6 +4972,23 @@ mod followup_tests {
         .unwrap();
         msg.route.origin_key = origin_key.map(str::to_owned);
         msg
+    }
+
+    #[test]
+    fn tts_announce_skips_when_tts_disabled() {
+        let mut cfg = AppConfig::default();
+        cfg.tts.options.queue.max_pending = 100;
+        let config = Mutex::new(cfg);
+        let queue = TtsShared::default();
+        try_enqueue_tts_message(&NullSink, &config, &queue, tts_message("waiting", None));
+        config.lock().unwrap().tts.backend = TtsBackendKind::None;
+        try_enqueue_achievement_tts(&NullSink, &config, &queue, tts_message("unlock", None));
+        let snapshot = queue.snapshot();
+        assert_eq!(snapshot.depth, 1);
+        assert_eq!(snapshot.items[0].id, "waiting");
+        config.lock().unwrap().tts.backend = TtsBackendKind::WebSpeech;
+        try_enqueue_achievement_tts(&NullSink, &config, &queue, tts_message("unlock", None));
+        assert_eq!(queue.snapshot().depth, 2);
     }
 
     #[test]

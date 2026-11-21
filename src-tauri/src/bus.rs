@@ -688,6 +688,10 @@ async fn handle_ws_client(
         std::collections::VecDeque::new();
     let mut achievement_queue: std::collections::VecDeque<AchievementUnlocked> =
         std::collections::VecDeque::new();
+    // 受信した解除は 1 tick 保留する。原因のコメントは解除より後に publish されうるので、
+    // 次の tick でチャットを送った後に出す。
+    let mut achievement_held: std::collections::VecDeque<AchievementUnlocked> =
+        std::collections::VecDeque::new();
 
     loop {
         tokio::select! {
@@ -769,7 +773,8 @@ async fn handle_ws_client(
                     }
                 }
                 // モデレーションの後に実績(1 tick 1 フレーム)。
-                let unlocks: Vec<AchievementUnlocked> = achievement_queue.drain(..).collect();
+                let unlocks: Vec<AchievementUnlocked> = achievement_held.drain(..).collect();
+                achievement_held.append(&mut achievement_queue);
                 if let Some(json) = achievement_frame(&unlocks) {
                     if socket.send(WsMessage::Text(json.into())).await.is_err() {
                         return;
@@ -1457,6 +1462,22 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&frames[1]).unwrap();
         assert_eq!(value["achievements"][0]["id"], "u1");
         assert_eq!(value["achievements"][0]["achievementId"], "viewer-platinum");
+    }
+
+    #[tokio::test]
+    async fn ws_achievements_follow_chat_published_after_them() {
+        let bus = test_bus();
+        let mut ws = ws_connect(&bus, "?achievementEvents=1").await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        for i in 0..5 {
+            bus.achievement_sender().send(sample_unlock("u1")).unwrap();
+            bus.publish(sample_chat(&format!("c{i}")));
+            tokio::time::sleep(Duration::from_millis(7)).await;
+        }
+        let frames = collect_frames(&mut ws, Duration::from_millis(300)).await;
+        let first_unlock = frames.iter().position(|f| f.starts_with("{\"achievements\"")).unwrap();
+        let first_chat = frames.iter().position(|f| f.starts_with('[')).unwrap();
+        assert!(first_chat < first_unlock, "{frames:?}");
     }
 
     #[tokio::test]
