@@ -44,5 +44,12 @@ mod channel_overrides_commit;
 mod channel_overrides_relay;
 mod channel_overrides_tts;
 
+mod achievements_common;
+mod achievements_model;
+mod achievements_currency;
+mod achievements_store;
+mod achievements_engine;
+mod achievements_wiring;
+
 #[test]
 fn acceptance_harness_runs() {}
