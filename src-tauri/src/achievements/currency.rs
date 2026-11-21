@@ -11,11 +11,10 @@ pub struct ParsedAmount {
 
 pub fn parse_display_amount(text: &str) -> Option<ParsedAmount> {
     let first_digit = text.find(is_decimal_digit)?;
-    // Allow fractional forms like `$.50` or `CHF .50`. A mark attached to a
-    // currency abbreviation belongs to the label, as in `kr.50` and `kr. 50`.
+    // A mark right before the first digit is a decimal point (`$.50`, `EUR,50`).
+    // A mark followed by spacing stays in the label, as in `kr. 50`.
     let number_start = text[..first_digit]
         .strip_suffix(is_decimal_mark)
-        .filter(|prefix| !prefix.ends_with(char::is_alphabetic))
         .map_or(first_digit, str::len);
     let number_end = text.trim_end_matches(|c| !is_decimal_digit(c)).len();
     let currency = format!(
@@ -203,10 +202,15 @@ mod tests {
 
     #[test]
     fn display_amount_preserves_currency_punctuation() {
-        for input in ["kr. 50", "kr.50", "50 kr."] {
+        for input in ["kr. 50", "50 kr."] {
             let parsed = parse_display_amount(input).unwrap();
             assert_eq!(parsed.currency, "kr.");
             assert_eq!(parsed.milli, 50_000);
+        }
+        for (input, currency) in [("kr.50", "kr"), ("EUR,50", "EUR"), ("KWD٫٥٠", "KWD"), ("EUR.50", "EUR")] {
+            let parsed = parse_display_amount(input).unwrap();
+            assert_eq!(parsed.currency, currency, "{input}");
+            assert_eq!(parsed.milli, 500, "{input}");
         }
         let parsed = parse_display_amount("$.50").unwrap();
         assert_eq!(parsed.currency, "$");
