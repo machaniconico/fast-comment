@@ -2,7 +2,7 @@
   import { onMount, onDestroy } from 'svelte';
   import type { ChannelConfig, ChannelStatus } from '../ipc';
   import ChannelOverridesDialog from './ChannelOverridesDialog.svelte';
-  import { applyChannelsSaved, chipBadge } from '../channelOverrides';
+  import { applyChannelsSaved, chipBadge, replacedChannelKeys } from '../channelOverrides';
   import { addChannel, removeChannel, getConfig, onStats, openUrl, setChannelOwnStream } from '../ipc';
   import { ownStreamBlockedReason } from '../xAutopost';
   import { extractTwitcastingScreenId, isPrefixedTwitcastingId, isTwitcastingUrl } from '../twitcastingId';
@@ -615,34 +615,18 @@
     }
 
     const ch: ChannelConfig = { platform, identifier, enabled: true };
-    // X/ニコ生は配信ごとに URL を貼る運用なので、新しい配信は同じプラットフォームの前の接続を置き換える(1 回の保存)。
-    const [replaced, ...extra] =
-      platform === 'x' || platform === 'niconico'
-        ? channels.filter((c) => c.platform === platform && !sameChannel(c, ch))
-        : [];
+    const replaces = replacedChannelKeys(channels, ch);
     try {
-      const commit = await addChannel(ch, replaced && `${replaced.platform}:${replaced.identifier}`);
+      const commit = await addChannel(ch, replaces);
       if (commit) {
         channels = applyChannelsSaved(channels, commit);
       } else if (!channels.some((c) => sameChannel(c, ch))) {
-        channels = [...channels, ch];
+        channels = [...channels.filter((c) => !replaces.includes(`${c.platform}:${c.identifier}`)), ch];
       }
       onAdded?.(ch);
       newIdentifier = '';
     } catch (e) {
       addError = `追加に失敗しました: ${e instanceof Error ? e.message : String(e)}`;
-      return;
-    }
-
-    // 2 件以上残っていた場合だけ、余りを削除する。
-    const label = platform === 'x' ? 'X' : 'ニコ生';
-    for (const old of extra) {
-      try {
-        await removeChannel(`${old.platform}:${old.identifier}`);
-        channels = channels.filter((c) => !sameChannel(c, old));
-      } catch (e) {
-        addError = `前の ${label} 接続の削除に失敗しました: ${e instanceof Error ? e.message : String(e)}`;
-      }
     }
   }
 </script>

@@ -806,9 +806,9 @@ export async function probeTtsEngine(engine: VoicevoxEngineKind, url: string): P
   return res;
 }
 
-/** `replaces` を渡すと、その key の行を 1 回の保存で置き換える(上書き設定は Rust が引き継ぐ)。 */
-export async function addChannel(channel: ChannelConfig, replaces?: string): Promise<ChannelsCommit | null> {
-  return invoke<ChannelsCommit>('add_channel', { channel, replaces: replaces ?? null });
+/** `replaces` の key の行をすべて外し、1 回の保存で置き換える(上書き設定は最初の行から Rust が引き継ぐ)。 */
+export async function addChannel(channel: ChannelConfig, replaces: string[] = []): Promise<ChannelsCommit | null> {
+  return invoke<ChannelsCommit>('add_channel', { channel, replaces: replaces.length ? replaces : null });
 }
 
 export async function removeChannel(key: string): Promise<void> {

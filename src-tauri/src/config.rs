@@ -53,14 +53,31 @@ impl ChannelOverrides {
             voice.web_speech_voice = voice
                 .web_speech_voice
                 .as_deref()
-                .map(str::trim)
-                .filter(|name| !name.is_empty())
-                .map(str::to_owned);
+                .map(|name| name.trim().chars().take(MAX_WEB_SPEECH_VOICE_CHARS).collect::<String>())
+                .filter(|name| !name.chars().all(|c| c.is_whitespace() || is_invisible_format(c)));
             if voice.is_empty() {
                 self.tts_voice = None;
             }
         }
     }
+}
+
+const MAX_WEB_SPEECH_VOICE_CHARS: usize = 200;
+
+/// ゼロ幅・書式制御文字(Unicode Cf の主なもの)。これだけの声名は空とみなす。
+fn is_invisible_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{061C}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+    )
 }
 
 fn deserialize_channel_overrides<'de, D>(deserializer: D) -> Result<ChannelOverrides, D::Error>
@@ -179,23 +196,68 @@ pub fn set_channel_overrides_in(
 pub fn replace_channel_in(
     cfg: &mut AppConfig,
     old_key: &str,
+    new: ChannelConfig,
+) -> Result<(), ChannelEditError> {
+    replace_channels_in(cfg, &[old_key.to_string()], new)
+}
+
+/// 旧行をすべて外し、新しい行を最初の旧行の位置に入れる(1 回の保存で済ませるため)。
+/// 新しい行の上書きが空なら最初の旧行のものを引き継ぐ。
+pub fn replace_channels_in(
+    cfg: &mut AppConfig,
+    old_keys: &[String],
     mut new: ChannelConfig,
 ) -> Result<(), ChannelEditError> {
-    let index = cfg
-        .channels
-        .iter()
-        .position(|ch| channel_matches_key(ch, old_key))
-        .ok_or(ChannelEditError::NotFound)?;
+    let mut indices = Vec::with_capacity(old_keys.len());
+    for key in old_keys {
+        let index = cfg
+            .channels
+            .iter()
+            .position(|ch| channel_matches_key(ch, key))
+            .ok_or(ChannelEditError::NotFound)?;
+        if !indices.contains(&index) {
+            indices.push(index);
+        }
+    }
+    let Some(&first) = indices.first() else {
+        return Err(ChannelEditError::NotFound);
+    };
     if cfg.channels.iter().enumerate().any(|(i, ch)| {
-        i != index && ch.platform == new.platform && ch.identifier == new.identifier
+        !indices.contains(&i) && ch.platform == new.platform && ch.identifier == new.identifier
     }) {
         return Err(ChannelEditError::Duplicate);
     }
+    new.overrides.normalize();
     if new.overrides.is_empty() {
-        new.overrides = cfg.channels[index].overrides.clone();
+        new.overrides = cfg.channels[first].overrides.clone();
     }
-    cfg.channels[index] = new;
+    cfg.channels[first] = new;
+    let mut i = 0;
+    cfg.channels.retain(|_| {
+        let keep = i == first || !indices.contains(&i);
+        i += 1;
+        keep
+    });
     Ok(())
+}
+
+/// `create_new` で開くので既存の退避ファイルは上書きしない。同じ ms に既にあれば連番を付ける。
+fn preserve_broken_config(path: &Path, now_ms: u128) -> std::io::Result<PathBuf> {
+    let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+    for n in 0..100u32 {
+        let suffix = if n == 0 { String::new() } else { format!("-{n}") };
+        let backup = path.with_file_name(format!("{name}.broken-{now_ms}{suffix}"));
+        let mut target = match std::fs::OpenOptions::new().write(true).create_new(true).open(&backup) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        };
+        let mut source = File::open(path)?;
+        std::io::copy(&mut source, &mut target)?;
+        target.sync_all()?;
+        return Ok(backup);
+    }
+    Err(std::io::ErrorKind::AlreadyExists.into())
 }
 
 const MAX_OBS_ROWS: u16 = 1000;
@@ -1217,6 +1279,31 @@ impl AppConfig {
         })?;
         cfg.normalize_all();
         Ok(cfg)
+    }
+
+    /// 起動時のロード。失敗したら元ファイルを `config.json.broken-<unix-ms>` へ複製してから既定値で続行する
+    /// (次の保存で上書きされ、チャンネルや資格情報を失わないため)。既存の退避ファイルは上書きしない。
+    pub fn load_or_preserve(dir: &Path) -> AppConfig {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or_default();
+        Self::load_or_preserve_at(dir, now_ms)
+    }
+
+    fn load_or_preserve_at(dir: &Path, now_ms: u128) -> AppConfig {
+        let e = match Self::load(dir) {
+            Ok(cfg) => return cfg,
+            Err(e) => e,
+        };
+        match preserve_broken_config(&Self::path_in(dir), now_ms) {
+            Ok(backup) => tracing::warn!(
+                "設定ロード失敗・{} に退避して既定値で続行: {e}",
+                backup.file_name().unwrap_or_default().to_string_lossy()
+            ),
+            Err(err) => tracing::warn!("設定ロード失敗・退避できず既定値で続行: {e} (退避: {})", err.kind()),
+        }
+        AppConfig::default()
     }
 
     /// IPC の入力値はエラー文に含めない。
@@ -2483,5 +2570,118 @@ mod tests {
         let text = serde_json::to_string(&specified_cfg).expect("serialize override paths");
         let decoded: AppConfig = serde_json::from_str(&text).expect("deserialize override paths");
         assert_eq!(decoded.youtube_overrides.paths, specified_cfg.youtube_overrides.paths);
+    }
+    fn row(platform: ChannelPlatform, identifier: &str, overrides: ChannelOverrides) -> ChannelConfig {
+        ChannelConfig {
+            platform,
+            identifier: identifier.into(),
+            enabled: true,
+            own_stream: false,
+            overrides,
+        }
+    }
+
+    fn disabled_tts() -> ChannelOverrides {
+        ChannelOverrides {
+            tts_enabled: Some(false),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn replace_channels_in_removes_all_old_rows_and_inherits_first_overrides() {
+        let mut cfg = AppConfig::default();
+        cfg.channels = vec![
+            row(ChannelPlatform::Niconico, "lv1", disabled_tts()),
+            row(ChannelPlatform::Twitch, "keep", ChannelOverrides::default()),
+            row(ChannelPlatform::Niconico, "lv2", ChannelOverrides::default()),
+        ];
+        let keys = ["niconico:lv1".to_string(), "niconico:lv2".to_string()];
+        replace_channels_in(&mut cfg, &keys, row(ChannelPlatform::Niconico, "lv3", ChannelOverrides::default()))
+            .unwrap();
+        let ids: Vec<_> = cfg.channels.iter().map(|c| c.identifier.as_str()).collect();
+        assert_eq!(ids, ["lv3", "keep"]);
+        assert_eq!(cfg.channels[0].overrides, disabled_tts());
+
+        // 1 件でも見つからなければ何も変えない。
+        let before = cfg.channels.clone();
+        let missing = ["niconico:lv3".to_string(), "niconico:gone".to_string()];
+        assert_eq!(
+            replace_channels_in(&mut cfg, &missing, row(ChannelPlatform::Niconico, "lv4", ChannelOverrides::default())),
+            Err(ChannelEditError::NotFound)
+        );
+        assert_eq!(cfg.channels, before);
+    }
+
+    #[test]
+    fn replace_channel_in_normalizes_new_overrides_before_carry_over() {
+        let mut cfg = AppConfig::default();
+        cfg.channels = vec![row(ChannelPlatform::Twitch, "old", disabled_tts())];
+        // ttsEnabled: true と空白だけの声は正規化で空になるので、旧行の上書きを引き継ぐ。
+        let new = row(
+            ChannelPlatform::Twitch,
+            "new",
+            ChannelOverrides {
+                tts_enabled: Some(true),
+                tts_voice: Some(ChannelTtsVoice {
+                    web_speech_voice: Some("  ".into()),
+                    ..Default::default()
+                }),
+            },
+        );
+        replace_channel_in(&mut cfg, "twitch:old", new).unwrap();
+        assert_eq!(cfg.channels[0].overrides, disabled_tts());
+    }
+
+    #[test]
+    fn web_speech_voice_is_capped_and_invisible_only_names_are_empty() {
+        let voice = |name: String| {
+            let mut o = ChannelOverrides {
+                tts_voice: Some(ChannelTtsVoice {
+                    web_speech_voice: Some(name),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            o.normalize();
+            o.tts_voice.and_then(|v| v.web_speech_voice)
+        };
+        for invisible in ["\u{200B}", "\u{FEFF}", " \u{2060}\u{200B} ", "\u{200D}\u{00AD}"] {
+            assert_eq!(voice(invisible.to_string()), None, "{invisible:?}");
+        }
+        let long = format!("  {}  ", "あ".repeat(MAX_WEB_SPEECH_VOICE_CHARS + 50));
+        assert_eq!(voice(long).unwrap().chars().count(), MAX_WEB_SPEECH_VOICE_CHARS);
+        assert_eq!(voice(" \u{200B}Kyoko ".into()).as_deref(), Some("\u{200B}Kyoko"));
+    }
+
+    #[test]
+    fn broken_config_is_preserved_before_default_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = AppConfig::path_in(dir.path());
+        std::fs::write(&path, b"{ broken").unwrap();
+        // 同じ ms の退避ファイルが既にあっても上書きしない。
+        let existing = dir.path().join("config.json.broken-42");
+        std::fs::write(&existing, b"older").unwrap();
+
+        assert_eq!(AppConfig::load_or_preserve_at(dir.path(), 42), AppConfig::default());
+        assert_eq!(std::fs::read(&existing).unwrap(), b"older");
+        assert_eq!(std::fs::read(dir.path().join("config.json.broken-42-1")).unwrap(), b"{ broken");
+        assert_eq!(std::fs::read(&path).unwrap(), b"{ broken");
+
+        assert_eq!(AppConfig::load_or_preserve_at(dir.path(), 43), AppConfig::default());
+        assert_eq!(std::fs::read(dir.path().join("config.json.broken-43")).unwrap(), b"{ broken");
+    }
+
+    #[test]
+    fn missing_or_valid_config_is_not_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(AppConfig::load_or_preserve_at(dir.path(), 1), AppConfig::default());
+        AppConfig::default().save(dir.path()).unwrap();
+        AppConfig::load_or_preserve_at(dir.path(), 2);
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.iter().all(|n| !n.contains(".broken-")), "{names:?}");
     }
 }

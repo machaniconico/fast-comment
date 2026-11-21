@@ -91,3 +91,11 @@ export function chipBadge(ch: ChannelConfig): string | null {
 export function applyChannelsSaved(_local: ChannelConfig[], saved: Pick<ChannelsCommit, 'channels'>): ChannelConfig[] {
   return saved.channels.map((c) => ({ ...c }));
 }
+
+/** X/ニコ生は配信ごとに URL を貼る運用なので、同じプラットフォームの前の接続をすべて置き換える(1 回の保存)。 */
+export function replacedChannelKeys(channels: ChannelConfig[], added: ChannelConfig): string[] {
+  if (added.platform !== 'x' && added.platform !== 'niconico') return [];
+  return channels
+    .filter((c) => c.platform === added.platform && c.identifier !== added.identifier)
+    .map((c) => `${c.platform}:${c.identifier}`);
+}
