@@ -171,6 +171,21 @@ async fn run_achievement_forwarder<F>(
                         if batch.len() < MAX_ACHIEVEMENTS_PER_UI_BATCH {
                             batch.push(unlock);
                         }
+                        // 既に届いている分も同じフレームに入れる。tick と受信が同時に準備できた時に、
+                        // 同時に送られた解除が 2 フレームに割れないようにする。
+                        loop {
+                            match rx.try_recv() {
+                                Ok(unlock) => {
+                                    if batch.len() < MAX_ACHIEVEMENTS_PER_UI_BATCH {
+                                        batch.push(unlock);
+                                    }
+                                }
+                                Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                                    tracing::warn!(lagged = n, "実績解除の通知を取りこぼしました");
+                                }
+                                Err(_) => break,
+                            }
+                        }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         tracing::warn!(lagged = n, "実績解除の通知を取りこぼしました");
