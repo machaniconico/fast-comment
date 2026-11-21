@@ -49,7 +49,7 @@ use uuid::Uuid;
 
 use crate::achievements::{
     engine::{AchievementEngine, AchievementUnlocked},
-    store::{AchievementDefs, CommitError, DefsStore},
+    store::{AchievementDefs, DefsStore},
 };
 use crate::autopost::{
     AutopostStatus, KeyringTokenStore, UserCommand as AutopostCommand, XEndpoints, XPostAuth,
@@ -104,6 +104,8 @@ pub struct AppState {
     twitcasting_login: OAuthLoginGate,
     listeners: Arc<listeners::ListenerStore>,
     achievement_engine: Mutex<Option<Arc<AchievementEngine>>>,
+    // 定義の保存 IPC(DefsStore::commit)は PR3 で足す。それまでは読まない。
+    #[allow(dead_code)]
     achievement_defs: DefsStore,
     achievement_unlock_tx: broadcast::Sender<AchievementUnlocked>,
     chatlog: chatlog::ChatLog,
@@ -257,7 +259,7 @@ async fn delete_listener(
     }
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        let engine = state.achievement_engine.lock().unwrap();
+        let engine = state.lock_achievement_engine();
         delete_listener_achievement_progress(
             engine.as_deref(), &state.config_dir, &platform, &author_id,
         )
@@ -280,46 +282,6 @@ fn delete_listener_achievement_progress(
     }
 }
 
-#[tauri::command]
-async fn commit_achievements(
-    app: AppHandle,
-    base_revision: u64,
-    next: AchievementDefs,
-) -> Result<u64, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let state = app.state::<AppState>();
-        // 進捗のファイル操作とエンジンの生成・定義の反映を直列化する。
-        let mut engine = state.achievement_engine.lock().unwrap();
-        if state.app_cancel.is_cancelled() {
-            return Err("実績の定義を保存できませんでした".to_owned());
-        }
-        let revision = state.achievement_defs.commit(base_revision, next).map_err(|error| {
-            match error {
-                CommitError::Stale => "実績の定義は既に変更されています",
-                CommitError::Invalid(_, _) => "実績の定義が無効です",
-                CommitError::Io | CommitError::SaveRefused => "実績の定義を保存できませんでした",
-            }
-            .to_owned()
-        })?;
-        let defs = state.achievement_defs.current();
-        let now_ms = timer_now_ms();
-        if engine.is_none() && defs.enabled {
-            *engine = Some(Arc::new(AchievementEngine::open(
-                &state.config_dir,
-                defs.clone(),
-                now_ms,
-            )));
-        }
-        // 無効化後も、削除と再有効化には同じ進捗ストアを使う。
-        if let Some(engine) = engine.as_deref() {
-            state.broadcast_achievement_unlocks(engine.set_definitions(defs, now_ms));
-        }
-        Ok(revision)
-    })
-    .await
-    .map_err(|_| "実績の定義を保存できませんでした".to_owned())?
-}
-
 /// OBS サーバの再起動に必要な実行時ハンドル。
 struct ObsServerControl {
     port: u16,
@@ -332,6 +294,13 @@ impl AppState {
         config::channel_key(ch)
     }
 
+    /// エンジンの外側のロック。パニックで毒化しても、エンジン内部と同じく中身を取り出して続ける。
+    fn lock_achievement_engine(&self) -> std::sync::MutexGuard<'_, Option<Arc<AchievementEngine>>> {
+        self.achievement_engine
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     fn broadcast_achievement_unlocks(&self, unlocks: Vec<AchievementUnlocked>) {
         for unlock in unlocks {
             let _ = self.achievement_unlock_tx.send(unlock);
@@ -342,14 +311,14 @@ impl AppState {
         &self,
         evaluate: impl FnOnce(&AchievementEngine) -> Vec<AchievementUnlocked>,
     ) {
-        let engine = self.achievement_engine.lock().unwrap();
+        let engine = self.lock_achievement_engine();
         if let Some(engine) = engine.as_deref().filter(|_| !self.app_cancel.is_cancelled()) {
             self.broadcast_achievement_unlocks(evaluate(engine));
         }
     }
 
     fn flush_achievements(&self) {
-        let engine = self.achievement_engine.lock().unwrap();
+        let engine = self.lock_achievement_engine();
         if let Some(engine) = engine.as_deref() {
             if engine.flush().is_err() {
                 tracing::error!("実績の進捗を保存できませんでした");
@@ -3716,7 +3685,6 @@ pub fn run() {
             set_listener_voice,
             list_listeners,
             delete_listener,
-            commit_achievements,
             get_config,
             take_startup_config_notice,
             get_comment_log_dir,
