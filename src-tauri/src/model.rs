@@ -22,7 +22,7 @@ pub enum Platform {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveStream {
     pub platform: Platform,
-    /// 設定の ChannelConfig.identifier をそのまま(印の照合キー)
+    /// 設定の ChannelConfig.identifier をそのまま(印の照合キー)。ツイキャスだけは抽出した screen_id の小文字
     pub channel_identifier: String,
     /// 配信 1 回を一意に表す ID: YouTube=videoId / Twitch=Helix stream id / ニコ生=lv 番組 ID
     pub stream_id: String,

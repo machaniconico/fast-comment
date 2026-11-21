@@ -42,6 +42,7 @@ const mock = window.mock = {
   revision: 0,
   rejected: 0,
   writes: [],
+  baseRevisions: [],
   reads: 0,
   status: {
     twitcasting: { clientId: 'saved-tc', configured: true, state: 'loggedOut' },
@@ -129,6 +130,7 @@ if (location.search === '?browser') {
             }
           }
           mock.writes.push(next);
+          mock.baseRevisions.push(args.baseRevision ?? null);
           mock.saved = next;
           const outcome = { warnings: [], protectedOAuth, revision: ++mock.revision, config: structuredClone(next) };
           if (mock.holdUpdates) await new Promise(resolve => mock.heldUpdates.push(resolve));

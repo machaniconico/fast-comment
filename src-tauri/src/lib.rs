@@ -139,6 +139,7 @@ pub struct AppState {
     /// Twitchモデレーション用OAuth状態。access tokenはメモリのみ。
     twitch_auth: Arc<TwitchAuth>,
     twitcasting_auth: Arc<TwitcastingAuth<integrations::KeyringSecretStore>>,
+    twitcasting_api: Arc<sources::twitcasting_api::TwitcastingApi<integrations::KeyringSecretStore>>,
 }
 
 #[tauri::command]
@@ -1412,7 +1413,9 @@ async fn update_config(
     }
 
     // チャンネル差分適用(コミット済み設定を参照する)。
-    apply_channel_diff(&app, &state, &new_config.channels);
+    apply_channel_diff(&state.config, &state.channels, |cfg, ch| {
+        spawn_one_channel(&state, cfg, ch)
+    });
 
     // 棒読みちゃん自動起動: 設定保存時にも(起動時だけでなく)未起動なら立ち上げる。
     // パスを設定した直後に効くようにする。ensure_launched 側で TCP 接続を確認し、
@@ -1596,39 +1599,54 @@ async fn set_moderation(
 /// チャンネルを1件追加して起動する。
 #[tauri::command]
 fn add_channel(
-    app: AppHandle,
     state: State<'_, AppState>,
     channel: ChannelConfig,
 ) -> Result<ConfigCommit<ChannelsSaved>, String> {
-    let commit = {
-        let mut cfg = state.config.lock().unwrap();
-        // 既存の同一キーがあれば重複追加しない。
+    let mut cfg = state.config.lock().unwrap();
+    ensure_new_channel(&cfg, &channel)?;
+    let mut next = cfg.clone();
+    next.channels.push(channel.clone());
+    let revision = state.commit_config(&mut cfg, next).map_err(|e| e.to_string())?;
+    if channel.enabled {
+        let token = spawn_one_channel(&state, &cfg, &channel);
         let key = AppState::channel_key(&channel);
-        if cfg.channels.iter().any(|c| AppState::channel_key(c) == key) {
-            return Err(format!("チャンネルは既に存在します: {key}"));
+        if let Some(old) = state.channels.lock().unwrap().insert(key, token) {
+            old.cancel();
         }
-        let mut next = cfg.clone();
-        next.channels.push(channel.clone());
-        let revision = state.commit_config(&mut cfg, next).map_err(|e| e.to_string())?;
-        channels_commit(&cfg, revision)
-    };
+    }
+    Ok(channels_commit(&cfg, revision))
+}
 
-    spawn_one_channel(&app, &state, &channel);
-    Ok(commit)
+/// 既存の同一キーがあれば重複追加しない。キーは URL やトークンでありうるのでエラー文に入れない。
+fn ensure_new_channel(cfg: &AppConfig, channel: &ChannelConfig) -> Result<(), String> {
+    let key = duplicate_key(channel);
+    if cfg.channels.iter().any(|c| duplicate_key(c) == key) {
+        return Err("チャンネルは既に存在します".into());
+    }
+    Ok(())
+}
+
+/// 重複判定のキー。ツイキャスは URL・大小文字違いでも同じ配信者なので screen id に寄せる
+/// (別行にすると共有のレート枠を二重に使う)。抽出できなければ生の識別子のまま。
+fn duplicate_key(ch: &ChannelConfig) -> String {
+    if ch.platform == config::ChannelPlatform::Twitcasting {
+        if let Some(id) = sources::twitcasting::extract_screen_id(&ch.identifier) {
+            return format!("twitcasting:{}", id.to_lowercase());
+        }
+    }
+    AppState::channel_key(ch)
 }
 
 /// チャンネルを1件削除して停止する。`key` は `twitch:name` / `youtube:videoId`。
 #[tauri::command]
 fn remove_channel(state: State<'_, AppState>, key: String) -> Result<ConfigCommit<ChannelsSaved>, String> {
-    // 起動中タスクを停止。
-    if let Some(token) = state.channels.lock().unwrap().remove(&key) {
-        token.cancel();
-    }
-    // 設定から除去して保存。
     let mut cfg = state.config.lock().unwrap();
     let mut next = cfg.clone();
     next.channels.retain(|c| AppState::channel_key(c) != key);
     let revision = state.commit_config(&mut cfg, next).map_err(|e| e.to_string())?;
+    if let Some(token) = state.channels.lock().unwrap().remove(&key) {
+        token.cancel();
+    }
     Ok(channels_commit(&cfg, revision))
 }
 
@@ -1660,7 +1678,7 @@ fn set_own_stream_in(cfg: &mut AppConfig, key: &str, own: bool) -> Result<(), St
         .channels
         .iter_mut()
         .find(|c| AppState::channel_key(c) == key)
-        .ok_or_else(|| format!("チャンネルが見つかりません: {key}"))?;
+        .ok_or_else(|| "チャンネルが見つかりません".to_string())?;
     row.own_stream = own;
     Ok(())
 }
@@ -2778,47 +2796,47 @@ fn restart_obs_server_if_needed(
     Ok(())
 }
 
-/// 新しい設定のチャンネル一覧と現在の起動状態を突き合わせ、追加/削除を適用する。
-fn apply_channel_diff(app: &AppHandle, state: &AppState, desired: &[ChannelConfig]) {
-    let desired_keys: std::collections::HashSet<String> = desired
+/// 最新の設定と起動状態を突き合わせる。追加・削除と同じ順でロックする。
+fn apply_channel_diff(
+    config: &Mutex<AppConfig>,
+    channels: &Mutex<HashMap<String, CancellationToken>>,
+    mut spawn: impl FnMut(&AppConfig, &ChannelConfig) -> CancellationToken,
+) {
+    let config = config.lock().unwrap();
+    let desired_keys: std::collections::HashSet<String> = config
+        .channels
         .iter()
         .filter(|c| c.enabled)
         .map(AppState::channel_key)
         .collect();
 
-    // 不要になったチャンネルを停止。
-    {
-        let mut chans = state.channels.lock().unwrap();
-        let to_remove: Vec<String> = chans
-            .keys()
-            .filter(|k| !desired_keys.contains(*k))
-            .cloned()
-            .collect();
-        for k in to_remove {
-            if let Some(token) = chans.remove(&k) {
-                token.cancel();
-            }
+    let mut active = channels.lock().unwrap();
+    active.retain(|key, token| {
+        let keep = desired_keys.contains(key);
+        if !keep {
+            token.cancel();
         }
-    }
-
-    // 新規チャンネルを起動。
-    for ch in desired.iter().filter(|c| c.enabled) {
-        let key = AppState::channel_key(ch);
-        let already = state.channels.lock().unwrap().contains_key(&key);
-        if !already {
-            spawn_one_channel(app, state, ch);
-        }
+        keep
+    });
+    for ch in config.channels.iter().filter(|c| c.enabled) {
+        active
+            .entry(AppState::channel_key(ch))
+            .or_insert_with(|| spawn(&config, ch));
     }
 }
 
-/// 1チャンネル分の Source を起動し、停止トークンを state に登録する。
-fn spawn_one_channel(_app: &AppHandle, state: &AppState, ch: &ChannelConfig) {
-    if !ch.enabled {
-        return;
-    }
-    let key = AppState::channel_key(ch);
-    let (overrides, youtube_api_key, x_overrides, x_auth, niconico_overrides, twitcasting_overrides, twitch_viewer_auth) = {
-        let config = state.config.lock().unwrap();
+/// 有効なチャンネルの Source を起動し、停止トークンを返す。
+fn spawn_one_channel(state: &AppState, config: &AppConfig, ch: &ChannelConfig) -> CancellationToken {
+    let (
+        overrides,
+        youtube_api_key,
+        x_overrides,
+        x_auth,
+        niconico_overrides,
+        twitcasting_overrides,
+        twitcasting_mode,
+        twitch_viewer_auth,
+    ) = {
         // X の名前解決 cookie は auth_token / ct0 の両方が揃って初めて有効。
         let x_auth = {
             let token = config.credentials.x_auth_token.trim();
@@ -2844,6 +2862,7 @@ fn spawn_one_channel(_app: &AppHandle, state: &AppState, ch: &ChannelConfig) {
             x_auth,
             config.niconico_overrides.clone(),
             config.twitcasting_overrides.clone(),
+            config.twitcasting.mode,
             twitch_viewer_auth,
         )
     };
@@ -2876,16 +2895,15 @@ fn spawn_one_channel(_app: &AppHandle, state: &AppState, ch: &ChannelConfig) {
             Some(state.reaction_tx.clone()),
             Some(state.mod_tx.clone()),
         )
+        .with_twitcasting(state.twitcasting_api.clone(), state.twitcasting_auth.subscribe())
+        .with_twitcasting_mode(twitcasting_mode)
         .with_twitcasting_started_movies(state.twitcasting_started_movies.clone())
         .with_live_tx(Some(state.live_tx.clone()));
         manager.spawn_channel(ch)
     };
     let app_cancel = state.app_cancel.clone();
     let token_for_app_cancel = token.clone();
-    tauri::async_runtime::spawn(async move {
-        app_cancel.cancelled().await;
-        token_for_app_cancel.cancel();
-    });
+    tauri::async_runtime::spawn(relay_channel_cancel(app_cancel, token_for_app_cancel));
     if ch.platform == ChannelPlatform::Youtube
         && !sources::youtube::is_channel_identifier(&ch.identifier)
     {
@@ -2907,10 +2925,13 @@ fn spawn_one_channel(_app: &AppHandle, state: &AppState, ch: &ChannelConfig) {
             token.clone(),
         );
     }
-    let mut map = state.channels.lock().unwrap();
-    // 同一キーの旧タスクが残っていれば確実にキャンセルしてからリーク無く差し替える(#18)。
-    if let Some(old) = map.insert(key, token) {
-        old.cancel();
+    token
+}
+
+async fn relay_channel_cancel(app: CancellationToken, channel: CancellationToken) {
+    tokio::select! {
+        _ = app.cancelled() => channel.cancel(),
+        _ = channel.cancelled() => {}
     }
 }
 
@@ -3151,6 +3172,15 @@ pub fn run() {
             );
             let twitcasting_client_id =
                 effective_client_id(config.credentials.twitcasting_client_id.as_deref());
+            let twitcasting_config_rx = config_tx.subscribe();
+            let twitcasting_api = sources::twitcasting_api::TwitcastingApi::new(
+                twitcasting_auth.clone(),
+                sources::twitcasting_api::official_endpoints(&config),
+                Arc::new(move || {
+                    let config = twitcasting_config_rx.borrow();
+                    effective_client_id(config.credentials.twitcasting_client_id.as_deref())
+                }),
+            );
 
             // 下流 Bus(パイプライン → UI/OBS)。
             let bus = Bus::new(obs_port, stats_tx.clone(), timer_tx.clone());
@@ -3239,6 +3269,7 @@ pub fn run() {
                         twitcasting_login: OAuthLoginGate::default(),
                         x_post_auth: x_post_auth.clone(),
                         twitcasting_auth: twitcasting_auth.clone(),
+                        twitcasting_api,
                         participants: Mutex::new(Vec::new()),
                         youtube_auth: YoutubeAuth::new()
                             .expect("YouTube投稿用HTTPクライアントの作成に失敗しました"),
@@ -3339,9 +3370,9 @@ pub fn run() {
             // 設定済みチャンネルを起動。
             {
                 let st = handle.state::<AppState>();
-                for ch in config.channels.iter().filter(|c| c.enabled) {
-                    spawn_one_channel(&handle, &st, ch);
-                }
+                apply_channel_diff(&st.config, &st.channels, |cfg, ch| {
+                    spawn_one_channel(&st, cfg, ch)
+                });
             }
 
             Ok(())
@@ -3757,6 +3788,79 @@ mod followup_tests {
     }
 
     #[test]
+    fn twitcasting_duplicates_are_detected_by_screen_id() {
+        let tc = |id: &str| -> ChannelConfig {
+            serde_json::from_value(serde_json::json!({"platform": "twitcasting", "identifier": id}))
+                .unwrap()
+        };
+        let mut cfg = AppConfig::default();
+        cfg.channels.push(tc("alice"));
+        for dup in ["https://twitcasting.tv/alice", "ALICE", "https://twitcasting.tv/Alice/movie/1"] {
+            assert_eq!(
+                ensure_new_channel(&cfg, &tc(dup)).unwrap_err(),
+                "チャンネルは既に存在します",
+                "{dup}"
+            );
+        }
+        assert_eq!(ensure_new_channel(&cfg, &tc("bob")), Ok(()));
+        // 他のプラットフォームは従来どおり生の識別子で比べる。
+        let mut twitch = tc("alice");
+        twitch.platform = config::ChannelPlatform::Twitch;
+        assert_eq!(ensure_new_channel(&cfg, &twitch), Ok(()));
+    }
+
+    #[test]
+    fn channel_errors_do_not_include_the_identifier() {
+        let mut cfg = AppConfig::default();
+        let channel: ChannelConfig = serde_json::from_value(serde_json::json!({
+            "platform": "twitcasting",
+            "identifier": "https://invalid.example/?token=MARKER",
+        }))
+        .unwrap();
+        assert_eq!(ensure_new_channel(&cfg, &channel), Ok(()));
+        cfg.channels.push(channel.clone());
+        let duplicate = ensure_new_channel(&cfg, &channel).unwrap_err();
+        assert_eq!(duplicate, "チャンネルは既に存在します");
+        let missing =
+            set_own_stream_in(&mut cfg, "twitcasting:https://other.example/?token=MARKER", true)
+                .unwrap_err();
+        assert_eq!(missing, "チャンネルが見つかりません");
+        for text in [duplicate, missing] {
+            assert!(!text.contains("MARKER") && !text.contains("example"), "{text}");
+        }
+    }
+
+    #[test]
+    fn twitcasting_login_protection_does_not_revert_mode() {
+        let mut current = AppConfig::default();
+        current.credentials.twitcasting_client_id = Some("current-tc".into());
+        current.twitcasting.callback_port = 41322;
+        let mut incoming = current.clone();
+        incoming.credentials.twitcasting_client_id = Some("backup-tc".into());
+        incoming.twitcasting.callback_port = 42322;
+        incoming.twitcasting.mode = config::TwitcastingMode::Official;
+
+        let protected = protect_oauth_config(&current, &mut incoming, |service| {
+            service == OAuthService::Twitcasting
+        });
+
+        assert_eq!(protected, [OAuthService::Twitcasting]);
+        assert_eq!(
+            incoming.credentials.twitcasting_client_id.as_deref(),
+            Some("current-tc")
+        );
+        assert_eq!(incoming.twitcasting.callback_port, 41322);
+        assert_eq!(incoming.twitcasting.mode, config::TwitcastingMode::Official);
+
+        // mode だけの変更は保護の対象にならず、そのまま通る。
+        let mut incoming = current.clone();
+        incoming.twitcasting.mode = config::TwitcastingMode::Unofficial;
+        let protected = protect_oauth_config(&current, &mut incoming, |_| true);
+        assert!(protected.is_empty());
+        assert_eq!(incoming.twitcasting.mode, config::TwitcastingMode::Unofficial);
+    }
+
+    #[test]
     fn oauth_review_connect_callback_port_errors_omit_the_json_value() {
         const PUBLIC_ERROR: &str = "待受ポートは 1024〜65535 の整数にしてください";
         for value in [
@@ -4010,6 +4114,72 @@ mod followup_tests {
         let dir = tempfile::tempdir().unwrap();
         let (tx, _rx) = watch::channel(AppConfig::default());
         (dir, AtomicU64::new(0), tx, AppConfig::default())
+    }
+
+    #[tokio::test]
+    async fn channel_deleted_after_config_save_is_not_restarted_by_diff() {
+        let (dir, revision, tx, initial) = commit_parts();
+        let config = Mutex::new(initial);
+        let active = Mutex::new(HashMap::new());
+        let (saved, wait_for_save) = tokio::sync::oneshot::channel();
+        let (deleted, wait_for_delete) = tokio::sync::oneshot::channel();
+        let save_and_reconcile = async {
+            {
+                let mut current = config.lock().unwrap();
+                let mut next = current.clone();
+                next.channels = ["alice", "bob"]
+                    .into_iter()
+                    .map(|identifier| ChannelConfig {
+                        platform: ChannelPlatform::Twitcasting,
+                        identifier: identifier.into(),
+                        enabled: true,
+                        own_stream: false,
+                    })
+                    .collect();
+                commit_config(dir.path(), &revision, &tx, &mut current, next, Some(0)).unwrap();
+            }
+            saved.send(()).unwrap();
+            wait_for_delete.await.unwrap();
+            apply_channel_diff(&config, &active, |_, ch| {
+                assert_eq!(ch.identifier, "bob");
+                CancellationToken::new()
+            });
+        };
+        let delete = async {
+            wait_for_save.await.unwrap();
+            let mut current = config.lock().unwrap();
+            let mut next = current.clone();
+            next.channels.retain(|ch| ch.identifier != "alice");
+            commit_config(dir.path(), &revision, &tx, &mut current, next, None).unwrap();
+            deleted.send(()).unwrap();
+        };
+        tokio::join!(save_and_reconcile, delete);
+
+        let active = active.lock().unwrap();
+        assert!(!active.contains_key("twitcasting:alice"));
+        assert!(active.contains_key("twitcasting:bob"));
+    }
+
+    #[tokio::test]
+    async fn channel_cancel_relay_exits_on_channel_stop_and_propagates_app_stop() {
+        let app = CancellationToken::new();
+        let channel = CancellationToken::new();
+        let relay = tokio::spawn(relay_channel_cancel(app.clone(), channel.clone()));
+        channel.cancel();
+        tokio::time::timeout(Duration::from_secs(1), relay)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!app.is_cancelled());
+
+        let channel = CancellationToken::new();
+        let relay = tokio::spawn(relay_channel_cancel(app.clone(), channel.clone()));
+        app.cancel();
+        tokio::time::timeout(Duration::from_secs(1), relay)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(channel.is_cancelled());
     }
 
     #[test]

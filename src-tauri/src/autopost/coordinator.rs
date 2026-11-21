@@ -654,7 +654,16 @@ fn eligible(settings: &AutopostSettings, stream: &LiveStream) -> bool {
         row.enabled
             && row.own_stream
             && platform == stream.platform
-            && row.identifier == stream.channel_identifier
+            && match platform {
+                // ツイキャスの LiveEvent は抽出済みの screen_id(小文字)を運ぶ。保存値は URL や大文字を含みうる。
+                Platform::Twitcasting => {
+                    crate::sources::twitcasting::extract_screen_id(&row.identifier)
+                        .map(|id| id.to_ascii_lowercase())
+                        .as_deref()
+                        == Some(stream.channel_identifier.as_str())
+                }
+                _ => row.identifier == stream.channel_identifier,
+            }
             && match platform {
                 Platform::X => false,
                 Platform::Youtube => youtube_channel(&row.identifier),
@@ -1515,5 +1524,27 @@ mod tests {
         let mut c = Coordinator::new(Ledger::default(), s);
         let actions = started(&mut c, st, NOW + 1000);
         assert!(!actions.is_empty());
+    }
+
+    #[test]
+    fn twitcasting_saved_url_or_uppercase_matches_normalized_event_id() {
+        for saved in ["https://twitcasting.tv/Mine#access_token=X", "MINE", "twitcasting.tv/mine/movie/1"] {
+            let mut s = settings("intent");
+            s.channels.push(ChannelConfig {
+                platform: ChannelPlatform::Twitcasting,
+                identifier: saved.into(),
+                enabled: true,
+                own_stream: true,
+            });
+            assert!(eligible(&s, &stream(Platform::Twitcasting, "1")), "{saved}");
+        }
+        let mut s = settings("intent");
+        s.channels.push(ChannelConfig {
+            platform: ChannelPlatform::Twitcasting,
+            identifier: "other".into(),
+            enabled: true,
+            own_stream: true,
+        });
+        assert!(!eligible(&s, &stream(Platform::Twitcasting, "1")));
     }
 }

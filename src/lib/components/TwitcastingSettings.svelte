@@ -1,22 +1,24 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { getTwitcastingStatus, reloadTwitcastingStatus, connectTwitcasting, cancelTwitcastingLogin, disconnectTwitcasting, newOAuthAttempt, type ConfigSavedHandler, type OAuthClientSaved } from '../ipc';
-  import type { TwitcastingStatus } from '../types';
+  import type { TwitcastingMode, TwitcastingStatus } from '../types';
   import { errorText } from '../xAutopost';
   import { DEFAULT_TWITCASTING_CALLBACK_PORT, twitcastingDisplayCallbackUrl } from '../twitcasting';
   import { createCallbackPortInput } from '../callbackPortInput.svelte';
 
   let {
-    clientId = '', callbackPort = DEFAULT_TWITCASTING_CALLBACK_PORT, configRevision,
-    saving, allFieldsLocked, configReloading, onCallbackPortChange, onConnectingChange, onConnectionSettled, onConfigSaved,
+    clientId = '', callbackPort = DEFAULT_TWITCASTING_CALLBACK_PORT, mode = 'auto', configRevision,
+    saving, allFieldsLocked, configReloading, onCallbackPortChange, onModeChange, onConnectingChange, onConnectionSettled, onConfigSaved,
   }: {
     clientId?: string;
     callbackPort?: number;
+    mode?: TwitcastingMode;
     configRevision: number;
     saving: boolean;
     allFieldsLocked: boolean;
     configReloading: boolean;
     onCallbackPortChange: (port: number | null) => void;
+    onModeChange: (mode: TwitcastingMode) => void;
     onConnectingChange: (connecting: boolean) => void;
     onConnectionSettled: () => Promise<void>;
     /** 接続コマンドが ClientID と待受ポートを保存した。 */
@@ -236,6 +238,15 @@
     {/if}
   </div>
   <div aria-live="polite">{#if message && (successClientId === null || successClientId === clientId.trim())}<p class:warn={failed}>{message}</p>{/if}</div>
+  <div class="field-row">
+    <label for="twitcasting-mode">取得経路</label>
+    <select id="twitcasting-mode" value={mode} onchange={(e) => onModeChange(e.currentTarget.value as TwitcastingMode)} disabled={fieldsLocked}>
+      <option value="auto">自動(既定)</option>
+      <option value="unofficial">非公式のみ</option>
+      <option value="official">公式 API のみ</option>
+    </select>
+  </div>
+  <p>自動: 非公式で取得し、読めない時はログイン済みなら公式 API へ切り替えます。非公式のみ: ログインを使いません。公式 API のみ: 要ログイン。変更は「設定を保存」後、そのチャンネルの次回の接続(再起動・チャンネル再追加)から反映されます。</p>
   <details>
     <summary>詳細: 自分の ClientID を使う</summary>
     <div class="field-row">

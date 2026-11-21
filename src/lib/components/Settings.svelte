@@ -2089,6 +2089,7 @@
     <TwitcastingSettings
       clientId={config.credentials?.twitcastingClientId ?? ''}
       callbackPort={config.twitcasting?.callbackPort ?? DEFAULT_TWITCASTING_CALLBACK_PORT}
+      mode={config.twitcasting?.mode ?? 'auto'}
       configRevision={oauthConfigRevision.twitcasting}
       {saving}
       {allFieldsLocked}
@@ -2096,6 +2097,9 @@
       onConnectingChange={(connecting) => onOAuthConnectingChange('twitcasting', connecting)}
       onConnectionSettled={async () => { await reloadConfig(['twitcasting']); }}
       onConfigSaved={(commit, late) => onOAuthConfigSaved('twitcasting', commit, late)}
+      onModeChange={(mode) => {
+        if (config) config.twitcasting = { callbackPort: DEFAULT_TWITCASTING_CALLBACK_PORT, ...config.twitcasting, mode };
+      }}
       onCallbackPortChange={(port) => {
         twitcastingPortInvalid = port === null;
         if (config && port !== null) config.twitcasting = { ...(config.twitcasting ?? {}), callbackPort: port };
