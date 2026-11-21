@@ -281,21 +281,30 @@ fn try_enqueue_tts_message(
         return;
     }
     // 設定ロックを持ったまま投入する。枠の読み上げ OFF の保存(キューから除く)と順序を揃えるため。
-    let config = config.lock().unwrap();
-    let overrides = tts::origin_overrides(&config, &msg);
-    if !tts::overrides_allow_tts(overrides) {
-        return;
-    }
-    msg.route.channel_tts_voice = overrides.and_then(|o| o.tts_voice.clone());
-    let max_pending = config.tts.options.queue.max_pending as usize;
-    queue.enqueue(sink, msg, max_pending);
+    // UI への通知はロックを放してから出す。
+    let result = {
+        let config = config.lock().unwrap();
+        let overrides = tts::origin_overrides(&config, &msg);
+        if !tts::overrides_allow_tts(overrides) {
+            return;
+        }
+        msg.route.channel_tts_voice = overrides.and_then(|o| o.tts_voice.clone());
+        let max_pending = config.tts.options.queue.max_pending as usize;
+        queue.enqueue_silent(msg, max_pending)
+    };
+    queue.after_enqueue(sink, &result);
 }
 
-/// 枠の読み上げを OFF にしたら、その枠の未読み上げコメントを捨てる。設定ロック中に呼ぶ。
-fn drop_disabled_channel_tts(sink: &dyn tts::TtsSink, cfg: &AppConfig, queue: &TtsShared, key: &str) {
-    if !tts::overrides_allow_tts(cfg.channel_overrides(key)) {
-        queue.remove_channel(sink, key);
-    }
+/// 読み上げ OFF の枠の未読み上げコメントを捨てる。設定ロック中(保存の直後)に呼び、
+/// true が返ったらロックを放してから `emit_queue_state` する。
+fn purge_disabled_channel_tts(cfg: &AppConfig, queue: &TtsShared) -> bool {
+    let keys: Vec<String> = cfg
+        .channels
+        .iter()
+        .filter(|ch| !tts::overrides_allow_tts(Some(&ch.overrides)))
+        .map(config::channel_key)
+        .collect();
+    queue.remove_channels(&keys) > 0
 }
 
 fn emit_bouyomi_launch_notice(app: &AppHandle, outcome: bouyomi::LaunchOutcome) {
@@ -1363,6 +1372,7 @@ async fn update_config(
         youtube_oauth_client_changed,
         x_source_config_changed,
         twitch_viewer_auth_changed,
+        tts_purged,
     ) = {
         let mut current = state.config.lock().unwrap();
         let changes = (
@@ -1396,8 +1406,12 @@ async fn update_config(
             base_revision,
         )
         .map_err(|e| e.to_string())?;
-        (revision, changes.0, changes.1, changes.2, changes.3)
+        let purged = purge_disabled_channel_tts(&current, &state.tts);
+        (revision, changes.0, changes.1, changes.2, changes.3, purged)
     };
+    if tts_purged {
+        state.tts.emit_queue_state(&app);
+    }
 
     // moderation 反映。
     state
@@ -1701,7 +1715,16 @@ fn parse_replaces(value: Option<serde_json::Value>) -> Result<Vec<String>, Strin
     match value {
         None | Some(serde_json::Value::Null) => Ok(Vec::new()),
         Some(serde_json::Value::String(key)) => Ok(vec![key]),
-        Some(value) => from_ipc_value(value, "置き換え対象"),
+        Some(value) => {
+            let keys: Vec<String> = from_ipc_value(value, "置き換え対象")?;
+            let mut unique = Vec::with_capacity(keys.len());
+            for key in keys {
+                if !unique.contains(&key) {
+                    unique.push(key);
+                }
+            }
+            Ok(unique)
+        }
     }
 }
 
@@ -1764,25 +1787,32 @@ fn set_channel_own_stream(
 async fn set_channel_overrides(
     app: AppHandle,
     state: State<'_, AppState>,
-    key: String,
+    key: serde_json::Value,
     overrides: serde_json::Value,
-    base_revision: u64,
+    base_revision: serde_json::Value,
 ) -> Result<ConfigCommit<ChannelsSaved>, String> {
+    let key: String = from_ipc_value(key, "枠のキー")?;
     let overrides: ChannelOverrides = from_ipc_value(overrides, "上書き設定")?;
+    let base_revision: u64 = from_ipc_value(base_revision, "基準 revision")?;
     let _write = state.config_write.lock().await;
-    let mut cfg = state.config.lock().unwrap();
-    let revision = commit_channel_overrides(
-        &state.config_dir,
-        &state.config_revision,
-        &state.config_tx,
-        &mut cfg,
-        &key,
-        overrides,
-        base_revision,
-    )
-    .map_err(|e| e.to_string())?;
-    drop_disabled_channel_tts(&app, &cfg, &state.tts, &key);
-    Ok(channels_commit(&cfg, revision))
+    let (commit, purged) = {
+        let mut cfg = state.config.lock().unwrap();
+        let revision = commit_channel_overrides(
+            &state.config_dir,
+            &state.config_revision,
+            &state.config_tx,
+            &mut cfg,
+            &key,
+            overrides,
+            base_revision,
+        )
+        .map_err(|e| e.to_string())?;
+        (channels_commit(&cfg, revision), purge_disabled_channel_tts(&cfg, &state.tts))
+    };
+    if purged {
+        state.tts.emit_queue_state(&app);
+    }
+    Ok(commit)
 }
 
 #[derive(Clone, Serialize)]
@@ -3258,7 +3288,8 @@ pub fn run() {
                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
             // 設定ロード(失敗時は壊れたファイルを退避して既定値で続行)。
-            let config = AppConfig::load_or_preserve(&config_dir);
+            // 退避できなかった時は config.json への保存を止め、保存操作は固定文のエラーで利用者に伝わる。
+            let (config, _saves_blocked) = AppConfig::load_or_preserve(&config_dir);
 
             let obs_port = config.obs.port;
 
@@ -4698,7 +4729,7 @@ mod followup_tests {
                 ..Default::default()
             };
             commit_channel_overrides(dir.path(), &revision, &tx, &mut cfg, "twitch:off", off, 0).unwrap();
-            drop_disabled_channel_tts(&NullSink, &cfg, &queue, "twitch:off");
+            assert!(purge_disabled_channel_tts(&cfg, &queue));
         }
         try_enqueue_tts_message(&NullSink, &config, &queue, tts_message("late", Some("twitch:off")));
 
@@ -4708,6 +4739,116 @@ mod followup_tests {
             spoken.push(popped.job.msg.id.clone());
         }
         assert_eq!(spoken, ["on"]);
+    }
+
+    #[test]
+    fn full_config_save_turning_channel_off_purges_its_queue() {
+        let (dir, revision, tx, mut current) = commit_parts();
+        current.channels.push(ChannelConfig {
+            platform: ChannelPlatform::Twitch,
+            identifier: "full".into(),
+            enabled: true,
+            own_stream: false,
+            overrides: ChannelOverrides::default(),
+        });
+        let config = Mutex::new(current);
+        let queue = TtsShared::default();
+        try_enqueue_tts_message(&NullSink, &config, &queue, tts_message("q", Some("twitch:full")));
+        assert_eq!(queue.snapshot().depth, 1);
+
+        // update_config と同じく、画面の全体設定 JSON を解析して保存し、同じロック内で捨てる。
+        let mut json = serde_json::to_value(&*config.lock().unwrap()).unwrap();
+        json["channels"][0]["overrides"] = serde_json::json!({ "ttsEnabled": false });
+        let mut next = AppConfig::from_config_update(json).unwrap();
+        next.normalize_all();
+        let mut cfg = config.lock().unwrap();
+        commit_config(dir.path(), &revision, &tx, &mut cfg, next, Some(0)).unwrap();
+        assert!(purge_disabled_channel_tts(&cfg, &queue));
+        drop(cfg);
+        assert_eq!(queue.snapshot().depth, 0);
+    }
+
+    #[test]
+    fn tts_queue_state_is_emitted_after_config_lock_is_released() {
+        struct LockProbe<'a> {
+            config: &'a Mutex<AppConfig>,
+            locked: Mutex<Vec<bool>>,
+        }
+        impl tts::TtsSink for LockProbe<'_> {
+            fn audio(&self, _: String) {}
+            fn web_speech(&self, _: tts::WebSpeechPayload) {}
+            fn cancel(&self) {}
+            fn notice(&self, _: &'static str, _: String) {}
+            fn queue_state(&self, _: TtsQueueStatePayload) {
+                self.locked.lock().unwrap().push(self.config.try_lock().is_ok());
+            }
+        }
+        let mut cfg = AppConfig::default();
+        cfg.channels.push(ChannelConfig {
+            platform: ChannelPlatform::Twitch,
+            identifier: "probe".into(),
+            enabled: true,
+            own_stream: false,
+            overrides: ChannelOverrides::default(),
+        });
+        let config = Mutex::new(cfg);
+        let sink = LockProbe { config: &config, locked: Mutex::new(Vec::new()) };
+        let queue = TtsShared::default();
+        try_enqueue_tts_message(&sink, &config, &queue, tts_message("a", Some("twitch:probe")));
+        let purged = {
+            let mut cfg = config.lock().unwrap();
+            cfg.channels[0].overrides.tts_enabled = Some(false);
+            purge_disabled_channel_tts(&cfg, &queue)
+        };
+        assert!(purged);
+        queue.emit_queue_state(&sink);
+        assert_eq!(*sink.locked.lock().unwrap(), [true, true]);
+    }
+
+    #[test]
+    fn replaces_dedupes_keys_and_replaces_every_row_sharing_a_key() {
+        let (dir, revision, tx, mut current) = commit_parts();
+        let row = |identifier: &str| ChannelConfig {
+            platform: ChannelPlatform::X,
+            identifier: identifier.into(),
+            enabled: true,
+            own_stream: false,
+            overrides: ChannelOverrides::default(),
+        };
+        current.channels = vec![row("a"), row("a")];
+        let keep = CancellationToken::new();
+        let old = CancellationToken::new();
+        let active = Mutex::new(HashMap::from([
+            ("x:a".to_string(), old.clone()),
+            ("x:other".to_string(), keep.clone()),
+        ]));
+        let replaces = parse_replaces(Some(serde_json::json!(["x:a", "x:a"]))).unwrap();
+        assert_eq!(replaces, ["x:a"]);
+        add_channel_and_commit(
+            &mut current,
+            &active,
+            row("b"),
+            &replaces,
+            |cfg, next| commit_config(dir.path(), &revision, &tx, cfg, next, None),
+            |_, _| CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(current.channels, vec![row("b")]);
+        assert!(old.is_cancelled());
+        assert!(!keep.is_cancelled());
+        let mut keys: Vec<_> = active.lock().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, ["x:b", "x:other"]);
+    }
+
+    #[test]
+    fn set_channel_overrides_scalar_args_hide_values_in_errors() {
+        for value in [serde_json::json!("SECRET_REV_MARK"), serde_json::json!(-1), serde_json::json!(1.5)] {
+            let err = from_ipc_value::<u64>(value, "基準 revision").unwrap_err();
+            assert_eq!(err, "基準 revisionの形式が不正です (項目 .)");
+        }
+        let err = from_ipc_value::<String>(serde_json::json!(123456789), "枠のキー").unwrap_err();
+        assert!(!err.contains("123456789"), "{err}");
     }
 
     #[test]
