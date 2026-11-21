@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>fast-comment Trophy</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <svg class="tier-symbols" aria-hidden="true" focusable="false">
+      <symbol id="tier-bronze" viewBox="0 0 48 48">
+        <path d="M17 5h6l3 11h-6z" opacity=".85" />
+        <path d="M31 5h-6l-3 11h6z" opacity=".55" />
+        <circle cx="24" cy="30" r="11" />
+        <path d="M24 23l2.1 4.3 4.7.7-3.4 3.3.8 4.7-4.2-2.2-4.2 2.2.8-4.7-3.4-3.3 4.7-.7z" fill="rgba(0,0,0,.3)" />
+      </symbol>
+      <symbol id="tier-silver" viewBox="0 0 48 48">
+        <path d="M17 5h6l3 11h-6z" opacity=".7" />
+        <path d="M31 5h-6l-3 11h6z" opacity=".45" />
+        <circle cx="24" cy="30" r="11" fill="none" stroke="currentColor" stroke-width="4" />
+        <path d="M24 21l2.8 5.6 6.2.9-4.5 4.4 1.1 6.1-5.6-2.9-5.6 2.9 1.1-6.1-4.5-4.4 6.2-.9z" />
+      </symbol>
+      <symbol id="tier-gold" viewBox="0 0 48 48">
+        <path d="M14 8h20v5c0 7-4.5 12-10 12S14 20 14 13z" />
+        <path d="M14 10H8v3c0 4.5 3.5 6.5 7 6.5M34 10h6v3c0 4.5-3.5 6.5-7 6.5" fill="none" stroke="currentColor" stroke-width="3" />
+        <path d="M21 25h6v8h-6z" />
+        <path d="M15 37h18v4H15z" />
+      </symbol>
+      <symbol id="tier-platinum" viewBox="0 0 48 48">
+        <path d="M8 37L12 15l9 8 3-12 3 12 9-8 4 22z" />
+        <path d="M10 40h28v4H10z" />
+        <path d="M20 30l4-3 4 3-4 3z" fill="rgba(0,0,0,.32)" />
+      </symbol>
+    </svg>
+    <main id="overlay" class="overlay" aria-live="polite"></main>
+    <script defer src="app.js"></script>
+  </body>
+</html>

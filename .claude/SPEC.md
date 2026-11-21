@@ -331,7 +331,7 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
 
 - 各テンプレは index.html + style.css + app.js の独立した静的サイト。`/ws` に接続し、届いた batch を描画する。ユーザーが CSS を差し替えて見た目をカスタムできる。
 - OBS には「ブラウザソース」で `http://127.0.0.1:11180/?template=<name>&ws=ws://127.0.0.1:11180/ws&channel=...` を指定。`template` 未指定時は `default`。OBS ポート変更時は `ws` も同じポートを指す。
-- 出荷済みテンプレ(9種):
+- 出荷済みテンプレ(10種):
 
   | テンプレ | 用途 |
   |---|---|
@@ -344,10 +344,12 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
   | `donation` | 投げ銭(SuperChat/Bits)サマリー |
   | `timer` | カウントダウン/アップタイマー |
   | `danmaku` | ニコ生風に画面を横切る弾幕(後述 §8.1) |
+  | `trophy` | 実績解除を等級別のアイコン・色で1件ずつ表示(チャット非表示、`?duration=<秒>` 既定5秒) |
 
 - 共通クエリパラメータ: `ws`(接続先), `channel`(フィルタ), `only=gift`(投げ銭のみ) 等。テンプレ間で `max` の意味が異なる点に注意 — 通常overlayでは「表示行数の上限」、`danmaku` では「同時アニメDOM数の上限(MAX_ACTIVE)」。`danmaku` 専用: `dur`(横断秒数)/`size`(文字px)/`opacity`/`name`(名前前置)/`outline`(縁取り)/`area`(`full`/`top`/`bottom` 表示縦帯)/`coalesce`(連投まとめ ×N、`0`で無効)/`pin`(投げ銭を上部固定強調、`0`で無効)。弾幕URL生成(`Settings.svelte` の `withDanmaku()`)は弾幕に無関係なパラメータ(`max`/`ttl`/`font`/`bg`/`pos`/`icon`)を allowlist で除外する。
 - システム種別(`kind==='system'` 接続通知等)は配信画面に流さない(全テンプレで除外)。
 - **削除・BAN の反映(P6 3b)**: `/ws?modEvents=1`(`1` / `true` のみ opt-in。`0`・値なし・未指定は opt-out で購読もしない)のクライアントにだけ、同じソケットで chat 配列の後に `{"moderation":[ModerationEvent…]}` を 16ms tick 単位で送る(channel フィルタも適用)。opt-out の改造テンプレには一切届かない。
+- **実績解除(PR3)**: `/ws?achievementEvents=1`(判定は `modEvents` と同じ)のクライアントにだけ、chat 配列の後に `{"achievements":[AchievementUnlocked…]}` を 16ms tick 単位で送る。解除には channel が無いので channel フィルタは掛けない。内蔵 `trophy` がこれを使う。
   - 送るイベント: 配信側(§7 Phase 3)、アプリ発の `moderate_delete_message` / `moderate_ban_user` 成功時(moderation forwarder 経由で UI・TTS と同じ経路。BAN は `certain`=true・`beforeMs`=null)、ローカル非表示 `hide_message`(`platform`/`channel` 付きの時のみ messageDeleted を OBS へだけ。UI へは送らない)。解除(unhide / unban)は OBS へ戻さない。
   - 同梱テンプレ `default` / `simple` / `bubble` / `ticker` / `donation` / `danmaku` が対応し、該当コメントを DOM から完全に除く(減光しない)。messageDeleted は ID、userCleared は author + `beforeMs`(`certain` に関係なく除く)、chatCleared は `beforeMs` 以前。`donation` の合計、`danmaku` の集約弾幕(×N)は要素ごと除く・合計は戻さない。
   - `ranking` / `goals` / `timer` は集計表示で本文を出さないため対象外(接続 URL も opt-in しない)。

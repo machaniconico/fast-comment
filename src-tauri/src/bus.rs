@@ -31,6 +31,7 @@ use tokio_util::sync::CancellationToken;
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 
+use crate::achievements::engine::AchievementUnlocked;
 use crate::model::{ChatMessage, ModerationEvent, YoutubeReaction};
 use crate::stats::{StatsSnapshot, TimerSnapshot};
 use crate::templates::{TemplateRef, TemplateStore};
@@ -49,6 +50,12 @@ const WS_CLIENT_QUEUE: usize = 256;
 const MODERATION_BROADCAST_CAPACITY: usize = 1024;
 /// opt-in WS クライアントごとのモデレーションイベント待ち上限(溢れたら古いものから drop)。
 const WS_CLIENT_MODERATION_QUEUE: usize = 1024;
+/// 実績解除の broadcast 容量。解除記録は保存済みなので、落ちるのは通知だけ。
+const ACHIEVEMENT_BROADCAST_CAPACITY: usize = 1024;
+/// 1回の実績 IPC に載せる解除数上限(異常流量時の保険)。
+const MAX_ACHIEVEMENTS_PER_UI_BATCH: usize = 1024;
+/// opt-in WS クライアントごとの実績待ち上限(溢れたら古いものから drop)。
+const WS_CLIENT_ACHIEVEMENT_QUEUE: usize = 1024;
 
 /// YouTube リアクションをUIへ1フレーム単位でまとめて送る。
 ///
@@ -136,12 +143,70 @@ pub fn spawn_moderation_ui_forwarder<F>(
     });
 }
 
+/// 実績の解除を購読して 1 フレーム単位でまとめ、`emit` へ渡す。空のフレームでは呼ばない。
+///
+/// 購読側が遅れて `Lagged(n)` を受けても件数だけ warn に出して続ける(名前・ID は出さない)。
+async fn run_achievement_forwarder<F>(
+    mut rx: broadcast::Receiver<AchievementUnlocked>,
+    cancel: CancellationToken,
+    mut emit: F,
+) where
+    F: FnMut(&[AchievementUnlocked]),
+{
+    let mut ticker = interval(Duration::from_millis(UI_BATCH_INTERVAL_MS));
+    let mut batch = Vec::<AchievementUnlocked>::with_capacity(8);
+
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            _ = ticker.tick() => {
+                if !batch.is_empty() {
+                    emit(&batch);
+                    batch.clear();
+                }
+            }
+            incoming = rx.recv() => {
+                match incoming {
+                    Ok(unlock) => {
+                        if batch.len() < MAX_ACHIEVEMENTS_PER_UI_BATCH {
+                            batch.push(unlock);
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(lagged = n, "実績解除の通知を取りこぼしました");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }
+    }
+}
+
+/// 実績の解除を UI へ 1 フレーム単位でまとめて `emit("achievements", batch)` する。
+pub fn spawn_achievement_ui_forwarder(
+    rx: broadcast::Receiver<AchievementUnlocked>,
+    app: AppHandle,
+    cancel: CancellationToken,
+) {
+    tauri::async_runtime::spawn(async move {
+        run_achievement_forwarder(rx, cancel, |batch| {
+            if let Err(e) = app.emit("achievements", batch) {
+                tracing::warn!("実績解除のUI emitに失敗: {e}");
+            }
+        })
+        .await;
+        tracing::info!("achievement forwarder 終了");
+    });
+}
+
 /// Bus のハンドル。正規化済みメッセージの投入と、UI/OBS への配信起動を担う。
 #[derive(Clone)]
 pub struct Bus {
     tx: broadcast::Sender<ChatMessage>,
     /// OBS `/ws?modEvents=1` へ流す削除・BAN・ローカル非表示(配信側・アプリ発の両方)。
     mod_tx: broadcast::Sender<ModerationEvent>,
+    /// 実績の解除。UI・OBS(`/ws?achievementEvents=1`)・TTS が購読する。
+    achievement_tx: broadcast::Sender<AchievementUnlocked>,
     stats_tx: watch::Sender<StatsSnapshot>,
     timer_tx: watch::Sender<TimerSnapshot>,
     obs_port: u16,
@@ -156,9 +221,11 @@ impl Bus {
     ) -> Self {
         let (tx, _rx) = broadcast::channel(BROADCAST_CAPACITY);
         let (mod_tx, _mod_rx) = broadcast::channel(MODERATION_BROADCAST_CAPACITY);
+        let (achievement_tx, _achievement_rx) = broadcast::channel(ACHIEVEMENT_BROADCAST_CAPACITY);
         Bus {
             tx,
             mod_tx,
+            achievement_tx,
             stats_tx,
             timer_tx,
             obs_port,
@@ -168,6 +235,11 @@ impl Bus {
     /// 削除・BAN イベントの購読者を得る。
     pub fn subscribe_moderation(&self) -> broadcast::Receiver<ModerationEvent> {
         self.mod_tx.subscribe()
+    }
+
+    /// 実績解除の送信端(エンジンの出力をここへ流す)。
+    pub fn achievement_sender(&self) -> broadcast::Sender<AchievementUnlocked> {
+        self.achievement_tx.clone()
     }
 
     /// 新規コメント購読者を得る。
@@ -356,6 +428,7 @@ impl Bus {
         ObsState {
             tx: Arc::new(self.tx.clone()),
             mod_tx: Arc::new(self.mod_tx.clone()),
+            achievement_tx: Arc::new(self.achievement_tx.clone()),
             stats_tx: Arc::new(self.stats_tx.clone()),
             timer_tx: Arc::new(self.timer_tx.clone()),
             templates: Arc::new(templates),
@@ -394,6 +467,7 @@ fn obs_router(state: ObsState, goals_skin_dir: &Path) -> Router {
 struct ObsState {
     tx: Arc<broadcast::Sender<ChatMessage>>,
     mod_tx: Arc<broadcast::Sender<ModerationEvent>>,
+    achievement_tx: Arc<broadcast::Sender<AchievementUnlocked>>,
     stats_tx: Arc<watch::Sender<StatsSnapshot>>,
     timer_tx: Arc<watch::Sender<TimerSnapshot>>,
     templates: Arc<TemplateStore>,
@@ -407,6 +481,10 @@ struct WsQuery {
     /// 未指定・`0`・値なしは opt-out(改造テンプレに未知フレームを送らない)。
     #[serde(rename = "modEvents")]
     mod_events: Option<String>,
+    /// `achievementEvents=1`(または `true`)のクライアントにだけ `{"achievements":[…]}` を送る。
+    /// 解除には channel が無いので `channel` フィルタは掛けない。
+    #[serde(rename = "achievementEvents")]
+    achievement_events: Option<String>,
 }
 
 /// `modEvents` クエリ値が opt-in か。
@@ -420,6 +498,28 @@ fn moderation_receiver(
     query: &WsQuery,
 ) -> Option<broadcast::Receiver<ModerationEvent>> {
     mod_events_opted_in(query.mod_events.as_deref()).then(|| mod_tx.subscribe())
+}
+
+/// opt-in のときだけ実績解除を購読する(opt-out は購読自体しない)。
+fn achievement_receiver(
+    achievement_tx: &broadcast::Sender<AchievementUnlocked>,
+    query: &WsQuery,
+) -> Option<broadcast::Receiver<AchievementUnlocked>> {
+    mod_events_opted_in(query.achievement_events.as_deref()).then(|| achievement_tx.subscribe())
+}
+
+/// 1 tick 分の実績解除を `{"achievements":[…]}` へ。空なら送らない。
+fn achievement_frame(unlocks: &[AchievementUnlocked]) -> Option<String> {
+    if unlocks.is_empty() {
+        return None;
+    }
+    match serde_json::to_string(&serde_json::json!({ "achievements": unlocks })) {
+        Ok(json) => Some(json),
+        Err(e) => {
+            tracing::warn!("WS 向け実績 JSON 化失敗: {e}");
+            None
+        }
+    }
 }
 
 /// 1 tick 分のモデレーションイベントを `{"moderation":[…]}` へ。空なら送らない。
@@ -539,7 +639,10 @@ async fn ws_handler(
 ) -> impl IntoResponse {
     let rx = state.tx.subscribe();
     let mod_rx = moderation_receiver(&state.mod_tx, &query);
-    ws.on_upgrade(move |socket| handle_ws_client(socket, rx, mod_rx, query.channel))
+    let achievement_rx = achievement_receiver(&state.achievement_tx, &query);
+    ws.on_upgrade(move |socket| {
+        handle_ws_client(socket, rx, mod_rx, achievement_rx, query.channel)
+    })
 }
 
 /// `/stats` のアップグレードハンドラ。
@@ -569,16 +672,21 @@ async fn timer_ws_handler(
 ///
 /// `mod_rx` は `?modEvents=1` の opt-in クライアントだけ Some。同じ tick で chat 配列の
 /// **後に** `{"moderation":[…]}` を送り、chat との順序を同じソケット上で保つ。
+/// `achievement_rx` は `?achievementEvents=1` の opt-in だけ Some。その後に `{"achievements":[…]}`
+/// を送る(`channel` フィルタは掛けない)。
 async fn handle_ws_client(
     mut socket: WebSocket,
     mut rx: broadcast::Receiver<ChatMessage>,
     mut mod_rx: Option<broadcast::Receiver<ModerationEvent>>,
+    mut achievement_rx: Option<broadcast::Receiver<AchievementUnlocked>>,
     channel: Option<String>,
 ) {
     let mut ticker = interval(Duration::from_millis(UI_BATCH_INTERVAL_MS));
     // クライアント個別の bounded queue。溢れたら古いものから drop(最新優先)。
     let mut queue: std::collections::VecDeque<ChatMessage> = std::collections::VecDeque::new();
     let mut mod_queue: std::collections::VecDeque<ModerationEvent> =
+        std::collections::VecDeque::new();
+    let mut achievement_queue: std::collections::VecDeque<AchievementUnlocked> =
         std::collections::VecDeque::new();
 
     loop {
@@ -625,6 +733,21 @@ async fn handle_ws_client(
                     Err(broadcast::error::RecvError::Closed) => mod_rx = None,
                 }
             }
+            // opt-in クライアントだけ: 実績解除をキューへ(channel フィルタなし)。
+            recv = async { achievement_rx.as_mut().unwrap().recv().await }, if achievement_rx.is_some() => {
+                match recv {
+                    Ok(unlock) => {
+                        if achievement_queue.len() >= WS_CLIENT_ACHIEVEMENT_QUEUE {
+                            achievement_queue.pop_front();
+                        }
+                        achievement_queue.push_back(unlock);
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(lagged = n, "WS 実績 forwarder が取りこぼしました");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => achievement_rx = None,
+                }
+            }
             // ~16ms ごとに溜まった分を1つの JSON 配列としてまとめて送る。
             _ = ticker.tick() => {
                 if !queue.is_empty() {
@@ -641,6 +764,13 @@ async fn handle_ws_client(
                 // chat の後にモデレーション(1 tick 1 フレーム)。
                 let events: Vec<ModerationEvent> = mod_queue.drain(..).collect();
                 if let Some(json) = moderation_frame(&events) {
+                    if socket.send(WsMessage::Text(json.into())).await.is_err() {
+                        return;
+                    }
+                }
+                // モデレーションの後に実績(1 tick 1 フレーム)。
+                let unlocks: Vec<AchievementUnlocked> = achievement_queue.drain(..).collect();
+                if let Some(json) = achievement_frame(&unlocks) {
                     if socket.send(WsMessage::Text(json.into())).await.is_err() {
                         return;
                     }
@@ -947,6 +1077,7 @@ mod tests {
 
     fn query(mod_events: Option<&str>) -> WsQuery {
         WsQuery {
+            achievement_events: None,
             channel: None,
             mod_events: mod_events.map(str::to_string),
         }
@@ -1179,5 +1310,166 @@ mod tests {
         for reserved in ["custom", "skin", "ws", "stats", "api"] {
             assert!(!templates.join(reserved).exists(), "templates/{reserved} が配信ルートと衝突する");
         }
+    }
+
+    fn sample_unlock(id: &str) -> AchievementUnlocked {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "achievementId": "viewer-platinum",
+            "name": "テスト",
+            "description": "",
+            "tier": "platinum",
+            "icon": "T",
+            "subject": { "kind": "viewer", "platform": "twitch", "authorId": "a1", "name": "x" },
+            "valueMilli": 0,
+            "thresholdMilli": 0,
+            "currency": null,
+            "windowKey": "",
+            "unlockedAtMs": 1
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn unlocks_batched_into_one_emit_per_frame() {
+        let (tx, rx) = broadcast::channel(ACHIEVEMENT_BROADCAST_CAPACITY);
+        let cancel = CancellationToken::new();
+        let emits = Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
+        let sink = emits.clone();
+        let task = tokio::spawn(run_achievement_forwarder(rx, cancel.clone(), move |batch| {
+            sink.lock().unwrap().push(batch.len());
+        }));
+        // 空のフレームでは emit しない。
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(emits.lock().unwrap().is_empty());
+        // 同一フレームの 3 件は 1 回の emit にまとまる(送信は同期的に完了する)。
+        for i in 0..3 {
+            tx.send(sample_unlock(&format!("u{i}"))).unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(*emits.lock().unwrap(), vec![3]);
+        cancel.cancel();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn achievement_forwarder_survives_lagged() {
+        let (tx, rx) = broadcast::channel(2);
+        for i in 0..5 {
+            tx.send(sample_unlock(&format!("old{i}"))).unwrap();
+        }
+        let cancel = CancellationToken::new();
+        let emits = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = emits.clone();
+        let task = tokio::spawn(run_achievement_forwarder(rx, cancel.clone(), move |batch| {
+            sink.lock().unwrap().extend(batch.iter().map(|u| u.id.clone()));
+        }));
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        // Lagged の後も購読が続き、新しい解除が届く。
+        tx.send(sample_unlock("fresh")).unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let seen = emits.lock().unwrap().clone();
+        assert!(seen.contains(&"fresh".to_string()), "{seen:?}");
+        assert!(!seen.contains(&"old0".to_string()), "{seen:?}");
+        cancel.cancel();
+        task.await.unwrap();
+    }
+
+    async fn ws_connect(
+        bus: &Bus,
+        query: &str,
+    ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+        let root = temp_root();
+        let state = bus.obs_state(TemplateStore::new(root.join("builtin"), root.join("custom")));
+        let app = obs_router(state, &root.join("no-skin"));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws{query}"))
+            .await
+            .unwrap();
+        ws
+    }
+
+    fn test_bus() -> Bus {
+        let (stats_tx, _) = watch::channel(StatsSnapshot::default());
+        let (timer_tx, _) = watch::channel(TimerSnapshot::default());
+        Bus::new(0, stats_tx, timer_tx)
+    }
+
+    fn sample_chat(channel: &str) -> ChatMessage {
+        serde_json::from_value(serde_json::json!({
+            "id": "c1",
+            "platform": "twitch",
+            "channel": channel,
+            "author": { "id": "u1", "name": "viewer" },
+            "fragments": [],
+            "kind": "normal",
+            "timestampMs": 1
+        }))
+        .unwrap()
+    }
+
+    /// 受信したテキストフレームを `wait` の間だけ集める。
+    async fn collect_frames(
+        ws: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        wait: Duration,
+    ) -> Vec<String> {
+        use futures_util::StreamExt;
+        let mut frames = Vec::new();
+        let deadline = tokio::time::Instant::now() + wait;
+        while let Ok(Some(Ok(msg))) = tokio::time::timeout_at(deadline, ws.next()).await {
+            if let tokio_tungstenite::tungstenite::Message::Text(text) = msg {
+                frames.push(text.to_string());
+            }
+        }
+        frames
+    }
+
+    #[tokio::test]
+    async fn ws_without_param_receives_no_achievement_frames() {
+        let bus = test_bus();
+        for query in ["", "?achievementEvents=0", "?achievementEvents=yes"] {
+            let mut ws = ws_connect(&bus, query).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            bus.achievement_sender().send(sample_unlock("u1")).ok();
+            bus.publish(sample_chat("c"));
+            let frames = collect_frames(&mut ws, Duration::from_millis(200)).await;
+            assert_eq!(frames.len(), 1, "{query}: {frames:?}");
+            assert!(frames[0].starts_with('['), "{query}: {frames:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn ws_with_param_receives_achievements_after_chat() {
+        let bus = test_bus();
+        let mut ws = ws_connect(&bus, "?achievementEvents=1").await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        bus.publish(sample_chat("c"));
+        bus.achievement_sender().send(sample_unlock("u1")).unwrap();
+        let frames = collect_frames(&mut ws, Duration::from_millis(200)).await;
+        assert_eq!(frames.len(), 2, "{frames:?}");
+        assert!(frames[0].starts_with('['), "{frames:?}");
+        let value: serde_json::Value = serde_json::from_str(&frames[1]).unwrap();
+        assert_eq!(value["achievements"][0]["id"], "u1");
+        assert_eq!(value["achievements"][0]["achievementId"], "viewer-platinum");
+    }
+
+    #[tokio::test]
+    async fn ws_achievement_frames_ignore_channel_filter() {
+        let bus = test_bus();
+        let mut ws = ws_connect(&bus, "?achievementEvents=1&channel=only-this").await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        bus.publish(sample_chat("other"));
+        bus.achievement_sender().send(sample_unlock("u1")).unwrap();
+        let frames = collect_frames(&mut ws, Duration::from_millis(200)).await;
+        // chat は channel で絞られて届かず、実績だけが届く。
+        assert_eq!(frames.len(), 1, "{frames:?}");
+        let value: serde_json::Value = serde_json::from_str(&frames[0]).unwrap();
+        assert_eq!(value["achievements"][0]["id"], "u1");
     }
 }

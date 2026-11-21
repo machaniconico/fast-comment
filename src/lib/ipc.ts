@@ -7,7 +7,7 @@
  * - Safe to import in a plain browser (Tauri absent): all calls are no-ops.
  */
 
-import type { ChatMessage, ListenerRecord, ListenerUpdate, ModerationEvent, TtsVoiceOverride, TwitcastingMode, YoutubeReaction } from './types';
+import type { AchievementUnlocked, ChatMessage, ListenerRecord, ListenerUpdate, ModerationEvent, TtsVoiceOverride, TwitcastingMode, YoutubeReaction } from './types';
 import { Channel, invoke as tauriInvoke } from '@tauri-apps/api/core';
 import { emit, listen } from '@tauri-apps/api/event';
 import { getCurrentWindow, primaryMonitor } from '@tauri-apps/api/window';
@@ -221,6 +221,18 @@ export async function takeStartupConfigNotice(): Promise<TtsNotice | null> {
 export async function onTtsQueueState(cb: (state: TtsQueueState) => void): Promise<() => void> {
   if (!isTauri()) return () => {};
   const unlisten = await listen<TtsQueueState>('tts-queue-state', (event) => {
+    cb(event.payload);
+  });
+  return unlisten;
+}
+
+/**
+ * Listen to 'achievements' (AchievementUnlocked[], batched per frame by Rust).
+ * Returns an unlisten function; no-op in browser-only mode.
+ */
+export async function onAchievements(cb: (unlocks: AchievementUnlocked[]) => void): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  const unlisten = await listen<AchievementUnlocked[]>('achievements', (event) => {
     cb(event.payload);
   });
   return unlisten;
