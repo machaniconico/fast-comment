@@ -34,6 +34,8 @@ mod twitcasting_common_official;
 mod twitcasting_cursor;
 mod twitcasting_official_map;
 mod twitcasting_official_source;
+mod twitcasting_mode;
+mod twitcasting_identifier_secrecy;
 
 #[test]
 fn acceptance_harness_runs() {}

@@ -139,6 +139,7 @@ pub struct AppState {
     /// Twitchモデレーション用OAuth状態。access tokenはメモリのみ。
     twitch_auth: Arc<TwitchAuth>,
     twitcasting_auth: Arc<TwitcastingAuth<integrations::KeyringSecretStore>>,
+    twitcasting_api: Arc<sources::twitcasting_api::TwitcastingApi<integrations::KeyringSecretStore>>,
 }
 
 #[tauri::command]
@@ -2822,7 +2823,16 @@ fn spawn_one_channel(_app: &AppHandle, state: &AppState, ch: &ChannelConfig) {
         return;
     }
     let key = AppState::channel_key(ch);
-    let (overrides, youtube_api_key, x_overrides, x_auth, niconico_overrides, twitcasting_overrides, twitch_viewer_auth) = {
+    let (
+        overrides,
+        youtube_api_key,
+        x_overrides,
+        x_auth,
+        niconico_overrides,
+        twitcasting_overrides,
+        twitcasting_mode,
+        twitch_viewer_auth,
+    ) = {
         let config = state.config.lock().unwrap();
         // X の名前解決 cookie は auth_token / ct0 の両方が揃って初めて有効。
         let x_auth = {
@@ -2849,6 +2859,7 @@ fn spawn_one_channel(_app: &AppHandle, state: &AppState, ch: &ChannelConfig) {
             x_auth,
             config.niconico_overrides.clone(),
             config.twitcasting_overrides.clone(),
+            config.twitcasting.mode,
             twitch_viewer_auth,
         )
     };
@@ -2881,6 +2892,8 @@ fn spawn_one_channel(_app: &AppHandle, state: &AppState, ch: &ChannelConfig) {
             Some(state.reaction_tx.clone()),
             Some(state.mod_tx.clone()),
         )
+        .with_twitcasting(state.twitcasting_api.clone(), state.twitcasting_auth.subscribe())
+        .with_twitcasting_mode(twitcasting_mode)
         .with_twitcasting_started_movies(state.twitcasting_started_movies.clone())
         .with_live_tx(Some(state.live_tx.clone()));
         manager.spawn_channel(ch)
@@ -3156,6 +3169,15 @@ pub fn run() {
             );
             let twitcasting_client_id =
                 effective_client_id(config.credentials.twitcasting_client_id.as_deref());
+            let twitcasting_config_rx = config_tx.subscribe();
+            let twitcasting_api = sources::twitcasting_api::TwitcastingApi::new(
+                twitcasting_auth.clone(),
+                sources::twitcasting_api::official_endpoints(&config),
+                Arc::new(move || {
+                    let config = twitcasting_config_rx.borrow();
+                    effective_client_id(config.credentials.twitcasting_client_id.as_deref())
+                }),
+            );
 
             // 下流 Bus(パイプライン → UI/OBS)。
             let bus = Bus::new(obs_port, stats_tx.clone(), timer_tx.clone());
@@ -3244,6 +3266,7 @@ pub fn run() {
                         twitcasting_login: OAuthLoginGate::default(),
                         x_post_auth: x_post_auth.clone(),
                         twitcasting_auth: twitcasting_auth.clone(),
+                        twitcasting_api,
                         participants: Mutex::new(Vec::new()),
                         youtube_auth: YoutubeAuth::new()
                             .expect("YouTube投稿用HTTPクライアントの作成に失敗しました"),
