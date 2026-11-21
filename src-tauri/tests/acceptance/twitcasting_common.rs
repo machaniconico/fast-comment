@@ -359,7 +359,8 @@ pub fn comment(id: u64) -> Value {
     json!({
         "id": id.to_string(),
         "message": format!("msg-{id}"),
-        "created": 1_700_000_000u64 + id,
+        // 既定は「ほぼ今」。60 秒より古いと読み上げ対象から外れる規則(§9)に、古さと無関係なテストが当たらないようにする
+        "created": epoch_s().saturating_sub(2),
         "from_user": {
             "id": format!("u{id}"),
             "screen_id": format!("s{id}"),
@@ -368,6 +369,23 @@ pub fn comment(id: u64) -> Value {
         }
     })
 }
+
+/// `created`(秒)を指定するコメント。
+pub fn comment_at(id: u64, created: u64) -> Value {
+    let mut v = comment(id);
+    v["created"] = json!(created);
+    v
+}
+
+/// 新しい順(hi から lo へ)で、各コメントの `created` を `created_of(id)` にした応答。
+pub fn page_reply_created(hi: u64, lo: u64, created_of: impl Fn(u64) -> u64) -> Reply {
+    let items: Vec<Value> = (lo..=hi).rev().map(|i| comment_at(i, created_of(i))).collect();
+    Reply::json(200, json!({ "comments": items }))
+}
+
+/// 固定の HTTP Date(epoch 1_700_001_000 = 2023-11-14 22:30:00 GMT)と、その秒。
+pub const FIXED_DATE: &str = "Tue, 14 Nov 2023 22:30:00 GMT";
+pub const FIXED_DATE_EPOCH_S: u64 = 1_700_001_000;
 
 /// 新しい順(hi から lo へ)のコメント配列を返す応答。
 pub fn page_reply(hi: u64, lo: u64) -> Reply {
@@ -519,19 +537,38 @@ pub async fn rig_logged_in_default_budget() -> Rig {
 
 /// 実フロー(認可 URL → ブラウザ役の POST → 検証)でログインする。ログイン済みでも再ログインとして使える。
 pub async fn login(auth: &Auth, port: u16, token: &str) {
+    // free_port は bind して手放した番号なので、他のテストの socket と取り合うことがある(PortInUse)。
+    // 待受の bind に負けて connect が早期終了したら、新しい番号で `connect_on` をやり直す。
+    let mut port = port;
+    for attempt in 0..8 {
+        if attempt > 0 {
+            port = free_port();
+        }
+        if try_login(auth, port, token).await {
+            return;
+        }
+    }
+    panic!("ログインが 8 回とも待受の確保に失敗した");
+}
+
+/// 待受を確保できず `open_browser` の前に終わった時だけ false。それ以外の失敗は panic。
+async fn try_login(auth: &Auth, port: u16, token: &str) -> bool {
     let (tx, rx) = tokio::sync::oneshot::channel::<String>();
     let a = auth.clone();
     let h = tokio::spawn(async move {
-        a.connect(CLIENT, epoch_ms(), move |url| {
+        a.connect_on(port, CLIENT, epoch_ms(), move |url| {
             let _ = tx.send(url);
             Ok(())
         })
         .await
     });
-    let url = tokio::time::timeout(Duration::from_secs(5), rx)
-        .await
-        .expect("open_browser が呼ばれる")
-        .expect("open_browser が呼ばれる前に connect が終わった");
+    let url = match tokio::time::timeout(Duration::from_secs(5), rx).await.expect("open_browser が呼ばれる") {
+        Ok(url) => url,
+        Err(_) => {
+            let _ = h.await;
+            return false;
+        }
+    };
     let state = url::Url::parse(&url)
         .expect("認可 URL は URL")
         .query_pairs()
@@ -552,6 +589,7 @@ pub async fn login(auth: &Auth, port: u16, token: &str) {
         .expect("connect が終わる")
         .expect("タスクが落ちない");
     assert!(r.is_ok(), "ログインが成功する");
+    true
 }
 
 // ---------------------------------------------------------------- Source の実行と収集
