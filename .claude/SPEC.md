@@ -85,7 +85,7 @@ JSON は `serde(rename_all = "camelCase")` で UI/OBS に流す。
 `ChatMessage` とは別の side channel(`mpsc`、容量 64)。UI/OBS へは流さない(JSON 化しない)。
 
 ```rust
-LiveStream { platform, channel_identifier /*設定の identifier そのまま*/, stream_id, title: Option<String>,
+LiveStream { platform, channel_identifier /*設定の identifier そのまま。ツイキャスだけは抽出した screen_id の小文字(URL・大文字の保存値も同じキーに揃え、原文のクエリ・フラグメントを持ち出さない)*/, stream_id, title: Option<String>,
              url, started_at_ms: Option<u64> }
 LiveEvent  = Started(LiveStream) | Ended { platform, channel_identifier }
 ```
