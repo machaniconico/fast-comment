@@ -1340,6 +1340,7 @@ impl TwitcastingSource {
             if let Some(mut message) = event_to_chat(&value, &ctx) {
                 // 接続前の直近コメントは既読扱い(読み上げない)。
                 message.skip_tts = true;
+                message.route.uncounted = true;
                 let _ = tx.send(message);
             }
         }
@@ -2482,6 +2483,36 @@ mod tests {
         let fresh = seen.admit(ws);
         assert_eq!(fresh.len(), 1);
         assert_eq!(id_string(fresh[0].get("id")).as_deref(), Some("4"));
+    }
+
+    #[tokio::test]
+    async fn listall_history_is_uncounted() {
+        let (port, _) = serve_html(r#"{"comments":[
+            {"type":"comment","id":1,"message":"history","author":{"id":"u","name":"N"}}
+        ]}"#).await;
+        let overrides = TwitcastingOverrides {
+            endpoints: HashMap::from([(
+                "commentHistoryUrl".to_owned(),
+                format!("http://127.0.0.1:{port}/"),
+            )]),
+            ..TwitcastingOverrides::default()
+        };
+        let source = TwitcastingSource::new("alice".to_owned(), overrides, None);
+        let (tx, mut rx) = broadcast::channel(4);
+        source
+            .load_history(
+                &reqwest::Client::new(),
+                "42",
+                "alice",
+                "alice",
+                &mut CommentDedup::new(10),
+                &tx,
+                &CancellationToken::new(),
+            )
+            .await;
+        let message = rx.try_recv().unwrap();
+        assert_eq!(message.plain_text(), "history");
+        assert!(message.route.uncounted);
     }
 
     #[test]

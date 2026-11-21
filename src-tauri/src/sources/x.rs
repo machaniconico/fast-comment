@@ -900,6 +900,7 @@ impl XSource {
             // flush タイマー経過後に遅れて届いたバックフィルも読み上げない
             // (通常経路で emit されるため、ここで立てないと TTS に流れる)。
             chat.skip_tts = true;
+            chat.route.uncounted = true;
         }
         if *backfill_open {
             if is_backfill {
@@ -927,6 +928,7 @@ impl XSource {
     ) {
         while let Some(mut chat) = buf.pop_front() {
             chat.skip_tts = true;
+            chat.route.uncounted = true;
             self.emit(chat, chat_tx, stats);
         }
     }
@@ -1483,6 +1485,34 @@ mod tests {
             title: Some("t".to_string()),
             viewers: Some(1),
             state: "RUNNING".to_string(),
+        }
+    }
+
+    #[test]
+    fn buffered_and_late_backfill_are_uncounted() {
+        let source = XSource::new("b1".into(), XOverrides::default(), None, None);
+        let show = show_info("99", "Host");
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut stats = SessionStats::new("b1");
+        let mut seen = ChatDedup::new(4);
+        let mut backfill_open = true;
+        let mut buffer = VecDeque::new();
+        for (ts, is_backfill) in [(1, true), (2, true), (3, false)] {
+            let line = json!({
+                "chatType": 1, "userId": "1", "message": "chat",
+                "ts": ts, "isBackfill": is_backfill
+            });
+            source.handle_line(
+                &line.to_string(), &show, &tx, &mut stats, &mut seen,
+                &mut backfill_open, &mut buffer,
+            );
+            if ts == 1 {
+                // flush_backfill must flag buffered messages independently.
+                buffer.front_mut().unwrap().route.uncounted = false;
+                source.flush_backfill(&mut buffer, &tx, &mut stats);
+                backfill_open = false;
+            }
+            assert_eq!(rx.try_recv().unwrap().route.uncounted, is_backfill);
         }
     }
 

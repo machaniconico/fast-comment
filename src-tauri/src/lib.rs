@@ -21,6 +21,7 @@ pub mod bus;
 pub mod chatlog;
 pub mod config;
 pub mod listeners;
+pub mod live_fanout;
 pub mod model;
 pub mod moderation;
 mod moderation_error;
@@ -46,6 +47,10 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::achievements::{
+    engine::{AchievementEngine, AchievementUnlocked},
+    store::{AchievementDefs, CommitError, DefsStore},
+};
 use crate::autopost::{
     AutopostStatus, KeyringTokenStore, UserCommand as AutopostCommand, XEndpoints, XPostAuth,
     XPostError, XPostErrorCode, XPostStatus,
@@ -98,6 +103,9 @@ pub struct AppState {
     x_post_login: OAuthLoginGate,
     twitcasting_login: OAuthLoginGate,
     listeners: Arc<listeners::ListenerStore>,
+    achievement_engine: Mutex<Option<Arc<AchievementEngine>>>,
+    achievement_defs: DefsStore,
+    achievement_unlock_tx: broadcast::Sender<AchievementUnlocked>,
     chatlog: chatlog::ChatLog,
     /// stats 集約などへ設定変更を伝える watch 送信端。
     config_tx: watch::Sender<AppConfig>,
@@ -129,7 +137,7 @@ pub struct AppState {
     reaction_tx: mpsc::Sender<Vec<YoutubeReaction>>,
     /// プラットフォーム側の削除・BAN 通知 Source → moderation forwarder の bounded 送信端。
     mod_tx: mpsc::Sender<ModerationEvent>,
-    /// 配信開始/終了イベント Source → X 自動告知の bounded 送信端(満杯なら Source 側で破棄する)。
+    /// 配信開始/終了イベント Source → fanout の bounded 送信端(満杯なら Source 側で破棄する)。
     live_tx: mpsc::Sender<LiveEvent>,
     twitcasting_started_movies: sources::twitcasting::StartedMovies,
     /// UI 操作(取消・承認・再試行)→ X 自動告知の駆動タスク。
@@ -247,7 +255,69 @@ async fn delete_listener(
             tracing::warn!("listener-updated emit 失敗: {e}");
         }
     }
-    Ok(deleted)
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let engine = state.achievement_engine.lock().unwrap();
+        delete_listener_achievement_progress(
+            engine.as_deref(), &state.config_dir, &platform, &author_id,
+        )
+        .map(|()| deleted)
+        .map_err(|_| "実績のリスナー記録を削除できませんでした".to_owned())
+    })
+    .await
+    .map_err(|_| "実績のリスナー記録を削除できませんでした".to_owned())?
+}
+
+fn delete_listener_achievement_progress(
+    engine: Option<&AchievementEngine>,
+    dir: &std::path::Path,
+    platform: &str,
+    author_id: &str,
+) -> anyhow::Result<()> {
+    match engine {
+        Some(engine) => engine.forget_listener(platform, author_id),
+        None => achievements::store::delete_listener_progress(dir, platform, author_id).map(|_| ()),
+    }
+}
+
+#[tauri::command]
+async fn commit_achievements(
+    app: AppHandle,
+    base_revision: u64,
+    next: AchievementDefs,
+) -> Result<u64, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        // 進捗のファイル操作とエンジンの生成・定義の反映を直列化する。
+        let mut engine = state.achievement_engine.lock().unwrap();
+        if state.app_cancel.is_cancelled() {
+            return Err("実績の定義を保存できませんでした".to_owned());
+        }
+        let revision = state.achievement_defs.commit(base_revision, next).map_err(|error| {
+            match error {
+                CommitError::Stale => "実績の定義は既に変更されています",
+                CommitError::Invalid(_, _) => "実績の定義が無効です",
+                CommitError::Io | CommitError::SaveRefused => "実績の定義を保存できませんでした",
+            }
+            .to_owned()
+        })?;
+        let defs = state.achievement_defs.current();
+        let now_ms = timer_now_ms();
+        if engine.is_none() && defs.enabled {
+            *engine = Some(Arc::new(AchievementEngine::open(
+                &state.config_dir,
+                defs.clone(),
+                now_ms,
+            )));
+        }
+        // 無効化後も、削除と再有効化には同じ進捗ストアを使う。
+        if let Some(engine) = engine.as_deref() {
+            state.broadcast_achievement_unlocks(engine.set_definitions(defs, now_ms));
+        }
+        Ok(revision)
+    })
+    .await
+    .map_err(|_| "実績の定義を保存できませんでした".to_owned())?
 }
 
 /// OBS サーバの再起動に必要な実行時ハンドル。
@@ -260,6 +330,31 @@ impl AppState {
     /// チャンネルの一意キー(プラットフォーム + 識別子)。
     fn channel_key(ch: &ChannelConfig) -> String {
         config::channel_key(ch)
+    }
+
+    fn broadcast_achievement_unlocks(&self, unlocks: Vec<AchievementUnlocked>) {
+        for unlock in unlocks {
+            let _ = self.achievement_unlock_tx.send(unlock);
+        }
+    }
+
+    fn evaluate_achievements(
+        &self,
+        evaluate: impl FnOnce(&AchievementEngine) -> Vec<AchievementUnlocked>,
+    ) {
+        let engine = self.achievement_engine.lock().unwrap();
+        if let Some(engine) = engine.as_deref().filter(|_| !self.app_cancel.is_cancelled()) {
+            self.broadcast_achievement_unlocks(evaluate(engine));
+        }
+    }
+
+    fn flush_achievements(&self) {
+        let engine = self.achievement_engine.lock().unwrap();
+        if let Some(engine) = engine.as_deref() {
+            if engine.flush().is_err() {
+                tracing::error!("実績の進捗を保存できませんでした");
+            }
+        }
     }
 }
 
@@ -3180,12 +3275,37 @@ fn spawn_pipeline(app: AppHandle, cancel: CancellationToken) {
                     // 同期 I/O やネットワーク待ちをせず、有界キューに投入する。
                     try_enqueue_tts_message(&app, &state.config, &state.tts, msg.clone());
 
+                    state.evaluate_achievements(|engine| engine.observe(&msg, timer_now_ms()));
+
                     // 下流(UI/OBS)へ。
                     bus.publish(msg);
                 }
             }
         }
         tracing::info!("moderation/TTS パイプライン終了");
+    });
+}
+
+fn spawn_achievement_events(
+    app: AppHandle,
+    mut live_rx: mpsc::Receiver<LiveEvent>,
+    mut stats_rx: watch::Receiver<StatsSnapshot>,
+    cancel: CancellationToken,
+) {
+    tauri::async_runtime::spawn(async move {
+        let state = app.state::<AppState>();
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                Some(event) = live_rx.recv() => {
+                    state.evaluate_achievements(|engine| engine.on_live_event(&event, timer_now_ms()));
+                }
+                Ok(()) = stats_rx.changed() => {
+                    let snapshot = stats_rx.borrow_and_update().clone();
+                    state.evaluate_achievements(|engine| engine.on_stats(&snapshot, timer_now_ms()));
+                }
+            }
+        }
     });
 }
 
@@ -3310,7 +3430,7 @@ pub fn run() {
             let tts = Arc::new(TtsShared::default());
 
             // Goals stats 用 channel。
-            let (stats_tx, _stats_rx) = watch::channel::<StatsSnapshot>(StatsSnapshot::default());
+            let (stats_tx, stats_rx) = watch::channel::<StatsSnapshot>(StatsSnapshot::default());
             let (timer_tx, _timer_rx) = watch::channel::<TimerSnapshot>(TimerSnapshot::default());
             let (config_tx, config_rx) = watch::channel::<AppConfig>(config.clone());
             let (metadata_tx, metadata_rx) = mpsc::channel::<YoutubeMetadataUpdate>(64);
@@ -3405,12 +3525,22 @@ pub fn run() {
                         obs_port,
                     );
                     let webhook = webhook::WebhookRuntime::new(integrations.clone(), webhook::ReqwestSender::new());
+                    let now_ms = timer_now_ms();
+                    let achievement_defs = DefsStore::load(&config_dir, now_ms);
+                    let defs = achievement_defs.current();
+                    let achievement_engine = defs.enabled.then(|| {
+                        Arc::new(AchievementEngine::open(&config_dir, defs, now_ms))
+                    });
+                    let (achievement_unlock_tx, _) = broadcast::channel(64);
                     let state = AppState {
                         webhook,
                         integrations,
                         api_feed,
                         api_rate_limit,
                         listeners: Arc::new(listeners::ListenerStore::load(&config_dir)),
+                        achievement_engine: Mutex::new(achievement_engine),
+                        achievement_defs,
+                        achievement_unlock_tx,
                         chatlog: chatlog::ChatLog::start(&config_dir, config.log.clone()),
                         config: Mutex::new(config.clone()),
                         startup_config_outcome: Mutex::new(Some(load_outcome)),
@@ -3457,9 +3587,22 @@ pub fn run() {
                     }
                 },
             );
+            let (autopost_live_tx, autopost_live_rx) = mpsc::channel(64);
+            let (achievement_live_tx, achievement_live_rx) = mpsc::channel(64);
+            let fanout_cancel = app_cancel.clone();
+            tauri::async_runtime::spawn(async move {
+                let mut fanout = live_fanout::spawn_live_fanout(
+                    live_rx, vec![autopost_live_tx, achievement_live_tx],
+                );
+                tokio::select! {
+                    _ = fanout_cancel.cancelled() => fanout.abort(),
+                    _ = &mut fanout => {}
+                }
+            });
+            spawn_achievement_events(handle.clone(), achievement_live_rx, stats_rx, app_cancel.clone());
             // 配信開始/終了イベント → X 自動告知。状態は変化時だけ UI へ emit する。
             autopost::spawn_autopost(
-                live_rx,
+                autopost_live_rx,
                 autopost_config_rx,
                 autopost_user_rx,
                 x_post_auth,
@@ -3470,6 +3613,7 @@ pub fn run() {
             );
             spawn_autopost_status_emitter(autopost_status, handle.clone(), app_cancel.clone());
             let listener_cancel = app_cancel.clone();
+            let flush_app = handle.clone();
             tauri::async_runtime::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(5));
                 interval.tick().await;
@@ -3478,7 +3622,12 @@ pub fn run() {
                         _ = listener_cancel.cancelled() => break,
                         _ = interval.tick() => {
                             let store = listener_store.clone();
-                            match tauri::async_runtime::spawn_blocking(move || store.flush()).await {
+                            let flush_app = flush_app.clone();
+                            match tauri::async_runtime::spawn_blocking(move || {
+                                let result = store.flush();
+                                flush_app.state::<AppState>().flush_achievements();
+                                result
+                            }).await {
                                 Ok(Ok(())) => {},
                                 result => tracing::error!("リスナー記録の保存失敗: {result:?}"),
                             }
@@ -3567,6 +3716,7 @@ pub fn run() {
             set_listener_voice,
             list_listeners,
             delete_listener,
+            commit_achievements,
             get_config,
             take_startup_config_notice,
             get_comment_log_dir,
@@ -3649,6 +3799,7 @@ pub fn run() {
                 if let Err(e) = state.listeners.shutdown() {
                     tracing::error!("終了時のリスナー記録の保存失敗: {e}");
                 }
+                state.flush_achievements();
             }
         });
 }
@@ -3656,6 +3807,65 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deleting_listener_from_disabled_engine_preserves_future_unlocks() {
+        use achievements::model::{
+            Achievement, Announce, Condition, CurrencyMode, Metric, SubjectKind, Tier, Window,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let defs = AchievementDefs {
+            enabled: true,
+            achievements: vec![Achievement {
+                id: "two-comments".into(),
+                name: "Two comments".into(),
+                description: String::new(),
+                icon: "star".into(),
+                tier: Tier::Bronze,
+                subject: SubjectKind::Viewer,
+                enabled: true,
+                builtin_id: None,
+                edited: false,
+                condition: Some(Condition {
+                    window: Window::Lifetime,
+                    metric: Metric::Comments,
+                    threshold: 2.0,
+                    currency: CurrencyMode::None,
+                    platforms: Vec::new(),
+                }),
+                announce: Announce { tts: false },
+            }],
+            ..AchievementDefs::default()
+        };
+        let evaluator = AchievementEngine::open(dir.path(), defs.clone(), 1);
+        let comment = |id: &str| -> ChatMessage {
+            serde_json::from_value(serde_json::json!({
+                "id": id,
+                "platform": "twitch",
+                "channel": "fixture",
+                "author": { "id": "u1", "name": "viewer" },
+                "fragments": [],
+                "kind": "normal",
+                "timestampMs": 1
+            }))
+            .unwrap()
+        };
+        assert!(evaluator.observe(&comment("old-1"), 2).is_empty());
+        assert_eq!(evaluator.observe(&comment("old-2"), 3).len(), 1);
+
+        let mut disabled = defs.clone();
+        disabled.enabled = false;
+        assert!(evaluator.set_definitions(disabled, 4).is_empty());
+        delete_listener_achievement_progress(Some(&evaluator), dir.path(), "twitch", "u1").unwrap();
+        assert!(evaluator.observe(&comment("disabled-1"), 5).is_empty());
+        assert!(evaluator.observe(&comment("disabled-2"), 6).is_empty());
+
+        assert!(evaluator.set_definitions(defs, 7).is_empty());
+        assert!(evaluator.listener_unlocks("twitch", "u1").is_empty());
+        assert!(evaluator.observe(&comment("new-1"), 8).is_empty());
+        assert_eq!(evaluator.observe(&comment("new-2"), 9).len(), 1);
+    }
 
     #[test]
     fn startup_config_notice_can_be_taken_only_once() {

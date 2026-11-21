@@ -49,6 +49,7 @@ mod achievements_model;
 mod achievements_currency;
 mod achievements_store;
 mod achievements_engine;
+mod achievements_wiring;
 
 #[test]
 fn acceptance_harness_runs() {}

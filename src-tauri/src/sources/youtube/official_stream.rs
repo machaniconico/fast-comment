@@ -110,7 +110,7 @@ pub(super) async fn stream_live_chat(
                 }
                 if let Some(mut message) = to_chat_message(item, video_id) {
                     message.skip_tts = first_response;
-                    match seen.accept(&message) {
+                    match seen.accept_for_delivery(&mut message, first_response) {
                         MessageDisposition::New => {
                             let _ = tx.send(message);
                         }
@@ -980,6 +980,21 @@ mod tests {
         let update = to_chat_message(make_item(2), "video-1").expect("combo update");
         assert_eq!(first.id, update.id);
         assert_ne!(first.plain_text(), update.plain_text());
+    }
+
+    #[test]
+    fn official_history_and_gift_updates_are_uncounted() {
+        let mut seen = RecentMessageIds::new();
+        let mut history = text_message("history", "previous comment");
+        let mut live = gift_message("gift-1", "バラ（100 Jewels）");
+        let mut update = gift_message("gift-1", "バラ（100 Jewels・×2）");
+
+        assert_eq!(seen.accept_for_delivery(&mut history, true), MessageDisposition::New);
+        assert!(history.route.uncounted);
+        assert_eq!(seen.accept_for_delivery(&mut live, false), MessageDisposition::New);
+        assert!(!live.route.uncounted);
+        assert_eq!(seen.accept_for_delivery(&mut update, false), MessageDisposition::GiftUpdate);
+        assert!(update.route.uncounted);
     }
 
     #[test]

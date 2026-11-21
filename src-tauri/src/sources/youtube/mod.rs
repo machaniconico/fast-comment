@@ -56,6 +56,16 @@ impl RecentMessageIds {
         }
     }
 
+    fn accept_for_delivery(
+        &mut self,
+        message: &mut ChatMessage,
+        history: bool,
+    ) -> MessageDisposition {
+        let disposition = self.accept(message);
+        message.route.uncounted = history || disposition == MessageDisposition::GiftUpdate;
+        disposition
+    }
+
     pub(super) fn accept(&mut self, message: &ChatMessage) -> MessageDisposition {
         if self.ids.contains(&message.id) {
             if message.kind != crate::model::MessageKind::Gift {
@@ -290,7 +300,7 @@ impl YoutubeSource {
                     msg.skip_tts = first_poll;
                     // raw は通常 None。デバッグ目的で残したい場合のみ付与する。
                     msg.raw = None;
-                    match seen.accept(&msg) {
+                    match seen.accept_for_delivery(&mut msg, first_poll) {
                         MessageDisposition::New => {
                             let _ = tx.send(msg);
                         }
@@ -560,6 +570,31 @@ fn cut_id(s: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn innertube_history_and_gift_updates_are_uncounted() {
+        let parse_gift = |id: &str, combo_count| {
+            let action = json!({ "addChatItemAction": { "item": {
+                "liveChatGiftPurchaseAnnouncementRenderer": {
+                    "id": id,
+                    "authorName": { "simpleText": "Viewer" },
+                    "giftDetails": { "giftName": "バラ", "jewelsAmount": 100, "comboCount": combo_count }
+                }
+            } } });
+            parser::parse_action(&action, "video-1").unwrap()
+        };
+        let mut seen = RecentMessageIds::new();
+        let mut history = parse_gift("historical-gift", 1);
+        let mut live = parse_gift("live-gift", 1);
+        let mut update = parse_gift("live-gift", 2);
+
+        assert_eq!(seen.accept_for_delivery(&mut history, true), MessageDisposition::New);
+        assert!(history.route.uncounted);
+        assert_eq!(seen.accept_for_delivery(&mut live, false), MessageDisposition::New);
+        assert!(!live.route.uncounted);
+        assert_eq!(seen.accept_for_delivery(&mut update, false), MessageDisposition::GiftUpdate);
+        assert!(update.route.uncounted);
+    }
 
     #[test]
     fn classifies_direct_video_ids_as_video_mode() {
