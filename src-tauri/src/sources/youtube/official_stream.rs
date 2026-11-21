@@ -14,6 +14,7 @@ use tonic::codec::ProstCodec;
 use tonic::metadata::MetadataValue;
 use tonic::transport::Endpoint;
 
+use crate::achievements::currency::amount_from_micros;
 use crate::model::{
     Amount, Author, Badge, ChatMessage, Fragment, MessageKind, ModerationEvent, Platform, Roles,
 };
@@ -465,18 +466,30 @@ fn gift_fallback_id(
 }
 
 fn amount_from_super_chat(details: &LiveChatSuperChatDetails) -> Amount {
-    Amount {
-        value: details.amount_micros.unwrap_or_default() as f64 / 1_000_000.0,
-        currency: details.currency.clone().unwrap_or_default(),
-        raw_text: details.amount_display_string.clone().unwrap_or_default(),
-    }
+    paid_amount(
+        details.amount_micros,
+        details.currency.as_deref(),
+        details.amount_display_string.as_deref(),
+    )
 }
 
 fn amount_from_super_sticker(details: &LiveChatSuperStickerDetails) -> Amount {
+    paid_amount(
+        details.amount_micros,
+        details.currency.as_deref(),
+        details.amount_display_string.as_deref(),
+    )
+}
+
+fn paid_amount(micros: Option<u64>, currency: Option<&str>, display: Option<&str>) -> Amount {
+    let micros = micros.unwrap_or_default();
+    // The unsigned API field can exceed i64 in micros. Both parts fit after splitting.
+    let parsed = amount_from_micros((micros % 1000) as i64, currency.unwrap_or_default());
+    let milli = (micros / 1000) as i64 + parsed.milli;
     Amount {
-        value: details.amount_micros.unwrap_or_default() as f64 / 1_000_000.0,
-        currency: details.currency.clone().unwrap_or_default(),
-        raw_text: details.amount_display_string.clone().unwrap_or_default(),
+        value: milli as f64 / 1000.0,
+        currency: parsed.currency,
+        raw_text: display.unwrap_or_default().to_owned(),
     }
 }
 
