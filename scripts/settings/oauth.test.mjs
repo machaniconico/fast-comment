@@ -343,6 +343,28 @@ test('closing untouched settings before its initial config reply leaves the goal
   assert.equal(await toggle.isEnabled(), true);
 }, 'app'));
 
+test('twitcasting_mode_select_saves_through_full_save', async t => withSettings(t, async page => {
+  const mode = page.locator('#twitcasting-mode');
+  assert.equal(await mode.inputValue(), 'auto');
+  assert.deepEqual(await mode.locator('option').allTextContents(), ['自動(既定)', '非公式のみ', '公式 API のみ']);
+  await page.getByText(/次回の接続/).first().waitFor();
+  // ログイン中(接続処理を終えた後)でも mode は変えられ、全体保存で revision 付きに保存される。
+  await page.locator('#twitcasting-client-id').fill('new-client');
+  await page.getByRole('button', { name: 'ログイン', exact: true }).click();
+  await page.waitForFunction(() => !!window.mock.login.twitcasting);
+  await page.evaluate(() => window.mock.login.twitcasting.accept());
+  await page.evaluate(() => window.mock.login.twitcasting.finish({ state: 'ready', screenId: 'current-tc', clientId: 'new-client' }));
+  await page.getByText(/として(ログイン|接続)中/).waitFor();
+  assert.equal(await mode.isEnabled(), true);
+  const revision = await page.evaluate(() => window.mock.revision);
+  await mode.selectOption({ label: '公式 API のみ' });
+  const next = await saveSettings(page);
+  assert.equal(next.twitcasting.mode, 'official');
+  assert.equal(next.credentials.twitcastingClientId, 'new-client');
+  assert.deepEqual(await page.evaluate(() => window.mock.baseRevisions.at(-1)), revision);
+  assert.equal(await mode.inputValue(), 'official');
+}));
+
 test('ツイキャス treats a missing connect result as a failure', async t => withSettings(t, async page => {
   await page.locator('#twitcasting-client-id').fill('new-client');
   const login = page.getByRole('button', { name: 'ログイン', exact: true });

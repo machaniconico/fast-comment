@@ -228,6 +228,9 @@ export interface WebhookTestResult {
 }
 
 
+/** ツイキャスの取得経路(Rust `TwitcastingMode`)。 */
+export type TwitcastingMode = 'auto' | 'unofficial' | 'official';
+
 export interface TwitcastingStatus {
   clientId: string;
   configured: boolean;

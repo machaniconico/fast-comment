@@ -20,7 +20,7 @@
 
 ### 1.3 ツイキャス認証 (`sources/twitcasting_auth.rs`、PR1)
 
-- コメント取得はこのログインを使わない非公式経路(§4.5)が既定。保存したトークンは PR3' の公式 API ポーリングと `twitcasting.mode`(`auto` 既定。ログイン済みなら非公式の連続読込失敗で公式へ切替)で使う。この版ではログインの有無で取得経路は変わらない。
+- 保存したトークンは、コメント取得の公式 API ポーリング(§4.5)にだけ使う。取得経路は `twitcasting.mode`(`auto` 既定 / `unofficial` / `official`)で決まる。`auto` は非公式経路で始め、ログイン済みで非公式が連続して読めなければ公式へ切り替える。`unofficial` はトークンを一切使わない。`official` は公式 API だけで、未ログインでも非公式へは落とさない(「ツイキャスにログインしてください」を出して待つ)。公式 API の送信先(Bearer を載せる先)は設定で変えられない。
 - 公式 API v2 の Implicit (`response_type=token`) のみ。ClientSecret は扱わない。公開 ClientID は `DEFAULT_CLIENT_ID` (未登録のため空文字) + 任意の上書き `credentials.twitcastingClientId`。空白だけの上書きは既定へ戻す。
 - ログイン中だけ `127.0.0.1:<port>` と `[::1]:<port>` を bind(`<port>` は `twitcasting.callbackPort`、既定 39822 = `CALLBACK_PORT`。WSL の mirrored モードが Windows 側の 44620〜48715 を確保して bind できないため範囲外にした)。IPv6 無効(アドレス使用不可)のみ IPv4 だけに劣化し、いずれかが使用中なら開始しない(`PortInUse`。エラー文で WSL の確保範囲と、ポートを変えて開発者ページのコールバック URL を登録し直す案内を出す)。コールバックは `http://localhost:<port>/twitcasting/callback`(status の `callbackUrl`)。180 秒・取消・次のログインで終了し、コマンドが返るまでにポートを解放する。
 - 固定 HTML は `history.replaceState` で URL のフラグメントとクエリを消す。ページとサーバーの両方でキーと値をパーセントデコードし、`+` はリテラルとして保持し、同じキーは最後の値を採用する。ページはフラグメントの `access_token` / `expires_in` / `state` の採用分だけを再エンコードせず同一オリジンへ POST する。拒否 (`result=denied` または OAuth の `error`) はクエリまたはフラグメントから固定の `result=denied` と、存在する場合だけ同じ場所の `state` を送る。POST は Host / Origin 検査後に state 省略または一致で拒否を確定し、不一致（空も含む）は待受を続ける。GET クエリの拒否は state が一致した時だけ確定する。state を省略した拒否の GET は待受を続け、ページのスクリプトが同一オリジンへ拒否を POST した時点で確定する。不一致の state を含む拒否の GET には中立の終了ページを返す。
@@ -186,7 +186,7 @@ trait Source {
 - 再接続は他 Source と同じ指数バックオフ。NDGR 購読が死んだらセッション全体を張り直す。サーバー `disconnect`/`error` メッセージも同様。
 
 ### 4.5 ツイキャス (`sources/twitcasting.rs`、非公式経路。ログイン不要)
-- 既定の取得経路。認証もログイン cookie も使わない(§1.3 の公式ログインとは独立)。非公式のため予告なく壊れうる。公式 API ポーリングと `mode` 切替(`auto` / `unofficial` / `official`)は PR3' で、この版には無い。
+- 既定の取得経路。認証もログイン cookie も使わない(§1.3 の公式ログインとは独立)。非公式のため予告なく壊れうる。取得経路は `twitcasting.mode` で選ぶ(下の「公式 API 経路と切替」)。
 - `identifier`: `extract_screen_id()` で正規化する。許可ホストは `twitcasting.tv` / `www.` / `ssl.` / `en.` / `ja.`(ポート・認証情報付きは不可)、接頭辞は `c:` `g:` `f:` `ig:`、本体は英数字と `_` の 32 文字以下。URL は `/movie/…` 等の後続パス可、`%3A` だけデコードする。`ChatMessage.channel` は小文字化した ID。解釈できなければ接続せず、チップに「ツイキャスの配信者 ID を解釈できません」を出して cancel まで待機する。
 - 手順(1 セッション):
   1. `GET <userPageBaseUrl><screen_id>`(既定 `https://twitcasting.tv/`)の HTML から movie_id と `data-is-onlive` を読む。HTML コメント(閉じ忘れは末尾まで)は読み飛ばす。`data-is-onlive` は `true` / `false`(ASCII 大小無視)だけ受理し、それ以外の値はページ全体を Unreadable とする。タグの `data-broadcaster-id` と `data-broadcaster-screen-name` は、値の前後空白と ASCII の大文字小文字を無視して比較し、どちらかが一致すれば本人とする。他の配信者のタグは読み飛ばし、配信者属性が他人のものしかないページは Unreadable とする。リダイレクトは追わず、一般ブラウザの User-Agent を使う。タイムアウトは HTTP 15 秒。
@@ -214,7 +214,23 @@ trait Source {
   - 時刻は `createdAt`(10 桁以下は秒、それ以外はミリ秒)。読めなければ受信時刻。
   - 匿名: `isAnonymous` が真、または `author.id` が `c:tw` + 数字 1 桁以上(`c:twinkle` は実ユーザー)か `twitcastinguest` なら、`author.id` を固定の `tc:anonymous` に置き換え、バッジ `anonymous`(「匿名」)を付ける(同じ ID を複数人が共有するため。ユーザー単位の NG・色分けに使わせない)。
   - 視聴者数・タイトルは取らない(チップは live の真偽と notice のみ更新)。
-- 対応しない物: 公式 API によるポーリングと自動切替(PR3')、合言葉・限定配信(Unavailable の文言を出すのみ)、コメント投稿、モデレーション、金額換算。
+- 対応しない物: 公式経路でのギフト取得、合言葉・限定配信(Unavailable の文言を出すのみ)、コメント投稿、モデレーション、金額換算。
+- 公式 API 経路と切替(`sources/twitcasting_official.rs` / `twitcasting_mode.rs`):
+  - `twitcasting.mode`(既定 `auto`。未知値・型違いは `auto`)はチャンネルの Source を起動する時に読む。稼働中の Source は作り直さないので、変更は再起動・チャンネル再追加(次回の接続)から反映される。設定画面の「取得経路」で選び、保存は他の項目と同じ全体保存(`baseRevision` 照合、`commit_config`)だけを通す。
+  - `unofficial`: 非公式だけ。トークンを使わず、公式 API へは一切切り替えない。
+  - `official`: 公式 API だけ。非公式へは落とさない。未ログインなら「ツイキャスにログインしてください」を出して待ち、ログインしたら再起動なしで始める。
+  - `auto`: 非公式で始める。切替の引き金に数えるのは Unreadable だけ。
+    - 数える物: 視聴ページ HTML が読めない(上の Unreadable)、eventpubsuburl が 2xx なのに本文が不正(`url` の欠落は限定配信の Unavailable で数えない)、WS で最初の配列フレームより前に非配列フレームが来た。
+    - 数えず、カウンタも戻さない物(Neutral。ネットワーク断・未配信は数えない): ネットワーク断・HTTP 3xx / 4xx / 5xx・NotFound・Unavailable・配列を受けた後の非配列フレーム・WS 切断。
+    - 明示的な未配信ページと、WS の最初の配列フレームはカウンタを 0 に戻す。
+    - 連続 3 回で、ログイン済みなら公式へ切り替える(info ログ 1 行、チャンネル名だけ)。未ログインなら「非公式経路が使えません。ログインすると公式 API で取得できます」を出して非公式を続け、ログインを検知したら再起動なしで公式へ切り替える。
+    - 公式へ切り替えた後は戻らない(その Source が止まるまで公式のまま)。非公式からやり直すのは再起動・チャンネル再追加・mode 変更の時だけ。
+  - 公式ポーリング: `/users/:id` で存在確認、`/users/:id/current_live` で配信中か判定(未配信なら待機として再確認)、配信中は `/movies/:id/comments` を `slice_id`(確定カーソル)+ `offset`(0,50,100…、`limit=50`)で空ページまで最大 5 ページ取る。短いページでは止めない。カーソルはページ取得が正常に終わった後だけ進め、途中のエラーではその回は何も流さず同じカーソルから再試行する。非数値 ID はカーソルを動かさず重複集合(直近 4096 件)だけで落とす。movie が変われば全部リセットする。切替直後・途中参加は新しい 20 件だけを古い順に `skip_tts=true` で流す。
+  - レート予算: 全チャンネルで共有する 1 本(54 回/分、ローリング)。`X-RateLimit-Remaining` が 2 以下、または 429 の時は Reset + 1 秒(1〜120 秒に丸め、Reset が無ければ 60 秒)まで全チャンネルを止める。停止期限は延ばす方向にしか更新しない。配信中のコメント poll 間隔は max(4 秒, 配信中の行数 × 2 秒)で、下限は 4 秒(表示遅延は最大約 4 秒)。
+  - 認証エラー: 現世代のトークンへの 401 は「ツイキャスに再ログインしてください」を出して再ログインを待つ(`auto` でも非公式へは落とさない。再ログインで再開、カーソルは保持)。遅れて届いた古い世代の 401 では止まらない。その他: 2001(アプリ無効)は専用の注記で `not_found_retry` 間隔に落とし、2002(合言葉付き)は「この配信は非公開のため取得できません」でコメント取得だけ止める。5xx・ネットワーク断は指数バックオフでカーソルを保つ。
+  - 公式経路中はギフトを取らない(公式のギフトは自分の配信に限られ、非公式の方が広く取れる)。視聴者数・タイトルは公式の応答から反映する。
+  - 切替では、非公式で流した直近 256 件の `ChatMessage.id` を Rust 側で持ち越し、公式の最初のバッチから落とす(UI は変えない)。開始告知(`Started`)の movie_id 照合と `channel` 名は切替後も同じ。
+  - 未検証(実機で確かめていない): 未配信時の `current_live` が 404 か。`slice_id` の境界・50 件超の向き・短いページの頻度。コメント ID が単調増加か。2000 応答への Reset ヘッダの有無。合言葉付き配信が 2002 か。**非公式 WS / listall のコメント ID と公式の `comment.id` が同じ番号体系か(違えば持ち越しが効かず、切替直後に最大 20 件が重複し得る)**。構造が読めない実際の HTML(ログイン壁・チャレンジ)が Unreadable に入るか。レートの実際の制限単位と、多チャンネル時に予算が伸ばす遅延の大きさ。
 - ログ: WS URL にトークンが入るので、ログ・エラー文にはホスト名だけを出す(`SecretWsUrl`)。`tungstenite` と `tokio_tungstenite` およびその配下(`::` 区切り)のターゲットの DEBUG / TRACE は、`EnvFilter` ではなく出力レイヤーに付けた上限フィルタで落とす(INFO 以上は通す)。`RUST_LOG` が許す範囲を超えて引き上げない(`off` / `warn` なら WS の INFO も出ない)。HTTP 取得・本文の読み取り失敗ログでは `reqwest::Error` から URL を除く。
 - 壊れうる箇所と吸収:
 
@@ -404,8 +420,8 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
   - `obs`: ポートに加え `maxRows` / `fontScalePct` / `ttlMs` / `bgOpacityPct` / `position` 等の見た目設定。範囲外値が入らないよう **Rust 側でも `normalize()` で clamp**(`maxRows` 1..=1000, `fontScalePct` 50..=200, `bgOpacityPct` 0..=100, `ttlMs` 500..=600000, `position`∈{top,bottom})。`normalize()` は config ロード時と `update_config` 適用時の両方で呼ぶ。上限定数は Rust 側に1箇所(`MAX_OBS_ROWS`)を置き UI/テンプレと値を揃える。
   - `channels[].ownStream`(bool 既定false): 「自分の配信」の印(X 自動告知の対象)。旧 config は欠落で false。
   - `xPost{enabled=false, mode="intent"|"api"="intent", intentOpen="button"|"auto"="button", combine=false, template, delaySecs=60, staleMinutes=15, cooldownMinutes=60, dailyLimit=5, callbackPort=47821}`: X 自動告知。`template` 既定は `{title}\n{url}\n{date} {time}`。全項目 serde default。`normalize_all()` で clamp(`delaySecs` 0..=600, `staleMinutes` 0..=180, `cooldownMinutes` 10..=1440, `dailyLimit` 1..=20、`mode` / `intentOpen` は不正値なら既定)。
-  - `twitcasting{callbackPort=39822}`: ツイキャスのログイン待受ポート(§1.3)。serde default で旧 config.json も読める。`xPost.callbackPort` と同じく、設定画面と接続コマンドは 1024〜65535 の整数を受け付ける。設定ロードと `update_config` では 1024 未満を各サービスの既定値に戻す。設定画面のログイン(`connect_twitcasting`)が `credentials.twitcastingClientId` と一緒にこの値だけを保存し、待受と status の `callbackUrl` に使う。
-  - `twitcastingOverrides{endpoints?, patterns?}`: ツイキャス非公式経路(§4.5)の上書き。両方とも文字列→文字列のマップで、全項目が既定値(未指定・空文字・前後空白のみは既定を使用)。値が既定(両マップが空)なら JSON から省略し、旧 config.json も読める。チャンネルの Source を起動する時に読む。 保存は他の項目と同じく全体保存(`update_config` の `baseRevision` 照合)とインポートだけで、`commit_config` を通って revision を進める。Source が書き戻すことはない。
+  - `twitcasting{callbackPort=39822, mode="auto"|"unofficial"|"official"="auto"}`: ツイキャスのログイン待受ポート(§1.3)と取得経路(§4.5。チャンネルの Source を起動する時に読み、稼働中は反映しない)。serde default で旧 config.json も読める。`xPost.callbackPort` と同じく、設定画面と接続コマンドは 1024〜65535 の整数を受け付ける。設定ロードと `update_config` では 1024 未満を各サービスの既定値に戻す。設定画面のログイン(`connect_twitcasting`)が `credentials.twitcastingClientId` と一緒にこの値だけを保存し、待受と status の `callbackUrl` に使う。
+  - `twitcastingOverrides{endpoints?, patterns?}`: ツイキャス非公式経路(§4.5)の上書き。両方とも文字列→文字列のマップで、全項目が既定値(未指定・空文字・前後空白のみは既定を使用)。値が既定(両マップが空)なら JSON から省略し、旧 config.json も読める。チャンネルの Source を起動する時に読む。 保存は他の項目と同じく全体保存(`update_config` の `baseRevision` 照合)とインポートだけで、`commit_config` を通って revision を進める。Source が書き戻すことはない。公式 API の送信先(Bearer を載せる先)は設定で変えられず、この上書きは非公式経路にだけ効く。
     - `endpoints`: `userPageBaseUrl`(既定 `https://twitcasting.tv/`、末尾に配信者 ID を連結)/ `eventPubsubUrl`(既定 `https://twitcasting.tv/eventpubsuburl.php`)/ `commentHistoryUrl`(既定 `https://twitcasting.tv/`、`<配信者 ID>/userajax.php` を連結)。
     - `patterns`(正規表現。キャプチャ 1 番目を使う): `movieId`(既定 `data-movie-id="(\d+)"`)/ `movieIdFallback`(既定 `var\s+movieid\s*=\s*"(\d+)"`、`movieId` で取れない時に試す)/ `isOnlive`(既定 `data-is-onlive="([^"]*)"`、`true` / `false` を ASCII の大文字小文字を区別せず判定し、未知値は Unreadable)。不正な正規表現は warn ログを出して既定へ戻す。
   - `credentials.twitcastingClientId`(任意): ツイキャス公開 ClientID の上書き。未設定は JSON から省略し、空欄なら既定値を使用する。トークンは資格情報一覧の `twitcasting-oauth-token` にのみ保存する(§1.3)。
