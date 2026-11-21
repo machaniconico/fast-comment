@@ -979,6 +979,7 @@ mod tests {
                 identifier: "https://twitcasting.tv/Alice#access_token=MARKER".into(),
                 enabled: true,
                 own_stream: true,
+                overrides: Default::default(),
             }],
             connected: false,
         };

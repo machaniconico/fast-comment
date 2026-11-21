@@ -51,7 +51,10 @@ use crate::autopost::{
 };
 use crate::bus::{spawn_moderation_ui_forwarder, spawn_reaction_ui_forwarder, Bus};
 use crate::templates::{TemplateInfo, TemplateRef, TemplateStore};
-use crate::config::{commit_config, ConfigCommitError, CONFIG_CHANGED_ERROR};
+use crate::config::{
+    commit_channel_overrides, commit_config, replace_channel_in, ChannelEditError, ChannelOverrides,
+    ConfigCommitError, CONFIG_CHANGED_ERROR,
+};
 use crate::config::{AppConfig, ChannelConfig, ChannelPlatform, TtsBackendKind, VoicevoxEngineKind};
 use crate::model::{
     Author, Badge, ChatMessage, Fragment, LiveEvent, LiveStream, MessageKind, ModerationEvent, Participant,
@@ -253,14 +256,7 @@ struct ObsServerControl {
 impl AppState {
     /// チャンネルの一意キー(プラットフォーム + 識別子)。
     fn channel_key(ch: &ChannelConfig) -> String {
-        let p = match ch.platform {
-            config::ChannelPlatform::Twitch => "twitch",
-            config::ChannelPlatform::Youtube => "youtube",
-            config::ChannelPlatform::X => "x",
-            config::ChannelPlatform::Niconico => "niconico",
-            config::ChannelPlatform::Twitcasting => "twitcasting",
-        };
-        format!("{p}:{}", ch.identifier)
+        config::channel_key(ch)
     }
 }
 
@@ -1596,32 +1592,73 @@ async fn set_moderation(
     update_moderation(&state, |rules| *rules = moderation)
 }
 
-/// チャンネルを1件追加して起動する。
+/// チャンネルを1件追加または置き換え、有効なら起動する。
 #[tauri::command]
 fn add_channel(
     state: State<'_, AppState>,
     channel: ChannelConfig,
+    replaces: Option<String>,
 ) -> Result<ConfigCommit<ChannelsSaved>, String> {
     let mut cfg = state.config.lock().unwrap();
-    ensure_new_channel(&cfg, &channel)?;
+    add_channel_and_commit(
+        &mut cfg,
+        &state.channels,
+        channel,
+        replaces.as_deref(),
+        |current, next| state.commit_config(current, next),
+        |cfg, ch| spawn_one_channel(&state, cfg, ch),
+    )
+}
+
+fn add_channel_and_commit(
+    cfg: &mut AppConfig,
+    channels: &Mutex<HashMap<String, CancellationToken>>,
+    mut channel: ChannelConfig,
+    replaces: Option<&str>,
+    commit: impl FnOnce(&mut AppConfig, AppConfig) -> Result<u64, ConfigCommitError>,
+    spawn: impl FnOnce(&AppConfig, &ChannelConfig) -> CancellationToken,
+) -> Result<ConfigCommit<ChannelsSaved>, String> {
+    channel.overrides.normalize();
+    let key = AppState::channel_key(&channel);
     let mut next = cfg.clone();
-    next.channels.push(channel.clone());
-    let revision = state.commit_config(&mut cfg, next).map_err(|e| e.to_string())?;
+    if let Some(old_key) = replaces {
+        replace_channel_in(&mut next, old_key, channel.clone()).map_err(|e| e.to_string())?;
+        ensure_new_channel(&next, &channel, Some(&key))?;
+    } else {
+        ensure_new_channel(cfg, &channel, None)?;
+        next.channels.push(channel.clone());
+    }
+    let revision = commit(cfg, next).map_err(|e| e.to_string())?;
+    let mut active = channels.lock().unwrap();
+    if let Some(token) = replaces.and_then(|old_key| active.remove(old_key)) {
+        token.cancel();
+    }
     if channel.enabled {
-        let token = spawn_one_channel(&state, &cfg, &channel);
-        let key = AppState::channel_key(&channel);
-        if let Some(old) = state.channels.lock().unwrap().insert(key, token) {
+        let saved_channel = cfg
+            .channels
+            .iter()
+            .find(|ch| ch.platform == channel.platform && ch.identifier == channel.identifier)
+            .expect("コミットした行が見つかる");
+        let token = spawn(cfg, saved_channel);
+        if let Some(old) = active.insert(key, token) {
             old.cancel();
         }
     }
-    Ok(channels_commit(&cfg, revision))
+    Ok(channels_commit(cfg, revision))
 }
 
 /// 既存の同一キーがあれば重複追加しない。キーは URL やトークンでありうるのでエラー文に入れない。
-fn ensure_new_channel(cfg: &AppConfig, channel: &ChannelConfig) -> Result<(), String> {
+fn ensure_new_channel(
+    cfg: &AppConfig,
+    channel: &ChannelConfig,
+    exclude: Option<&str>,
+) -> Result<(), String> {
     let key = duplicate_key(channel);
-    if cfg.channels.iter().any(|c| duplicate_key(c) == key) {
-        return Err("チャンネルは既に存在します".into());
+    if cfg.channels.iter().any(|c| {
+        duplicate_key(c) == key
+            && !exclude.is_some_and(|excluded| AppState::channel_key(c) == excluded)
+    }) {
+        return Err(ChannelEditError::Duplicate.to_string());
     }
     Ok(())
 }
@@ -1664,6 +1701,29 @@ fn set_channel_own_stream(
     Ok(channels_commit(&cfg, revision))
 }
 
+/// 行の上書きだけを保存する。実行中の Source はそのまま使う。
+#[tauri::command]
+async fn set_channel_overrides(
+    state: State<'_, AppState>,
+    key: String,
+    overrides: ChannelOverrides,
+    base_revision: u64,
+) -> Result<ConfigCommit<ChannelsSaved>, String> {
+    let _write = state.config_write.lock().await;
+    let mut cfg = state.config.lock().unwrap();
+    let revision = commit_channel_overrides(
+        &state.config_dir,
+        &state.config_revision,
+        &state.config_tx,
+        &mut cfg,
+        &key,
+        overrides,
+        base_revision,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(channels_commit(&cfg, revision))
+}
+
 #[derive(Clone, Serialize)]
 struct ChannelsSaved {
     channels: Vec<ChannelConfig>,
@@ -1678,7 +1738,7 @@ fn set_own_stream_in(cfg: &mut AppConfig, key: &str, own: bool) -> Result<(), St
         .channels
         .iter_mut()
         .find(|c| AppState::channel_key(c) == key)
-        .ok_or_else(|| "チャンネルが見つかりません".to_string())?;
+        .ok_or_else(|| ChannelEditError::NotFound.to_string())?;
     row.own_stream = own;
     Ok(())
 }
@@ -3423,6 +3483,7 @@ pub fn run() {
             append_moderation_value,
             set_moderation,
             add_channel,
+            set_channel_overrides,
             remove_channel,
             hide_message,
             unhide_message,
@@ -3797,16 +3858,16 @@ mod followup_tests {
         cfg.channels.push(tc("alice"));
         for dup in ["https://twitcasting.tv/alice", "ALICE", "https://twitcasting.tv/Alice/movie/1"] {
             assert_eq!(
-                ensure_new_channel(&cfg, &tc(dup)).unwrap_err(),
+                ensure_new_channel(&cfg, &tc(dup), None).unwrap_err(),
                 "チャンネルは既に存在します",
                 "{dup}"
             );
         }
-        assert_eq!(ensure_new_channel(&cfg, &tc("bob")), Ok(()));
+        assert_eq!(ensure_new_channel(&cfg, &tc("bob"), None), Ok(()));
         // 他のプラットフォームは従来どおり生の識別子で比べる。
         let mut twitch = tc("alice");
         twitch.platform = config::ChannelPlatform::Twitch;
-        assert_eq!(ensure_new_channel(&cfg, &twitch), Ok(()));
+        assert_eq!(ensure_new_channel(&cfg, &twitch, None), Ok(()));
     }
 
     #[test]
@@ -3817,9 +3878,9 @@ mod followup_tests {
             "identifier": "https://invalid.example/?token=MARKER",
         }))
         .unwrap();
-        assert_eq!(ensure_new_channel(&cfg, &channel), Ok(()));
+        assert_eq!(ensure_new_channel(&cfg, &channel, None), Ok(()));
         cfg.channels.push(channel.clone());
-        let duplicate = ensure_new_channel(&cfg, &channel).unwrap_err();
+        let duplicate = ensure_new_channel(&cfg, &channel, None).unwrap_err();
         assert_eq!(duplicate, "チャンネルは既に存在します");
         let missing =
             set_own_stream_in(&mut cfg, "twitcasting:https://other.example/?token=MARKER", true)
@@ -4005,12 +4066,14 @@ mod followup_tests {
                 identifier: "mine".into(),
                 enabled: true,
                 own_stream: false,
+                overrides: ChannelOverrides::default(),
             },
             ChannelConfig {
                 platform: ChannelPlatform::Youtube,
                 identifier: "@other".into(),
                 enabled: true,
                 own_stream: false,
+                overrides: ChannelOverrides::default(),
             },
         ];
         let before = cfg.channels.clone();
@@ -4116,6 +4179,104 @@ mod followup_tests {
         (dir, AtomicU64::new(0), tx, AppConfig::default())
     }
 
+    #[test]
+    fn set_channel_overrides_does_not_restart_source() {
+        let (dir, revision, tx, mut current) = commit_parts();
+        let channel = ChannelConfig {
+            platform: ChannelPlatform::Twitch,
+            identifier: "active".into(),
+            enabled: true,
+            own_stream: false,
+            overrides: ChannelOverrides::default(),
+        };
+        let key = AppState::channel_key(&channel);
+        current.channels.push(channel);
+        let config = Mutex::new(current);
+        let token = CancellationToken::new();
+        let active = Mutex::new(HashMap::from([(key.clone(), token.clone())]));
+        let overrides = ChannelOverrides {
+            tts_enabled: Some(false),
+            ..Default::default()
+        };
+        {
+            let mut current = config.lock().unwrap();
+            assert_eq!(
+                commit_channel_overrides(dir.path(), &revision, &tx, &mut current, &key, overrides.clone(), 0)
+                    .unwrap(),
+                1
+            );
+            assert_eq!(current.channel_overrides(&key), Some(&overrides));
+        }
+        let mut starts = 0;
+        apply_channel_diff(&config, &active, |_, _| {
+            starts += 1;
+            CancellationToken::new()
+        });
+        assert_eq!(starts, 0);
+        assert!(!token.is_cancelled());
+        assert!(active.lock().unwrap().contains_key(&key));
+    }
+
+    #[test]
+    fn add_channel_with_replaces_commits_once_and_inherits_overrides() {
+        for enabled in [true, false] {
+            let (dir, revision, tx, mut current) = commit_parts();
+            let overrides = ChannelOverrides {
+                tts_enabled: Some(false),
+                ..Default::default()
+            };
+            let old = ChannelConfig {
+                platform: ChannelPlatform::Niconico,
+                identifier: "lv1".into(),
+                enabled: true,
+                own_stream: true,
+                overrides: overrides.clone(),
+            };
+            let new = ChannelConfig {
+                identifier: "lv2".into(),
+                enabled,
+                own_stream: false,
+                overrides: ChannelOverrides::default(),
+                ..old.clone()
+            };
+            let old_key = AppState::channel_key(&old);
+            let new_key = AppState::channel_key(&new);
+            current.channels.push(old);
+            let old_token = CancellationToken::new();
+            let active = Mutex::new(HashMap::from([(old_key.clone(), old_token.clone())]));
+            let mut starts = 0;
+
+            let saved = add_channel_and_commit(
+                &mut current,
+                &active,
+                new,
+                Some(&old_key),
+                |cfg, next| commit_config(dir.path(), &revision, &tx, cfg, next, None),
+                |cfg, ch| {
+                    assert!(old_token.is_cancelled());
+                    assert_eq!(&cfg.channels[0], ch);
+                    assert_eq!(ch.overrides, overrides);
+                    starts += 1;
+                    CancellationToken::new()
+                },
+            )
+            .unwrap();
+            assert_eq!(saved.revision, Some(1));
+            assert_eq!(revision.load(Ordering::SeqCst), 1);
+            assert_eq!(saved.saved.channels, current.channels);
+            assert_eq!(current.channels.len(), 1);
+            assert_eq!(current.channel_overrides(&new_key), Some(&overrides));
+            assert!(!current.channels[0].own_stream);
+            assert_eq!(tx.borrow().channels, current.channels);
+            assert_eq!(AppConfig::load(dir.path()).unwrap().channels, current.channels);
+            assert!(old_token.is_cancelled());
+            assert_eq!(starts, usize::from(enabled));
+            let active = active.lock().unwrap();
+            assert!(!active.contains_key(&old_key));
+            assert_eq!(active.contains_key(&new_key), enabled);
+        }
+    }
+
     #[tokio::test]
     async fn channel_deleted_after_config_save_is_not_restarted_by_diff() {
         let (dir, revision, tx, initial) = commit_parts();
@@ -4134,6 +4295,7 @@ mod followup_tests {
                         identifier: identifier.into(),
                         enabled: true,
                         own_stream: false,
+                        overrides: ChannelOverrides::default(),
                     })
                     .collect();
                 commit_config(dir.path(), &revision, &tx, &mut current, next, Some(0)).unwrap();

@@ -12,6 +12,81 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ChannelTtsVoice {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub voicevox_speaker: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bouyomi_voice: Option<i16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub web_speech_voice: Option<String>,
+}
+
+impl ChannelTtsVoice {
+    pub fn is_empty(&self) -> bool {
+        self.voicevox_speaker.is_none()
+            && self.bouyomi_voice.is_none()
+            && self.web_speech_voice.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ChannelOverrides {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tts_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tts_voice: Option<ChannelTtsVoice>,
+}
+
+impl ChannelOverrides {
+    pub fn is_empty(&self) -> bool {
+        self.tts_enabled.is_none() && self.tts_voice.as_ref().is_none_or(ChannelTtsVoice::is_empty)
+    }
+
+    pub fn normalize(&mut self) {
+        if self.tts_enabled == Some(true) {
+            self.tts_enabled = None;
+        }
+        if let Some(voice) = &mut self.tts_voice {
+            voice.web_speech_voice = voice
+                .web_speech_voice
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned);
+            if voice.is_empty() {
+                self.tts_voice = None;
+            }
+        }
+    }
+}
+
+fn deserialize_channel_overrides<'de, D>(deserializer: D) -> Result<ChannelOverrides, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct OverridesVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for OverridesVisitor {
+        type Value = ChannelOverrides;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a channel overrides object")
+        }
+
+        fn visit_map<M>(self, map: M) -> Result<Self::Value, M::Error>
+        where
+            M: serde::de::MapAccess<'de>,
+        {
+            ChannelOverrides::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+        }
+    }
+
+    deserializer.deserialize_map(OverridesVisitor)
+}
+
 /// 監視対象チャンネル1件。
 ///
 /// Twitch はチャンネル名(`#` 抜き)、YouTube は videoId か配信URL を `identifier` に入れる。
@@ -28,6 +103,12 @@ pub struct ChannelConfig {
     /// 「自分の配信」の印(X 自動告知の対象)。旧 config.json には無いので既定は false。
     #[serde(default)]
     pub own_stream: bool,
+    #[serde(
+        default,
+        skip_serializing_if = "ChannelOverrides::is_empty",
+        deserialize_with = "deserialize_channel_overrides"
+    )]
+    pub overrides: ChannelOverrides,
 }
 
 /// 設定上のプラットフォーム種別。`model::Platform` と1対1だが、
@@ -43,6 +124,78 @@ pub enum ChannelPlatform {
     Niconico,
     /// ツイキャス。identifier は配信者 ID(screen_id)または URL。
     Twitcasting,
+}
+
+impl ChannelPlatform {
+    fn key_prefix(self) -> &'static str {
+        match self {
+            Self::Twitch => "twitch",
+            Self::Youtube => "youtube",
+            Self::X => "x",
+            Self::Niconico => "niconico",
+            Self::Twitcasting => "twitcasting",
+        }
+    }
+}
+
+pub fn channel_key(ch: &ChannelConfig) -> String {
+    format!("{}:{}", ch.platform.key_prefix(), ch.identifier)
+}
+
+fn channel_matches_key(ch: &ChannelConfig, key: &str) -> bool {
+    key.split_once(':') == Some((ch.platform.key_prefix(), ch.identifier.as_str()))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ChannelEditError {
+    NotFound,
+    Duplicate,
+}
+
+impl std::fmt::Display for ChannelEditError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound => f.write_str("チャンネルが見つかりません"),
+            Self::Duplicate => f.write_str("チャンネルは既に存在します"),
+        }
+    }
+}
+
+pub fn set_channel_overrides_in(
+    cfg: &mut AppConfig,
+    key: &str,
+    mut overrides: ChannelOverrides,
+) -> Result<(), ChannelEditError> {
+    let row = cfg
+        .channels
+        .iter_mut()
+        .find(|ch| channel_matches_key(ch, key))
+        .ok_or(ChannelEditError::NotFound)?;
+    overrides.normalize();
+    row.overrides = overrides;
+    Ok(())
+}
+
+pub fn replace_channel_in(
+    cfg: &mut AppConfig,
+    old_key: &str,
+    mut new: ChannelConfig,
+) -> Result<(), ChannelEditError> {
+    let index = cfg
+        .channels
+        .iter()
+        .position(|ch| channel_matches_key(ch, old_key))
+        .ok_or(ChannelEditError::NotFound)?;
+    if cfg.channels.iter().enumerate().any(|(i, ch)| {
+        i != index && ch.platform == new.platform && ch.identifier == new.identifier
+    }) {
+        return Err(ChannelEditError::Duplicate);
+    }
+    if new.overrides.is_empty() {
+        new.overrides = cfg.channels[index].overrides.clone();
+    }
+    cfg.channels[index] = new;
+    Ok(())
 }
 
 const MAX_OBS_ROWS: u16 = 1000;
@@ -1080,6 +1233,16 @@ impl AppConfig {
         self.tts.options.normalize();
         self.x_post.normalize();
         self.twitcasting.normalize();
+        for channel in &mut self.channels {
+            channel.overrides.normalize();
+        }
+    }
+
+    pub fn channel_overrides(&self, key: &str) -> Option<&ChannelOverrides> {
+        self.channels
+            .iter()
+            .find(|ch| channel_matches_key(ch, key))
+            .map(|ch| &ch.overrides)
     }
 
     /// `config.json` へ保存する(ディレクトリは必要なら作成)。
@@ -1148,6 +1311,44 @@ pub fn commit_config(
     *current = next;
     tx.send_replace(current.clone());
     Ok(revision.fetch_add(1, Ordering::SeqCst) + 1)
+}
+
+#[derive(Debug)]
+pub enum ChannelOverridesCommitError {
+    Stale,
+    NotFound,
+    Save(anyhow::Error),
+}
+
+impl std::fmt::Display for ChannelOverridesCommitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Stale => f.write_str(CONFIG_CHANGED_ERROR),
+            Self::NotFound => std::fmt::Display::fmt(&ChannelEditError::NotFound, f),
+            Self::Save(_) => f.write_str("枠の設定を保存できませんでした"),
+        }
+    }
+}
+
+pub fn commit_channel_overrides(
+    dir: &Path,
+    revision: &AtomicU64,
+    tx: &tokio::sync::watch::Sender<AppConfig>,
+    current: &mut AppConfig,
+    key: &str,
+    overrides: ChannelOverrides,
+    base_revision: u64,
+) -> Result<u64, ChannelOverridesCommitError> {
+    if base_revision != revision.load(Ordering::SeqCst) {
+        return Err(ChannelOverridesCommitError::Stale);
+    }
+    let mut next = current.clone();
+    set_channel_overrides_in(&mut next, key, overrides)
+        .map_err(|_| ChannelOverridesCommitError::NotFound)?;
+    commit_config(dir, revision, tx, current, next, Some(base_revision)).map_err(|err| match err {
+        ConfigCommitError::Stale => ChannelOverridesCommitError::Stale,
+        ConfigCommitError::Save(err) => ChannelOverridesCommitError::Save(err),
+    })
 }
 
 // ---- serde default ヘルパ ----
@@ -1247,6 +1448,17 @@ fn default_welcome_count() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn channel_overrides_reject_positional_arrays() {
+        for overrides in [serde_json::json!([]), serde_json::json!([false])] {
+            let err = AppConfig::from_config_update(serde_json::json!({
+                "channels": [{"platform": "x", "identifier": "live", "overrides": overrides}]
+            }))
+            .unwrap_err();
+            assert!(err.contains("channels"), "{err}");
+        }
+    }
     #[test]
     fn legacy_config_without_own_stream_or_x_post_loads_with_defaults() {
         let legacy = r#"{"channels":[{"platform":"twitch","identifier":"abc"}],"credentials":{"twitchOauth":"x"}}"#;
@@ -1447,6 +1659,7 @@ mod tests {
                 identifier: "https://www.youtube.com/watch?v=abc123".to_string(),
                 enabled: false,
                 own_stream: true,
+                overrides: ChannelOverrides::default(),
             }],
             obs: ObsConfig {
                 port: 12000,
