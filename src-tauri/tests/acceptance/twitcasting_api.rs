@@ -209,10 +209,10 @@ async fn no_request_is_sent_when_not_ready() {
         endpoints(&r.fake.base),
         Arc::new(|| Some("other-client".to_string())),
     );
-    let before = state(&r.auth);
     all_unauthorized(&other).await;
     assert_eq!(r.fake.total(), 0, "ClientID 不一致で送った");
-    assert_eq!(state(&r.auth), before);
+    // ClientID が違うログインは再ログイン要求になる(PR #43 の既定の挙動)
+    assert_eq!(state(&r.auth), AuthState::ReloginRequired);
 }
 
 // ---------------------------------------------------------------- 秘密
@@ -234,24 +234,28 @@ async fn errors_never_contain_token_or_response_body() {
         error_reply(503, 0),
     ];
     let mut errors: Vec<(ApiError, String)> = Vec::new();
+    let mut log = String::new();
     for reply in cases {
         let r = rig_logged_in().await;
+        logs.clear(); // ログイン手順(PR #43)のログは API クライアントのものではない
         hosts.push(r.fake.host());
         r.fake.set_responder(move |_: &Req| reply.clone());
         errors.push((r.api.user("alice").await.unwrap_err(), r.fake.host()));
+        log.push_str(&logs.take());
     }
     {
         let r = rig_logged_in().await;
+        logs.clear();
         hosts.push(r.fake.host());
         r.fake.set_down(true);
         errors.push((r.api.user("alice").await.unwrap_err(), r.fake.host()));
+        log.push_str(&logs.take());
     }
     for (e, host) in &errors {
         for (place, text) in [("Display", format!("{e}")), ("Debug", format!("{e:?}"))] {
             assert_absent(&format!("ApiError {place}"), &text, &[TOK_A, "BODY-MARKER", host.as_str()]);
         }
     }
-    let log = logs.text();
     assert_absent("ログ", &log, &[TOK_A, "BODY-MARKER"]);
     for h in &hosts {
         assert_absent("ログ", &log, &[h.as_str()]);
@@ -271,35 +275,43 @@ async fn api_debug_never_contains_token() {
 async fn no_log_line_contains_token_or_url() {
     let (logs, _guard) = capture_logs();
     let mut hosts: Vec<String> = Vec::new();
+    let mut log = String::new();
     // 成功
     {
         let r = rig_logged_in().await;
+        logs.clear();
         hosts.push(r.fake.host());
         r.fake.set_responder(|_: &Req| Reply::json(200, json!({"user": {"id": "1"}})));
         assert!(r.api.user("alice").await.is_ok());
+        log.push_str(&logs.take());
     }
     // 401
     {
         let r = rig_logged_in().await;
+        logs.clear();
         hosts.push(r.fake.host());
         r.fake.set_responder(|_: &Req| error_reply(401, 1000));
         assert_eq!(r.api.user("alice").await, Err(ApiError::Unauthorized));
+        log.push_str(&logs.take());
     }
     // 5xx
     {
         let r = rig_logged_in().await;
+        logs.clear();
         hosts.push(r.fake.host());
         r.fake.set_responder(|_: &Req| error_reply(503, 0));
         assert_eq!(r.api.user("alice").await, Err(ApiError::Server));
+        log.push_str(&logs.take());
     }
     // Network
     {
         let r = rig_logged_in().await;
+        logs.clear();
         hosts.push(r.fake.host());
         r.fake.set_down(true);
         assert_eq!(r.api.user("alice").await, Err(ApiError::Network));
+        log.push_str(&logs.take());
     }
-    let log = logs.text();
     assert_absent("ログ", &log, &[TOK_A, "Bearer"]);
     for h in &hosts {
         assert_absent("ログ", &log, &[h.as_str()]);

@@ -13,7 +13,6 @@ use fast_comment_lib::model::{ChatMessage, LiveEvent};
 use fast_comment_lib::sources::twitcasting::{TwitcastingOverrides, TwitcastingSource, UnofficialTuning};
 use fast_comment_lib::sources::twitcasting_api::{ClientIdFn, RateBudget, TwitcastingApi};
 use fast_comment_lib::sources::twitcasting_auth::{AuthOptions, TwitcastingAuth, TwitcastingEndpoints};
-use fast_comment_lib::sources::twitcasting_official::{PollTuning, TwitcastingOfficialSource};
 use fast_comment_lib::sources::Source;
 use fast_comment_lib::stats::YoutubeMetadataUpdate;
 use serde_json::{json, Value};
@@ -72,6 +71,17 @@ impl LogBuf {
     pub fn text(&self) -> String {
         String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
     }
+    /// 溜まった分を捨てる(セットアップ中のログを検査対象から外す)。
+    pub fn clear(&self) {
+        self.0.lock().unwrap().clear();
+    }
+    /// 溜まった分を取り出して空にする。
+    pub fn take(&self) -> String {
+        let mut g = self.0.lock().unwrap();
+        let s = String::from_utf8_lossy(&g).into_owned();
+        g.clear();
+        s
+    }
     pub fn lines(&self) -> Vec<String> {
         self.text().lines().map(str::to_owned).collect()
     }
@@ -94,11 +104,11 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
     }
 }
 
-/// このスレッドに限ってログを捕捉する。戻り値のガードを落とすまで有効。
+/// このスレッドに限って、アプリ(`fast_comment_lib`)のログだけを全レベルで捕捉する(依存クレートの DEBUG は除く)。戻り値のガードを落とすまで有効。
 pub fn capture_logs() -> (LogBuf, tracing::subscriber::DefaultGuard) {
     let buf = LogBuf::default();
     let subscriber = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::TRACE)
+        .with_env_filter(tracing_subscriber::EnvFilter::new("fast_comment_lib=trace"))
         .with_ansi(false)
         .with_writer(buf.clone())
         .finish();
@@ -545,15 +555,6 @@ pub async fn login(auth: &Auth, port: u16, token: &str) {
 }
 
 // ---------------------------------------------------------------- Source の実行と収集
-
-pub fn tuning() -> PollTuning {
-    PollTuning { offline: ms(50), live_refresh: ms(50), comment_unit: ms(20), not_found_retry: ms(200), jitter: false }
-}
-
-pub fn official_source(rig: &Rig, id: &str, chan: &Chan, t: PollTuning) -> TwitcastingOfficialSource<MemorySecretStore> {
-    TwitcastingOfficialSource::new(id.to_string(), rig.api.clone(), rig.auth.subscribe(), Some(chan.meta_tx()), t)
-        .with_live_tx(Some(chan.live_tx()))
-}
 
 pub fn unofficial_tuning() -> UnofficialTuning {
     UnofficialTuning { offline: ms(30), unreadable_recheck: ms(30), not_found_retry: ms(200), jitter: false }
