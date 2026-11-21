@@ -226,3 +226,23 @@ export interface WebhookTestResult {
   status: number | null;
   errorKind: string | null;
 }
+
+
+export interface TwitcastingStatus {
+  clientId: string;
+  configured: boolean;
+  state: 'loggedOut' | 'ready' | 'reloginRequired' | 'loading' | 'loadFailed';
+  logoutPending?: boolean;
+  logoutIssue?: 'markerUnavailable' | 'markerInaccessible' | 'markerCorrupt' | 'deleteFailed' | 'markerAndDeleteFailed' | 'timedOut' | 'checkTimedOut' | 'otherLoginKept' | 'recordUnrecognized' | 'unreadableRecordDeleted' | 'lockTimedOut';
+  /** 削除を伴って完了したログアウトの回数(0 のときは省略)。 */
+  logoutsCompleted?: number;
+  screenId: string | null;
+  name: string | null;
+  expiresAtMs: number | null;
+  callbackUrl: string;
+  customClientId: boolean;
+}
+export interface TwitcastingAuthError {
+  code: 'notConfigured' | 'portInUse' | 'loginTimeout' | 'cancelled' | 'denied' | 'clientMismatch' | 'tokenStore' | 'network' | 'other';
+  message: string;
+}

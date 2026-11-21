@@ -18,6 +18,27 @@
 - **OBS配信サーバ**: axum (HTTP + WebSocket) + tower-http (静的テンプレ配信)
 - **ビルド/実行ターゲット**: **Windows**（WSLでは編集のみ、ビルドはWindows側）
 
+### 1.3 ツイキャス認証 (`sources/twitcasting_auth.rs`、PR1)
+
+- 公式 API v2 の Implicit (`response_type=token`) のみ。ClientSecret は扱わない。公開 ClientID は `DEFAULT_CLIENT_ID` (未登録のため空文字) + 任意の上書き `credentials.twitcastingClientId`。空白だけの上書きは既定へ戻す。
+- ログイン中だけ `127.0.0.1:<port>` と `[::1]:<port>` を bind(`<port>` は `twitcasting.callbackPort`、既定 39822 = `CALLBACK_PORT`。WSL の mirrored モードが Windows 側の 44620〜48715 を確保して bind できないため範囲外にした)。IPv6 無効(アドレス使用不可)のみ IPv4 だけに劣化し、いずれかが使用中なら開始しない(`PortInUse`。エラー文で WSL の確保範囲と、ポートを変えて開発者ページのコールバック URL を登録し直す案内を出す)。コールバックは `http://localhost:<port>/twitcasting/callback`(status の `callbackUrl`)。180 秒・取消・次のログインで終了し、コマンドが返るまでにポートを解放する。
+- 固定 HTML は `history.replaceState` で URL のフラグメントとクエリを消す。ページとサーバーの両方でキーと値をパーセントデコードし、`+` はリテラルとして保持し、同じキーは最後の値を採用する。ページはフラグメントの `access_token` / `expires_in` / `state` の採用分だけを再エンコードせず同一オリジンへ POST する。拒否 (`result=denied` または OAuth の `error`) はクエリまたはフラグメントから固定の `result=denied` と、存在する場合だけ同じ場所の `state` を送る。POST は Host / Origin 検査後に state 省略または一致で拒否を確定し、不一致（空も含む）は待受を続ける。GET クエリの拒否は state が一致した時だけ確定する。state を省略した拒否の GET は待受を続け、ページのスクリプトが同一オリジンへ拒否を POST した時点で確定する。不一致の state を含む拒否の GET には中立の終了ページを返す。
+- Host と、指定された Origin を 3 種のループバックに限定する。POST 本文は 4096 バイト以下、32 バイト乱数の state を定数時間で比較する。トークンは可視 ASCII で、**新規保存のトークン単体は最大 1024 バイト**。実際に保存できる長さは、ClientID、アカウント名、JSON エスケープなどを含めた記録全体の検査で決まる。state が正しく 1025〜2048 バイトの可視 ASCII トークンは `TokenStore` でログインを終了する。空、制御文字を含む値、2048 バイト超は不正なコールバックとして待受を続ける。既存の保存値は従来の構文上限で復元する。成功は一回限り。全応答に no-store / no-referrer / nosniff と、外部リソース禁止・`frame-ancestors 'none'` の CSP を付ける。
+- 保存前に `/verify_credentials` を Bearer、`X-Api-Version: 2.0`、JSON Accept で呼び、`app.client_id` を照合する。トークン・state・拒否の詳細はログ、エラー文、Debug、emit、状態 JSON に出さない。
+- 資格情報ストア (`integrations::SecretStore`、service `fast-comment`、キー `twitcasting-oauth-token`) に `{clientId, accessToken, userId, screenId, name, expiresAtMs, obtainedAtMs}` を保存する。検証 API の結果を反映し、ブラウザへ成功を返す前に、外側の JSON、エスケープ、保存時刻の最大桁数まで含めた UTF-16 の記録全体を検査する。Windows の上限 2560 バイトを超える場合は、ブラウザへ HTTP 400、アプリへ `TokenStore` を返し、ストアへのアクセスを省く。`obtainedAtMs` は grant 受領時刻。`expires_in` は省略時のみ期限不明とし、指定時は 1〜315360000 秒の整数を受け付ける。不正な期限や保存時にすでに期限切れのトークンではログインを失敗させる。復元時に `expiresAtMs` が `obtainedAtMs` から 10 年を超える値、または JS の Date 範囲外の値は破損として扱う。
+- ストア操作はプロセスごとに単一のワーカーと待機枠 4 件の FIFO で実行する。Windows で同じユーザーの別ログオンセッションが同時に使う場合も、ローカルアプリデータの `twitcasting-credentials.lock` に対する OS のファイルロックで、ツイキャスのマーカー検査・更新、資格情報の読込、照合から削除まで、ログインの保存から確定または巻き戻しまでを直列化する。排他ファイルは置換せず、プロセス終了時に OS がロックを解放する。ロック待ちには操作ごとの `read_timeout` の絶対期限を使い、ログインでは全体期限も適用する。ストアのキューとブロッキングタスクの開始待ちを含む残り時間まで待ち、他セッションのロック保持が期限まで続いた場合は `lockTimedOut` を返す。
+- ストア操作の登録時に待機枠が満杯なら `TokenStore` を返す。保存待ち（キュー・排他・旧値取得・put）は `read_timeout` で `TokenStore` を返し、ログインの取消・全体期限にも従う。待ちを終えた書き込みは、その値が実際に保存されていれば後続の操作より前に元に戻す。旧値が読めなかった時は、書き込みが残っている場合だけ削除する。巻き戻しは失敗が返った場合に最大 3 回試し、すべて失敗した場合はメモリを未ログインにする。開始済みのストア操作は完了まで後続を待たせる。ログアウトはマーカーの追加、ストアの削除待ち、マーカーの解除を合わせて `read_timeout` まで待つ。マーカー I/O とファイルロック取得はブロッキングタスク上で実行し、その間メモリとログインのロックを解放する。期限後も開始済みのログアウトは継続し、重複して登録しない。
+- `LoggedOut` / `Loading` / `LoadFailed` / `Ready` / `ReloginRequired` を watch 通知する。ログアウト保留・理由・読込の進み具合だけが変わった時も通知する。起動時は `Integrations::open` の完了後、状態を登録する前に `loading` にし、登録後に `initialize` の future を実行する。マーカー検査、必要な照合、復元は 1 回の `read_timeout` を共有する。起動時に別の記録を見つけた場合は、照合時に読んだ値を復元に使う。期限後の値や照合時に解析できなかった値は `loadFailed` にし、再読込できるようにする。期限判定には検査中の経過時間を含める。マーカー検査中はログインを `TokenStore` で拒否し、画面のログインボタンも `loading` 中は無効にする。通常の保存値の読込も失敗または時間切れで `loadFailed` になる。
+- 期限切れ (`now >= expiresAtMs`)、ClientID 不一致、401 通知で再ログインが必要になる。既知の期限はタイマーでも通知する。Bearer は Ready かつ期限内かつ ClientID 一致時だけ取得でき、API リクエストの 401 は取得時の世代が一致する場合だけ現在のログインを失効させる。`user_id()` は Ready 時に返す。失効では保存値を維持し、再読込で状態を変えない。
+- 明示ログアウトではメモリ上の認証をすぐ解除し、知っている記録を削除対象の集合に追加する。対象が未確定なら、受付時刻を決めた初回の受付に限り、別セッションのマーカーに他の識別子があっても、ストアから読めた現在値を対象に加える。初回の受付がロック待ちの時間切れやキュー満杯などでストアを読む前に終わっても、再試行は初回扱いにせず、下の受付時刻で判定する(再試行の時点の現在値は、受付後に別セッションが保存したログインかもしれないため)。外側の JSON または記録を解析できない場合は、生の値を識別して照合する。生の値も読めなければ、初回の受付に限り資格情報を直接削除できる。明示操作自身のマーカー読込だけでは対象は未確定のまま。起動時・再読込で見つけた保留マーカーでは識別子で対象を確定する。空のストアを含め、読込または直接削除が成功した時点で対象を確定する。確定後の再試行では既存の識別子を照合する。
+- 同じ保留中のログアウトにつき直接削除は初回の受付の一度だけ。直接削除にも失敗した後、再試行でまた読めなければ保留を維持し、理由 `deleteFailed` を返す。マーカーにもアクセスできなければ `markerAndDeleteFailed` を返す。再試行で記録が読めたら、既存の識別子で照合し、`obtainedAtMs` が最初の明示ログアウトの受付時刻以前(同時刻を含む)の記録を削除対象に加える。受付時刻は同じ PC の壁時計の Unix epoch ミリ秒としてメモリに保持する。`obtainedAtMs` はグラントの受信時刻(ログイン開始時の壁時計に、そこから受信までの経過を足した値)で、記録の保存はトークン検証などの後になる。そのため既知の限界として、別セッション B がグラントを受信してから保存するまでの間に、このセッションがログアウトを受け付け、しかも初回の受付がストアを読む前に失敗した場合、B の記録は受付時刻以前になり、再試行で消える(`<` で比べても同じ。失敗が重なった時だけの経路で、B は再ログインで戻せる)。同時刻を消す側に含めるのは、ログアウトした記録が次回起動で復元されるのを防ぐため。壁時計が 1970 年より前で 0 を返す場合、受付時刻は 0 になり、記録の `obtainedAtMs` はログイン開始からの経過だけになるので、取得時刻ではセッションを区別できない。この場合の再試行は読めた記録をすべて削除対象にする(ログアウトした資格情報を残すより、別セッションに再ログインさせる方を選ぶ)。受付時刻より後の記録は、既存の削除対象に一致しない限り保持する。再試行で読めた解析できない値は、直接削除を試したかに関わらず削除する(どのセッションも解析できる記録を保存するため、後から保存された別のログインではない)。照合で残した別のログインは `otherLoginKept`、起動時・再読込や対象確定後の照合で残した解析不能な記録は `recordUnrecognized` で知らせる。直接削除後は `unreadableRecordDeleted` を表示する。削除の完了は `logoutsCompleted` の増加で知らせ、理由には最後の試行の結果を出す。
+- マーカー `twitcasting-logout-pending` は 1 行につき 1 件の削除対象を保存する。識別子は正規化した記録 JSON の SHA-256 の小文字 16 進とし、解析不能な記録には `raw:`、外側の JSON には `envelope:` を付ける。旧形式の 0 バイトの通常ファイルは任意の現在値 1 件を表し、他の識別子との和集合では `*` として保存する。空白のみ・通常ファイル以外・64 KiB 超は破損扱いとし、起動時の削除は保留する。起動時はロック内で前回終了時に残ったマーカーの一時ファイルを掃除する。
+- マーカーの更新ではロック内で読み直して集合の和を取り、一時ファイルを同期してから rename で公開する。起動時の再試行では削除直前にマーカーを再確認し、再確認に失敗しても判明済みの識別子はメモリに保持する。資格情報ストアの現在値が対象の集合に含まれる場合だけ削除し、ストアに無いと確認できた識別子だけをマーカーから外す。最後の識別子が消えたらマーカーを取り除く。明示操作では破損マーカーや空ディレクトリ、リンクを取り除ける。
+- `logoutPending` と理由はストアとの照合とマーカーの解除結果から決める。`logoutsCompleted` は、実際の削除とマーカーの解除が揃った時に増える。削除後に解除だけ失敗した時は削除済みをメモリに保持し、再試行で解除できた時に一度だけ画面へ削除完了を通知する。
+- 安定した設定ディレクトリを取得できない時は復元を保留し、ログアウトは失敗として返す。マーカー検査が時間切れなら理由 `checkTimedOut` で再検査でき、アクセスエラーなら `markerInaccessible` を返す。どちらもアプリ再起動の選択肢を出す。マーカーの記録と資格情報の削除が両方失敗した時は `markerAndDeleteFailed`、設定ディレクトリまたはロックを置くローカルデータフォルダーを取得できない時は `markerUnavailable` を返す。保留時は `logoutPending` と必要に応じて固定の `logoutIssue` を返す。設定画面から再試行できる。
+- 設定には状態、アカウント、期限（残り 14 日以下は警告）、ログイン / 取消 / ログアウトと再試行、ClientID 上書きとコールバック URL を表示する。状態の取得に失敗した時は理由と再読込ボタンを表示する。`get_twitcasting_status` / `reload_twitcasting_status` / `connect_twitcasting` / `cancel_twitcasting_login` / `disconnect_twitcasting` を使い、接続時は ClientID と待受ポートを即時保存する。接続終了後に保存済みの ClientID と待受ポートを読み直す。状態の `clientId` が保存済みの上書き値（未設定は空文字）と一致する時だけ表示する。ツイキャス側の許可解除は連携アプリ設定で行う。
+- 残るリスク。Implicit のフラグメント付き URL が一瞬ブラウザ履歴に載る。待受終了後のコールバックでは接続拒否画面の URL 欄にトークンが残る場合がある。遅れた書き込みの巻き戻し前にアプリが終了するか、巻き戻しが 3 回失敗すると、取り消したトークンが次の起動で復元されうる。旧版や資格情報マネージャーなど、同じファイルロックを使わない更新は、OS ストアの照合と削除の間に入りうる。旧形式の任意マーカーが残っている間は、現在値を対象にし、新しいログインの保存を保留する。明示ログアウトで削除とマーカーの永続化が両方失敗した場合や、生の値を読めず対象を記録できなかった場合は、削除が成功する前に終了すると旧値が次回起動で復元されうる。時刻による照合は壁時計の変更やミリ秒単位の丸め、受付前に取得され受付後に保存された grant により、実際の資格情報の保存順とずれる場合がある。PR1 は認証のみで、コメント受信は後続 PR。
+
 ## 2. 全体アーキテクチャ
 
 ```
@@ -29,6 +50,8 @@
                                           Tauri IPC(UI)   axum WS(OBS)    TTS dispatch
                                           rAFバッチ描画   テンプレ配信     bouyomi/voicevox/webspeech
 ```
+
+- **単一インスタンス**: `tauri-plugin-single-instance` を Builder の最初に登録する(デスクトップ)。2 つ目の起動は既存のメインウィンドウを表示・前面化して終了する。メインが閉じられ弾幕ウィンドウだけが残っている時は、`tauri.conf.json` の `main` 設定からメインを作り直す。プラグインの排他は Windows のログオンセッション単位。ツイキャスの資格情報とログアウトマーカーは同じユーザーの別ログオンセッションをまたいで §1.3 のファイルロックで保護する。
 
 ## 3. 統一データモデル (`model.rs`)
 
@@ -338,11 +361,24 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
   - `obs`: ポートに加え `maxRows` / `fontScalePct` / `ttlMs` / `bgOpacityPct` / `position` 等の見た目設定。範囲外値が入らないよう **Rust 側でも `normalize()` で clamp**(`maxRows` 1..=1000, `fontScalePct` 50..=200, `bgOpacityPct` 0..=100, `ttlMs` 500..=600000, `position`∈{top,bottom})。`normalize()` は config ロード時と `update_config` 適用時の両方で呼ぶ。上限定数は Rust 側に1箇所(`MAX_OBS_ROWS`)を置き UI/テンプレと値を揃える。
   - `channels[].ownStream`(bool 既定false): 「自分の配信」の印(X 自動告知の対象)。旧 config は欠落で false。
   - `xPost{enabled=false, mode="intent"|"api"="intent", intentOpen="button"|"auto"="button", combine=false, template, delaySecs=60, staleMinutes=15, cooldownMinutes=60, dailyLimit=5, callbackPort=47821}`: X 自動告知。`template` 既定は `{title}\n{url}\n{date} {time}`。全項目 serde default。`normalize_all()` で clamp(`delaySecs` 0..=600, `staleMinutes` 0..=180, `cooldownMinutes` 10..=1440, `dailyLimit` 1..=20、`mode` / `intentOpen` は不正値なら既定)。
+  - `twitcasting{callbackPort=39822}`: ツイキャスのログイン待受ポート(§1.3)。serde default で旧 config.json も読める。`xPost.callbackPort` と同じく、設定画面と接続コマンドは 1024〜65535 の整数を受け付ける。設定ロードと `update_config` では 1024 未満を各サービスの既定値に戻す。設定画面のログイン(`connect_twitcasting`)が `credentials.twitcastingClientId` と一緒にこの値だけを保存し、待受と status の `callbackUrl` に使う。
+  - `credentials.twitcastingClientId`(任意): ツイキャス公開 ClientID の上書き。未設定は JSON から省略し、空欄なら既定値を使用する。トークンは資格情報一覧の `twitcasting-oauth-token` にのみ保存する(§1.3)。
   - `credentials.xPostClientId`(任意): API モード用の X OAuth 2.0 Client ID。未設定なら JSON に出さない。設定画面の「X に接続」(`connect_x_post`)が `xPost.callbackPort` と一緒にこの 2 項目だけを保存する。
   - `xOverrides.endpoints` の `postAuthorizeUrl` / `postTokenUrl` / `postTweetsUrl` / `postUsersMeUrl`: API モードの X エンドポイントの上書き(起動時に読む。変えたらアプリを再起動)。
   - X 投稿の認証は `config.json` に置かない: OS 資格情報ストア(`secret_store`)のエントリ `x-post-oauth-token` に `{ clientId, refreshToken, userId, username }`。access token はメモリのみ。
   - 台帳 `<config_dir>/x-autopost-ledger.json`(§13)。
-- 起動時ロード、変更時保存。`config.json` をアプリ設定の正本とする。
+- 起動時ロード、変更時保存。`config.json` をアプリ設定の正本とする。読込時は JSON の末尾まで検証する。設定の型エラーは固定の項目名で示し、入力値や任意のマップキーをログ・画面に出さない。インポート後は Rust の正規化済み設定をフォームに反映する。ブラウザでは外観設定を反映できる。
+- 全体保存（インポートを含む）では、X とツイキャスそれぞれの接続コマンドの待機中に、そのサービスの ClientID と待受ポートを現在の値のまま保存する。保持した項目は `protectedOAuth` で返す。UI は応答の正規化済み設定全体でフォームを置き換えるので、保持した値がそのまま入る。接続コマンドに無効なポートを渡した時のエラーは入力値を含まない。
+- 設定の revision: Rust は `AppState.config_revision`(u64、プロセス内で単調増加、永続化しない)を持つ。設定の保存は `config::commit_config` だけが行い、設定のロック内でディスク保存に成功した時だけメモリ・watch と一緒に revision を 1 進める。`get_config` は `{ config, revision }` を返す。既知の制限: `AppConfig::save` は受け入れテストが使うため公開のままで、クレート内の迂回保存は lib.rs のソース検査テスト(`src` 全体の `config_tx.send*`・`AppConfig::save(`・設定ディレクトリを渡す `.save(`)で防ぐ。
+- 書込 IPC は保存後の `revision`(保存しなかった時は null)と、書いた部分の正規化済みの値を返す。`update_config` → `{ warnings, protectedOAuth, revision, config }`(正規化後の設定全体)、`set_goals_show_in_app` → `{ revision, showInApp }`、`set_moderation` → `{ revision, moderation }`、`append_moderation_value` → `{ revision, value, moderation }`、`add_channel` / `remove_channel` / `set_channel_own_stream` → `{ revision, channels }`。保存が応答より前に起きる `connect_twitcasting` / `connect_x_post`(`{ revision, clientId, callbackPort }`)、`connect_youtube_oauth`(`{ revision, youtubeOauthClientId }`、ClientID が変わった時だけ保存)、`disconnect_x_post`(API モードを戻した時 `{ revision, xPost: { mode } }`)は引数 `onConfigSaved` の Channel で送る。
+- 全体保存の楽観的排他: 設定画面の「設定を保存」は `update_config(newConfig, baseRevision)` を送る。`update_config` は `newConfig` を JSON 値で受け、型変換を含む他の検証(API モードの接続確認など)より先に `baseRevision` を照合し、現在の revision と違えば保存せず固定文言「設定が別の操作で変更されました。読み直してから保存してください」で拒否する。設定全体のインポートは意図的な上書きなので `baseRevision` を送らない(ログイン中の OAuth 項目の保持は上記のとおり)。部分更新の IPC は最新設定へのパッチなので `baseRevision` を取らない。
+- 画面(設定画面・コメント画面)が基準 revision を進めるのは (a) `get_config` の応答でフォーム/状態を丸ごと置き換えた時、(b) 自分が呼んだ書込 IPC の応答の revision が基準 + 1 ちょうどの時(書いた部分を応答の正規化済みの値で反映する。全体保存では応答の設定全体でフォームを置き換える)だけ。それ以外(基準 + 2 以上、応答待ちの間に別の書込があった)は再読込を求める。基準は単調増加で、応答(`get_config`・書込の応答・Channel)の revision が基準以下なら何も反映しない(全体読込で基準と同じ revision を読めた時は再読込要求だけ下ろす)。部分読込が基準より新しい設定を返したら、その項目を表示に反映して再読込を求める。自分の書込・再読込の間は、それが書き換える欄を無効にし、全体保存中はフォーム全体を無効にする。接続系コマンドの `onConfigSaved` は、そのコマンドが settle した後に届いたら反映せず、基準より新しければ再読込を求める。ログインが失敗・取消で終わった時は ClientID 欄を保存済みの値に戻す(全体保存は ClientID 欄の未保存の入力値を使わず、保存済みの ID を送る。待受ポートは全体保存で送るので入力値を残す)。他の画面の書込は設定画面へ知らせず、古いフォームの保存は Rust の拒否に任せる。拒否されたら「設定を読み直してください」と再読込ボタンを出し、設定全体の再読込に成功するまで通常保存を止める。
+- ログイン終了後、手動の「設定を再読み込み」、モデレーション規則の取込後、設定全体のインポート後は、共通の関数で保存済み設定を読み直す。10 秒で打ち切る。応答の revision が基準以下なら反映しない(下記)。読込中は対象の入力欄と通常保存を無効にする。ログインの ClientID・待受ポート欄と通常保存はログイン開始時から無効にする。ツイキャスと X のログイン取消は設定のインポートや再読込中も操作できる。
+- 読込成功時は対象項目だけをフォームに反映する。ログイン後は該当サービスの ClientID と待受ポート、規則取込後は `moderation`、手動再読込と設定全体のインポート後は設定全体を反映する。失敗・期限切れ時は入力欄を解放し、設定全体の再読込に成功するまで全体保存を止める。設定画面の破棄後に完了した読込では何もしない。
+- コメント画面は読んだ設定の revision を持ち、インポートなどで新しい revision を知ったら設定を読み直す。読み直すまで「コメビュに表示」を無効にする。読込に失敗したら(Tauri の外で読めない時を含む)1・2・4 秒あけて再試行し、それでも失敗したら止めて「設定を読み直してください」を出す。全体読込の成功、設定画面からの反映、新しい revision を知った時に再試行の回数を戻す。
+- 接続と取消には UI が発行した試行 ID を渡す。設定画面を閉じると進行中の試行を取り消す。取消は対応する試行だけに効く。進行中の試行は重複開始を拒否する。開始前に取り消した試行と終了済みの試行は、サービスごとに直近 32 件を保持し、その間の再利用を拒否する。
+- コメント画面の「コメビュに表示」は `set_goals_show_in_app` で保存済み設定の `goals.showInApp` だけを更新する。
+- コメント画面の NG 追加は `append_moderation_value(kind, value)`、規則 JSON のインポートは `set_moderation(moderation)` を使う。Rust 側で保存を直列化し、最新設定の `moderation` だけを更新する。型とリスト種別は Rust 側で検証する。NG 追加は JavaScript の `String.prototype.trim` と同じ空白を前後から除いて重複を判定する。コメントの操作メニューでは保存失敗をトーストで知らせる。不正な正規表現は既存のモデレーション判定と同様に無視し、パターン本文を含まない警告を記録する。
 - **localStorage 併用**: 一部のUI/ウィンドウ局所設定は各ウィンドウの `localStorage` に保持する(`config.json` には載せない)。現状: 弾幕表示設定(`fc.danmaku`)、テーマ、最前面ピン状態、コマンドパレット履歴 等。これらはウィンドウローカルかつ低リスクなため意図的に localStorage 側に置いている。
 
 ## 11. フェーズ計画
@@ -418,7 +454,7 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
 
   再送は利用者の「再試行」(`retry_x_autopost`)で同じ文面を 1 回だけ。自動では送らない。成功は 2xx だけで判定し、本文の内容で成功を失敗にしない。
 - **テスト投稿**(`send_x_test_post`): 文面 `fast-comment 連携テスト YYYY/MM/DD HH:MM`(URL なし)。UI は確認ダイアログで文面と「実際に公開され、課金される」旨を出してから呼ぶ。台帳・クールダウン・1 日上限には数えない。
-- **状態取得**: `get_x_post_status` → `{ configured, connected, username, callbackUrl, unsavedToken }`。接続・切断の後は駆動タスクに `AuthChanged` を送り、投稿できるかを読み直させる。
+- **状態取得**: `get_x_post_status` → `{ clientId, configured, connected, username, callbackUrl, unsavedToken }`。接続・切断の後は駆動タスクに `AuthChanged` を送り、投稿できるかを読み直させる。接続終了後の設定再取得と状態の `clientId` 照合はツイキャスと同じ。
 - **秘密値**: access / refresh token と認可コードはログ・エラー文・emit・`Debug` に出さない(`XPostError` は固定文のみ)。
 
 ## 14. 自動更新(`tauri-plugin-updater` + `tauri-plugin-process`、v0.2.0〜)

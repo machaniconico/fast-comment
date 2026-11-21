@@ -38,7 +38,7 @@ impl XPostError {
                 "固定文面と URL が長すぎます。テンプレートを短くしてください。"
             }
             XPostErrorCode::PortInUse => {
-                "認証ポートを使用できません。ポートと X のコールバック設定を確認してください。"
+                "認証ポートを使用できません。ポートと X のコールバック設定を確認してください。WSL の mirrored モードは 44620〜48715 を確保する場合があります。設定でポートを変え、X の開発者ページのコールバック URL も合わせて登録し直してください。"
             }
             XPostErrorCode::LoginTimeout => "ログインがタイムアウトしました。",
             XPostErrorCode::Cancelled => "操作を取り消しました。",
