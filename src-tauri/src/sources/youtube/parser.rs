@@ -13,6 +13,7 @@ use std::sync::OnceLock;
 
 use serde_json::Value;
 
+use crate::achievements::currency::parse_display_amount;
 use crate::model::{
     Amount, Author, Badge, ChatMessage, Fragment, MessageKind, ModerationEvent, Platform, Roles,
     YoutubeReaction,
@@ -937,13 +938,10 @@ fn parse_emoji(emoji: &Value) -> Fragment {
 /// `purchaseAmountText`({ simpleText: "¥500" })から Amount を作る。
 fn parse_amount(field: Option<&Value>) -> Option<Amount> {
     let raw = field.and_then(simple_text)?;
-    if raw.is_empty() {
-        return None;
-    }
-    let (currency, value) = split_currency_value(&raw);
+    let parsed = parse_display_amount(&raw)?;
     Some(Amount {
-        value,
-        currency,
+        value: parsed.milli as f64 / 1000.0,
+        currency: parsed.currency,
         raw_text: raw,
     })
 }
@@ -964,75 +962,6 @@ fn simple_text(v: &Value) -> Option<String> {
     }
     // 文字列リテラル直渡しも許容。
     v.as_str().map(|s| s.to_string())
-}
-
-/// "¥500" / "$5.00" / "￥1,000" 等から通貨記号と数値を分離する(寛容)。
-///
-/// 数値は内部的に小数点ドットへ正規化し、桁区切りカンマは除去する。
-/// 欧州表記のように `.` と `,` が混在し `,` が後ろにある場合は、`,` を小数点と
-/// みなして `.` を桁区切りとして扱う。
-fn split_currency_value(raw: &str) -> (String, f64) {
-    // 通貨部 = 数字/小数点/桁区切り/空白 以外の連続部分。
-    let currency: String = raw
-        .chars()
-        .filter(|c| !c.is_ascii_digit() && *c != '.' && *c != ',' && !c.is_whitespace())
-        .collect();
-
-    let number: String = normalize_amount_number(
-        &raw.chars()
-            .filter(|c| c.is_ascii_digit() || *c == '.' || *c == ',')
-            .collect::<String>(),
-    );
-
-    let value = number.parse::<f64>().unwrap_or(0.0);
-    let currency = if currency.is_empty() {
-        "".to_string()
-    } else {
-        currency
-    };
-    (currency, value)
-}
-
-fn normalize_amount_number(number: &str) -> String {
-    let last_dot = number.rfind('.');
-    let last_comma = number.rfind(',');
-
-    if let (Some(dot), Some(comma)) = (last_dot, last_comma) {
-        if comma > dot {
-            return number
-                .chars()
-                .filter_map(|c| match c {
-                    '.' => None,
-                    ',' => Some('.'),
-                    _ => Some(c),
-                })
-                .collect();
-        }
-
-        return number.chars().filter(|c| *c != ',').collect();
-    }
-
-    if last_comma.is_some() {
-        return normalize_comma_only_number(number);
-    }
-
-    number.to_string()
-}
-
-fn normalize_comma_only_number(number: &str) -> String {
-    let parts: Vec<&str> = number.split(',').collect();
-    if parts.len() > 1 && parts[0].len() <= 3 && parts[1..].iter().all(|part| part.len() == 3) {
-        return parts.concat();
-    }
-
-    if parts.len() == 2 && matches!(parts[1].len(), 1 | 2) {
-        return format!("{}.{}", parts[0], parts[1]);
-    }
-
-    number
-        .chars()
-        .filter(|c| c.is_ascii_digit() || *c == '.')
-        .collect()
 }
 
 /// 解析できなかったアクションを `logs/yt-unparsed.jsonl` に1行追記する。
@@ -1091,7 +1020,7 @@ mod tests {
 
     use super::{
         dig, extract_actions, extract_reaction_counts, extract_reactions_delta, parse_action,
-        parse_moderation_action, parse_runs, split_currency_value, Seg,
+        parse_amount, parse_moderation_action, parse_runs, Seg,
     };
     use crate::model::{Fragment, MessageKind, ModerationEvent, Platform, YoutubeReaction};
 
@@ -1819,15 +1748,11 @@ mod tests {
     }
 
     #[test]
-    fn split_currency_value_handles_jpy_and_european_amounts() {
+    fn parse_amount_handles_jpy_and_european_amounts() {
         // 金額文字列は日本円の桁区切りと欧州表記を数値化し、Amount は raw_text を温存する。
-        let (currency, value) = split_currency_value("¥1,000");
-        assert_eq!(currency, "¥");
-        assert_eq!(value, 1000.0);
-
-        let (currency, value) = split_currency_value("1.000,50");
-        assert_eq!(currency, "");
-        assert_eq!(value, 1000.50);
+        let amount = parse_amount(Some(&json!("¥1,000"))).expect("amount");
+        assert_eq!(amount.currency, "¥");
+        assert_eq!(amount.value, 1000.0);
 
         let action = json!({
             "addChatItemAction": {

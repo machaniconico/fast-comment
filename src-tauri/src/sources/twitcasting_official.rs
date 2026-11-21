@@ -632,6 +632,7 @@ impl<S: SecretStore> TwitcastingOfficialSource<S> {
                 continue;
             }
             message.skip_tts = history || stale;
+            message.route.uncounted = history || stale;
             let _ = tx.send(message);
         }
     }
@@ -1034,6 +1035,15 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn official_history_is_uncounted_and_live_comments_are_counted() {
+        let mut source = start_source(handoff_router("42"), test_tuning(), AuthState::Ready).await;
+        for id in 31..=50 {
+            assert_next_comment(&mut source, id, true).await;
+        }
+        assert_next_comment(&mut source, 51, false).await;
+    }
+
+    #[tokio::test]
     async fn handoff_to_different_movie_ends_old_movie_and_silences_history() {
         let mut source = start_source_with_initial_movie(
             handoff_router("43"),
@@ -1424,6 +1434,7 @@ mod tests {
             .unwrap();
         assert_eq!(message.id, format!("tc-{id}"));
         assert_eq!(message.skip_tts, skip_tts, "comment {id}");
+        assert_eq!(message.route.uncounted, skip_tts, "comment {id}");
     }
 
     #[test]
