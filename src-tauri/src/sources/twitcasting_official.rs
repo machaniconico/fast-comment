@@ -107,7 +107,17 @@ impl CommentCursor {
 
     pub fn commit_mid_stream(&mut self, batch: PollBatch) -> Vec<Value> {
         let mut entries = self.commit(batch);
-        entries.drain(..entries.len().saturating_sub(HISTORY_LIMIT));
+        if entries.len() > HISTORY_LIMIT {
+            // commit orders numeric IDs first, so taking the tail alone could
+            // discard newer numeric IDs in favor of non-numeric ones.
+            let numeric_end = entries.partition_point(|value| {
+                id_string(&value["id"]).is_some_and(|id| id.parse::<u64>().is_ok())
+            });
+            let numeric_kept = numeric_end.min(HISTORY_LIMIT);
+            let other_kept = HISTORY_LIMIT - numeric_kept;
+            entries.drain(numeric_end..entries.len() - other_kept);
+            entries.drain(..numeric_end - numeric_kept);
+        }
         entries
     }
 
@@ -248,7 +258,7 @@ struct Movie {
 struct LiveState {
     movie: Option<Movie>,
     guard: Option<LiveGuard>,
-    observed_offline: bool,
+    observed_offline_at: Option<Instant>,
 }
 
 pub struct TwitcastingOfficialSource<S: SecretStore> {
@@ -332,28 +342,29 @@ impl<S: SecretStore> TwitcastingOfficialSource<S> {
             let state = *auth.borrow_and_update();
             if state != AuthState::Ready {
                 live.guard = None;
-                let notice = if state == AuthState::ReloginRequired {
-                    RELOGIN_REQUIRED_NOTICE
-                } else {
-                    LOGIN_REQUIRED_NOTICE
+                let notice = match state {
+                    AuthState::Loading => None,
+                    AuthState::ReloginRequired => Some(RELOGIN_REQUIRED_NOTICE),
+                    _ => Some(LOGIN_REQUIRED_NOTICE),
                 };
-                if auth_notice != Some(notice) {
-                    self.send_metadata(false, Some(notice), None).await;
-                    auth_notice = Some(notice);
+                if notice != auth_notice {
+                    if let Some(notice) = notice {
+                        self.send_metadata(false, Some(notice), None).await;
+                    }
+                    auth_notice = notice;
                 }
                 if auth.changed().await.is_err() {
                     return;
                 }
+                next_live = Instant::now();
                 continue;
             }
-            if auth_notice.take().is_some() {
-                next_live = Instant::now();
-            }
+            auth_notice = None;
 
             let comment_due = live
                 .movie
                 .as_ref()
-                .filter(|movie| !movie.protected)
+                .filter(|_| live.guard.is_some())
                 .map(|movie| {
                     let live_count =
                         u32::try_from(self.api.live_count().max(2)).unwrap_or(u32::MAX);
@@ -435,6 +446,7 @@ impl<S: SecretStore> TwitcastingOfficialSource<S> {
                     }
                 }
                 Err(ApiError::Protected) => {
+                    live.guard = None;
                     if let Some(movie) = &mut live.movie {
                         movie.protected = true;
                     } else if user_id.is_none() {
@@ -444,10 +456,9 @@ impl<S: SecretStore> TwitcastingOfficialSource<S> {
                         .await;
                 }
                 Err(ApiError::AppDisabled) => {
+                    live.guard = None;
                     request_after = Instant::now() + self.tuning.not_found_retry;
-                    if !refresh_live {
-                        next_live = request_after;
-                    }
+                    next_live = request_after;
                     self.send_metadata(false, Some(APP_DISABLED_NOTICE), None)
                         .await;
                 }
@@ -465,7 +476,7 @@ impl<S: SecretStore> TwitcastingOfficialSource<S> {
                     request_after = Instant::now() + network_backoff.next_delay();
                 }
                 Err(ApiError::Server | ApiError::Other) => {
-                    *next = Instant::now() + backoff.next_delay();
+                    *next = (*next).max(Instant::now() + backoff.next_delay());
                 }
             }
         }
@@ -485,25 +496,30 @@ impl<S: SecretStore> TwitcastingOfficialSource<S> {
                 self.send_live_ended();
             }
             live.guard = None;
-            live.observed_offline = true;
+            live.observed_offline_at = Some(Instant::now());
             self.send_metadata(false, None, None).await;
             return Ok(false);
         };
 
         let new_movie = live.movie.as_ref().is_none_or(|movie| movie.id != movie_id);
         if new_movie {
+            let recently_offline = live.observed_offline_at.take().is_some_and(|offline_at| {
+                offline_at.elapsed() <= self.tuning.offline.saturating_mul(2)
+            });
             live.movie = Some(Movie {
                 id: movie_id,
                 broadcaster_id: None,
                 cursor: CommentCursor::new(),
-                mid_stream: !live.observed_offline && live.movie.is_none(),
+                mid_stream: !recently_offline && live.movie.is_none(),
                 protected: false,
                 last_poll: None,
             });
         }
         let movie = live.movie.as_mut().expect("live snapshot has a movie");
         movie.broadcaster_id = id_string(&snapshot["broadcaster"]["id"]);
-        live.guard.get_or_insert_with(|| self.api.live_guard());
+        if !movie.protected {
+            live.guard.get_or_insert_with(|| self.api.live_guard());
+        }
 
         let notice = movie.protected.then_some(UNAVAILABLE_NOTICE);
         self.send_metadata(true, notice, Some(&snapshot["movie"]))
@@ -667,5 +683,297 @@ impl<S: SecretStore> Source for TwitcastingOfficialSource<S> {
             }
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        integrations::MemorySecretStore,
+        sources::twitcasting_auth::{AuthOptions, TwitcastingAuth, TOKEN_KEY},
+        TwitcastingEndpoints,
+    };
+    use axum::{http::StatusCode, routing::get, Json, Router};
+    use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::{sync::Notify, task::JoinHandle, time::timeout};
+
+    struct RunningSource {
+        api: Arc<TwitcastingApi<MemorySecretStore>>,
+        auth: watch::Sender<AuthState>,
+        metadata: mpsc::Receiver<YoutubeMetadataUpdate>,
+        messages: broadcast::Receiver<ChatMessage>,
+        user_calls: Arc<AtomicUsize>,
+        source: JoinHandle<()>,
+        server: JoinHandle<()>,
+    }
+
+    impl RunningSource {
+        async fn metadata_matching(
+            &mut self,
+            mut matches: impl FnMut(&YoutubeMetadataUpdate) -> bool,
+        ) -> YoutubeMetadataUpdate {
+            timeout(Duration::from_secs(5), async {
+                loop {
+                    let update = self.metadata.recv().await.unwrap();
+                    if matches(&update) {
+                        return update;
+                    }
+                }
+            })
+            .await
+            .expect("expected metadata update")
+        }
+    }
+
+    impl Drop for RunningSource {
+        fn drop(&mut self) {
+            self.source.abort();
+            self.server.abort();
+        }
+    }
+
+    async fn start_source(router: Router, tuning: PollTuning, state: AuthState) -> RunningSource {
+        let user_calls = Arc::new(AtomicUsize::new(0));
+        let router = router.route(
+            "/users/alice",
+            get({
+                let user_calls = Arc::clone(&user_calls);
+                move || async move {
+                    user_calls.fetch_add(1, Ordering::Relaxed);
+                    Json(json!({ "user": { "id": "1" } }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoints = TwitcastingEndpoints {
+            api_base: format!("http://{}", listener.local_addr().unwrap()),
+            ..TwitcastingEndpoints::default()
+        };
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let store = MemorySecretStore::new();
+        store
+            .put(
+                TOKEN_KEY,
+                &json!({
+                    "clientId": "test-client",
+                    "accessToken": "test-token",
+                    "userId": "1",
+                    "screenId": "alice",
+                    "name": "Alice",
+                    "expiresAtMs": null,
+                    "obtainedAtMs": now_ms
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        let credentials = TwitcastingAuth::new(store, endpoints.clone(), AuthOptions::default());
+        credentials.load(Some("test-client"), now_ms).await;
+        assert_eq!(*credentials.subscribe().borrow(), AuthState::Ready);
+        let api = TwitcastingApi::new(
+            credentials,
+            endpoints,
+            Arc::new(|| Some("test-client".into())),
+        );
+        let (auth, auth_rx) = watch::channel(state);
+        let (metadata_tx, metadata) = mpsc::channel(32);
+        let (tx, messages) = broadcast::channel(256);
+        let official = TwitcastingOfficialSource::new(
+            "alice".into(),
+            Arc::clone(&api),
+            auth_rx,
+            Some(metadata_tx),
+            tuning,
+        );
+        let source = tokio::spawn(async move { official.poll(tx).await });
+        RunningSource {
+            api,
+            auth,
+            metadata,
+            messages,
+            user_calls,
+            source,
+            server,
+        }
+    }
+
+    fn test_tuning() -> PollTuning {
+        PollTuning {
+            offline: Duration::from_millis(100),
+            live_refresh: Duration::from_millis(100),
+            comment_unit: Duration::from_millis(20),
+            not_found_retry: Duration::from_millis(250),
+            jitter: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn current_live_server_error_keeps_scheduled_refresh() {
+        let (calls, mut requests) = mpsc::unbounded_channel();
+        let router = Router::new().route(
+            "/users/1/current_live",
+            get(move || async move {
+                calls.send(Instant::now()).unwrap();
+                StatusCode::SERVICE_UNAVAILABLE
+            }),
+        );
+        let tuning = PollTuning {
+            offline: Duration::from_secs(2),
+            ..test_tuning()
+        };
+        let interval = tuning.offline;
+        let _source = start_source(router, tuning, AuthState::Ready).await;
+        let (first, second) = timeout(Duration::from_secs(5), async {
+            (
+                requests.recv().await.unwrap(),
+                requests.recv().await.unwrap(),
+            )
+        })
+        .await
+        .unwrap();
+        assert!(second.duration_since(first) >= interval);
+    }
+
+    #[tokio::test]
+    async fn loading_auth_is_silent_until_its_state_changes() {
+        let router = Router::new().route(
+            "/users/1/current_live",
+            get(|| async { StatusCode::NOT_FOUND }),
+        );
+        let mut source = start_source(router, test_tuning(), AuthState::Loading).await;
+        assert!(timeout(Duration::from_millis(100), source.metadata.recv())
+            .await
+            .is_err());
+        assert_eq!(source.user_calls.load(Ordering::Relaxed), 0);
+
+        source.auth.send(AuthState::LoadFailed).unwrap();
+        source
+            .metadata_matching(|update| update.notice.as_deref() == Some(LOGIN_REQUIRED_NOTICE))
+            .await;
+        assert_eq!(source.user_calls.load(Ordering::Relaxed), 0);
+
+        source.auth.send(AuthState::Ready).unwrap();
+        source
+            .metadata_matching(|update| update.live == Some(false) && update.notice.is_none())
+            .await;
+        assert_eq!(source.user_calls.load(Ordering::Relaxed), 1);
+    }
+
+    async fn live_count_after_comment_error(
+        code: u32,
+        notice: &str,
+        expected_after_refresh: usize,
+    ) {
+        let release_error = Arc::new(Notify::new());
+        let router = Router::new()
+            .route(
+                "/users/1/current_live",
+                get(|| async { Json(json!({ "movie": { "id": "9" } })) }),
+            )
+            .route(
+                "/movies/9/comments",
+                get({
+                    let release_error = Arc::clone(&release_error);
+                    move || async move {
+                        release_error.notified().await;
+                        (
+                            StatusCode::FORBIDDEN,
+                            Json(json!({ "error": { "code": code } })),
+                        )
+                    }
+                }),
+            );
+        let mut source = start_source(router, test_tuning(), AuthState::Ready).await;
+        source
+            .metadata_matching(|update| update.live == Some(true))
+            .await;
+        assert_eq!(source.api.live_count(), 1);
+        release_error.notify_one();
+
+        source
+            .metadata_matching(|update| update.notice.as_deref() == Some(notice))
+            .await;
+        assert_eq!(source.api.live_count(), 0);
+
+        source
+            .metadata_matching(|update| update.live == Some(true))
+            .await;
+        assert_eq!(source.api.live_count(), expected_after_refresh);
+    }
+
+    #[tokio::test]
+    async fn protected_movie_stays_out_of_live_count_after_refresh() {
+        live_count_after_comment_error(2002, UNAVAILABLE_NOTICE, 0).await;
+    }
+
+    #[tokio::test]
+    async fn app_disabled_movie_leaves_live_count_until_refresh_recovers() {
+        live_count_after_comment_error(2001, APP_DISABLED_NOTICE, 1).await;
+    }
+
+    #[test]
+    fn mid_stream_history_prefers_newest_numeric_ids() {
+        let entries: Vec<Value> = (1..=25)
+            .rev()
+            .flat_map(|id| [json!({ "id": id }), json!({ "id": format!("other-{id}") })])
+            .collect();
+        let mut cursor = CommentCursor::new();
+        let mut batch = cursor.begin_poll();
+        batch.push_page(entries);
+        let history = cursor.commit_mid_stream(batch);
+        assert_eq!(
+            history
+                .iter()
+                .map(|entry| entry["id"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            (6..=25).collect::<Vec<_>>()
+        );
+        assert_eq!(cursor.slice_id().as_deref(), Some("25"));
+
+        let mut batch = cursor.begin_poll();
+        batch.push_page(vec![json!({ "id": "other-25" })]);
+        assert!(cursor.commit(batch).is_empty());
+    }
+
+    #[tokio::test]
+    async fn expired_offline_observation_treats_new_movie_as_mid_stream() {
+        let checks = Arc::new(AtomicUsize::new(0));
+        let router = Router::new()
+            .route("/users/1/current_live", get(move || async move {
+                if checks.fetch_add(1, Ordering::Relaxed) == 0 {
+                    return (StatusCode::NOT_FOUND, Json(Value::Null));
+                }
+                time::sleep(Duration::from_millis(250)).await;
+                (StatusCode::OK, Json(json!({ "movie": { "id": "9" } })))
+            }))
+            .route("/movies/9/comments", get(|axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>| async move {
+                let comments: Vec<_> = if !params.contains_key("slice_id") && params.get("offset").is_some_and(|offset| offset == "0") {
+                    (101..=150).rev().map(|id| json!({ "id": id, "message": "chat", "from_user": { "id": "1" } })).collect()
+                } else {
+                    Vec::new()
+                };
+                Json(json!({ "comments": comments }))
+            }));
+        let mut source = start_source(router, test_tuning(), AuthState::Ready).await;
+        source
+            .metadata_matching(|update| update.live == Some(false))
+            .await;
+        for id in 131..=150 {
+            let message = timeout(Duration::from_secs(5), source.messages.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(message.id, format!("tc-{id}"));
+            assert!(message.skip_tts);
+        }
+        assert!(timeout(Duration::from_millis(100), source.messages.recv())
+            .await
+            .is_err());
     }
 }
