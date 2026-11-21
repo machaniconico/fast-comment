@@ -201,63 +201,91 @@ pub fn replace_channel_in(
     replace_channels_in(cfg, &[old_key.to_string()], new)
 }
 
-/// 旧行をすべて外し、新しい行を最初の旧行の位置に入れる(1 回の保存で済ませるため)。
-/// 新しい行の上書きが空なら最初の旧行のものを引き継ぐ。
+/// 旧 key に一致する行をすべて外し(同じ key の行が複数あれば全部)、新しい行を一番前の旧行の位置に入れる
+/// (1 回の保存で済ませるため)。新しい行の上書きが空ならその旧行のものを引き継ぐ。
+/// key の重複は 1 つとみなし、どれか 1 つでも一致する行が無ければ何も変えない。
 pub fn replace_channels_in(
     cfg: &mut AppConfig,
     old_keys: &[String],
     mut new: ChannelConfig,
 ) -> Result<(), ChannelEditError> {
-    let mut indices = Vec::with_capacity(old_keys.len());
-    for key in old_keys {
-        let index = cfg
-            .channels
+    if old_keys.is_empty()
+        || !old_keys
             .iter()
-            .position(|ch| channel_matches_key(ch, key))
-            .ok_or(ChannelEditError::NotFound)?;
-        if !indices.contains(&index) {
-            indices.push(index);
-        }
-    }
-    let Some(&first) = indices.first() else {
+            .all(|key| cfg.channels.iter().any(|ch| channel_matches_key(ch, key)))
+    {
         return Err(ChannelEditError::NotFound);
-    };
-    if cfg.channels.iter().enumerate().any(|(i, ch)| {
-        !indices.contains(&i) && ch.platform == new.platform && ch.identifier == new.identifier
-    }) {
+    }
+    let removed = |ch: &ChannelConfig| old_keys.iter().any(|key| channel_matches_key(ch, key));
+    if cfg
+        .channels
+        .iter()
+        .any(|ch| !removed(ch) && ch.platform == new.platform && ch.identifier == new.identifier)
+    {
         return Err(ChannelEditError::Duplicate);
     }
+    let first = cfg.channels.iter().position(removed).expect("一致する行がある");
     new.overrides.normalize();
     if new.overrides.is_empty() {
         new.overrides = cfg.channels[first].overrides.clone();
     }
-    cfg.channels[first] = new;
     let mut i = 0;
-    cfg.channels.retain(|_| {
-        let keep = i == first || !indices.contains(&i);
+    cfg.channels.retain(|ch| {
+        let keep = i == first || !removed(ch);
         i += 1;
         keep
     });
+    cfg.channels[first] = new;
     Ok(())
 }
 
-/// `create_new` で開くので既存の退避ファイルは上書きしない。同じ ms に既にあれば連番を付ける。
+/// 元ファイルを読み切ってから一時ファイルへ書き、既存名を上書きしない hard link で `.broken-*` に確定する。
+/// 読込・書込の途中で失敗しても空や途中までの `.broken-*` は残らない。名前は空くまで連番を進める。
 fn preserve_broken_config(path: &Path, now_ms: u128) -> std::io::Result<PathBuf> {
+    let bytes = std::fs::read(path)?;
     let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
-    for n in 0..100u32 {
-        let suffix = if n == 0 { String::new() } else { format!("-{n}") };
-        let backup = path.with_file_name(format!("{name}.broken-{now_ms}{suffix}"));
-        let mut target = match std::fs::OpenOptions::new().write(true).create_new(true).open(&backup) {
-            Ok(file) => file,
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e),
-        };
-        let mut source = File::open(path)?;
-        std::io::copy(&mut source, &mut target)?;
-        target.sync_all()?;
-        return Ok(backup);
+    let tmp = path.with_file_name(format!("{name}.broken-{now_ms}.tmp"));
+    let result = (|| {
+        {
+            let mut file = File::create(&tmp)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+        }
+        for n in 0u64.. {
+            let suffix = if n == 0 { String::new() } else { format!("-{n}") };
+            let backup = path.with_file_name(format!("{name}.broken-{now_ms}{suffix}"));
+            match std::fs::hard_link(&tmp, &backup) {
+                Ok(()) => return Ok(backup),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(std::io::ErrorKind::AlreadyExists.into())
+    })();
+    let _ = std::fs::remove_file(&tmp);
+    result
+}
+
+/// 退避できなかった設定ディレクトリ。元の config.json を既定値で上書きしないよう保存を止める。
+static SAVE_BLOCKED_DIRS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+pub const CONFIG_SAVE_BLOCKED_ERROR: &str =
+    "設定ファイルを読めず退避もできなかったため、上書きしないよう保存を止めています。config.json を確認してアプリを再起動してください";
+
+/// 保存停止中の `save` が返すエラー。表示は固定文。
+#[derive(Debug)]
+pub struct ConfigSaveBlocked;
+
+impl std::fmt::Display for ConfigSaveBlocked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(CONFIG_SAVE_BLOCKED_ERROR)
     }
-    Err(std::io::ErrorKind::AlreadyExists.into())
+}
+
+impl std::error::Error for ConfigSaveBlocked {}
+
+fn save_blocked(dir: &Path) -> bool {
+    SAVE_BLOCKED_DIRS.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|d| d == dir)
 }
 
 const MAX_OBS_ROWS: u16 = 1000;
@@ -1283,7 +1311,8 @@ impl AppConfig {
 
     /// 起動時のロード。失敗したら元ファイルを `config.json.broken-<unix-ms>` へ複製してから既定値で続行する
     /// (次の保存で上書きされ、チャンネルや資格情報を失わないため)。既存の退避ファイルは上書きしない。
-    pub fn load_or_preserve(dir: &Path) -> AppConfig {
+    /// 戻り値の bool は退避に失敗して保存を止めたか(起動側で利用者に知らせる)。
+    pub fn load_or_preserve(dir: &Path) -> (AppConfig, bool) {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
@@ -1291,19 +1320,28 @@ impl AppConfig {
         Self::load_or_preserve_at(dir, now_ms)
     }
 
-    fn load_or_preserve_at(dir: &Path, now_ms: u128) -> AppConfig {
+    fn load_or_preserve_at(dir: &Path, now_ms: u128) -> (AppConfig, bool) {
         let e = match Self::load(dir) {
-            Ok(cfg) => return cfg,
+            Ok(cfg) => return (cfg, false),
             Err(e) => e,
         };
         match preserve_broken_config(&Self::path_in(dir), now_ms) {
-            Ok(backup) => tracing::warn!(
-                "設定ロード失敗・{} に退避して既定値で続行: {e}",
-                backup.file_name().unwrap_or_default().to_string_lossy()
-            ),
-            Err(err) => tracing::warn!("設定ロード失敗・退避できず既定値で続行: {e} (退避: {})", err.kind()),
+            Ok(backup) => {
+                tracing::warn!(
+                    "設定ロード失敗・{} に退避して既定値で続行: {e}",
+                    backup.file_name().unwrap_or_default().to_string_lossy()
+                );
+                (AppConfig::default(), false)
+            }
+            Err(err) => {
+                tracing::warn!("設定ロード失敗・退避できず保存を止めて既定値で続行: {e} (退避: {})", err.kind());
+                SAVE_BLOCKED_DIRS
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(dir.to_path_buf());
+                (AppConfig::default(), true)
+            }
         }
-        AppConfig::default()
     }
 
     /// IPC の入力値はエラー文に含めない。
@@ -1340,6 +1378,9 @@ impl AppConfig {
     /// クレート内では `commit_config` だけが呼ぶ(revision を進めない保存を作らない。lib.rs の
     /// `every_config_write_goes_through_commit_config` で検査)。受け入れテストが使うので公開している。
     pub fn save(&self, dir: &Path) -> anyhow::Result<()> {
+        if save_blocked(dir) {
+            return Err(anyhow::Error::new(ConfigSaveBlocked));
+        }
         std::fs::create_dir_all(dir)
             .map_err(|e| anyhow::anyhow!("設定ディレクトリ作成失敗 {}: {e}", dir.display()))?;
         let path = Self::path_in(dir);
@@ -1412,6 +1453,7 @@ impl std::fmt::Display for ChannelOverridesCommitError {
         match self {
             Self::Stale => f.write_str(CONFIG_CHANGED_ERROR),
             Self::NotFound => std::fmt::Display::fmt(&ChannelEditError::NotFound, f),
+            Self::Save(e) if e.is::<ConfigSaveBlocked>() => f.write_str(CONFIG_SAVE_BLOCKED_ERROR),
             Self::Save(_) => f.write_str("枠の設定を保存できませんでした"),
         }
     }
@@ -2663,25 +2705,81 @@ mod tests {
         let existing = dir.path().join("config.json.broken-42");
         std::fs::write(&existing, b"older").unwrap();
 
-        assert_eq!(AppConfig::load_or_preserve_at(dir.path(), 42), AppConfig::default());
+        assert_eq!(AppConfig::load_or_preserve_at(dir.path(), 42), (AppConfig::default(), false));
         assert_eq!(std::fs::read(&existing).unwrap(), b"older");
         assert_eq!(std::fs::read(dir.path().join("config.json.broken-42-1")).unwrap(), b"{ broken");
         assert_eq!(std::fs::read(&path).unwrap(), b"{ broken");
 
-        assert_eq!(AppConfig::load_or_preserve_at(dir.path(), 43), AppConfig::default());
+        assert_eq!(AppConfig::load_or_preserve_at(dir.path(), 43), (AppConfig::default(), false));
         assert_eq!(std::fs::read(dir.path().join("config.json.broken-43")).unwrap(), b"{ broken");
     }
 
     #[test]
     fn missing_or_valid_config_is_not_preserved() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(AppConfig::load_or_preserve_at(dir.path(), 1), AppConfig::default());
+        assert_eq!(AppConfig::load_or_preserve_at(dir.path(), 1), (AppConfig::default(), false));
         AppConfig::default().save(dir.path()).unwrap();
-        AppConfig::load_or_preserve_at(dir.path(), 2);
+        assert!(!AppConfig::load_or_preserve_at(dir.path(), 2).1);
         let names: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         assert!(names.iter().all(|n| !n.contains(".broken-")), "{names:?}");
+    }
+
+    #[test]
+    fn many_existing_backup_names_never_block_preservation() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(AppConfig::path_in(dir.path()), b"{ broken").unwrap();
+        std::fs::write(dir.path().join("config.json.broken-7"), b"old").unwrap();
+        for n in 1..=100 {
+            std::fs::write(dir.path().join(format!("config.json.broken-7-{n}")), b"old").unwrap();
+        }
+        assert_eq!(AppConfig::load_or_preserve_at(dir.path(), 7), (AppConfig::default(), false));
+        assert_eq!(std::fs::read(dir.path().join("config.json.broken-7-101")).unwrap(), b"{ broken");
+        assert_eq!(std::fs::read(dir.path().join("config.json.broken-7-100")).unwrap(), b"old");
+        AppConfig::default().save(dir.path()).expect("退避できたので保存できる");
+    }
+
+    #[test]
+    fn unreadable_config_leaves_no_partial_backup_and_blocks_saves() {
+        let dir = tempfile::tempdir().unwrap();
+        // config.json がディレクトリだと読めず、退避もできない。
+        std::fs::create_dir(AppConfig::path_in(dir.path())).unwrap();
+        assert_eq!(AppConfig::load_or_preserve_at(dir.path(), 9), (AppConfig::default(), true));
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["config.json"]);
+
+        let err = AppConfig::default().save(dir.path()).unwrap_err();
+        assert_eq!(err.to_string(), CONFIG_SAVE_BLOCKED_ERROR);
+        let revision = AtomicU64::new(0);
+        let (tx, _rx) = tokio::sync::watch::channel(AppConfig::default());
+        let mut current = AppConfig::default();
+        current.channels.push(ChannelConfig {
+            platform: ChannelPlatform::Twitch,
+            identifier: "a".into(),
+            enabled: true,
+            own_stream: false,
+            overrides: ChannelOverrides::default(),
+        });
+        let mut next = current.clone();
+        next.obs.max_rows = 3;
+        let err = commit_config(dir.path(), &revision, &tx, &mut current, next, None).unwrap_err();
+        assert_eq!(err.to_string(), CONFIG_SAVE_BLOCKED_ERROR);
+        assert_eq!(revision.load(Ordering::SeqCst), 0);
+        let err = commit_channel_overrides(
+            dir.path(),
+            &revision,
+            &tx,
+            &mut current,
+            "twitch:a",
+            ChannelOverrides { tts_enabled: Some(false), ..Default::default() },
+            0,
+        )
+        .unwrap_err();
+        assert_eq!(err.to_string(), CONFIG_SAVE_BLOCKED_ERROR);
     }
 }

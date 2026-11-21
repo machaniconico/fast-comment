@@ -807,8 +807,9 @@ export async function probeTtsEngine(engine: VoicevoxEngineKind, url: string): P
 }
 
 /** `replaces` の key の行をすべて外し、1 回の保存で置き換える(上書き設定は最初の行から Rust が引き継ぐ)。 */
-export async function addChannel(channel: ChannelConfig, replaces: string[] = []): Promise<ChannelsCommit | null> {
-  return invoke<ChannelsCommit>('add_channel', { channel, replaces: replaces.length ? replaces : null });
+export async function addChannel(channel: ChannelConfig, replaces: string | string[] = []): Promise<ChannelsCommit | null> {
+  const keys = typeof replaces === 'string' ? [replaces] : replaces;
+  return invoke<ChannelsCommit>('add_channel', { channel, replaces: keys.length ? keys : null });
 }
 
 export async function removeChannel(key: string): Promise<void> {

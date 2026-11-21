@@ -71,6 +71,13 @@ impl TtsShared {
     }
 
     pub fn enqueue(&self, sink: &dyn TtsSink, msg: ChatMessage, max_pending: usize) -> PushResult {
+        let result = self.enqueue_silent(msg, max_pending);
+        self.after_enqueue(sink, &result);
+        result
+    }
+
+    /// 通知を出さずに投入する。呼び出し側が他のロックを放してから `after_enqueue` を呼ぶ。
+    pub fn enqueue_silent(&self, msg: ChatMessage, max_pending: usize) -> PushResult {
         if self
             .recent_moderation
             .lock()
@@ -84,17 +91,27 @@ impl TtsShared {
             msg,
             enqueued_at: Instant::now(),
         };
-        let result = {
-            let mut core = self.core.lock().unwrap();
-            let result = core.push(job, max_pending);
-            sink.queue_state(core.snapshot());
-            result
-        };
-        if let PushResult::Queued { dropped_oldest } = result {
-            self.dropped(sink, dropped_oldest);
+        let result = self.core.lock().unwrap().push(job, max_pending);
+        if let PushResult::Queued { .. } = result {
             self.wake.notify_one();
         }
         result
+    }
+
+    pub fn after_enqueue(&self, sink: &dyn TtsSink, result: &PushResult) {
+        if matches!(result, PushResult::RejectedModerated) {
+            return;
+        }
+        self.emit_queue_state(sink);
+        if let PushResult::Queued { dropped_oldest } = *result {
+            self.dropped(sink, dropped_oldest);
+        }
+    }
+
+    /// 現在のキューを通知する。キューのロック内で取るので通知の順序は変更順と揃う。
+    pub fn emit_queue_state(&self, sink: &dyn TtsSink) {
+        let core = self.core.lock().unwrap();
+        sink.queue_state(core.snapshot());
     }
 
     pub fn clear(&self, sink: &dyn TtsSink) {
@@ -146,11 +163,18 @@ impl TtsShared {
         }
     }
 
-    /// 読み上げを切った枠のコメントを未読み上げキューから除く。
-    pub fn remove_channel(&self, sink: &dyn TtsSink, origin_key: &str) {
-        let mut core = self.core.lock().unwrap();
-        core.remove_where(|msg| msg.route.origin_key.as_deref() == Some(origin_key));
-        sink.queue_state(core.snapshot());
+    /// 読み上げを切った枠のコメントを未読み上げキューから除き、除いた件数を返す。
+    /// 通知は出さない(呼び出し側が設定ロックを放してから `emit_queue_state` する)。
+    pub fn remove_channels(&self, origin_keys: &[String]) -> usize {
+        if origin_keys.is_empty() {
+            return 0;
+        }
+        self.core.lock().unwrap().remove_where(|msg| {
+            msg.route
+                .origin_key
+                .as_deref()
+                .is_some_and(|key| origin_keys.iter().any(|k| k == key))
+        })
     }
 
     pub fn snapshot(&self) -> TtsQueueStatePayload {
