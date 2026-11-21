@@ -32,7 +32,7 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 
-use crate::config::{TtsBackendKind, TtsConfig, TtsDictEntry, TtsOptions};
+use crate::config::{AppConfig, ChannelTtsVoice, TtsBackendKind, TtsConfig, TtsDictEntry, TtsOptions};
 use crate::listeners::TtsVoiceOverride;
 use crate::model::{ChatMessage, Fragment, MessageKind};
 
@@ -271,10 +271,13 @@ impl TtsDispatcher {
 
         // TOCTOU と二重往復を避けるため、speak パスでは available() プローブを
         // 行わず直接合成を試み、Err なら Web Speech へフォールバックする。
-        let voice = msg
+        // 枠の声は全体で選んだバックエンドにだけ適用する。
+        let listener_voice = msg
             .listener
             .as_ref()
             .and_then(|info| info.tts_voice.as_ref());
+        let voice = effective_voice(msg.route.channel_tts_voice.as_ref(), listener_voice);
+        let voice = voice.as_ref();
         match self.config.backend {
             TtsBackendKind::None => SpeechOutput::Nothing,
             TtsBackendKind::WebSpeech => self.webspeech(&text, voice),
@@ -293,7 +296,7 @@ impl TtsDispatcher {
                                 "棒読みちゃんで読み上げできないため Web Speech に切り替えました: {e}"
                             ),
                         );
-                        self.webspeech(&text, voice)
+                        self.webspeech(&text, listener_voice)
                     }
                 }
             }
@@ -325,7 +328,7 @@ impl TtsDispatcher {
                                 "VOICEVOXで読み上げできないため Web Speech に切り替えました: {e}"
                             ),
                         );
-                        self.webspeech(&text, voice)
+                        self.webspeech(&text, listener_voice)
                     }
                 }
             }
@@ -472,6 +475,48 @@ impl CompiledDictionary {
         }
         body
     }
+}
+
+/// 発信元の枠が読み上げを無効にしている場合だけ false を返す。
+pub fn channel_allows_tts(cfg: &AppConfig, msg: &ChatMessage) -> bool {
+    msg.route
+        .origin_key
+        .as_deref()
+        .and_then(|key| cfg.channel_overrides(key))
+        .and_then(|overrides| overrides.tts_enabled)
+        != Some(false)
+}
+
+/// キュー投入時点の枠の声をメッセージに記録する。
+pub fn stamp_channel_voice(cfg: &AppConfig, msg: &mut ChatMessage) {
+    msg.route.channel_tts_voice = msg
+        .route
+        .origin_key
+        .as_deref()
+        .and_then(|key| cfg.channel_overrides(key))
+        .and_then(|overrides| overrides.tts_voice.clone());
+}
+
+/// 声の各項目はリスナー、枠の順に優先する。速度と音程はリスナー設定を使う。
+pub fn effective_voice(
+    channel: Option<&ChannelTtsVoice>,
+    listener: Option<&TtsVoiceOverride>,
+) -> Option<TtsVoiceOverride> {
+    let voice = TtsVoiceOverride {
+        voicevox_speaker: listener
+            .and_then(|voice| voice.voicevox_speaker)
+            .or_else(|| channel.and_then(|voice| voice.voicevox_speaker)),
+        bouyomi_voice: listener
+            .and_then(|voice| voice.bouyomi_voice)
+            .or_else(|| channel.and_then(|voice| voice.bouyomi_voice).map(i32::from)),
+        web_speech_voice: listener
+            .and_then(|voice| voice.web_speech_voice.as_ref())
+            .or_else(|| channel.and_then(|voice| voice.web_speech_voice.as_ref()))
+            .cloned(),
+        rate: listener.and_then(|voice| voice.rate),
+        pitch: listener.and_then(|voice| voice.pitch),
+    };
+    (voice != TtsVoiceOverride::default()).then_some(voice)
 }
 
 /// コメントの読み上げ可否。手動テキストはユーザーミュートだけを尊重する。
@@ -1176,6 +1221,59 @@ mod tests {
             SpeechOutput::WebSpeech(_)
         ));
         assert!(dispatcher.take_notices().is_empty());
+    }
+
+    #[tokio::test]
+    async fn speak_uses_channel_voice_when_listener_has_none() {
+        let mut config = TtsConfig {
+            backend: TtsBackendKind::WebSpeech,
+            ..TtsConfig::default()
+        };
+        config.options.web_speech_voice = "global".into();
+        let mut dispatcher = TtsDispatcher::new(config);
+        let mut msg = message("太郎", "こんにちは");
+        msg.listener = Some(listener(None, false));
+        msg.route.channel_tts_voice = Some(ChannelTtsVoice {
+            web_speech_voice: Some("channel".into()),
+            ..Default::default()
+        });
+
+        match dispatcher.speak(&msg, SpeakContext::default()).await {
+            SpeechOutput::WebSpeech(payload) => assert_eq!(payload.voice, "channel"),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fallback_uses_listener_voice_without_inactive_channel_voice() {
+        let mut config = TtsConfig {
+            backend: TtsBackendKind::Voicevox,
+            ..TtsConfig::default()
+        };
+        config.options.voicevox_url.clear();
+        config.options.web_speech_voice = "global".into();
+        let mut dispatcher = TtsDispatcher::new(config);
+        let mut msg = message("太郎", "こんにちは");
+        msg.route.channel_tts_voice = Some(ChannelTtsVoice {
+            web_speech_voice: Some("channel".into()),
+            ..Default::default()
+        });
+
+        match dispatcher.speak(&msg, SpeakContext::default()).await {
+            SpeechOutput::WebSpeech(payload) => assert_eq!(payload.voice, "global"),
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let mut info = listener(None, false);
+        info.tts_voice = Some(TtsVoiceOverride {
+            web_speech_voice: Some("listener".into()),
+            ..Default::default()
+        });
+        msg.listener = Some(info);
+        match dispatcher.speak(&msg, SpeakContext::default()).await {
+            SpeechOutput::WebSpeech(payload) => assert_eq!(payload.voice, "listener"),
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     #[tokio::test]

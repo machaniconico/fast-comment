@@ -42,6 +42,7 @@ mod channel_overrides_common;
 mod channel_overrides_config;
 mod channel_overrides_commit;
 mod channel_overrides_relay;
+mod channel_overrides_tts;
 
 #[test]
 fn acceptance_harness_runs() {}
