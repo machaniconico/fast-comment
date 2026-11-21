@@ -3061,6 +3061,33 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn signal_channel_keeps_more_than_64_unread_signals_in_order() {
+        // 受け手が読まないまま 64 件を超えて溜めても、落とさず順序も保つ(有界 64 では通らない)。
+        let (signal_tx, mut signal_rx) = mpsc::unbounded_channel();
+        let source = TwitcastingSource::new("alice".to_string(), TwitcastingOverrides::default(), None)
+            .with_signal_tx(signal_tx);
+        let mut sent = Vec::new();
+        for i in 0..100 {
+            let signal = match i % 3 {
+                0 => UnofficialSignal::Unreadable,
+                1 => UnofficialSignal::Neutral,
+                _ => UnofficialSignal::Unreadable,
+            };
+            source.send_signal(signal);
+            sent.push(signal);
+        }
+        source.send_signal(UnofficialSignal::Healthy);
+        sent.push(UnofficialSignal::Healthy);
+        let mut received = Vec::new();
+        while let Ok(signal) = signal_rx.try_recv() {
+            received.push(signal);
+        }
+        assert_eq!(received.len(), 101);
+        assert_eq!(received.last(), Some(&UnofficialSignal::Healthy));
+        assert_eq!(received, sent);
+    }
+
     #[test]
     fn default_unofficial_tuning_matches_previous_constants() {
         let tuning = UnofficialTuning::default();

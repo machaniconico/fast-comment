@@ -1340,6 +1340,7 @@ async fn update_config(
         },
     );
     new_config.normalize_all();
+    drop_duplicate_channels(&mut new_config);
     validate_x_post_mode(&state, &new_config).await?;
     let (
         revision,
@@ -1619,11 +1620,28 @@ fn add_channel(
 
 /// 既存の同一キーがあれば重複追加しない。キーは URL やトークンでありうるのでエラー文に入れない。
 fn ensure_new_channel(cfg: &AppConfig, channel: &ChannelConfig) -> Result<(), String> {
-    let key = AppState::channel_key(channel);
-    if cfg.channels.iter().any(|c| AppState::channel_key(c) == key) {
+    let key = duplicate_key(channel);
+    if cfg.channels.iter().any(|c| duplicate_key(c) == key) {
         return Err("チャンネルは既に存在します".into());
     }
     Ok(())
+}
+
+/// 重複判定のキー。ツイキャスは URL・大小文字違いでも同じ配信者なので screen id に寄せる
+/// (別行にすると共有のレート枠を二重に使う)。抽出できなければ生の識別子のまま。
+fn duplicate_key(ch: &ChannelConfig) -> String {
+    if ch.platform == config::ChannelPlatform::Twitcasting {
+        if let Some(id) = sources::twitcasting::extract_screen_id(&ch.identifier) {
+            return format!("twitcasting:{}", id.to_lowercase());
+        }
+    }
+    AppState::channel_key(ch)
+}
+
+/// 設定の全体保存で入った重複行を、先頭を残して落とす。
+fn drop_duplicate_channels(config: &mut AppConfig) {
+    let mut seen = std::collections::HashSet::new();
+    config.channels.retain(|c| seen.insert(duplicate_key(c)));
 }
 
 /// チャンネルを1件削除して停止する。`key` は `twitch:name` / `youtube:videoId`。
@@ -3774,6 +3792,36 @@ mod followup_tests {
             assert_ne!(incoming.x_post.enabled, current.x_post.enabled);
             assert_ne!(incoming.goals.show_in_app, current.goals.show_in_app);
         }
+    }
+
+    #[test]
+    fn twitcasting_duplicates_are_detected_by_screen_id() {
+        let tc = |id: &str| -> ChannelConfig {
+            serde_json::from_value(serde_json::json!({"platform": "twitcasting", "identifier": id}))
+                .unwrap()
+        };
+        let mut cfg = AppConfig::default();
+        cfg.channels.push(tc("alice"));
+        for dup in ["https://twitcasting.tv/alice", "ALICE", "https://twitcasting.tv/Alice/movie/1"] {
+            assert_eq!(
+                ensure_new_channel(&cfg, &tc(dup)).unwrap_err(),
+                "チャンネルは既に存在します",
+                "{dup}"
+            );
+        }
+        assert_eq!(ensure_new_channel(&cfg, &tc("bob")), Ok(()));
+        // 他のプラットフォームは従来どおり生の識別子で比べる。
+        let mut twitch = tc("alice");
+        twitch.platform = config::ChannelPlatform::Twitch;
+        assert_eq!(ensure_new_channel(&cfg, &twitch), Ok(()));
+
+        // 全体保存でも先頭を残して落とす。
+        let mut saved = AppConfig::default();
+        saved.channels = vec![tc("alice"), tc("bob"), tc("https://twitcasting.tv/ALICE"), twitch.clone()];
+        drop_duplicate_channels(&mut saved);
+        let ids: Vec<_> = saved.channels.iter().map(|c| c.identifier.as_str()).collect();
+        assert_eq!(ids, ["alice", "bob", "alice"]);
+        assert_eq!(saved.channels[2].platform, config::ChannelPlatform::Twitch);
     }
 
     #[test]

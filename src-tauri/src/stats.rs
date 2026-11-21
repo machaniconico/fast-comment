@@ -470,7 +470,8 @@ fn merge_metadata_update(
         entry.title = Some(title);
     }
     if update.live.is_some() || update.notice.is_some() {
-        entry.notice = update.notice;
+        // 空・空白だけの状態メッセージは「なし」(OBS の /stats で "" を出さない)。
+        entry.notice = update.notice.filter(|n| !n.trim().is_empty());
     }
     if let Some(live) = update.live {
         entry.live = Some(live);
@@ -1079,6 +1080,27 @@ mod tests {
         merge_metadata_update(&mut metadata, upd(None, None));
         assert_eq!(metadata[&key].notice.as_deref(), Some("msg"));
         merge_metadata_update(&mut metadata, upd(Some(true), None));
+        assert_eq!(metadata[&key].notice, None);
+    }
+
+    #[test]
+    fn empty_notice_is_none_and_still_clears_an_earlier_one() {
+        let mut metadata = HashMap::new();
+        let upd = |notice: &str| YoutubeMetadataUpdate {
+            platform: Platform::X,
+            channel: "@a".to_string(),
+            notice: Some(notice.to_string()),
+            ..YoutubeMetadataUpdate::default()
+        };
+        let key = metadata_key(Platform::X, "@a");
+        merge_metadata_update(&mut metadata, upd("msg"));
+        assert_eq!(metadata[&key].notice.as_deref(), Some("msg"));
+        merge_metadata_update(&mut metadata, upd(""));
+        assert_eq!(metadata[&key].notice, None);
+        merge_metadata_update(&mut metadata, upd("msg"));
+        merge_metadata_update(&mut metadata, upd(" \u{3000}\n"));
+        assert_eq!(metadata[&key].notice, None);
+        merge_metadata_update(&mut metadata, upd(""));
         assert_eq!(metadata[&key].notice, None);
     }
 
