@@ -88,6 +88,10 @@ fn is_group_spacing(c: char) -> bool {
 }
 
 fn decimal_position(number: &str) -> Option<usize> {
+    // A leading mark has no integer part to group, so it is always a decimal point (`,125`).
+    if number.starts_with(['.', ',']) {
+        return Some(0);
+    }
     match (number.rfind('.'), number.rfind(',')) {
         (Some(dot), Some(comma)) => Some(dot.max(comma)),
         (Some(dot), None) if number.find('.') == Some(dot) => Some(dot),
@@ -211,6 +215,10 @@ mod tests {
             let parsed = parse_display_amount(input).unwrap();
             assert_eq!(parsed.currency, currency, "{input}");
             assert_eq!(parsed.milli, 500, "{input}");
+        }
+        for input in ["EUR,125", "EUR，１２５", "$.125"] {
+            let parsed = parse_display_amount(input).unwrap();
+            assert_eq!(parsed.milli, 125, "{input}");
         }
         let parsed = parse_display_amount("$.50").unwrap();
         assert_eq!(parsed.currency, "$");
