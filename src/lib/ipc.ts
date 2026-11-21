@@ -214,6 +214,10 @@ export async function onTtsNotice(cb: (notice: TtsNotice) => void): Promise<() =
   return unlisten;
 }
 
+export async function takeStartupConfigNotice(): Promise<TtsNotice | null> {
+  return invoke<TtsNotice>('take_startup_config_notice');
+}
+
 export async function onTtsQueueState(cb: (state: TtsQueueState) => void): Promise<() => void> {
   if (!isTauri()) return () => {};
   const unlisten = await listen<TtsQueueState>('tts-queue-state', (event) => {

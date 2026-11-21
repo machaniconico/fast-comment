@@ -53,7 +53,7 @@ use crate::bus::{spawn_moderation_ui_forwarder, spawn_reaction_ui_forwarder, Bus
 use crate::templates::{TemplateInfo, TemplateRef, TemplateStore};
 use crate::config::{
     commit_channel_overrides, commit_config, replace_channels_in, ChannelEditError, ChannelOverrides,
-    ConfigCommitError, CONFIG_CHANGED_ERROR,
+    ConfigCommitError, ConfigLoadOutcome, CONFIG_CHANGED_ERROR,
 };
 use crate::config::{AppConfig, ChannelConfig, ChannelPlatform, TtsBackendKind, VoicevoxEngineKind};
 use crate::model::{
@@ -87,6 +87,8 @@ pub struct AppState {
     webhook: webhook::WebhookRuntime<integrations::KeyringSecretStore, webhook::ReqwestSender>,
     /// 現在の設定。
     config: Mutex<AppConfig>,
+    /// メイン画面からの通知取得を待つ起動時ロード結果。
+    startup_config_outcome: Mutex<Option<ConfigLoadOutcome>>,
     /// 設定の revision。`config` のロック内で、保存に成功するたびに `commit_config` が 1 進める。
     /// プロセス内だけの値で永続化しない。全体保存の楽観的排他に使う。
     config_revision: AtomicU64,
@@ -440,6 +442,20 @@ fn get_config(state: State<'_, AppState>) -> Result<ConfigSnapshot, String> {
     Ok(ConfigSnapshot {
         config: config.clone(),
         revision: state.config_revision.load(Ordering::SeqCst),
+    })
+}
+
+/// 通知の購読準備ができた画面へ、起動時の結果に対応する通知を一度だけ返す。
+#[tauri::command]
+fn take_startup_config_notice(state: State<'_, AppState>) -> Option<TtsNoticePayload> {
+    take_config_load_notice(&state.startup_config_outcome)
+}
+
+fn take_config_load_notice(outcome: &Mutex<Option<ConfigLoadOutcome>>) -> Option<TtsNoticePayload> {
+    let message = outcome.lock().unwrap().take()?.notice()?;
+    Some(TtsNoticePayload {
+        level: "warn",
+        message: message.to_owned(),
     })
 }
 
@@ -3282,16 +3298,8 @@ pub fn run() {
                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
             // 設定ロード(失敗時は壊れたファイルを退避して既定値で続行)。
-            // 退避できなかった時は config.json への保存を止める。どちらも固定文の通知で利用者に知らせる
-            // (UI の通知購読が済むまで少し待ってから出す。パス・内容は出さない)。
+            // 退避できなかった時は config.json への保存を止める。ロード結果は UI が取得するまで保持する。
             let (config, load_outcome) = AppConfig::load_or_preserve(&config_dir);
-            if let Some(message) = load_outcome.notice() {
-                let handle = handle.clone();
-                tauri::async_runtime::spawn(async move {
-                    tokio::time::sleep(Duration::from_secs(3)).await;
-                    emit_tts_notice(&handle, "warn", message.to_string());
-                });
-            }
 
             let obs_port = config.obs.port;
 
@@ -3404,6 +3412,7 @@ pub fn run() {
                         listeners: Arc::new(listeners::ListenerStore::load(&config_dir)),
                         chatlog: chatlog::ChatLog::start(&config_dir, config.log.clone()),
                         config: Mutex::new(config.clone()),
+                        startup_config_outcome: Mutex::new(Some(load_outcome)),
                         config_revision: AtomicU64::new(0),
                         config_tx,
                         timer_tx,
@@ -3558,6 +3567,7 @@ pub fn run() {
             list_listeners,
             delete_listener,
             get_config,
+            take_startup_config_notice,
             get_comment_log_dir,
             open_comment_log_dir,
             get_tts_queue_state,
@@ -3645,6 +3655,26 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_config_notice_can_be_taken_only_once() {
+        for outcome in [
+            ConfigLoadOutcome::BackedUp,
+            ConfigLoadOutcome::SavesBlocked,
+            ConfigLoadOutcome::Loaded,
+        ] {
+            let stored = Mutex::new(Some(outcome));
+            assert_eq!(
+                take_config_load_notice(&stored),
+                outcome.notice().map(|message| TtsNoticePayload {
+                    level: "warn",
+                    message: message.to_owned(),
+                })
+            );
+            assert_eq!(*stored.lock().unwrap(), None);
+            assert_eq!(take_config_load_notice(&stored), None);
+        }
+    }
 
     #[test]
     fn tts_disabled_channel_message_is_dropped_before_enqueue() {
