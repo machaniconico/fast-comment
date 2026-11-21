@@ -791,12 +791,14 @@ mod tests {
                     identifier: "@mine".into(),
                     enabled: true,
                     own_stream: true,
+                    overrides: Default::default(),
                 },
                 ChannelConfig {
                     platform: ChannelPlatform::Twitch,
                     identifier: "mine".into(),
                     enabled: true,
                     own_stream: true,
+                    overrides: Default::default(),
                 },
             ],
             connected: true,
@@ -1517,6 +1519,7 @@ mod tests {
             identifier: "mine".into(),
             enabled: true,
             own_stream: true,
+            overrides: Default::default(),
         });
         let st = stream(Platform::Twitcasting, "1");
         assert!(eligible(&s, &st));
@@ -1535,6 +1538,7 @@ mod tests {
                 identifier: saved.into(),
                 enabled: true,
                 own_stream: true,
+                overrides: Default::default(),
             });
             assert!(eligible(&s, &stream(Platform::Twitcasting, "1")), "{saved}");
         }
@@ -1544,6 +1548,7 @@ mod tests {
             identifier: "other".into(),
             enabled: true,
             own_stream: true,
+            overrides: Default::default(),
         });
         assert!(!eligible(&s, &stream(Platform::Twitcasting, "1")));
     }

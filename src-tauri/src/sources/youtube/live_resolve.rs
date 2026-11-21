@@ -184,6 +184,7 @@ pub fn spawn_live_resolve_poller(
                             identifier: video_id.clone(),
                             enabled: true,
                             own_stream: false,
+                            overrides: Default::default(),
                         };
                         let child = manager.spawn_channel(&child_config);
                         super::metadata::spawn_metadata_poller(

@@ -364,6 +364,7 @@ mod tests {
             identifier: "!!".to_string(),
             enabled,
             own_stream: false,
+            overrides: Default::default(),
         }
     }
 

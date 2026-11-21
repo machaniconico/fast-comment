@@ -357,6 +357,7 @@ mod tests {
             identifier: "mine".into(),
             enabled: true,
             own_stream: true,
+            overrides: Default::default(),
         }];
         cfg
     }
