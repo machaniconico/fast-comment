@@ -48,6 +48,8 @@ pub(super) struct Entry {
 pub(super) enum Item {
     Chat(Arc<Entry>),
     Moderation(ModerationEvent),
+    /// 実績解除(K12 の JSON)。履歴・再開カーソルには載せない。
+    Achievement(Value),
 }
 // Kept in arrival (bus) order so SSE can tell which chats follow a clear.
 #[derive(Default)]
@@ -230,6 +232,21 @@ impl ApiFeed {
             }
         }
     }
+    /// 実績解除を接続中の SSE へ流す。履歴には残さない(`id:` なし、再開不可)。
+    pub fn push_achievement(&self, unlock: &crate::achievements::engine::AchievementUnlocked) {
+        let mut state = self.0.lock().unwrap();
+        if !state.enabled {
+            return;
+        }
+        let value = unlock.relay_json();
+        state.clients.retain(|client| {
+            let Some(client) = client.upgrade() else {
+                return false;
+            };
+            client.lock().unwrap().push(Item::Achievement(value.clone()));
+            true
+        });
+    }
     pub(super) fn head(&self) -> Option<u64> {
         self.0.lock().unwrap().history.back().map(|e| e.seq)
     }
@@ -279,7 +296,13 @@ impl ApiFeed {
         gate.on_transition(move |enabled| {
             let mut receivers = receivers.lock().unwrap();
             feed.set_enabled(enabled);
-            *receivers = enabled.then(|| (bus.subscribe(), bus.subscribe_moderation()));
+            *receivers = enabled.then(|| {
+                (
+                    bus.subscribe(),
+                    bus.subscribe_moderation(),
+                    bus.achievement_sender().subscribe(),
+                )
+            });
             wake.notify_one();
         });
         let feed = self.clone();
@@ -295,8 +318,9 @@ impl ApiFeed {
                     _ = tick.tick(), if enabled => {}
                 }
                 let mut active = active.lock().unwrap();
-                if let Some((chat, moderation)) = active.as_mut() {
+                if let Some((chat, moderation, achievement)) = active.as_mut() {
                     feed.drain_bus(chat, moderation);
+                    feed.drain_achievements(achievement);
                 }
             }
             *active.lock().unwrap() = None;
@@ -345,6 +369,20 @@ impl ApiFeed {
         }
         for event in events {
             self.push_moderation(&event);
+        }
+    }
+    // 実績は履歴を持たないので、取りこぼしはチャットの欠落扱いにせず読み捨てる。
+    fn drain_achievements(
+        &self,
+        achievement: &mut tokio::sync::broadcast::Receiver<crate::achievements::engine::AchievementUnlocked>,
+    ) {
+        use tokio::sync::broadcast::error::TryRecvError;
+        loop {
+            match achievement.try_recv() {
+                Ok(unlock) => self.push_achievement(&unlock),
+                Err(TryRecvError::Lagged(_)) => continue,
+                Err(_) => break,
+            }
         }
     }
     fn record_dropped(&self, count: u64, moderation_lost: bool) {

@@ -60,6 +60,41 @@ pub struct AchievementUnlocked {
     pub unlocked_at_ms: u64,
 }
 
+impl AchievementUnlocked {
+    /// Webhook と SSE に送る外向きの形(決定 K12 の 11 キー)。説明・アイコン・内部 id は含めない。
+    /// `currency` があれば金額系(ミリ単位のまま)、無ければ回数系(回数そのもの)。
+    pub fn relay_json(&self) -> serde_json::Value {
+        use serde_json::json;
+        let subject = match (self.subject.kind, &self.subject.platform) {
+            (SubjectKind::Viewer, platform) => json!({
+                "kind": "viewer",
+                "platform": platform,
+                "authorId": self.subject.author_id,
+                "name": self.subject.name,
+            }),
+            (SubjectKind::Streamer, _) => json!({"kind": "streamer"}),
+        };
+        let (value, threshold, unit) = if self.currency.is_some() {
+            (self.value_milli, self.threshold_milli, "milli")
+        } else {
+            (self.value_milli / 1000, self.threshold_milli / 1000, "count")
+        };
+        json!({
+            "type": "achievement",
+            "achievementId": self.achievement_id,
+            "name": self.name,
+            "tier": self.tier,
+            "subject": subject,
+            "value": value,
+            "threshold": threshold,
+            "currency": self.currency,
+            "unit": unit,
+            "windowKey": self.window_key,
+            "unlockedAtMs": self.unlocked_at_ms,
+        })
+    }
+}
+
 impl fmt::Debug for UnlockSubject {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("UnlockSubject")

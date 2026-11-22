@@ -47,6 +47,7 @@ pub fn discord(matched: &Matched, msg: &ChatMessage) -> Value {
             "キーワード一致: {}",
             escape(matched.keyword.as_deref().unwrap_or_default())
         ),
+        Trigger::Achievement => "実績解除".into(),
         Trigger::Test => "Webhook テスト送信".into(),
     };
     // Discord title 自体の上限も守る。
@@ -66,6 +67,28 @@ pub fn discord(matched: &Matched, msg: &ChatMessage) -> Value {
         .unwrap_or_default()
         .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     json!({"username":"fast-comment", "allowed_mentions":{"parse":[]}, "embeds":[{"title":title,"description":description,"author":author,"color":15081751,"footer":{"text":platform},"timestamp":timestamp}]})
+}
+pub fn discord_achievement(unlock: &crate::achievements::engine::AchievementUnlocked) -> Value {
+    use crate::achievements::model::SubjectKind;
+    let achievement = cut(&escape(&unlock.name), 200);
+    let description = match (unlock.subject.kind, unlock.subject.name.as_deref()) {
+        (SubjectKind::Viewer, Some(name)) => {
+            format!("{} さんが「{achievement}」を解除しました", cut(&escape(name), 200))
+        }
+        (SubjectKind::Viewer, None) => format!("視聴者が「{achievement}」を解除しました"),
+        (SubjectKind::Streamer, _) => format!("配信者が「{achievement}」を解除しました"),
+    };
+    let timestamp = chrono::DateTime::from_timestamp_millis(unlock.unlocked_at_ms as i64)
+        .unwrap_or_default()
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    json!({"username":"fast-comment", "allowed_mentions":{"parse":[]}, "embeds":[{"title":"実績解除","description":description,"color":15081751,"footer":{"text":"fast-comment"},"timestamp":timestamp}]})
+}
+pub fn generic_achievement(
+    event_id: &str,
+    unlock: &crate::achievements::engine::AchievementUnlocked,
+    sent_at_ms: u64,
+) -> Value {
+    json!({"schema":"fast-comment.webhook.v1","eventId":event_id,"trigger":Trigger::Achievement,"sentAtMs":sent_at_ms,"achievement":unlock.relay_json()})
 }
 fn escape_donation_title(matched: &Matched, title: &str) -> String {
     if matched.trigger == Trigger::Donation {

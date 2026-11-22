@@ -116,6 +116,12 @@ pub async fn events(
                                 }
                             }
                             Item::Moderation(event) => events.push(event),
+                            Item::Achievement(value) => {
+                                flush(&mut output, &deps.epoch, &mut entries, &mut events);
+                                output.push_back(
+                                    Event::default().event("achievement").data(value.to_string()),
+                                );
+                            }
                         }
                     }
                     flush(&mut output, &deps.epoch, &mut entries, &mut events);

@@ -5,6 +5,7 @@ use super::{
     sign, Matched, OutboundRequest, Sender, Trigger,
 };
 use crate::{
+    achievements::engine::AchievementUnlocked,
     integrations::{Integrations, Paused, SecretStore, WebhookDef, WebhookFormat, WebhookSecret},
     model::ChatMessage,
 };
@@ -254,22 +255,27 @@ impl<S: SecretStore, T: Sender> WebhookRuntime<S, T> {
             let Some(secret) = &w.secret else {
                 continue;
             };
-            let item = Item {
-                at: Instant::now(),
-                request: request(&w.def, secret, &matched, msg, self.0.clock.now_ms()),
-            };
-            let mut s = w.state.lock().unwrap();
-            if s.status.state != "active" || w.cancel.is_cancelled() {
+            enqueue(
+                &w,
+                request(&w.def, secret, &matched, msg, self.0.clock.now_ms()),
+            );
+        }
+    }
+    /// 実績解除を `achievement` を有効にした送り先のキューへ積む(`handle_message` と同じく I/O しない)。
+    pub fn handle_achievement(&self, unlock: &AchievementUnlocked) {
+        let workers: Vec<_> = self.0.workers.lock().unwrap().values().cloned().collect();
+        for w in workers {
+            if !w.active() || !w.def.enabled || w.def.paused.is_some() || !w.def.triggers.achievement
+            {
                 continue;
             }
-            if s.queue.len() == 100 {
-                s.queue.pop_front();
-                s.status.dropped += 1;
-            }
-            s.queue.push_back(item);
-            s.status.queued = s.queue.len();
-            drop(s);
-            w.wake.notify_one();
+            let Some(secret) = &w.secret else {
+                continue;
+            };
+            enqueue(
+                &w,
+                achievement_request(&w.def, secret, unlock, self.0.clock.now_ms()),
+            );
         }
     }
     pub fn status(&self) -> Vec<WebhookStatus> {
@@ -329,6 +335,24 @@ impl<S: SecretStore, T: Sender> WebhookRuntime<S, T> {
         }
     }
 }
+fn enqueue(w: &Worker, request: OutboundRequest) {
+    let item = Item {
+        at: Instant::now(),
+        request,
+    };
+    let mut s = w.state.lock().unwrap();
+    if s.status.state != "active" || w.cancel.is_cancelled() {
+        return;
+    }
+    if s.queue.len() == 100 {
+        s.queue.pop_front();
+        s.status.dropped += 1;
+    }
+    s.queue.push_back(item);
+    s.status.queued = s.queue.len();
+    drop(s);
+    w.wake.notify_one();
+}
 fn request(
     def: &WebhookDef,
     secret: &WebhookSecret,
@@ -336,12 +360,35 @@ fn request(
     msg: &ChatMessage,
     now: u64,
 ) -> OutboundRequest {
+    build_request(def, secret, |event_id| {
+        if def.format == WebhookFormat::Discord {
+            payload::discord(matched, msg)
+        } else {
+            payload::generic(event_id, matched, msg, now)
+        }
+    })
+}
+fn achievement_request(
+    def: &WebhookDef,
+    secret: &WebhookSecret,
+    unlock: &AchievementUnlocked,
+    now: u64,
+) -> OutboundRequest {
+    build_request(def, secret, |event_id| {
+        if def.format == WebhookFormat::Discord {
+            payload::discord_achievement(unlock)
+        } else {
+            payload::generic_achievement(event_id, unlock, now)
+        }
+    })
+}
+fn build_request(
+    def: &WebhookDef,
+    secret: &WebhookSecret,
+    payload: impl FnOnce(&str) -> serde_json::Value,
+) -> OutboundRequest {
     let event_id = uuid::Uuid::new_v4().to_string();
-    let v = if def.format == WebhookFormat::Discord {
-        payload::discord(matched, msg)
-    } else {
-        payload::generic(&event_id, matched, msg, now)
-    };
+    let v = payload(&event_id);
     let body = serde_json::to_vec(&v).expect("JSON payload");
     let mut headers = vec![
         ("Content-Type".into(), "application/json".into()),

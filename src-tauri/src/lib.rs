@@ -3013,6 +3013,7 @@ fn spawn_webhook_forwarder(app: AppHandle, cancel: CancellationToken) {
         };
         runtime.reload().await;
         let mut rx = None;
+        let mut achievement_rx = None;
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut last = runtime.status();
@@ -3022,8 +3023,12 @@ fn spawn_webhook_forwarder(app: AppHandle, cancel: CancellationToken) {
                 if rx.is_none() {
                     rx = Some(bus.subscribe());
                 }
+                if achievement_rx.is_none() {
+                    achievement_rx = Some(bus.achievement_sender().subscribe());
+                }
             } else {
                 rx = None;
+                achievement_rx = None;
             }
             tokio::select! {
                 biased;
@@ -3033,6 +3038,15 @@ fn spawn_webhook_forwarder(app: AppHandle, cancel: CancellationToken) {
                     let status = runtime.status();
                     if status != last { let _ = app.emit("webhook-status", &status); last = status; }
                 },
+                unlock = async { match achievement_rx.as_mut() { Some(rx) => rx.recv().await, None => std::future::pending().await } } => {
+                    match unlock {
+                        Ok(unlock) => runtime.handle_achievement(&unlock),
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::warn!(lagged = n, "Webhook の実績通知を取りこぼしました");
+                        },
+                        Err(broadcast::error::RecvError::Closed) => { achievement_rx = None; },
+                    }
+                }
                 incoming = async { match rx.as_mut() { Some(rx) => rx.recv().await, None => std::future::pending().await } } => {
                     match incoming {
                         Ok(msg) => runtime.handle_message(&msg),
