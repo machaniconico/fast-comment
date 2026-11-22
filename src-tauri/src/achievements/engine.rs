@@ -77,7 +77,8 @@ impl AchievementUnlocked {
         let (value, threshold, unit) = if self.currency.is_some() {
             (self.value_milli, self.threshold_milli, "milli")
         } else {
-            (self.value_milli / 1000, self.threshold_milli / 1000, "count")
+            // しきい値は切り上げる(1.5 回は 2 回で解除されるため)。値はミリ単位でも回数の整数倍。
+            (self.value_milli / 1000, (self.threshold_milli + 999) / 1000, "count")
         };
         json!({
             "type": "achievement",
@@ -92,6 +93,28 @@ impl AchievementUnlocked {
             "windowKey": self.window_key,
             "unlockedAtMs": self.unlocked_at_ms,
         })
+    }
+}
+
+#[cfg(test)]
+mod relay_json_tests {
+    use super::*;
+
+    fn count_unlock(value_milli: i64, threshold_milli: i64) -> AchievementUnlocked {
+        serde_json::from_value(serde_json::json!({
+            "id": "i", "achievementId": "a", "name": "n", "description": "", "tier": "bronze",
+            "icon": "", "subject": {"kind": "streamer"}, "valueMilli": value_milli,
+            "thresholdMilli": threshold_milli, "currency": null, "windowKey": "*", "unlockedAtMs": 1
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn count_threshold_rounds_up() {
+        let v = count_unlock(3000, 2500).relay_json();
+        assert_eq!((v["value"].clone(), v["threshold"].clone()), (3.into(), 3.into()));
+        assert_eq!(count_unlock(1000, 400).relay_json()["threshold"], 1);
+        assert_eq!(count_unlock(2000, 2000).relay_json()["threshold"], 2);
     }
 }
 

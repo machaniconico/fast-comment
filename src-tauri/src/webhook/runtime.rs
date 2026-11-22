@@ -261,6 +261,21 @@ impl<S: SecretStore, T: Sender> WebhookRuntime<S, T> {
             );
         }
     }
+    /// forwarder 用。受信結果を処理し、取りこぼした件数を返す(Closed は 0)。
+    pub fn relay_achievement(
+        &self,
+        incoming: Result<AchievementUnlocked, tokio::sync::broadcast::error::RecvError>,
+    ) -> u64 {
+        use tokio::sync::broadcast::error::RecvError;
+        match incoming {
+            Ok(unlock) => {
+                self.handle_achievement(&unlock);
+                0
+            }
+            Err(RecvError::Lagged(n)) => n,
+            Err(RecvError::Closed) => 0,
+        }
+    }
     /// 実績解除を `achievement` を有効にした送り先のキューへ積む(`handle_message` と同じく I/O しない)。
     pub fn handle_achievement(&self, unlock: &AchievementUnlocked) {
         let workers: Vec<_> = self.0.workers.lock().unwrap().values().cloned().collect();
@@ -659,6 +674,38 @@ mod tests {
             keywords: vec![],
             url: Some(url.into()),
         }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn bus_achievement_reaches_webhook_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let it = Integrations::open(dir.path().into(), MemorySecretStore::new(), 1).await;
+        let sender = Capture::default();
+        let rt = WebhookRuntime::new(it.clone(), sender.clone());
+        let mut i = input("https://a.example.test/hook");
+        i.triggers = WebhookTriggers {
+            achievement: true,
+            ..Default::default()
+        };
+        it.save_webhook(i).await.unwrap();
+        rt.reload().await;
+        let (stats, _) = tokio::sync::watch::channel(Default::default());
+        let (timer, _) = tokio::sync::watch::channel(Default::default());
+        let bus = crate::bus::Bus::new(1234, stats, timer);
+        let mut rx = bus.achievement_sender().subscribe();
+        let unlock: AchievementUnlocked = serde_json::from_value(serde_json::json!({
+            "id": "i", "achievementId": "a", "name": "n", "description": "", "tier": "bronze",
+            "icon": "", "subject": {"kind": "streamer"}, "valueMilli": 1000,
+            "thresholdMilli": 1000, "currency": null, "windowKey": "*", "unlockedAtMs": 1
+        }))
+        .unwrap();
+        bus.achievement_sender().send(unlock).unwrap();
+        assert_eq!(rt.relay_achievement(rx.recv().await), 0);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(sender.0.lock().unwrap().len(), 1);
+        assert_eq!(
+            rt.relay_achievement(Err(tokio::sync::broadcast::error::RecvError::Lagged(7))),
+            7
+        );
     }
     #[tokio::test(start_paused = true)]
     async fn injected_history_and_duplicates_never_reach_sender_on_any_target() {

@@ -70,13 +70,17 @@ pub fn discord(matched: &Matched, msg: &ChatMessage) -> Value {
 }
 pub fn discord_achievement(unlock: &crate::achievements::engine::AchievementUnlocked) -> Value {
     use crate::achievements::model::SubjectKind;
-    let achievement = cut(&escape(&unlock.name), 200);
-    let description = match (unlock.subject.kind, unlock.subject.name.as_deref()) {
-        (SubjectKind::Viewer, Some(name)) => {
-            format!("{} さんが「{achievement}」を解除しました", cut(&escape(name), 200))
-        }
-        (SubjectKind::Viewer, None) => format!("視聴者が「{achievement}」を解除しました"),
-        (SubjectKind::Streamer, _) => format!("配信者が「{achievement}」を解除しました"),
+    let achievement = escape(&cut(&unlock.name, 200));
+    let viewer = unlock
+        .subject
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map_or_else(|| "視聴者".to_owned(), |n| escape(&cut(n, 200)));
+    let description = match unlock.subject.kind {
+        SubjectKind::Viewer => format!("{viewer} さんが「{achievement}」を解除しました"),
+        SubjectKind::Streamer => format!("配信者が「{achievement}」を解除しました"),
     };
     let timestamp = chrono::DateTime::from_timestamp_millis(unlock.unlocked_at_ms as i64)
         .unwrap_or_default()

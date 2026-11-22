@@ -380,9 +380,16 @@ impl ApiFeed {
         loop {
             match achievement.try_recv() {
                 Ok(unlock) => self.push_achievement(&unlock),
-                Err(TryRecvError::Lagged(_)) => continue,
+                Err(TryRecvError::Lagged(n)) => self.record_achievement_dropped(n),
                 Err(_) => break,
             }
+        }
+    }
+    // 履歴の連番は進めず、接続中の SSE の lagged にだけ数える。
+    fn record_achievement_dropped(&self, count: u64) {
+        let state = self.0.lock().unwrap();
+        for client in state.clients.iter().filter_map(Weak::upgrade) {
+            client.lock().unwrap().dropped += count;
         }
     }
     fn record_dropped(&self, count: u64, moderation_lost: bool) {
@@ -716,6 +723,53 @@ mod tests {
         );
         feed.record_dropped(1, true);
         assert!(feed.snapshot().entries.is_empty());
+    }
+    fn unlock(id: &str) -> crate::achievements::engine::AchievementUnlocked {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "achievementId": "a", "name": "n", "description": "", "tier": "bronze",
+            "icon": "", "subject": {"kind": "streamer"}, "valueMilli": 1000,
+            "thresholdMilli": 1000, "currency": null, "windowKey": "*", "unlockedAtMs": 1
+        }))
+        .unwrap()
+    }
+    #[test]
+    fn achievement_bus_lag_is_added_to_client_dropped() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(256);
+        let feed = ApiFeed::new(10);
+        feed.set_enabled(true);
+        let (_, pending) = feed.subscribe().unwrap();
+        for i in 0..1025 {
+            tx.send(unlock(&i.to_string())).unwrap();
+        }
+        feed.drain_achievements(&mut rx);
+        let p = pending.lock().unwrap();
+        assert_eq!(p.dropped, 769, "bus 側の欠落 1025 - 256 件");
+        assert_eq!(p.items.len(), 256);
+    }
+    #[tokio::test]
+    async fn bus_achievement_reaches_sse_pending_through_bind() {
+        let (stats, _) = tokio::sync::watch::channel(Default::default());
+        let (timer, _) = tokio::sync::watch::channel(Default::default());
+        let bus = crate::bus::Bus::new(1234, stats, timer);
+        let feed = ApiFeed::new(10);
+        let gate = super::super::ApiGate::closed();
+        let stop = tokio_util::sync::CancellationToken::new();
+        feed.bind(&bus, &gate, stop.clone());
+        gate.open("t");
+        let (_, pending) = feed.subscribe().unwrap();
+        bus.achievement_sender().send(unlock("x")).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while pending.lock().unwrap().items.is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            pending.lock().unwrap().items.front(),
+            Some(Item::Achievement(v)) if v["achievementId"] == "a"
+        ));
+        stop.cancel();
     }
     #[tokio::test]
     async fn gate_transitions_drop_bus_subscriptions_and_clear_history_synchronously() {
