@@ -4,13 +4,14 @@
     achievementSchema, commitAchievements, duplicateAchievement, listAchievements, resetAchievementToPreset,
   } from '../ipc';
   import {
-    TIER_LABELS, coerceCondition, currencyOptions, formatDate, metricOptions, parseRate, platformOptions,
-    ratesNotice, windowOptions,
+    TIER_LABELS, canDelete, canDuplicate, checkRateRows, coerceCondition, currencyOptions, findDraftError,
+    formatDate, metricOptions, platformOptions, ratesNotice, windowOptions, withSubject,
   } from '../achievementsUi';
   import type {
     AchievementCondition, AchievementCurrencyKind, AchievementDef, AchievementList, AchievementMetric,
     AchievementRow, AchievementSchema, AchievementSubjectKind, Platform,
   } from '../types';
+  import type { RateRow } from '../achievementsUi';
 
   const METRIC_LABELS: Record<AchievementMetric, string> = {
     comments: 'コメント数', superChatCount: 'スーパーチャット回数', donationAmount: '金額', giftCount: 'ギフト数',
@@ -27,7 +28,7 @@
   let schema = $state<AchievementSchema | null>(null);
   let drafts = $state<AchievementDef[]>([]);
   let enabled = $state(false);
-  let rateRows = $state<{ code: string; text: string }[]>([]);
+  let rateRows = $state<RateRow[]>([]);
   let tab = $state<AchievementSubjectKind>('viewer');
   let editingId = $state<string | null>(null);
   let busy = $state(false);
@@ -63,27 +64,17 @@
 
   const FIELD_LABELS: Record<string, string> = {
     name: '名前', id: 'ID', currency: '通貨', metric: '指標', window: '期間', threshold: 'しきい値',
-    condition: '条件', tier: '等級',
+    condition: '条件', tier: '等級', platforms: 'プラットフォーム',
   };
-
-  function collectRates(): Record<string, number> | null {
-    const rates: Record<string, number> = {};
-    for (const row of rateRows) {
-      const code = row.code.trim();
-      if (!code) continue;
-      const rate = parseRate(row.text);
-      if (rate === null) { message = `レート「${code}」は 0 より大きい数値にしてください。`; return null; }
-      rates[code] = rate;
-    }
-    return rates;
-  }
 
   async function save() {
     await run(async () => {
       if (!loaded) return;
-      const rates = collectRates();
-      if (!rates) return;
-      const reply = await commitAchievements(loaded.revision, enabled, $state.snapshot(drafts), rates, loaded.symbolOverrides);
+      const draftError = findDraftError(drafts);
+      if (draftError) { message = draftError.message; editingId = draftError.id; return; }
+      const checked = checkRateRows(rateRows);
+      if ('error' in checked) { message = checked.error; return; }
+      const reply = await commitAchievements(loaded.revision, enabled, $state.snapshot(drafts), checked.rates, loaded.symbolOverrides);
       if (!reply) return;
       switch (reply.result) {
         case 'ok': message = '保存しました。'; await reload(); break;
@@ -91,12 +82,17 @@
           message = '別の場所で実績が変更されたため保存できませんでした。最新の内容を読み込みました。もう一度編集してください。';
           await reload();
           break;
-        case 'invalid': {
-          const name = drafts.find((a) => a.id === reply.id)?.name || reply.id;
-          message = `「${name}」の${FIELD_LABELS[reply.field] ?? reply.field}を確認してください。`;
-          editingId = reply.id;
+        case 'invalid':
+          if (reply.field === 'rateCode' || reply.field === 'rateValue') {
+            message = reply.field === 'rateCode'
+              ? `通貨「${reply.id}」が空または重複しています。`
+              : `レート「${reply.id}」は 0 より大きい数値にしてください。`;
+          } else {
+            const name = drafts.find((a) => a.id === reply.id)?.name || reply.id;
+            message = `「${name}」の${FIELD_LABELS[reply.field] ?? reply.field}を確認してください。`;
+            editingId = reply.id;
+          }
           break;
-        }
         default: message = '実績を保存できませんでした。保存先を確認してください。';
       }
     });
@@ -104,8 +100,9 @@
 
   async function duplicate(id: string) {
     await run(async () => {
-      const copy = await duplicateAchievement(id);
-      if (!copy) { message = '複製できませんでした(保存済みの実績だけ複製できます)。'; return; }
+      const src = drafts.find((a) => a.id === id);
+      const copy = src && canDuplicate(src) ? await duplicateAchievement($state.snapshot(src)) : null;
+      if (!copy) { message = '複製できませんでした(プラチナは複製できません。しきい値も確認してください)。'; return; }
       const at = drafts.findIndex((a) => a.id === id);
       drafts.splice(at + 1, 0, copy);
       editingId = copy.id;
@@ -123,6 +120,18 @@
     });
   }
 
+  function remove(id: string) {
+    const at = drafts.findIndex((a) => a.id === id);
+    if (at >= 0 && canDelete(drafts[at])) drafts.splice(at, 1);
+    if (editingId === id) editingId = null;
+    message = '削除しました。保存すると反映されます。';
+  }
+  function setSubject(a: AchievementDef, subject: AchievementSubjectKind) {
+    if (!schema) return;
+    const next = withSubject(schema, $state.snapshot(a), subject);
+    Object.assign(a, next);
+    tab = subject;
+  }
   function setMetric(a: AchievementDef, metric: AchievementMetric) {
     if (!a.condition || !schema) return;
     a.condition = coerceCondition(schema, { ...a.condition, metric });
@@ -157,6 +166,7 @@
   {#if !loaded}
     <p>読み込み中…</p>
   {:else}
+    <fieldset class="lock" disabled={busy}>
     <ul class="list">
       {#each rows as a (a.id)}
         <li class:selected={a.id === editingId}>
@@ -164,7 +174,7 @@
           <span class="name">{a.icon} {a.name}{a.edited ? '(編集済み)' : ''}</span>
           <span class="progress">{progressText(a)}</span>
           <label class="inline"><input type="checkbox" bind:checked={a.enabled} /> 有効</label>
-          <button disabled={busy} onclick={() => (editingId = a.id === editingId ? null : a.id)}>編集</button>
+          <button onclick={() => (editingId = a.id === editingId ? null : a.id)}>編集</button>
         </li>
       {/each}
     </ul>
@@ -173,6 +183,14 @@
       <div class="editor">
         <h4>「{editing.name}」を編集</h4>
         <label>名前 <input type="text" bind:value={editing.name} /></label>
+        {#if editing.condition}
+          <label>対象
+            <select value={editing.subject} onchange={(e) => setSubject(editing!, e.currentTarget.value as AchievementSubjectKind)}>
+              <option value="viewer">視聴者</option>
+              <option value="streamer">配信者</option>
+            </select>
+          </label>
+        {/if}
         <label>説明 <input type="text" bind:value={editing.description} /></label>
         <label>アイコン <input type="text" bind:value={editing.icon} maxlength="8" /></label>
         {#if editing.condition}
@@ -217,9 +235,12 @@
         {/if}
         <label class="inline"><input type="checkbox" bind:checked={editing.announce.tts} /> 解除時に読み上げる</label>
         <div class="row">
-          <button disabled={busy} onclick={() => duplicate(editing!.id)}>複製</button>
+          <button disabled={!canDuplicate(editing)} onclick={() => duplicate(editing!.id)}>複製</button>
+          {#if canDelete(editing)}
+            <button onclick={() => remove(editing!.id)}>削除</button>
+          {/if}
           {#if editing.builtinId}
-            <button disabled={busy} onclick={() => resetToPreset(editing!.id)}>プリセットに戻す</button>
+            <button onclick={() => resetToPreset(editing!.id)}>プリセットに戻す</button>
           {/if}
           <button onclick={() => (editingId = null)}>閉じる</button>
         </div>
@@ -238,9 +259,10 @@
     <div class="row"><button onclick={addRate}>通貨を追加</button></div>
 
     <div class="row">
-      <button class="primary" disabled={busy} onclick={save}>保存</button>
-      <button disabled={busy} onclick={() => run(reload)}>破棄して再読込</button>
+      <button class="primary" onclick={save}>保存</button>
+      <button onclick={() => run(reload)}>破棄して再読込</button>
     </div>
+    </fieldset>
   {/if}
   {#if message}<p role="status" class="message">{message}</p>{/if}
 </section>
@@ -267,6 +289,7 @@
   .editor > label.inline { display: inline-flex; }
   .inline { display: inline-flex; align-items: center; gap: 4px; }
   fieldset { border: 1px solid #444; display: flex; flex-wrap: wrap; gap: 8px; }
+  fieldset.lock { border: 0; padding: 0; margin: 0; display: block; min-width: 0; }
   .row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 8px 0; }
   .warn { color: #ffb347; }
   .message { color: #9fd; }

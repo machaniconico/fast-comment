@@ -96,6 +96,7 @@ pub enum ValidationError {
     PlatinumHasCondition,
     MissingCondition,
     MultiplePlatinum,
+    PlatformNotAllowed,
 }
 
 impl fmt::Display for ValidationError {
@@ -111,11 +112,45 @@ impl fmt::Display for ValidationError {
             Self::PlatinumHasCondition => "platinum achievement cannot have a condition",
             Self::MissingCondition => "achievement requires a condition",
             Self::MultiplePlatinum => "subject already has a platinum achievement",
+            Self::PlatformNotAllowed => "platform is unavailable for this metric",
         })
     }
 }
 
 impl std::error::Error for ValidationError {}
+
+/// 金額(DonationAmount)を持つプラットフォーム。X・ツイキャスの金額は取れない。
+const AMOUNT_PLATFORMS: [Platform; 3] = [Platform::Youtube, Platform::Twitch, Platform::Niconico];
+const ALL_PLATFORMS: [Platform; 5] = [
+    Platform::Twitch,
+    Platform::Youtube,
+    Platform::X,
+    Platform::Niconico,
+    Platform::Twitcasting,
+];
+
+/// メトリクスごとに選べるプラットフォーム(`achievement_schema` と保存時の検証が共有する表)。
+pub fn allowed_platforms(metric: Metric) -> &'static [Platform] {
+    match metric {
+        Metric::DonationAmount => &AMOUNT_PLATFORMS,
+        _ => &ALL_PLATFORMS,
+    }
+}
+
+/// 保存(commit)経路の検証。`validate_all` に加えてプラットフォーム制約を見る。
+/// 読み込み時は `validate_all` のまま(v0.5.0 で保存済みのファイルを退避させないため)。
+pub fn validate_for_save(list: &[Achievement]) -> Result<(), (String, ValidationError)> {
+    validate_all(list)?;
+    for a in list {
+        if let Some(c) = &a.condition {
+            let allowed = allowed_platforms(c.metric);
+            if c.platforms.iter().any(|p| !allowed.contains(p)) {
+                return Err((a.id.clone(), ValidationError::PlatformNotAllowed));
+            }
+        }
+    }
+    Ok(())
+}
 
 pub fn validate_all(list: &[Achievement]) -> Result<(), (String, ValidationError)> {
     let mut ids = HashSet::new();

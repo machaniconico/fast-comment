@@ -275,8 +275,13 @@ async fn delete_listener(
 
 #[tauri::command]
 fn list_achievements(state: State<'_, AppState>) -> achievements::ipc::AchievementList {
+    // 外部で更新されていればディスクから読み直す(Stale のあとの再読込もここを通る)。
+    let unlocks = achievements::ipc::refresh(
+        &state.achievement_defs, &state.achievement_engine, &state.config_dir, timer_now_ms(),
+    );
+    state.broadcast_achievement_unlocks(unlocks);
     let engine = state.lock_achievement_engine();
-    achievements::ipc::list(state.achievement_defs.current(), engine.as_deref())
+    achievements::ipc::list(state.achievement_defs.current(), engine.as_deref(), &state.config_dir)
 }
 
 #[tauri::command]
@@ -289,10 +294,14 @@ fn commit_achievements(
     state: State<'_, AppState>,
     base_revision: u64,
     enabled: bool,
-    achievements: Vec<achievements::model::Achievement>,
+    achievements: Vec<achievements::ipc::AchievementInput>,
     rates: achievements::currency::RateTable,
     symbol_overrides: std::collections::BTreeMap<String, String>,
 ) -> achievements::ipc::CommitReply {
+    let achievements = match achievements::ipc::build_achievements(achievements) {
+        Ok(list) => list,
+        Err(reply) => return reply,
+    };
     let mut next = state.achievement_defs.current();
     next.enabled = enabled;
     next.achievements = achievements;
@@ -311,8 +320,8 @@ fn commit_achievements(
 }
 
 #[tauri::command]
-fn duplicate_achievement(state: State<'_, AppState>, id: String) -> Option<achievements::model::Achievement> {
-    achievements::ipc::duplicate_by_id(&state.achievement_defs.current(), &id)
+fn duplicate_achievement(achievement: achievements::ipc::AchievementInput) -> Option<achievements::model::Achievement> {
+    achievements::ipc::duplicate_draft(achievement)
 }
 
 #[tauri::command]
@@ -328,7 +337,7 @@ fn listener_achievements(
 ) -> Vec<achievements::ipc::ListenerTrophy> {
     let engine = state.lock_achievement_engine();
     achievements::ipc::listener_trophies(
-        &state.achievement_defs.current(), engine.as_deref(), &platform, &author_id,
+        &state.achievement_defs.current(), engine.as_deref(), &state.config_dir, &platform, &author_id,
     )
 }
 

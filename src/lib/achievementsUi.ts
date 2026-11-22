@@ -2,6 +2,7 @@
 // by Rust (`achievement_schema` / `validate_all`); these only turn the schema into UI state.
 import type {
   AchievementCondition,
+  AchievementDef,
   AchievementCurrencyKind,
   AchievementMetric,
   AchievementSchema,
@@ -118,4 +119,53 @@ export function trophyViews(trophies: ListenerTrophy[], timeZone?: string): Trop
       unlockedAt: formatDate(t.unlockedAtMs, timeZone),
       scope: t.windowKey === '*' ? '' : '配信ごと',
     }));
+}
+
+/** Changing the subject: move the metric to one the subject allows, then re-coerce the rest. */
+export function withSubject(schema: AchievementSchema, a: AchievementDef, subject: AchievementSubjectKind): AchievementDef {
+  if (!a.condition) return a;
+  const options = metricOptions(schema, subject, a.condition.platforms);
+  const metric = options.some((o) => o.value === a.condition!.metric && !o.disabled)
+    ? a.condition.metric
+    : (options.find((o) => !o.disabled)?.value ?? a.condition.metric);
+  return { ...a, subject, condition: coerceCondition(schema, { ...a.condition, metric }) };
+}
+
+/** Platinum is unique per subject, so it can be neither duplicated nor deleted. */
+export const canDuplicate = (a: AchievementDef): boolean => a.tier !== 'platinum';
+/** Only user-made achievements (duplicates) can be deleted; presets are disabled instead. */
+export const canDelete = (a: AchievementDef): boolean => a.builtinId === null && a.tier !== 'platinum';
+
+export interface RateRow {
+  code: string;
+  text: string;
+}
+
+/** Pre-save check of the rate table. Rust normalizes keys and has the final say. */
+export function checkRateRows(rows: RateRow[]): { rates: Record<string, number> } | { error: string } {
+  const rates: Record<string, number> = {};
+  const seen = new Set<string>();
+  for (const row of rows) {
+    const code = row.code.trim();
+    if (!code && !row.text.trim()) continue;
+    if (!code) return { error: 'レートの通貨コードが空の行があります。' };
+    const rate = parseRate(row.text);
+    if (rate === null) return { error: `レート「${code}」は 0 より大きい数値にしてください。` };
+    const key = code.toUpperCase();
+    if (seen.has(key)) return { error: `通貨「${code}」が重複しています。` };
+    seen.add(key);
+    rates[code] = rate;
+  }
+  return { rates };
+}
+
+/** Empty threshold / name before saving (Rust validates everything else). */
+export function findDraftError(drafts: AchievementDef[]): { id: string; message: string } | null {
+  for (const a of drafts) {
+    if (!a.name.trim()) return { id: a.id, message: '名前が空の実績があります。' };
+    if (a.condition && (a.condition.threshold === null || !Number.isFinite(a.condition.threshold))) {
+      return { id: a.id, message: `「${a.name}」のしきい値を入力してください。` };
+    }
+  }
+  return null;
 }

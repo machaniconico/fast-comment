@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
-  coerceCondition, currencyOptions, DAY_MS, metricOptions, parseRate, platformOptions, ratesNotice, ratesStale,
+  canDelete, canDuplicate, checkRateRows, coerceCondition, findDraftError, withSubject, currencyOptions, DAY_MS, metricOptions, parseRate, platformOptions, ratesNotice, ratesStale,
   trophyViews, windowOptions,
 } from './achievementsUi.ts';
-import type { AchievementSchema, ListenerTrophy } from './types.ts';
+import type { AchievementDef, AchievementSchema, ListenerTrophy } from './types.ts';
 
 const ALL = ['twitch', 'youtube', 'x', 'niconico', 'twitcasting'] as const;
 const schema: AchievementSchema = {
@@ -67,4 +67,42 @@ test('listener_detail_shows_earned_trophies', () => {
   assert.equal(views[1].scope, '');
   assert.match(views[1].unlockedAt, /2026\/11\/01 03:04/);
   assert.deepEqual(trophyViews([]), []);
+});
+
+const def = (over: Partial<AchievementDef> = {}): AchievementDef => ({
+  id: 'a', name: 'n', description: '', icon: '', tier: 'bronze', subject: 'viewer', enabled: true, builtinId: null, edited: false,
+  condition: { window: 'lifetime', metric: 'streamsAttended', threshold: 1, currency: { mode: 'none' }, platforms: [] },
+  announce: { tts: false }, ...over,
+});
+
+test('editor changes the subject and moves the metric to an allowed one', () => {
+  const a = withSubject(schema, def(), 'streamer');
+  assert.equal(a.subject, 'streamer');
+  assert.equal(a.condition?.metric, 'comments');
+  const keep = withSubject(schema, def({ condition: { ...def().condition!, metric: 'comments' } }), 'streamer');
+  assert.equal(keep.condition?.metric, 'comments');
+  const platinum = def({ tier: 'platinum', condition: null });
+  assert.equal(withSubject(schema, platinum, 'streamer'), platinum);
+});
+
+test('duplicate and delete are gated by tier and origin', () => {
+  assert.equal(canDuplicate(def()), true);
+  assert.equal(canDuplicate(def({ tier: 'platinum', condition: null })), false);
+  assert.equal(canDelete(def()), true);
+  assert.equal(canDelete(def({ builtinId: 'viewer-first-comment' })), false);
+  assert.equal(canDelete(def({ tier: 'platinum', condition: null })), false);
+});
+
+test('rate rows reject empty codes, bad values and duplicates before saving', () => {
+  assert.deepEqual(checkRateRows([{ code: 'USD', text: '150.5' }, { code: ' ', text: '' }]), { rates: { USD: 150.5 } });
+  assert.ok('error' in checkRateRows([{ code: '', text: '150' }]));
+  assert.ok('error' in checkRateRows([{ code: 'USD', text: '' }]));
+  assert.ok('error' in checkRateRows([{ code: 'USD', text: '1' }, { code: 'usd', text: '2' }]));
+});
+
+test('empty threshold and empty name are caught before saving', () => {
+  assert.equal(findDraftError([def()]), null);
+  const empty = def({ id: 'x', condition: { ...def().condition!, threshold: null } });
+  assert.equal(findDraftError([def(), empty])?.id, 'x');
+  assert.equal(findDraftError([def({ id: 'y', name: ' ' })])?.id, 'y');
 });

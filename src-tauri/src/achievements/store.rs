@@ -11,7 +11,9 @@ use uuid::Uuid;
 
 use super::currency::RateTable;
 use super::engine::Progress;
-use super::model::{presets, reset_to_preset, validate_all, Achievement, ValidationError};
+use super::model::{
+    presets, reset_to_preset, validate_all, validate_for_save, Achievement, ValidationError,
+};
 
 pub const DEFS_FILE: &str = "achievements.json";
 pub const PROGRESS_FILE: &str = "achievement-progress.json";
@@ -158,6 +160,28 @@ impl DefsStore {
             .clone()
     }
 
+    /// ディスクの内容を読み直す(外部で更新された時、Stale のあとの再読込用)。変わったら true。
+    pub fn reload(&self, now_ms: u64) -> bool {
+        if self.save_refused {
+            return false;
+        }
+        let _transaction = DEFS_TRANSACTION.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok((loaded, bytes)) =
+            load_versioned(&self.path, now_ms, self.io.as_ref(), |defs: &AchievementDefs| {
+                validate_all(&defs.achievements).is_ok()
+            })
+        else {
+            return false;
+        };
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if bytes == state.saved_bytes {
+            return false;
+        }
+        state.current = loaded.unwrap_or_default();
+        state.saved_bytes = bytes;
+        true
+    }
+
     pub fn commit(
         &self,
         base_revision: u64,
@@ -173,7 +197,7 @@ impl DefsStore {
         {
             return Err(CommitError::Stale);
         }
-        validate_all(&next.achievements)
+        validate_for_save(&next.achievements)
             .map_err(|(id, reason)| CommitError::Invalid(id, reason))?;
         if next.rates.values().any(|rate| !rate.is_finite()) {
             return Err(CommitError::Io);
@@ -319,6 +343,16 @@ impl ProgressFile {
         self.loaded_generation.store(next, Ordering::Relaxed);
         Ok(())
     }
+}
+
+/// 進捗ファイルを読み取り専用で読む(退避も書き込みもしない)。無い・壊れている・版違いは None。
+pub(super) fn read_progress(dir: &Path) -> Option<Progress> {
+    let bytes = read_optional(&dir.join(PROGRESS_FILE)).ok()??;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    if value.get("version").and_then(serde_json::Value::as_u64) != Some(u64::from(STORE_VERSION)) {
+        return None;
+    }
+    serde_json::from_value(value).ok()
 }
 
 /// Remove a viewer's achievements when there is no active engine.

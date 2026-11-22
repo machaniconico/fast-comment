@@ -294,7 +294,8 @@ export type AchievementCurrency = { mode: 'none' | 'jpyConverted' } | { mode: 'o
 export interface AchievementCondition {
   window: AchievementWindow;
   metric: AchievementMetric;
-  threshold: number;
+  /** null while the input is empty; Rust reports it as a threshold field error. */
+  threshold: number | null;
   currency: AchievementCurrency;
   platforms: Platform[];
 }

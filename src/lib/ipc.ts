@@ -1306,8 +1306,9 @@ export async function commitAchievements(
   return invoke<AchievementCommitReply>('commit_achievements', { baseRevision, enabled, achievements, rates, symbolOverrides });
 }
 
-export async function duplicateAchievement(id: string): Promise<AchievementDef | null> {
-  return invoke<AchievementDef | null>('duplicate_achievement', { id });
+/** Duplicates the current draft (not the saved copy); Rust assigns the new id. */
+export async function duplicateAchievement(achievement: AchievementDef): Promise<AchievementDef | null> {
+  return invoke<AchievementDef | null>('duplicate_achievement', { achievement });
 }
 
 export async function resetAchievementToPreset(id: string): Promise<AchievementDef | null> {
