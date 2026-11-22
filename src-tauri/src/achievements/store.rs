@@ -118,6 +118,8 @@ static DEFS_TRANSACTION: Mutex<()> = Mutex::new(());
 struct DefsState {
     current: AchievementDefs,
     saved_bytes: Option<Vec<u8>>,
+    /// 再読込で退避済みの壊れた内容。取り込み(flush)に失敗しても同じ内容は二度退避しない。
+    backed_up: Option<Vec<u8>>,
 }
 
 /// 読み込んだファイル内容の識別子。revision を据え置いた外部編集も見分ける。
@@ -157,6 +159,7 @@ impl DefsStore {
             state: Mutex::new(DefsState {
                 current: loaded.unwrap_or_default(),
                 saved_bytes,
+                backed_up: None,
             }),
         }
     }
@@ -194,19 +197,20 @@ impl DefsStore {
         let unchanged = |bytes: &Option<Vec<u8>>| {
             *bytes == self.state.lock().unwrap_or_else(|e| e.into_inner()).saved_bytes
         };
-        match read_optional(&self.path) {
-            Ok(bytes) if !unchanged(&bytes) => {}
+        let bytes = match read_optional(&self.path) {
+            Ok(bytes) if !unchanged(&bytes) => bytes,
             _ => return Ok(false),
-        }
-        let Ok((loaded, bytes)) =
-            load_versioned(&self.path, now_ms, self.io.as_ref(), |defs: &AchievementDefs| {
-                validate_all(&defs.achievements).is_ok()
-            })
-        else {
-            return Ok(false);
         };
-        if unchanged(&bytes) {
-            return Ok(false);
+        let loaded = bytes.as_deref().and_then(|b| {
+            decode_versioned(b, |defs: &AchievementDefs| validate_all(&defs.achievements).is_ok())
+        });
+        if loaded.is_none() && bytes.is_some() {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.backed_up != bytes {
+                // 退避できなければ取り込まずにエラーにする(画面に保存先の確認を促す)。
+                preserve_broken(&self.path, now_ms, self.io.as_ref())?;
+                state.backed_up.clone_from(&bytes);
+            }
         }
         let loaded = loaded.unwrap_or_default();
         before_adopt(&loaded)?;
@@ -232,12 +236,18 @@ impl DefsStore {
         self.check_locked(&state, base_revision, base_token, next)
     }
 
-    fn check_locked(
+    /// 競合(Stale)だけを判定する。入力の正規化・検証より前に呼ぶ。
+    pub fn check_base(&self, base_revision: u64, base_token: Option<&str>) -> Result<(), CommitError> {
+        let _transaction = DEFS_TRANSACTION.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        self.check_base_locked(&state, base_revision, base_token)
+    }
+
+    fn check_base_locked(
         &self,
         state: &DefsState,
         base_revision: u64,
         base_token: Option<&str>,
-        next: &AchievementDefs,
     ) -> Result<(), CommitError> {
         if self.save_refused {
             return Err(CommitError::SaveRefused);
@@ -248,6 +258,17 @@ impl DefsStore {
         {
             return Err(CommitError::Stale);
         }
+        Ok(())
+    }
+
+    fn check_locked(
+        &self,
+        state: &DefsState,
+        base_revision: u64,
+        base_token: Option<&str>,
+        next: &AchievementDefs,
+    ) -> Result<(), CommitError> {
+        self.check_base_locked(state, base_revision, base_token)?;
         validate_for_save(&next.achievements)
             .map_err(|(id, reason)| CommitError::Invalid(id, reason))?;
         if next.rates.values().any(|rate| !rate.is_finite()) {
@@ -301,19 +322,19 @@ pub(crate) fn load_versioned<T: DeserializeOwned>(
     let Some(bytes) = read_optional(path).map_err(|_| CommitError::SaveRefused)? else {
         return Ok((None, None));
     };
-    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-        if value.get("version").and_then(serde_json::Value::as_u64)
-            == Some(u64::from(STORE_VERSION))
-        {
-            if let Ok(data) = serde_json::from_value(value) {
-                if validate(&data) {
-                    return Ok((Some(data), Some(bytes)));
-                }
-            }
-        }
+    if let Some(data) = decode_versioned(&bytes, validate) {
+        return Ok((Some(data), Some(bytes)));
     }
     preserve_broken(path, now_ms, io)?;
     Ok((None, Some(bytes)))
+}
+
+fn decode_versioned<T: DeserializeOwned>(bytes: &[u8], validate: impl FnOnce(&T) -> bool) -> Option<T> {
+    let value = serde_json::from_slice::<serde_json::Value>(bytes).ok()?;
+    if value.get("version").and_then(serde_json::Value::as_u64) != Some(u64::from(STORE_VERSION)) {
+        return None;
+    }
+    serde_json::from_value(value).ok().filter(|data| validate(data))
 }
 
 fn preserve_broken(path: &Path, now_ms: u64, io: &dyn StoreIo) -> Result<(), CommitError> {

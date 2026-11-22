@@ -326,7 +326,7 @@ pub fn refresh(
 }
 
 /// 保存し、成功したらエンジンへ反映する。返した解除は呼び出し側が配信する。
-/// 競合(Stale)と検証を最初に判定し、通らなければ何も書かない。`base_token` は一覧の
+/// 競合(Stale)を最初に、次に検証を判定し、通らなければ何も書かない(エンジンも触らない)。`base_token` は一覧の
 /// `content_token`。無効化は次に進捗を flush し、失敗したら何も変えずに Io を返す。
 pub fn commit(
     store: &DefsStore,
@@ -338,6 +338,10 @@ pub fn commit(
     now_ms: u64,
 ) -> (CommitReply, Vec<AchievementUnlocked>) {
     let mut slot = engine_slot.lock().unwrap_or_else(|e| e.into_inner());
+    // 競合は入力の正規化・検証より先に返す(画面は Stale で再読込に入る)。
+    if let Err(error) = store.check_base(base_revision, base_token) {
+        return (reply_of(error), Vec::new());
+    }
     let current = store.current();
     next.rates = match normalize_rates(next.rates, &next.symbol_overrides) {
         Ok(rates) => rates,
@@ -360,24 +364,55 @@ pub fn commit(
     if result.is_ok() {
         result = store.commit_at(base_revision, base_token, next).map(|_| ());
     }
-    let reply = match result {
-        Ok(()) => CommitReply::Ok { revision: store.current().revision },
-        Err(CommitError::Stale) => {
-            // 画面側が最新を読み直せるよう、メモリ上の旧い内容をディスクの内容に差し替える。
-            match reload_and_apply(store, &mut slot, dir, now_ms) {
-                Ok(more) => unlocks.extend(more),
-                Err(_) => tracing::error!("実績の定義を読み直せませんでした"),
-            }
-            return (CommitReply::Stale, unlocks);
-        }
-        Err(CommitError::Invalid(id, reason)) => {
-            return (CommitReply::Invalid { id, field: field_of(reason) }, unlocks);
-        }
-        Err(CommitError::Io) => return (CommitReply::Io, unlocks),
-        Err(CommitError::SaveRefused) => return (CommitReply::SaveRefused, unlocks),
-    };
+    // Stale は何もせずに返す。取り込みは画面の再読込(list_achievements → refresh)に任せる。
+    if let Err(error) = result {
+        return (reply_of(error), unlocks);
+    }
+    let reply = CommitReply::Ok { revision: store.current().revision };
     unlocks.extend(apply_to_engine(&mut slot, dir, store.current(), now_ms));
     (reply, unlocks)
+}
+
+fn reply_of(error: CommitError) -> CommitReply {
+    match error {
+        CommitError::Stale => CommitReply::Stale,
+        CommitError::Invalid(id, reason) => CommitReply::Invalid { id, field: field_of(reason) },
+        CommitError::Io => CommitReply::Io,
+        CommitError::SaveRefused => CommitReply::SaveRefused,
+    }
+}
+
+/// 画面から届いた保存内容(Tauri コマンドの引数)。
+pub struct AchievementDraft {
+    pub enabled: bool,
+    pub achievements: Vec<AchievementInput>,
+    pub rates: RateTable,
+    pub symbol_overrides: BTreeMap<String, String>,
+}
+
+/// 画面からの保存。競合判定を入力の変換(しきい値の空欄など)より先に行い、定義に組み立てて `commit` する。
+pub fn commit_draft(
+    store: &DefsStore,
+    engine_slot: &Mutex<Option<Arc<AchievementEngine>>>,
+    dir: &Path,
+    base_revision: u64,
+    base_token: Option<&str>,
+    draft: AchievementDraft,
+    now_ms: u64,
+) -> (CommitReply, Vec<AchievementUnlocked>) {
+    if let Err(error) = store.check_base(base_revision, base_token) {
+        return (reply_of(error), Vec::new());
+    }
+    let achievements = match build_achievements(draft.achievements) {
+        Ok(list) => list,
+        Err(reply) => return (reply, Vec::new()),
+    };
+    let mut next = store.current();
+    next.enabled = draft.enabled;
+    next.achievements = achievements;
+    next.rates = draft.rates;
+    next.symbol_overrides = draft.symbol_overrides;
+    commit(store, engine_slot, dir, base_revision, base_token, next, now_ms)
 }
 
 /// 複製。画面上のドラフトから作る(未保存の編集を含む)。id は Rust が振る。プラチナは複製不可。
@@ -598,7 +633,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_commit_reloads_from_disk_so_the_next_edit_succeeds() {
+    fn stale_commit_changes_nothing_and_the_list_reload_lets_the_next_edit_succeed() {
         let (dir, store, slot) = setup(false);
         let other = DefsStore::load(dir.path(), 0);
         let mut external = other.current();
@@ -609,6 +644,9 @@ mod tests {
         mine.achievements[0].name = "mine".into();
         let (reply, _) = commit(&store, &slot, dir.path(), 0, None, mine, 10);
         assert_eq!(reply, CommitReply::Stale);
+        assert_eq!(store.current().revision, 0, "Stale の応答では取り込まない");
+        // 画面の再読込(list_achievements → refresh)で取り込む。
+        refresh(&store, &slot, dir.path(), 10).unwrap();
         assert_eq!(store.current().revision, 1);
         assert_eq!(store.current().achievements[0].name, "external");
 
@@ -864,5 +902,91 @@ mod tests {
         let (next, token) = store.snapshot();
         let (reply, _) = commit(&store, &slot, dir.path(), 1, Some(&token), next, 7);
         assert_eq!(reply, CommitReply::Ok { revision: 2 });
+    }
+
+    #[test]
+    fn stale_commit_does_not_close_the_engine_or_write_progress() {
+        let (dir, store, slot) = setup(true);
+        let other = DefsStore::load(dir.path(), 0);
+        let mut external = other.current();
+        external.enabled = false;
+        external.achievements[0].name = "external".into();
+        assert_eq!(other.commit(0, external), Ok(1));
+        let mut next = store.current();
+        next.enabled = true;
+        let (reply, unlocks) = commit(&store, &slot, dir.path(), 0, None, next, 10);
+        assert_eq!(reply, CommitReply::Stale);
+        assert!(unlocks.is_empty());
+        assert!(!dir.path().join(crate::achievements::store::PROGRESS_FILE).exists(), "Stale で進捗を書いた");
+        assert!(slot.lock().unwrap().is_some(), "Stale でエンジンを閉じた");
+        assert_eq!(store.current().revision, 0);
+    }
+
+    #[test]
+    fn stale_is_reported_before_rate_normalization_errors() {
+        let (dir, store, slot) = setup(false);
+        let other = DefsStore::load(dir.path(), 0);
+        assert_eq!(other.commit(0, other.current()), Ok(1));
+        let mut next = store.current();
+        next.rates = BTreeMap::from([("$".to_owned(), 150.0), ("USD".to_owned(), 151.0)]);
+        let (reply, _) = commit(&store, &slot, dir.path(), 0, None, next, 10);
+        assert_eq!(reply, CommitReply::Stale);
+        // revision が合っていても内容トークンが違えば、正規化より先に Stale。
+        let mut next = store.current();
+        next.rates = BTreeMap::from([("$".to_owned(), 150.0), ("USD".to_owned(), 151.0)]);
+        let (reply, _) = commit(&store, &slot, dir.path(), 0, Some("not-the-token"), next, 10);
+        assert_eq!(reply, CommitReply::Stale);
+    }
+
+    #[test]
+    fn broken_defs_are_backed_up_once_even_while_the_flush_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DefsStore::load(dir.path(), 0);
+        let mut defs = store.current();
+        defs.enabled = true;
+        assert_eq!(store.commit(0, defs.clone()), Ok(1));
+        let engine = AchievementEngine::open_with(dir.path(), defs, 0, Arc::new(DenyWrites));
+        let slot = Mutex::new(Some(Arc::new(engine)));
+        std::fs::write(dir.path().join(crate::achievements::store::DEFS_FILE), "{broken").unwrap();
+        for now in 1..4 {
+            assert!(refresh(&store, &slot, dir.path(), now).is_err());
+        }
+        let backups = std::fs::read_dir(dir.path()).unwrap()
+            .filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().contains(".broken-"))
+            .count();
+        assert_eq!(backups, 1);
+        assert!(slot.lock().unwrap().is_some());
+    }
+
+    #[test]
+    fn stale_is_reported_before_draft_conversion_errors() {
+        let (dir, store, slot) = setup(false);
+        let other = DefsStore::load(dir.path(), 0);
+        assert_eq!(other.commit(0, other.current()), Ok(1));
+        let defs = store.current();
+        let mut inputs: Vec<AchievementInput> = defs.achievements.iter().map(input_of).collect();
+        let blank = inputs.iter_mut().find(|a| a.condition.is_some()).unwrap();
+        blank.condition.as_mut().unwrap().threshold = None;
+        let draft = AchievementDraft {
+            enabled: false,
+            achievements: inputs,
+            rates: defs.rates.clone(),
+            symbol_overrides: defs.symbol_overrides.clone(),
+        };
+        let (reply, _) = commit_draft(&store, &slot, dir.path(), 0, None, draft, 10);
+        assert_eq!(reply, CommitReply::Stale);
+    }
+
+    #[test]
+    fn failed_backup_of_broken_defs_is_a_refresh_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = DefsStore::load(dir.path(), 0);
+        assert_eq!(writer.commit(0, writer.current()), Ok(1));
+        let store = DefsStore::load_with(dir.path(), 0, Arc::new(DenyWrites));
+        assert_eq!(store.current().revision, 1);
+        std::fs::write(dir.path().join(crate::achievements::store::DEFS_FILE), "{broken").unwrap();
+        let slot = Mutex::new(None);
+        assert!(refresh(&store, &slot, dir.path(), 1).is_err(), "退避に失敗したのに Ok を返した");
+        assert_eq!(store.current().revision, 1);
     }
 }

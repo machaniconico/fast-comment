@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import {
-  canDelete, canDuplicate, checkRateRows, coerceCondition, findDraftError, withSubject, currencyOptions, DAY_MS, metricOptions, parseRate, platformOptions, ratesNotice, ratesStale,
+  canDelete, canDuplicate, checkRateRows, coerceCondition, findDraftError, invalidFieldMessage, withSubject, currencyOptions, DAY_MS, metricOptions, parseRate, platformOptions, ratesNotice, ratesStale,
   trophyViews, windowOptions,
 } from './achievementsUi.ts';
 import type { AchievementDef, AchievementSchema, ListenerTrophy } from './types.ts';
@@ -127,4 +127,21 @@ test('the enable checkbox is locked while saving', () => {
   const line = src.split('\n').find((l) => l.includes('bind:checked={enabled}'));
   assert.ok(line);
   assert.match(line, /disabled=\{busy\}/);
+});
+
+test('draft errors point at the position, never the typed name', () => {
+  const secret = 'https://example.invalid/hook/TEST_ONLY';
+  const drafts = [
+    def({ id: 's', subject: 'streamer' }),
+    def({ id: 'v1' }),
+    def({ id: 'v2', name: secret, condition: { ...def().condition!, threshold: null } }),
+  ];
+  const err = findDraftError(drafts);
+  assert.equal(err?.id, 'v2');
+  assert.ok(!err!.message.includes('TEST_ONLY'), err!.message);
+  assert.match(err!.message, /視聴者の 2 番目/);
+  const invalid = invalidFieldMessage(drafts, 'v2', 'currency');
+  assert.ok(!invalid.includes('TEST_ONLY'), invalid);
+  assert.match(invalid, /視聴者の 2 番目の実績の通貨/);
+  assert.ok(!invalidFieldMessage(drafts, secret, 'name').includes('TEST_ONLY'));
 });

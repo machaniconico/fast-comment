@@ -5,7 +5,7 @@
   } from '../ipc';
   import {
     TIER_LABELS, canDelete, canDuplicate, checkRateRows, coerceCondition, currencyOptions, findDraftError,
-    formatDate, metricOptions, platformOptions, ratesNotice, windowOptions, withSubject,
+    formatDate, invalidFieldMessage, metricOptions, platformOptions, ratesNotice, windowOptions, withSubject,
   } from '../achievementsUi';
   import type {
     AchievementCondition, AchievementCurrencyKind, AchievementDef, AchievementList, AchievementMetric,
@@ -53,7 +53,7 @@
     schema = sch;
     if (list) apply(list);
   }
-  onMount(() => { void reload().catch(() => { message = '実績を読み込めませんでした。'; }); });
+  onMount(() => { void reload().catch(() => { message = '実績を読み込めませんでした。保存先を確認してください。'; }); });
 
   async function run(action: () => Promise<void>) {
     if (busy) return;
@@ -61,11 +61,6 @@
     try { await action(); } catch { message = '操作に失敗しました。もう一度お試しください。'; }
     finally { busy = false; }
   }
-
-  const FIELD_LABELS: Record<string, string> = {
-    name: '名前', id: 'ID', currency: '通貨', metric: '指標', window: '期間', threshold: 'しきい値',
-    condition: '条件', tier: '等級', platforms: 'プラットフォーム',
-  };
 
   async function save() {
     await run(async () => {
@@ -88,8 +83,7 @@
               ? 'レート表の通貨コードが空か重複しています(「$」と「USD」のように同じ通貨になる行も重複です)。'
               : 'レート表に 0 より大きい数値でないレートがあります。';
           } else {
-            const name = drafts.find((a) => a.id === reply.id)?.name || reply.id;
-            message = `「${name}」の${FIELD_LABELS[reply.field] ?? reply.field}を確認してください。`;
+            message = invalidFieldMessage(drafts, reply.id, reply.field);
             editingId = reply.id;
           }
           break;

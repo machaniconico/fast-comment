@@ -276,11 +276,11 @@ async fn delete_listener(
 #[tauri::command]
 fn list_achievements(state: State<'_, AppState>) -> Result<achievements::ipc::AchievementList, String> {
     // 外部で更新されていればディスクから読み直す(Stale のあとの再読込もここを通る)。
-    // 外部の無効化で進捗を保存できなければ取り込まず、エンジンを残したままエラーにする。
+    // 外部の無効化で進捗を保存できない時・壊れた定義を退避できない時は取り込まず、エンジンを残したままエラーにする。
     let unlocks = achievements::ipc::refresh(
         &state.achievement_defs, &state.achievement_engine, &state.config_dir, timer_now_ms(),
     )
-    .map_err(|_| "実績の進捗を保存できませんでした。保存先を確認してください".to_owned())?;
+    .map_err(|_| "実績のデータを保存できませんでした。保存先を確認してください".to_owned())?;
     state.broadcast_achievement_unlocks(unlocks);
     let engine = state.lock_achievement_engine();
     Ok(achievements::ipc::list(state.achievement_defs.snapshot(), engine.as_deref(), &state.config_dir))
@@ -301,22 +301,14 @@ fn commit_achievements(
     rates: achievements::currency::RateTable,
     symbol_overrides: std::collections::BTreeMap<String, String>,
 ) -> achievements::ipc::CommitReply {
-    let achievements = match achievements::ipc::build_achievements(achievements) {
-        Ok(list) => list,
-        Err(reply) => return reply,
-    };
-    let mut next = state.achievement_defs.current();
-    next.enabled = enabled;
-    next.achievements = achievements;
-    next.rates = rates;
-    next.symbol_overrides = symbol_overrides;
-    let (reply, unlocks) = achievements::ipc::commit(
+    let draft = achievements::ipc::AchievementDraft { enabled, achievements, rates, symbol_overrides };
+    let (reply, unlocks) = achievements::ipc::commit_draft(
         &state.achievement_defs,
         &state.achievement_engine,
         &state.config_dir,
         base_revision,
         Some(&base_token),
-        next,
+        draft,
         timer_now_ms(),
     );
     state.broadcast_achievement_unlocks(unlocks);

@@ -161,13 +161,36 @@ export function checkRateRows(rows: RateRow[]): { rates: Record<string, number> 
   return { rates };
 }
 
+const SUBJECT_LABELS: Record<AchievementSubjectKind, string> = { viewer: '視聴者', streamer: '配信者' };
+
+/**
+ * Where an achievement sits in its tab ("視聴者の 2 番目の実績"). Error messages use this instead of
+ * the name or any typed value: a pasted URL or token must not be shown back.
+ */
+export function draftPosition(drafts: AchievementDef[], id: string): string {
+  const a = drafts.find((d) => d.id === id);
+  if (!a) return '実績';
+  const at = drafts.filter((d) => d.subject === a.subject).indexOf(a) + 1;
+  return `${SUBJECT_LABELS[a.subject]}の ${at} 番目の実績`;
+}
+
 /** Empty threshold / name before saving (Rust validates everything else). */
 export function findDraftError(drafts: AchievementDef[]): { id: string; message: string } | null {
   for (const a of drafts) {
-    if (!a.name.trim()) return { id: a.id, message: '名前が空の実績があります。' };
+    if (!a.name.trim()) return { id: a.id, message: `${draftPosition(drafts, a.id)}の名前が空です。` };
     if (a.condition && (a.condition.threshold === null || !Number.isFinite(a.condition.threshold))) {
-      return { id: a.id, message: `「${a.name}」のしきい値を入力してください。` };
+      return { id: a.id, message: `${draftPosition(drafts, a.id)}のしきい値を入力してください。` };
     }
   }
   return null;
+}
+
+const FIELD_LABELS: Record<string, string> = {
+  name: '名前', id: 'ID', currency: '通貨', metric: '指標', window: '期間', threshold: 'しきい値',
+  condition: '条件', tier: '等級', platforms: 'プラットフォーム',
+};
+
+/** Message for a field error from Rust; names the position, never the name or the returned id. */
+export function invalidFieldMessage(drafts: AchievementDef[], id: string, field: string): string {
+  return `${draftPosition(drafts, id)}の${FIELD_LABELS[field] ?? '内容'}を確認してください。`;
 }
