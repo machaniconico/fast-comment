@@ -78,7 +78,11 @@ impl AchievementUnlocked {
             (self.value_milli, self.threshold_milli, "milli")
         } else {
             // しきい値は切り上げる(1.5 回は 2 回で解除されるため)。値はミリ単位でも回数の整数倍。
-            (self.value_milli / 1000, (self.threshold_milli + 999) / 1000, "count")
+            (
+                self.value_milli / 1000,
+                (self.threshold_milli / 1000 + i64::from(self.threshold_milli % 1000 > 0)).max(1),
+                "count",
+            )
         };
         json!({
             "type": "achievement",
@@ -116,6 +120,24 @@ mod relay_json_tests {
         assert_eq!(count_unlock(1000, 400).relay_json()["threshold"], 1);
         assert_eq!(count_unlock(2000, 2000).relay_json()["threshold"], 2);
     }
+
+    #[test]
+    fn count_threshold_does_not_overflow_at_i64_max() {
+        let v = count_unlock(i64::MAX, i64::MAX).relay_json();
+        assert_eq!(v["threshold"], i64::MAX / 1000 + 1);
+        assert_eq!(v["value"], i64::MAX / 1000);
+    }
+
+    #[test]
+    fn threshold_to_milli_keeps_fraction_as_ceil() {
+        assert_eq!(threshold_to_milli(0.0004), 1);
+        assert_eq!(threshold_to_milli(1.1), 1100);
+        assert_eq!(threshold_to_milli(2.3), 2300);
+        assert_eq!(threshold_to_milli(9223372036854776.0), i64::MAX);
+        for (t, need) in [(0.0004, 1), (1.0004, 2), (2.5, 3), (0.4, 1), (2.0, 2), (1.1, 2)] {
+            assert_eq!(count_unlock(need * 1000, threshold_to_milli(t)).relay_json()["threshold"], need, "{t}");
+        }
+    }
 }
 
 impl fmt::Debug for UnlockSubject {
@@ -140,6 +162,14 @@ pub struct UnlockRecord {
 
 fn zero(value: &u64) -> bool {
     *value == 0
+}
+
+/// 解除に要る最小のミリ値。浮動小数の誤差(1.1 * 1000 = 1100.0000000000002)は丸め、
+/// 本当に端数がある時(0.0004 → 0.4)は切り上げて、回数系の必要回数を過小にしない。
+fn threshold_to_milli(threshold: f64) -> i64 {
+    let scaled = threshold * 1000.0;
+    let nearest = scaled.round();
+    if (scaled - nearest).abs() < 1e-6 { nearest as i64 } else { scaled.ceil() as i64 }
 }
 
 fn milli(count: u64) -> i64 {
@@ -958,7 +988,7 @@ impl State {
             icon: achievement.icon.clone(),
             subject,
             value_milli,
-            threshold_milli: (threshold * 1000.0).round() as i64,
+            threshold_milli: threshold_to_milli(threshold),
             currency,
             window_key: window_key.to_owned(),
             unlocked_at_ms: self.now_ms,

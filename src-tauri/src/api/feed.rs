@@ -9,6 +9,8 @@ use std::{
 use tokio::time::{Duration, Instant};
 
 const RECENT_DELETION_LIMIT: usize = 4096;
+// 1 tick で取り込む実績の上限。残りは次 tick に回し、chat と active ロックを占有させない。
+const MAX_ACHIEVEMENTS_PER_TICK: usize = 256;
 const RECENT_DELETION_TTL: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
@@ -377,9 +379,13 @@ impl ApiFeed {
         achievement: &mut tokio::sync::broadcast::Receiver<crate::achievements::engine::AchievementUnlocked>,
     ) {
         use tokio::sync::broadcast::error::TryRecvError;
-        loop {
+        let mut taken = 0;
+        while taken < MAX_ACHIEVEMENTS_PER_TICK {
             match achievement.try_recv() {
-                Ok(unlock) => self.push_achievement(&unlock),
+                Ok(unlock) => {
+                    self.push_achievement(&unlock);
+                    taken += 1;
+                }
                 Err(TryRecvError::Lagged(n)) => self.record_achievement_dropped(n),
                 Err(_) => break,
             }
@@ -745,6 +751,19 @@ mod tests {
         let p = pending.lock().unwrap();
         assert_eq!(p.dropped, 769, "bus 側の欠落 1025 - 256 件");
         assert_eq!(p.items.len(), 256);
+    }
+    #[test]
+    fn achievement_drain_is_capped_per_tick() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(1024);
+        let feed = ApiFeed::new(10);
+        feed.set_enabled(true);
+        for i in 0..(MAX_ACHIEVEMENTS_PER_TICK + 44) {
+            tx.send(unlock(&i.to_string())).unwrap();
+        }
+        feed.drain_achievements(&mut rx);
+        assert_eq!(rx.len(), 44, "上限を超えた分は次 tick に残る(chat を飢えさせない)");
+        feed.drain_achievements(&mut rx);
+        assert_eq!(rx.len(), 0);
     }
     #[tokio::test]
     async fn bus_achievement_reaches_sse_pending_through_bind() {
