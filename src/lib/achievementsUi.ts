@@ -145,14 +145,16 @@ export interface RateRow {
 export function checkRateRows(rows: RateRow[]): { rates: Record<string, number> } | { error: string } {
   const rates: Record<string, number> = {};
   const seen = new Set<string>();
-  for (const row of rows) {
+  // Errors name the row, never the typed code: a pasted URL or token must not be shown back.
+  for (const [i, row] of rows.entries()) {
     const code = row.code.trim();
     if (!code && !row.text.trim()) continue;
-    if (!code) return { error: 'レートの通貨コードが空の行があります。' };
+    const at = `レート表の ${i + 1} 行目`;
+    if (!code) return { error: `${at}の通貨コードが空です。` };
     const rate = parseRate(row.text);
-    if (rate === null) return { error: `レート「${code}」は 0 より大きい数値にしてください。` };
+    if (rate === null) return { error: `${at}のレートは 0 より大きい数値にしてください。` };
     const key = code.toUpperCase();
-    if (seen.has(key)) return { error: `通貨「${code}」が重複しています。` };
+    if (seen.has(key)) return { error: `${at}の通貨コードが重複しています。` };
     seen.add(key);
     rates[code] = rate;
   }

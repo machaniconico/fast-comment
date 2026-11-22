@@ -1298,12 +1298,13 @@ export async function achievementSchema(): Promise<AchievementSchema | null> {
 
 export async function commitAchievements(
   baseRevision: number,
+  baseToken: string,
   enabled: boolean,
   achievements: AchievementDef[],
   rates: Record<string, number>,
   symbolOverrides: Record<string, string>,
 ): Promise<AchievementCommitReply | null> {
-  return invoke<AchievementCommitReply>('commit_achievements', { baseRevision, enabled, achievements, rates, symbolOverrides });
+  return invoke<AchievementCommitReply>('commit_achievements', { baseRevision, baseToken, enabled, achievements, rates, symbolOverrides });
 }
 
 /** Duplicates the current draft (not the saved copy); Rust assigns the new id. */

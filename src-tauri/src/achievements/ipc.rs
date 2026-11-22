@@ -33,6 +33,8 @@ pub struct AchievementRow {
 #[serde(rename_all = "camelCase")]
 pub struct AchievementList {
     pub revision: u64,
+    /// 読み込んだファイル内容のトークン。保存時に返してもらい、外部編集を Stale にする。
+    pub content_token: String,
     pub enabled: bool,
     pub rates: RateTable,
     pub rates_updated_at_ms: Option<u64>,
@@ -53,7 +55,11 @@ fn unlock_source(
     }
 }
 
-pub fn list(defs: AchievementDefs, engine: Option<&AchievementEngine>, dir: &Path) -> AchievementList {
+pub fn list(
+    (defs, content_token): (AchievementDefs, String),
+    engine: Option<&AchievementEngine>,
+    dir: &Path,
+) -> AchievementList {
     let (viewer_counts, streamer) = unlock_source(engine, dir);
     let achievements = defs
         .achievements
@@ -70,6 +76,7 @@ pub fn list(defs: AchievementDefs, engine: Option<&AchievementEngine>, dir: &Pat
         .collect();
     AchievementList {
         revision: defs.revision,
+        content_token,
         enabled: defs.enabled,
         rates: defs.rates,
         rates_updated_at_ms: defs.rates_updated_at_ms,
@@ -227,6 +234,7 @@ pub fn build_achievements(inputs: Vec<AchievementInput>) -> Result<Vec<Achieveme
 }
 
 /// レート表のキーを通貨コードに正規化(`$`→`USD`、`usd`→`USD`)し、空・重複・0 以下・非有限を弾く。
+/// エラーの id は空にする(入力値を返すと、誤って貼った URL やトークンが画面に出る)。
 /// エンジンは正規化後のコードで引くので、保存するキーもそれに揃える。
 fn normalize_rates(
     rates: RateTable,
@@ -236,19 +244,20 @@ fn normalize_rates(
     for (raw, rate) in rates {
         let code = normalize_currency(&raw, overrides);
         if code.is_empty() {
-            return Err(CommitReply::Invalid { id: raw, field: "rateCode" });
+            return Err(CommitReply::Invalid { id: String::new(), field: "rateCode" });
         }
         if !rate.is_finite() || rate <= 0.0 {
-            return Err(CommitReply::Invalid { id: raw, field: "rateValue" });
+            return Err(CommitReply::Invalid { id: String::new(), field: "rateValue" });
         }
         if out.insert(code, rate).is_some() {
-            return Err(CommitReply::Invalid { id: raw, field: "rateCode" });
+            return Err(CommitReply::Invalid { id: String::new(), field: "rateCode" });
         }
     }
     Ok(out)
 }
 
 /// 定義の状態に合わせてエンジンを開閉・再評価する。無効→有効では既存の進捗も再評価する。
+/// 無効化は呼ぶ前に `close_engine` を済ませておく(ここでは破棄だけ)。
 fn apply_to_engine(
     slot: &mut Option<Arc<AchievementEngine>>,
     dir: &Path,
@@ -263,15 +272,46 @@ fn apply_to_engine(
             *slot = Some(engine);
             unlocks
         }
-        (false, Some(engine)) => {
-            if engine.flush().is_err() {
-                tracing::error!("実績の進捗を保存できませんでした");
-            }
+        (false, _) => {
             *slot = None;
             Vec::new()
         }
-        (false, None) => Vec::new(),
     }
+}
+
+/// 無効化の前処理(画面から・外部からの両方)。進捗を flush し、保存できた再試行待ちの解除を返す。
+/// flush に失敗したらエンジンを保持して Io を返す(何も変えない)。
+fn close_engine(
+    slot: &Option<Arc<AchievementEngine>>,
+) -> Result<Vec<AchievementUnlocked>, CommitError> {
+    match slot {
+        Some(engine) => engine.close().map_err(|_| {
+            tracing::error!("実績の進捗を保存できませんでした");
+            CommitError::Io
+        }),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// ディスクを読み直し、変わっていればエンジンへ反映する。外部で無効化されていたら先に
+/// `close_engine` し、失敗したら取り込まずに Io を返す(次の再読込でやり直す)。
+fn reload_and_apply(
+    store: &DefsStore,
+    slot: &mut Option<Arc<AchievementEngine>>,
+    dir: &Path,
+    now_ms: u64,
+) -> Result<Vec<AchievementUnlocked>, CommitError> {
+    let mut closed = Vec::new();
+    let changed = store.reload_with(now_ms, |defs| {
+        if !defs.enabled {
+            closed = close_engine(slot)?;
+        }
+        Ok(())
+    })?;
+    if changed {
+        closed.extend(apply_to_engine(slot, dir, store.current(), now_ms));
+    }
+    Ok(closed)
 }
 
 /// ディスクを読み直し、変わっていればエンジンへ反映する(一覧の表示・Stale のあとに呼ぶ)。
@@ -280,21 +320,20 @@ pub fn refresh(
     engine_slot: &Mutex<Option<Arc<AchievementEngine>>>,
     dir: &Path,
     now_ms: u64,
-) -> Vec<AchievementUnlocked> {
+) -> Result<Vec<AchievementUnlocked>, CommitError> {
     let mut slot = engine_slot.lock().unwrap_or_else(|e| e.into_inner());
-    if !store.reload(now_ms) {
-        return Vec::new();
-    }
-    apply_to_engine(&mut slot, dir, store.current(), now_ms)
+    reload_and_apply(store, &mut slot, dir, now_ms)
 }
 
 /// 保存し、成功したらエンジンへ反映する。返した解除は呼び出し側が配信する。
-/// 無効化は先に進捗を flush し、失敗したら何も変えずに Io を返す。
+/// 競合(Stale)と検証を最初に判定し、通らなければ何も書かない。`base_token` は一覧の
+/// `content_token`。無効化は次に進捗を flush し、失敗したら何も変えずに Io を返す。
 pub fn commit(
     store: &DefsStore,
     engine_slot: &Mutex<Option<Arc<AchievementEngine>>>,
     dir: &Path,
     base_revision: u64,
+    base_token: Option<&str>,
     mut next: AchievementDefs,
     now_ms: u64,
 ) -> (CommitReply, Vec<AchievementUnlocked>) {
@@ -310,31 +349,34 @@ pub fn commit(
         } else {
             current.rates_updated_at_ms
         };
-    if !next.enabled {
-        if let Some(engine) = slot.as_ref() {
-            if engine.flush().is_err() {
-                return (CommitReply::Io, Vec::new());
-            }
+    let mut unlocks = Vec::new();
+    let mut result = store.check(base_revision, base_token, &next);
+    if result.is_ok() && !next.enabled {
+        match close_engine(&slot) {
+            Ok(closed) => unlocks = closed,
+            Err(_) => return (CommitReply::Io, Vec::new()),
         }
     }
-    let reply = match store.commit(base_revision, next) {
-        Ok(revision) => CommitReply::Ok { revision },
+    if result.is_ok() {
+        result = store.commit_at(base_revision, base_token, next).map(|_| ());
+    }
+    let reply = match result {
+        Ok(()) => CommitReply::Ok { revision: store.current().revision },
         Err(CommitError::Stale) => {
             // 画面側が最新を読み直せるよう、メモリ上の旧い内容をディスクの内容に差し替える。
-            let unlocks = if store.reload(now_ms) {
-                apply_to_engine(&mut slot, dir, store.current(), now_ms)
-            } else {
-                Vec::new()
-            };
+            match reload_and_apply(store, &mut slot, dir, now_ms) {
+                Ok(more) => unlocks.extend(more),
+                Err(_) => tracing::error!("実績の定義を読み直せませんでした"),
+            }
             return (CommitReply::Stale, unlocks);
         }
         Err(CommitError::Invalid(id, reason)) => {
-            return (CommitReply::Invalid { id, field: field_of(reason) }, Vec::new());
+            return (CommitReply::Invalid { id, field: field_of(reason) }, unlocks);
         }
-        Err(CommitError::Io) => return (CommitReply::Io, Vec::new()),
-        Err(CommitError::SaveRefused) => return (CommitReply::SaveRefused, Vec::new()),
+        Err(CommitError::Io) => return (CommitReply::Io, unlocks),
+        Err(CommitError::SaveRefused) => return (CommitReply::SaveRefused, unlocks),
     };
-    let unlocks = apply_to_engine(&mut slot, dir, store.current(), now_ms);
+    unlocks.extend(apply_to_engine(&mut slot, dir, store.current(), now_ms));
     (reply, unlocks)
 }
 
@@ -458,7 +500,7 @@ mod tests {
         let before = std::fs::read(dir.path().join(crate::achievements::store::DEFS_FILE)).ok();
         let mut next = store.current();
         next.achievements[0].name = "x".into();
-        let (reply, unlocks) = commit(&store, &slot, dir.path(), 7, next, 10);
+        let (reply, unlocks) = commit(&store, &slot, dir.path(), 7, None, next, 10);
         assert_eq!(reply, CommitReply::Stale);
         assert!(unlocks.is_empty());
         assert_eq!(store.current().revision, 0);
@@ -471,7 +513,7 @@ mod tests {
         let mut next = store.current();
         let id = next.achievements[0].id.clone();
         next.achievements[0].name = "  ".into();
-        let (reply, _) = commit(&store, &slot, dir.path(), 0, next, 10);
+        let (reply, _) = commit(&store, &slot, dir.path(), 0, None, next, 10);
         assert_eq!(reply, CommitReply::Invalid { id, field: "name" });
         assert_eq!(store.current().revision, 0);
         assert!(!dir.path().join(crate::achievements::store::DEFS_FILE).exists());
@@ -483,7 +525,7 @@ mod tests {
         let mut next = store.current();
         next.enabled = true;
         next.achievements[0].name = "renamed".into();
-        let (reply, _) = commit(&store, &slot, dir.path(), 0, next, 10);
+        let (reply, _) = commit(&store, &slot, dir.path(), 0, None, next, 10);
         assert_eq!(reply, CommitReply::Ok { revision: 1 });
         let engine = slot.lock().unwrap().clone().unwrap();
         assert_eq!(engine.definitions().achievements[0].name, "renamed");
@@ -496,14 +538,14 @@ mod tests {
         let mut next = store.current();
         next.enabled = true;
         next.rates.insert("USD".into(), 150.0);
-        let (reply, _) = commit(&store, &slot, dir.path(), 0, next, 99);
+        let (reply, _) = commit(&store, &slot, dir.path(), 0, None, next, 99);
         assert_eq!(reply, CommitReply::Ok { revision: 1 });
         assert!(slot.lock().unwrap().is_some());
         assert_eq!(store.current().rates_updated_at_ms, Some(99));
 
         let mut next = store.current();
         next.enabled = false;
-        let (reply, _) = commit(&store, &slot, dir.path(), 1, next, 200);
+        let (reply, _) = commit(&store, &slot, dir.path(), 1, None, next, 200);
         assert_eq!(reply, CommitReply::Ok { revision: 2 });
         assert!(slot.lock().unwrap().is_none());
         assert_eq!(store.current().rates_updated_at_ms, Some(99));
@@ -521,7 +563,7 @@ mod tests {
     fn list_without_engine_or_progress_has_zero_counts_and_reset_uses_rust() {
         let dir = tempfile::tempdir().unwrap();
         let defs = AchievementDefs::default();
-        let listed = list(defs.clone(), None, dir.path());
+        let listed = list((defs.clone(), String::new()), None, dir.path());
         assert_eq!(listed.achievements.len(), defs.achievements.len());
         assert!(listed.achievements.iter().all(|r| r.viewer_unlock_count == 0 && r.streamer_last_unlocked_at_ms.is_none()));
         let id = &defs.achievements[0].id;
@@ -565,26 +607,26 @@ mod tests {
 
         let mut mine = store.current();
         mine.achievements[0].name = "mine".into();
-        let (reply, _) = commit(&store, &slot, dir.path(), 0, mine, 10);
+        let (reply, _) = commit(&store, &slot, dir.path(), 0, None, mine, 10);
         assert_eq!(reply, CommitReply::Stale);
         assert_eq!(store.current().revision, 1);
         assert_eq!(store.current().achievements[0].name, "external");
 
         let mut again = store.current();
         again.achievements[0].name = "mine".into();
-        let (reply, _) = commit(&store, &slot, dir.path(), 1, again, 11);
+        let (reply, _) = commit(&store, &slot, dir.path(), 1, None, again, 11);
         assert_eq!(reply, CommitReply::Ok { revision: 2 });
     }
 
     #[test]
     fn refresh_picks_up_external_updates_and_ignores_unchanged_disk() {
         let (dir, store, slot) = setup(false);
-        assert!(refresh(&store, &slot, dir.path(), 1).is_empty());
+        assert!(refresh(&store, &slot, dir.path(), 1).unwrap().is_empty());
         let other = DefsStore::load(dir.path(), 0);
         let mut external = other.current();
         external.enabled = true;
         assert_eq!(other.commit(0, external), Ok(1));
-        refresh(&store, &slot, dir.path(), 2);
+        refresh(&store, &slot, dir.path(), 2).unwrap();
         assert_eq!(store.current().revision, 1);
         assert!(slot.lock().unwrap().is_some());
     }
@@ -596,7 +638,7 @@ mod tests {
         let path = dir.path().join(crate::achievements::store::PROGRESS_FILE);
         std::fs::write(&path, progress).unwrap();
         let defs = AchievementDefs::default();
-        let listed = list(defs.clone(), None, dir.path());
+        let listed = list((defs.clone(), String::new()), None, dir.path());
         let first = listed.achievements.iter().find(|r| r.achievement.id == "viewer-first-comment").unwrap();
         assert_eq!(first.viewer_unlock_count, 2);
         let trophies = listener_trophies(&defs, None, dir.path(), "youtube", "UC1");
@@ -632,7 +674,7 @@ mod tests {
         let slot = Mutex::new(Some(Arc::new(engine)));
         let mut next = store.current();
         next.enabled = false;
-        let (reply, _) = commit(&store, &slot, dir.path(), 0, next, 10);
+        let (reply, _) = commit(&store, &slot, dir.path(), 0, None, next, 10);
         assert_eq!(reply, CommitReply::Io);
         assert_eq!(store.current().revision, 0);
         assert!(!store.current().enabled || store.current() == AchievementDefs::default());
@@ -647,7 +689,7 @@ mod tests {
         next.enabled = true;
         let target = next.achievements.iter_mut().find(|a| a.id == "viewer-comments-100").unwrap();
         target.condition.as_mut().unwrap().threshold = 40.0;
-        let (reply, unlocks) = commit(&store, &slot, dir.path(), 0, next, 5000);
+        let (reply, unlocks) = commit(&store, &slot, dir.path(), 0, None, next, 5000);
         assert_eq!(reply, CommitReply::Ok { revision: 1 });
         assert!(unlocks.iter().any(|u| u.achievement_id == "viewer-comments-100"));
     }
@@ -671,7 +713,7 @@ mod tests {
                     a.condition.as_mut().unwrap().platforms = vec![platform];
                     let mut next = store.current();
                     next.achievements = vec![a];
-                    let (reply, _) = commit(&store, &slot, dir.path(), revision, next, 1);
+                    let (reply, _) = commit(&store, &slot, dir.path(), revision, None, next, 1);
                     let allowed = rule.platforms.contains(&platform);
                     match reply {
                         CommitReply::Ok { revision: r } => { assert!(allowed, "{:?} {:?}", rule.metric, platform); revision = r; }
@@ -701,7 +743,7 @@ mod tests {
         ] {
             let mut next = store.current();
             next.rates = rates.iter().map(|(k, v)| ((*k).to_owned(), *v)).collect();
-            let (reply, _) = commit(&store, &slot, dir.path(), 0, next, 1);
+            let (reply, _) = commit(&store, &slot, dir.path(), 0, None, next, 1);
             assert!(matches!(&reply, CommitReply::Invalid { field: f, .. } if *f == field), "{rates:?} {reply:?}");
         }
         assert_eq!(store.current().revision, 0);
@@ -712,7 +754,7 @@ mod tests {
         let (dir, store, slot) = setup(false);
         let mut next = store.current();
         next.rates = BTreeMap::from([("$".to_owned(), 150.5), ("jpy".to_owned(), 1.0)]);
-        let (reply, _) = commit(&store, &slot, dir.path(), 0, next, 1);
+        let (reply, _) = commit(&store, &slot, dir.path(), 0, None, next, 1);
         assert_eq!(reply, CommitReply::Ok { revision: 1 });
         let defs = store.current();
         assert_eq!(defs.rates.get("USD"), Some(&150.5));
@@ -720,5 +762,107 @@ mod tests {
         let mut totals = crate::achievements::currency::AmountTotals::default();
         totals.add("$", 1.0);
         assert_eq!(totals.jpy_milli(&defs.rates, &defs.symbol_overrides), 150_500);
+    }
+
+    #[test]
+    fn stale_disable_writes_nothing() {
+        let (dir, store, slot) = setup(true);
+        let other = DefsStore::load(dir.path(), 0);
+        let mut external = other.current();
+        external.enabled = true;
+        assert_eq!(other.commit(0, external), Ok(1));
+        let progress = dir.path().join(crate::achievements::store::PROGRESS_FILE);
+        let mut next = store.current();
+        next.enabled = false;
+        let (reply, _) = commit(&store, &slot, dir.path(), 0, None, next, 10);
+        assert_eq!(reply, CommitReply::Stale);
+        assert!(!progress.exists(), "Stale なのに進捗を書いた");
+    }
+
+    #[test]
+    fn external_disable_with_failed_flush_keeps_the_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DefsStore::load(dir.path(), 0);
+        let mut defs = store.current();
+        defs.enabled = true;
+        assert_eq!(store.commit(0, defs.clone()), Ok(1));
+        let engine = AchievementEngine::open_with(dir.path(), defs, 0, Arc::new(DenyWrites));
+        let slot = Mutex::new(Some(Arc::new(engine)));
+        let other = DefsStore::load(dir.path(), 0);
+        let mut external = other.current();
+        external.enabled = false;
+        assert_eq!(other.commit(1, external), Ok(2));
+        let _ = refresh(&store, &slot, dir.path(), 5);
+        assert!(slot.lock().unwrap().is_some(), "flush 失敗でエンジンを破棄した");
+        assert_eq!(store.current().revision, 1, "flush 失敗なのに外部の無効化を取り込んだ");
+    }
+
+    struct Toggle(std::sync::atomic::AtomicBool);
+    impl crate::achievements::store::StoreIo for Toggle {
+        fn write_atomic(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+            if self.0.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(std::io::ErrorKind::PermissionDenied.into());
+            }
+            crate::achievements::store::StoreIo::write_atomic(&crate::achievements::store::FsIo, path, bytes)
+        }
+        fn create_backup(&self, src: &Path, dst: &Path) -> std::io::Result<()> {
+            crate::achievements::store::StoreIo::create_backup(&crate::achievements::store::FsIo, src, dst)
+        }
+    }
+
+    #[test]
+    fn disable_delivers_unlocks_waiting_for_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(crate::achievements::store::PROGRESS_FILE), PROGRESS_50).unwrap();
+        let store = DefsStore::load(dir.path(), 0);
+        let mut defs = store.current();
+        defs.enabled = true;
+        defs.achievements.iter_mut().find(|a| a.id == "viewer-comments-100").unwrap()
+            .condition.as_mut().unwrap().threshold = 40.0;
+        assert_eq!(store.commit(0, defs.clone()), Ok(1));
+        let io = Arc::new(Toggle(std::sync::atomic::AtomicBool::new(true)));
+        let engine = Arc::new(AchievementEngine::open_with(dir.path(), defs.clone(), 0, io.clone()));
+        assert!(engine.set_definitions(defs, 10).is_empty(), "保存失敗の解除は返さない");
+        io.0.store(false, std::sync::atomic::Ordering::SeqCst);
+        let slot = Mutex::new(Some(engine));
+        let mut next = store.current();
+        next.enabled = false;
+        let (reply, unlocks) = commit(&store, &slot, dir.path(), 1, None, next, 20);
+        assert_eq!(reply, CommitReply::Ok { revision: 2 });
+        assert!(unlocks.iter().any(|u| u.achievement_id == "viewer-comments-100"), "{unlocks:?}");
+    }
+
+    #[test]
+    fn rate_errors_do_not_echo_the_input() {
+        let (dir, store, slot) = setup(false);
+        let mut next = store.current();
+        next.rates = BTreeMap::from([("https://example.invalid/hook/TEST_ONLY".to_owned(), 0.0)]);
+        let (reply, _) = commit(&store, &slot, dir.path(), 0, None, next, 1);
+        let CommitReply::Invalid { id, .. } = reply else { panic!("{reply:?}") };
+        assert!(!id.contains("TEST_ONLY"), "{id}");
+    }
+
+    #[test]
+    fn draft_read_before_a_same_revision_external_edit_is_stale() {
+        let (dir, store, slot) = setup(false);
+        assert_eq!(store.commit(0, store.current()), Ok(1));
+        let (mut draft, token) = store.snapshot();
+        let path = dir.path().join(crate::achievements::store::DEFS_FILE);
+        let mut json: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        json["achievements"][0]["name"] = "external".into();
+        std::fs::write(&path, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+        // 別の画面の一覧取得で取り込まれる(revision は 1 のまま)。
+        refresh(&store, &slot, dir.path(), 5).unwrap();
+        assert_eq!(store.current().revision, 1);
+        assert_eq!(store.current().achievements[0].name, "external");
+
+        draft.achievements[1].name = "mine".into();
+        let (reply, _) = commit(&store, &slot, dir.path(), 1, Some(&token), draft, 6);
+        assert_eq!(reply, CommitReply::Stale);
+        assert_eq!(store.current().achievements[0].name, "external");
+
+        let (next, token) = store.snapshot();
+        let (reply, _) = commit(&store, &slot, dir.path(), 1, Some(&token), next, 7);
+        assert_eq!(reply, CommitReply::Ok { revision: 2 });
     }
 }

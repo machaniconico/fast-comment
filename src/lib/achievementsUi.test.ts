@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import {
   canDelete, canDuplicate, checkRateRows, coerceCondition, findDraftError, withSubject, currencyOptions, DAY_MS, metricOptions, parseRate, platformOptions, ratesNotice, ratesStale,
@@ -105,4 +106,25 @@ test('empty threshold and empty name are caught before saving', () => {
   const empty = def({ id: 'x', condition: { ...def().condition!, threshold: null } });
   assert.equal(findDraftError([def(), empty])?.id, 'x');
   assert.equal(findDraftError([def({ id: 'y', name: ' ' })])?.id, 'y');
+});
+
+test('rate errors name the row, never the typed code', () => {
+  const secret = 'https://example.invalid/hook/TEST_ONLY';
+  for (const rows of [
+    [{ code: secret, text: '0' }],
+    [{ code: 'USD', text: '1' }, { code: secret, text: '' }],
+    [{ code: secret, text: '1' }, { code: secret.toLowerCase(), text: '2' }],
+  ]) {
+    const r = checkRateRows(rows);
+    assert.ok('error' in r);
+    assert.ok(!r.error.includes('TEST_ONLY') && !r.error.toLowerCase().includes('test_only'), r.error);
+    assert.match(r.error, /\d+ 行目/);
+  }
+});
+
+test('the enable checkbox is locked while saving', () => {
+  const src = readFileSync(new URL('./components/AchievementsSettings.svelte', import.meta.url), 'utf8');
+  const line = src.split('\n').find((l) => l.includes('bind:checked={enabled}'));
+  assert.ok(line);
+  assert.match(line, /disabled=\{busy\}/);
 });

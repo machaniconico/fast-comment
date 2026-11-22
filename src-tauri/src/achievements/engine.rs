@@ -731,6 +731,13 @@ impl AchievementEngine {
         Ok(())
     }
 
+    /// 閉じる前の flush。保存できた解除(再試行待ちだったものを含む)を返すので、呼び出し側が配信する。
+    /// 失敗したら何も返さず、エンジンはそのまま使い続けられる。
+    pub fn close(&self) -> anyhow::Result<Vec<AchievementUnlocked>> {
+        self.flush()?;
+        Ok(std::mem::take(&mut self.lock().flushed_unlocks))
+    }
+
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|error| error.into_inner())
     }

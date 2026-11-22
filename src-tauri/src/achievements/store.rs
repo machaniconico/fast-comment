@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::currency::RateTable;
@@ -119,6 +120,14 @@ struct DefsState {
     saved_bytes: Option<Vec<u8>>,
 }
 
+/// 読み込んだファイル内容の識別子。revision を据え置いた外部編集も見分ける。
+fn content_token(bytes: &Option<Vec<u8>>) -> String {
+    bytes
+        .as_ref()
+        .map(|b| hex::encode(Sha256::digest(b)))
+        .unwrap_or_default()
+}
+
 pub struct DefsStore {
     path: PathBuf,
     io: Arc<dyn StoreIo>,
@@ -160,39 +169,81 @@ impl DefsStore {
             .clone()
     }
 
+    /// 定義と、その元になったファイル内容のトークン。画面は保存時にトークンを返す。
+    pub fn snapshot(&self) -> (AchievementDefs, String) {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        (state.current.clone(), content_token(&state.saved_bytes))
+    }
+
     /// ディスクの内容を読み直す(外部で更新された時、Stale のあとの再読込用)。変わったら true。
     pub fn reload(&self, now_ms: u64) -> bool {
+        self.reload_with(now_ms, |_| Ok(())).unwrap_or(false)
+    }
+
+    /// `reload` と同じだが、取り込む前に `before_adopt` を呼ぶ。Err なら取り込まずに返す
+    /// (次の再読込でやり直す)。内容が前回と同じなら復号も退避もしない。
+    pub fn reload_with(
+        &self,
+        now_ms: u64,
+        before_adopt: impl FnOnce(&AchievementDefs) -> Result<(), CommitError>,
+    ) -> Result<bool, CommitError> {
         if self.save_refused {
-            return false;
+            return Ok(false);
         }
         let _transaction = DEFS_TRANSACTION.lock().unwrap_or_else(|e| e.into_inner());
+        let unchanged = |bytes: &Option<Vec<u8>>| {
+            *bytes == self.state.lock().unwrap_or_else(|e| e.into_inner()).saved_bytes
+        };
+        match read_optional(&self.path) {
+            Ok(bytes) if !unchanged(&bytes) => {}
+            _ => return Ok(false),
+        }
         let Ok((loaded, bytes)) =
             load_versioned(&self.path, now_ms, self.io.as_ref(), |defs: &AchievementDefs| {
                 validate_all(&defs.achievements).is_ok()
             })
         else {
-            return false;
+            return Ok(false);
         };
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if bytes == state.saved_bytes {
-            return false;
+        if unchanged(&bytes) {
+            return Ok(false);
         }
-        state.current = loaded.unwrap_or_default();
+        let loaded = loaded.unwrap_or_default();
+        before_adopt(&loaded)?;
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.current = loaded;
         state.saved_bytes = bytes;
-        true
+        Ok(true)
     }
 
-    pub fn commit(
+    pub fn commit(&self, base_revision: u64, next: AchievementDefs) -> Result<u64, CommitError> {
+        self.commit_at(base_revision, None, next)
+    }
+
+    /// 書かずに `commit_at` と同じ判定(Stale・検証)だけ行う。無効化の flush より前に呼ぶ。
+    pub fn check(
         &self,
         base_revision: u64,
-        mut next: AchievementDefs,
-    ) -> Result<u64, CommitError> {
+        base_token: Option<&str>,
+        next: &AchievementDefs,
+    ) -> Result<(), CommitError> {
+        let _transaction = DEFS_TRANSACTION.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        self.check_locked(&state, base_revision, base_token, next)
+    }
+
+    fn check_locked(
+        &self,
+        state: &DefsState,
+        base_revision: u64,
+        base_token: Option<&str>,
+        next: &AchievementDefs,
+    ) -> Result<(), CommitError> {
         if self.save_refused {
             return Err(CommitError::SaveRefused);
         }
-        let _transaction = DEFS_TRANSACTION.lock().unwrap_or_else(|e| e.into_inner());
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if base_revision != state.current.revision
+            || base_token.is_some_and(|token| token != content_token(&state.saved_bytes))
             || read_optional(&self.path).map_err(|_| CommitError::Io)? != state.saved_bytes
         {
             return Err(CommitError::Stale);
@@ -202,6 +253,19 @@ impl DefsStore {
         if next.rates.values().any(|rate| !rate.is_finite()) {
             return Err(CommitError::Io);
         }
+        Ok(())
+    }
+
+    /// `base_token` があれば、画面が読んだ内容とディスクの現内容が同じ時だけ保存する。
+    pub fn commit_at(
+        &self,
+        base_revision: u64,
+        base_token: Option<&str>,
+        mut next: AchievementDefs,
+    ) -> Result<u64, CommitError> {
+        let _transaction = DEFS_TRANSACTION.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        self.check_locked(&state, base_revision, base_token, &next)?;
 
         for achievement in &mut next.achievements {
             if let Some(mut preset) = reset_to_preset(achievement) {
@@ -430,5 +494,16 @@ mod tests {
         assert_eq!(loser.commit(0, loser.current()), Err(CommitError::Stale));
         assert_eq!(loser.current().revision, 0);
         assert_eq!(fs::read(path).unwrap(), saved);
+    }
+
+    #[test]
+    fn reload_does_not_back_up_the_same_broken_file_again() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(DEFS_FILE), "{broken").unwrap();
+        let store = DefsStore::load(dir.path(), 1);
+        for now in 2..5 {
+            assert!(!store.reload(now));
+        }
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2, "defs と退避 1 個だけ");
     }
 }

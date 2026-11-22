@@ -322,6 +322,8 @@ export interface AchievementRow extends AchievementDef {
 
 export interface AchievementList {
   revision: number;
+  /** Token of the file contents this list was read from; pass it back when saving. */
+  contentToken: string;
   enabled: boolean;
   rates: Record<string, number>;
   ratesUpdatedAtMs: number | null;

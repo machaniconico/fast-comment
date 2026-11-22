@@ -274,14 +274,16 @@ async fn delete_listener(
 }
 
 #[tauri::command]
-fn list_achievements(state: State<'_, AppState>) -> achievements::ipc::AchievementList {
+fn list_achievements(state: State<'_, AppState>) -> Result<achievements::ipc::AchievementList, String> {
     // 外部で更新されていればディスクから読み直す(Stale のあとの再読込もここを通る)。
+    // 外部の無効化で進捗を保存できなければ取り込まず、エンジンを残したままエラーにする。
     let unlocks = achievements::ipc::refresh(
         &state.achievement_defs, &state.achievement_engine, &state.config_dir, timer_now_ms(),
-    );
+    )
+    .map_err(|_| "実績の進捗を保存できませんでした。保存先を確認してください".to_owned())?;
     state.broadcast_achievement_unlocks(unlocks);
     let engine = state.lock_achievement_engine();
-    achievements::ipc::list(state.achievement_defs.current(), engine.as_deref(), &state.config_dir)
+    Ok(achievements::ipc::list(state.achievement_defs.snapshot(), engine.as_deref(), &state.config_dir))
 }
 
 #[tauri::command]
@@ -293,6 +295,7 @@ fn achievement_schema() -> achievements::ipc::AchievementSchema {
 fn commit_achievements(
     state: State<'_, AppState>,
     base_revision: u64,
+    base_token: String,
     enabled: bool,
     achievements: Vec<achievements::ipc::AchievementInput>,
     rates: achievements::currency::RateTable,
@@ -312,6 +315,7 @@ fn commit_achievements(
         &state.achievement_engine,
         &state.config_dir,
         base_revision,
+        Some(&base_token),
         next,
         timer_now_ms(),
     );

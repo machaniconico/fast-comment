@@ -74,7 +74,7 @@
       if (draftError) { message = draftError.message; editingId = draftError.id; return; }
       const checked = checkRateRows(rateRows);
       if ('error' in checked) { message = checked.error; return; }
-      const reply = await commitAchievements(loaded.revision, enabled, $state.snapshot(drafts), checked.rates, loaded.symbolOverrides);
+      const reply = await commitAchievements(loaded.revision, loaded.contentToken, enabled, $state.snapshot(drafts), checked.rates, loaded.symbolOverrides);
       if (!reply) return;
       switch (reply.result) {
         case 'ok': message = '保存しました。'; await reload(); break;
@@ -85,8 +85,8 @@
         case 'invalid':
           if (reply.field === 'rateCode' || reply.field === 'rateValue') {
             message = reply.field === 'rateCode'
-              ? `通貨「${reply.id}」が空または重複しています。`
-              : `レート「${reply.id}」は 0 より大きい数値にしてください。`;
+              ? 'レート表の通貨コードが空か重複しています(「$」と「USD」のように同じ通貨になる行も重複です)。'
+              : 'レート表に 0 より大きい数値でないレートがあります。';
           } else {
             const name = drafts.find((a) => a.id === reply.id)?.name || reply.id;
             message = `「${name}」の${FIELD_LABELS[reply.field] ?? reply.field}を確認してください。`;
@@ -156,7 +156,7 @@
 <section id="settings-achievements">
   <h3>実績</h3>
   <p>変更は「保存」を押すまで反映されません。</p>
-  <label><input type="checkbox" bind:checked={enabled} /> 実績機能を有効にする</label>
+  <label><input type="checkbox" bind:checked={enabled} disabled={busy} /> 実績機能を有効にする</label>
 
   <div class="tabs" role="tablist">
     <button role="tab" aria-selected={tab === 'viewer'} class:active={tab === 'viewer'} onclick={() => (tab = 'viewer')}>視聴者</button>
