@@ -2979,7 +2979,6 @@ const fetch = (_path, { body }) => {
         auth.cancel_login();
         let result = timeout(wait, login).await.unwrap().unwrap();
         assert!(matches!(result.unwrap_err().code, Code::Cancelled));
-        let rebound = TcpListener::bind(addr).await;
         let closed = timeout(wait, client.read_u8())
             .await
             .expect("callback connection stayed open after cancellation");
@@ -2987,7 +2986,16 @@ const fetch = (_path, { body }) => {
             closed.unwrap_err().kind(),
             std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
         ));
-        rebound.expect("callback port could not be rebound after cancellation");
+        // Check the listener is gone by a refused connect, not by rebinding: once released,
+        // a parallel test can take this ephemeral port as its local port and make bind fail.
+        // Windows retries SYN after RST for about 2 s before reporting the refusal.
+        let refused = timeout(Duration::from_secs(10), TcpStream::connect(addr))
+            .await
+            .expect("connect to the released callback port hung");
+        assert_eq!(
+            refused.expect_err("callback listener still accepts after cancellation").kind(),
+            std::io::ErrorKind::ConnectionRefused
+        );
     }
 
     mod revision7 {
