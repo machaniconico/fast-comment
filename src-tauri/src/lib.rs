@@ -280,7 +280,7 @@ fn list_achievements(state: State<'_, AppState>) -> Result<achievements::ipc::Ac
     let unlocks = achievements::ipc::refresh(
         &state.achievement_defs, &state.achievement_engine, &state.config_dir, timer_now_ms(),
     )
-    .map_err(|_| "実績のデータを保存できませんでした。保存先を確認してください".to_owned())?;
+    .map_err(|_| "実績のデータを読み書きできませんでした。保存先を確認して再読込してください".to_owned())?;
     state.broadcast_achievement_unlocks(unlocks);
     let engine = state.lock_achievement_engine();
     Ok(achievements::ipc::list(state.achievement_defs.snapshot(), engine.as_deref(), &state.config_dir))

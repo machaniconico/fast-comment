@@ -197,9 +197,12 @@ impl DefsStore {
         let unchanged = |bytes: &Option<Vec<u8>>| {
             *bytes == self.state.lock().unwrap_or_else(|e| e.into_inner()).saved_bytes
         };
+        // 読めない(他プロセスが排他で開いている等)時は「変化なし」にせずエラーにする。
+        // Ok(false) にすると古い revision の一覧のまま保存が Stale を繰り返す。
         let bytes = match read_optional(&self.path) {
             Ok(bytes) if !unchanged(&bytes) => bytes,
-            _ => return Ok(false),
+            Ok(_) => return Ok(false),
+            Err(_) => return Err(CommitError::Io),
         };
         let loaded = bytes.as_deref().and_then(|b| {
             decode_versioned(b, |defs: &AchievementDefs| validate_all(&defs.achievements).is_ok())
@@ -526,5 +529,21 @@ mod tests {
             assert!(!store.reload(now));
         }
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2, "defs と退避 1 個だけ");
+    }
+
+    #[test]
+    fn reload_reports_unreadable_defs_instead_of_unchanged() {
+        // 読めない定義(ここではディレクトリに差し替え。実機では他プロセスの排他オープン)を
+        // 「変化なし」にすると、古い revision の一覧から保存して Stale を繰り返す。
+        let dir = tempfile::tempdir().unwrap();
+        let store = DefsStore::load(dir.path(), 0);
+        let mut next = store.current();
+        next.enabled = true;
+        assert_eq!(store.commit(0, next), Ok(1));
+        let path = dir.path().join(DEFS_FILE);
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert_eq!(store.reload_with(1, |_| Ok(())), Err(CommitError::Io));
+        assert_eq!(store.current().revision, 1, "読めない間は取り込まない");
     }
 }
