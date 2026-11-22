@@ -5,6 +5,11 @@ use super::{
     sign, Matched, OutboundRequest, Sender, Trigger,
 };
 use crate::{
+    achievements::engine::AchievementUnlocked,
+    bus::{
+        relay::{poll, AchievementRelay, Polled},
+        SequencedAchievement, SequencedChat,
+    },
     integrations::{Integrations, Paused, SecretStore, WebhookDef, WebhookFormat, WebhookSecret},
     model::ChatMessage,
 };
@@ -15,7 +20,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    sync::Notify,
+    sync::{broadcast, Notify},
     time::{sleep_until, Instant},
 };
 use tokio_util::sync::CancellationToken;
@@ -82,6 +87,14 @@ struct Worker {
 impl Worker {
     fn active(&self) -> bool {
         !self.cancel.is_cancelled() && self.state.lock().unwrap().status.state == "active"
+    }
+    /// 実績解除を受け取る送り先か(購読は有効な送り先があれば行い、ここで送り先ごとに絞る)。
+    fn accepts_achievement(&self) -> bool {
+        self.active()
+            && self.def.enabled
+            && self.def.paused.is_none()
+            && self.def.triggers.achievement
+            && self.secret.is_some()
     }
     fn stop(&self) {
         self.cancel.cancel();
@@ -230,6 +243,14 @@ impl<S: SecretStore, T: Sender> WebhookRuntime<S, T> {
     pub fn has_active_webhooks(&self) -> bool {
         self.0.workers.lock().unwrap().values().any(|w| w.active())
     }
+    pub(crate) fn has_achievement_destinations(&self) -> bool {
+        self.0
+            .workers
+            .lock()
+            .unwrap()
+            .values()
+            .any(|w| w.accepts_achievement())
+    }
     pub fn handle_message(&self, msg: &ChatMessage) {
         if msg.injected_test || msg.skip_tts || msg.kind == crate::model::MessageKind::System {
             return;
@@ -254,22 +275,26 @@ impl<S: SecretStore, T: Sender> WebhookRuntime<S, T> {
             let Some(secret) = &w.secret else {
                 continue;
             };
-            let item = Item {
-                at: Instant::now(),
-                request: request(&w.def, secret, &matched, msg, self.0.clock.now_ms()),
-            };
-            let mut s = w.state.lock().unwrap();
-            if s.status.state != "active" || w.cancel.is_cancelled() {
+            enqueue(
+                &w,
+                request(&w.def, secret, &matched, msg, self.0.clock.now_ms()),
+            );
+        }
+    }
+    /// 実績解除を `achievement` を有効にした送り先のキューへ積む(`handle_message` と同じく I/O しない)。
+    pub fn handle_achievement(&self, unlock: &AchievementUnlocked) {
+        let workers: Vec<_> = self.0.workers.lock().unwrap().values().cloned().collect();
+        for w in workers {
+            if !w.accepts_achievement() {
                 continue;
             }
-            if s.queue.len() == 100 {
-                s.queue.pop_front();
-                s.status.dropped += 1;
-            }
-            s.queue.push_back(item);
-            s.status.queued = s.queue.len();
-            drop(s);
-            w.wake.notify_one();
+            let Some(secret) = &w.secret else {
+                continue;
+            };
+            enqueue(
+                &w,
+                achievement_request(&w.def, secret, unlock, self.0.clock.now_ms()),
+            );
         }
     }
     pub fn status(&self) -> Vec<WebhookStatus> {
@@ -329,6 +354,24 @@ impl<S: SecretStore, T: Sender> WebhookRuntime<S, T> {
         }
     }
 }
+fn enqueue(w: &Worker, request: OutboundRequest) {
+    let item = Item {
+        at: Instant::now(),
+        request,
+    };
+    let mut s = w.state.lock().unwrap();
+    if s.status.state != "active" || w.cancel.is_cancelled() {
+        return;
+    }
+    if s.queue.len() == 100 {
+        s.queue.pop_front();
+        s.status.dropped += 1;
+    }
+    s.queue.push_back(item);
+    s.status.queued = s.queue.len();
+    drop(s);
+    w.wake.notify_one();
+}
 fn request(
     def: &WebhookDef,
     secret: &WebhookSecret,
@@ -336,12 +379,35 @@ fn request(
     msg: &ChatMessage,
     now: u64,
 ) -> OutboundRequest {
+    build_request(def, secret, |event_id| {
+        if def.format == WebhookFormat::Discord {
+            payload::discord(matched, msg)
+        } else {
+            payload::generic(event_id, matched, msg, now)
+        }
+    })
+}
+fn achievement_request(
+    def: &WebhookDef,
+    secret: &WebhookSecret,
+    unlock: &AchievementUnlocked,
+    now: u64,
+) -> OutboundRequest {
+    build_request(def, secret, |event_id| {
+        if def.format == WebhookFormat::Discord {
+            payload::discord_achievement(unlock)
+        } else {
+            payload::generic_achievement(event_id, unlock, now)
+        }
+    })
+}
+fn build_request(
+    def: &WebhookDef,
+    secret: &WebhookSecret,
+    payload: impl FnOnce(&str) -> serde_json::Value,
+) -> OutboundRequest {
     let event_id = uuid::Uuid::new_v4().to_string();
-    let v = if def.format == WebhookFormat::Discord {
-        payload::discord(matched, msg)
-    } else {
-        payload::generic(&event_id, matched, msg, now)
-    };
+    let v = payload(&event_id);
     let body = serde_json::to_vec(&v).expect("JSON payload");
     let mut headers = vec![
         ("Content-Type".into(), "application/json".into()),
@@ -578,6 +644,70 @@ async fn run_worker<S: SecretStore, T: Sender>(
     }
 }
 
+/// 1 ラウンドの集計(件数のみ。URL・トークンは含めない)。
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct RelayRound {
+    pub chat_lagged: u64,
+    pub achievement_lagged: u64,
+    pub chat_closed: bool,
+    pub achievement_closed: bool,
+}
+/// 購読を揃える。不要なら外し、Closed になった後は再購読しない(空回りを防ぐ)。
+pub fn sync_subscription<T: Clone>(
+    slot: &mut Option<tokio::sync::broadcast::Receiver<T>>,
+    wanted: bool,
+    closed: bool,
+    subscribe: impl FnOnce() -> tokio::sync::broadcast::Receiver<T>,
+) {
+    if !wanted || closed {
+        *slot = None;
+    } else if slot.is_none() {
+        *slot = Some(subscribe());
+    }
+}
+/// Process up to `limit` receives per channel. Unlocks can wait across rounds
+/// even when chat was empty at the beginning of this round.
+pub(crate) fn drain_relay_round(
+    first: (
+        Option<Polled<SequencedChat>>,
+        Option<Polled<SequencedAchievement>>,
+    ),
+    relay: &mut AchievementRelay,
+    mut chat: Option<&mut broadcast::Receiver<SequencedChat>>,
+    achievement: Option<&mut broadcast::Receiver<SequencedAchievement>>,
+    limit: usize,
+    mut on_chat: impl FnMut(ChatMessage),
+    mut on_achievement: impl FnMut(AchievementUnlocked),
+) -> RelayRound {
+    let mut round = RelayRound::default();
+    let (mut first_chat, first_achievement) = first;
+    if chat.is_none() {
+        relay.close_chat();
+    }
+    for _ in 0..limit {
+        let Some(next) = first_chat.take().or_else(|| poll(chat.as_deref_mut()?)) else {
+            break;
+        };
+        match next {
+            Polled::Item(chat) => {
+                on_chat(chat.message);
+                relay.processed_chat(chat.seq);
+            }
+            Polled::Lagged(n) => round.chat_lagged = round.chat_lagged.saturating_add(n),
+            Polled::Closed => {
+                round.chat_closed = true;
+                relay.close_chat();
+                break;
+            }
+        }
+    }
+    (round.achievement_lagged, round.achievement_closed) =
+        relay.drain(first_achievement, achievement, limit, |event| {
+            on_achievement(event.unlock)
+        });
+    round
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -612,6 +742,225 @@ mod tests {
             keywords: vec![],
             url: Some(url.into()),
         }
+    }
+    fn bus() -> crate::bus::Bus {
+        let (stats, _) = tokio::sync::watch::channel(Default::default());
+        let (timer, _) = tokio::sync::watch::channel(Default::default());
+        crate::bus::Bus::new(1234, stats, timer)
+    }
+
+    fn unlock(id: &str) -> AchievementUnlocked {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "achievementId": "a", "name": "n", "description": "", "tier": "bronze",
+            "icon": "", "subject": {"kind": "streamer"}, "valueMilli": 1000,
+            "thresholdMilli": 1000, "currency": null, "windowKey": "*", "unlockedAtMs": 1
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn achievement_published_during_forwarding_waits_for_its_chat() {
+        let bus = bus();
+        let (mut chat, baseline) = bus.subscribe_chat_with_baseline();
+        let mut achievement = bus.subscribe_achievements();
+        let mut relay = AchievementRelay::new(baseline);
+        bus.publish_achievement(unlock("a1"), bus.latest_chat_seq());
+
+        let log = std::cell::RefCell::new(Vec::new());
+        for _ in 0..2 {
+            drain_relay_round(
+                (None, None),
+                &mut relay,
+                Some(&mut chat),
+                Some(&mut achievement),
+                4,
+                |chat| log.borrow_mut().push(chat.id),
+                |achievement| {
+                    if achievement.id == "a1" {
+                        let seq = bus.publish_sequenced(message("c2"));
+                        bus.publish_achievement(unlock("a2"), seq);
+                    }
+                    log.borrow_mut().push(achievement.id);
+                },
+            );
+        }
+        assert_eq!(log.into_inner(), ["a1", "c2", "a2"]);
+    }
+
+    #[test]
+    fn relay_releases_only_eligible_achievements_at_chat_round_limit() {
+        let bus = bus();
+        let baseline = bus.publish_sequenced(message("before-subscription"));
+        let (mut chat, actual_baseline) = bus.subscribe_chat_with_baseline();
+        assert_eq!(baseline, actual_baseline);
+        let mut achievement = bus.subscribe_achievements();
+        let mut relay = AchievementRelay::new(actual_baseline);
+        bus.publish_achievement(unlock("a0"), baseline);
+        let first = bus.publish_sequenced(message("c1"));
+        bus.publish_achievement(unlock("a1"), first);
+        let second = bus.publish_sequenced(message("c2"));
+        bus.publish_achievement(unlock("a2"), second);
+
+        let log = std::cell::RefCell::new(Vec::new());
+        let first_achievement = poll(&mut achievement);
+        for first_achievement in [first_achievement, None, None] {
+            drain_relay_round(
+                (None, first_achievement),
+                &mut relay,
+                Some(&mut chat),
+                Some(&mut achievement),
+                1,
+                |chat| log.borrow_mut().push(chat.id),
+                |achievement| log.borrow_mut().push(achievement.id),
+            );
+        }
+        assert_eq!(log.into_inner(), ["c1", "a0", "c2", "a1", "a2"]);
+    }
+
+    #[test]
+    fn lagged_chat_unblocks_fifo_using_the_next_received_sequence() {
+        let (ctx, mut chat) = broadcast::channel(2);
+        let (atx, mut achievement) = broadcast::channel(4);
+        let mut relay = AchievementRelay::new(0);
+        for seq in 1..=3 {
+            ctx.send(SequencedChat {
+                seq,
+                message: message(&format!("c{seq}")),
+            })
+            .unwrap();
+        }
+        for (id, after_seq) in [("a1", 1), ("a0", 0)] {
+            atx.send(SequencedAchievement {
+                after_seq,
+                unlock: unlock(id),
+            })
+            .unwrap();
+        }
+
+        let log = std::cell::RefCell::new(Vec::new());
+        let mut drain = || {
+            drain_relay_round(
+                (None, None),
+                &mut relay,
+                Some(&mut chat),
+                Some(&mut achievement),
+                1,
+                |chat| log.borrow_mut().push(chat.id),
+                |achievement| log.borrow_mut().push(achievement.id),
+            )
+        };
+        assert_eq!(drain().chat_lagged, 1);
+        assert!(
+            log.borrow().is_empty(),
+            "Lagged alone does not advance the chat sequence"
+        );
+        drain();
+        drain();
+        assert_eq!(log.into_inner(), ["c2", "a1", "c3", "a0"]);
+    }
+
+    #[test]
+    fn relay_counts_overflow_and_releases_on_chat_close() {
+        let (ctx, mut chat) = broadcast::channel::<SequencedChat>(2);
+        let (atx, mut achievement) = broadcast::channel(512);
+        let mut relay = AchievementRelay::new(0);
+        for i in 0..=256 {
+            atx.send(SequencedAchievement {
+                after_seq: 1,
+                unlock: unlock(&i.to_string()),
+            })
+            .unwrap();
+        }
+        for expected_dropped in [0, 1] {
+            let round = drain_relay_round(
+                (None, None),
+                &mut relay,
+                Some(&mut chat),
+                Some(&mut achievement),
+                256,
+                |_| unreachable!(),
+                |_| unreachable!("the cause has not been processed"),
+            );
+            assert_eq!(round.achievement_lagged, expected_dropped);
+        }
+
+        drop((ctx, atx));
+        let mut seen = Vec::new();
+        let round = drain_relay_round(
+            (None, None),
+            &mut relay,
+            Some(&mut chat),
+            Some(&mut achievement),
+            256,
+            |_| unreachable!(),
+            |achievement| seen.push(achievement.id),
+        );
+        assert!(round.chat_closed && round.achievement_closed);
+        assert_eq!(seen, (1..=256).map(|i| i.to_string()).collect::<Vec<_>>());
+
+        let mut slot = Some(achievement);
+        sync_subscription(&mut slot, true, round.achievement_closed, || unreachable!("Closed 後は再購読しない"));
+        assert!(slot.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disabling_achievement_trigger_stops_delivery_to_that_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let it = Integrations::open(dir.path().into(), MemorySecretStore::new(), 1).await;
+        let sender = Capture::default();
+        let rt = WebhookRuntime::new(it.clone(), sender.clone());
+        it.save_webhook(input("https://b.example.test/hook")).await.unwrap();
+        let mut i = input("https://a.example.test/hook");
+        i.triggers.achievement = true;
+        let saved = it.save_webhook(i).await.unwrap();
+        rt.reload().await;
+        let unlock: AchievementUnlocked = serde_json::from_value(serde_json::json!({
+            "id": "i", "achievementId": "a", "name": "n", "description": "", "tier": "bronze",
+            "icon": "", "subject": {"kind": "streamer"}, "valueMilli": 1000,
+            "thresholdMilli": 1000, "currency": null, "windowKey": "*", "unlockedAtMs": 1
+        }))
+        .unwrap();
+        rt.handle_achievement(&unlock);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(sender.0.lock().unwrap().len(), 1, "donation だけの送り先には送らない");
+        let mut i = input("https://a.example.test/hook");
+        i.id = Some(saved.definition.id.clone());
+        i.url = None;
+        it.save_webhook(i).await.unwrap();
+        rt.reload().await;
+        assert!(rt.has_active_webhooks(), "購読は有効な送り先があれば続ける");
+        assert!(!rt.has_achievement_destinations());
+        rt.handle_achievement(&unlock);
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        assert_eq!(sender.0.lock().unwrap().len(), 1, "achievement を外した送り先にはもう送らない");
+    }
+    #[tokio::test(start_paused = true)]
+    async fn bus_achievement_reaches_webhook_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let it = Integrations::open(dir.path().into(), MemorySecretStore::new(), 1).await;
+        let sender = Capture::default();
+        let rt = WebhookRuntime::new(it.clone(), sender.clone());
+        let mut i = input("https://a.example.test/hook");
+        i.triggers = WebhookTriggers {
+            achievement: true,
+            ..Default::default()
+        };
+        it.save_webhook(i).await.unwrap();
+        rt.reload().await;
+        let (stats, _) = tokio::sync::watch::channel(Default::default());
+        let (timer, _) = tokio::sync::watch::channel(Default::default());
+        let bus = crate::bus::Bus::new(1234, stats, timer);
+        let mut rx = bus.subscribe_achievements();
+        let unlock: AchievementUnlocked = serde_json::from_value(serde_json::json!({
+            "id": "i", "achievementId": "a", "name": "n", "description": "", "tier": "bronze",
+            "icon": "", "subject": {"kind": "streamer"}, "valueMilli": 1000,
+            "thresholdMilli": 1000, "currency": null, "windowKey": "*", "unlockedAtMs": 1
+        }))
+        .unwrap();
+        bus.publish_achievement(unlock, bus.latest_chat_seq());
+        rt.handle_achievement(&rx.recv().await.unwrap().unlock);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(sender.0.lock().unwrap().len(), 1);
     }
     #[tokio::test(start_paused = true)]
     async fn injected_history_and_duplicates_never_reach_sender_on_any_target() {

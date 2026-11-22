@@ -95,30 +95,7 @@ pub async fn events(
                     if batch.dropped > 0 {
                         output.push_back(lagged(std::mem::take(&mut batch.dropped)));
                     }
-                    // Per frame: chat, then moderation. A chat that a queued clear
-                    // would match arrived after it, so it starts a new chat/moderation pair.
-                    let cursor = params.after.as_deref().and_then(comments::cursor);
-                    let mut entries = Vec::new();
-                    let mut events = Vec::new();
-                    for item in batch.items.drain(..) {
-                        match item {
-                            Item::Chat(entry) => {
-                                if events
-                                    .iter()
-                                    .any(|e: &ModerationEvent| e.matches(&entry.target))
-                                {
-                                    flush(&mut output, &deps.epoch, &mut entries, &mut events);
-                                }
-                                if cursor.is_none_or(|(epoch, seq)| {
-                                    epoch != deps.epoch || entry.seq > seq
-                                }) {
-                                    entries.push(entry);
-                                }
-                            }
-                            Item::Moderation(event) => events.push(event),
-                        }
-                    }
-                    flush(&mut output, &deps.epoch, &mut entries, &mut events);
+                    drain_batch(&mut batch.items, params.after.as_deref(), &deps.epoch, &mut output);
                 }
                 if output.is_empty() && last_sent.elapsed() >= Duration::from_secs(15) {
                     output.push_back(Event::default().comment("ping"));
@@ -127,6 +104,41 @@ pub async fn events(
         },
     );
     Sse::new(stream).into_response()
+}
+// Per frame: chat, then moderation. A chat that a queued clear
+// would match arrived after it, so it starts a new chat/moderation pair.
+// 実績はチャットのバッチを割らないよう、その tick の chat / moderation の後に送る。
+fn drain_batch(
+    items: &mut VecDeque<Item>,
+    after: Option<&str>,
+    epoch: &str,
+    output: &mut VecDeque<Event>,
+) {
+    let cursor = after.and_then(comments::cursor);
+    let mut entries = Vec::new();
+    let mut events = Vec::new();
+    let mut achievements = Vec::new();
+    for item in items.drain(..) {
+        match item {
+            Item::Chat(entry) => {
+                if events
+                    .iter()
+                    .any(|e: &ModerationEvent| e.matches(&entry.target))
+                {
+                    flush(output, epoch, &mut entries, &mut events);
+                }
+                if cursor.is_none_or(|(e, seq)| e != epoch || entry.seq > seq) {
+                    entries.push(entry);
+                }
+            }
+            Item::Moderation(event) => events.push(event),
+            Item::Achievement(value) => achievements.push(value),
+        }
+    }
+    flush(output, epoch, &mut entries, &mut events);
+    for value in achievements {
+        output.push_back(Event::default().event("achievement").data(value.to_string()));
+    }
 }
 fn lagged(dropped: u64) -> Event {
     Event::default()
@@ -157,4 +169,33 @@ fn chat(epoch: &str, entries: &[std::sync::Arc<super::feed::Entry>]) -> Event {
         .event("chat")
         .id(format!("{epoch}.{}", entries.last().unwrap().seq))
         .data(json!({"items":items}).to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::ApiFeed;
+
+    #[test]
+    fn achievement_between_chats_does_not_split_the_chat_batch() {
+        let feed = ApiFeed::new(10);
+        feed.set_enabled(true);
+        let (_, pending) = feed.subscribe().unwrap();
+        let msg = |id: &str| -> crate::model::ChatMessage {
+            serde_json::from_value(serde_json::json!({"id":id,"platform":"youtube","channel":"c","author":{"id":"a","name":"A"},"kind":"normal","timestampMs":1,"fragments":[{"type":"text","text":"hi"}]})).unwrap()
+        };
+        let unlock: crate::achievements::engine::AchievementUnlocked =
+            serde_json::from_value(serde_json::json!({
+                "id": "i", "achievementId": "a", "name": "n", "description": "", "tier": "bronze",
+                "icon": "", "subject": {"kind": "streamer"}, "valueMilli": 1000,
+                "thresholdMilli": 1000, "currency": null, "windowKey": "*", "unlockedAtMs": 1
+            }))
+            .unwrap();
+        feed.push_chat(&msg("a"));
+        feed.push_achievement(&unlock);
+        feed.push_chat(&msg("b"));
+        let mut output = VecDeque::new();
+        drain_batch(&mut pending.lock().unwrap().items, None, "e", &mut output);
+        assert_eq!(output.len(), 2, "chat 1 件(A・B まとめて)+ achievement 1 件");
+    }
 }

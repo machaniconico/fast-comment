@@ -50,6 +50,8 @@ mod achievements_currency;
 mod achievements_store;
 mod achievements_engine;
 mod achievements_wiring;
+// PR4(実績): Webhook と SSE への配信(.omc/plans/achievements-acceptance.md §3.7)
+mod achievements_relay;
 
 #[test]
 fn acceptance_harness_runs() {}

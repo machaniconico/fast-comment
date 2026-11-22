@@ -153,11 +153,11 @@ Twitchの配信側モデレーション（コメント削除・タイムアウ�
 curl.exe -H "Authorization: Bearer <token>" http://127.0.0.1:<port>/api/v1/status
 ```
 
-主なエンドポイントは `GET /status`・`GET /comments`・`GET /events`(SSE)・`POST /test-comments`・`GET /tts` と `POST /tts/pause|resume|skip|clear`・`GET /timer` と `POST /timer/start|pause|resume|reset` です。詳細は `.claude/SPEC.md` §15 を参照してください。
+主なエンドポイントは `GET /status`・`GET /comments`・`GET /events`(SSE。チャット・モデレーションのほか、実績の解除を `achievement` イベントで流します)・`POST /test-comments`・`GET /tts` と `POST /tts/pause|resume|skip|clear`・`GET /timer` と `POST /timer/start|pause|resume|reset` です。詳細は `.claude/SPEC.md` §15 を参照してください。
 
 ### Webhook の設定
 
-投げ銭・メンバー加入・キーワード一致のコメントを、Discord や自作のサーバへ自動で送れます。設定画面の「Webhook」で送り先(最大 10 件)を追加します。
+投げ銭・メンバー加入・キーワード一致のコメントと、実績の解除(送り先ごとに「achievement」を有効にした場合。汎用 JSON は `achievement` キー、SSE の `achievement` イベントと同じ形)を、Discord や自作のサーバへ自動で送れます。設定画面の「Webhook」で送り先(最大 10 件)を追加します。
 
 - **形式**: 「Discord」はチャンネルの Webhook URL(`https://discord.com/api/webhooks/…`)へ埋め込みメッセージを送ります。「汎用 JSON」は任意の URL へ JSON を POST し、署名を付けます。汎用 JSON の `http` は `localhost` とプライベート IP のみ使えます。それ以外は `https` が必要です。
 - **きっかけ**: 投げ銭・メンバー加入・キーワード一致。キーワードは 1 行 1 語で、大文字小文字は区別しませんが、全角 / 半角・ひらがな / カタカナは区別します。1 つのコメントが複数に当たっても送るのは 1 回です。

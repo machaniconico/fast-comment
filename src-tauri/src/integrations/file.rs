@@ -51,6 +51,7 @@ pub struct WebhookTriggers {
     pub donation: bool,
     pub membership: bool,
     pub keyword: bool,
+    pub achievement: bool,
 }
 #[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]

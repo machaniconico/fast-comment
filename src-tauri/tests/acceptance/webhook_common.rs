@@ -60,7 +60,7 @@ pub fn superchat(id: &str, raw_text: &str) -> ChatMessage {
 // ---- 定義 ----
 
 pub fn triggers(donation: bool, membership: bool, keyword: bool) -> WebhookTriggers {
-    WebhookTriggers { donation, membership, keyword }
+    WebhookTriggers { donation, membership, keyword, achievement: false }
 }
 
 pub fn def(format: WebhookFormat, t: WebhookTriggers, keywords: &[&str]) -> WebhookDef {

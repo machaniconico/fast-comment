@@ -60,6 +60,137 @@ pub struct AchievementUnlocked {
     pub unlocked_at_ms: u64,
 }
 
+impl AchievementUnlocked {
+    /// Webhook と SSE に送る外向きの形(決定 K12 の 11 キー)。説明・アイコン・内部 id は含めない。
+    /// `currency` があれば金額系(ミリ単位のまま)、無ければ回数系(回数そのもの)。
+    pub fn relay_json(&self) -> serde_json::Value {
+        use serde_json::json;
+        let subject = match (self.subject.kind, &self.subject.platform) {
+            (SubjectKind::Viewer, platform) => json!({
+                "kind": "viewer",
+                "platform": platform,
+                "authorId": self.subject.author_id,
+                "name": self.subject.name,
+            }),
+            (SubjectKind::Streamer, _) => json!({"kind": "streamer"}),
+        };
+        let (value, threshold, unit) = if self.currency.is_some() {
+            (self.value_milli, self.threshold_milli, "milli")
+        } else {
+            // threshold_milli は解除される最小のミリ値なので、それ以上になる最小の回数へ切り上げる
+            // (1.5 回は 2 回で解除される)。値はミリ単位でも回数の整数倍(上限で飽和)。
+            (
+                self.value_milli / 1000,
+                (self.threshold_milli / 1000 + i64::from(self.threshold_milli % 1000 > 0)).max(1),
+                "count",
+            )
+        };
+        // 解除通知では値がしきい値を下回らない(回数の飽和などで下回る分を寄せる)。
+        let value = value.max(threshold);
+        json!({
+            "type": "achievement",
+            "achievementId": self.achievement_id,
+            "name": self.name,
+            "tier": self.tier,
+            "subject": subject,
+            "value": value,
+            "threshold": threshold,
+            "currency": self.currency,
+            "unit": unit,
+            "windowKey": self.window_key,
+            "unlockedAtMs": self.unlocked_at_ms,
+        })
+    }
+}
+
+#[cfg(test)]
+mod relay_json_tests {
+    use super::*;
+
+    fn count_unlock(value_milli: i64, threshold_milli: i64) -> AchievementUnlocked {
+        serde_json::from_value(serde_json::json!({
+            "id": "i", "achievementId": "a", "name": "n", "description": "", "tier": "bronze",
+            "icon": "", "subject": {"kind": "streamer"}, "valueMilli": value_milli,
+            "thresholdMilli": threshold_milli, "currency": null, "windowKey": "*", "unlockedAtMs": 1
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn count_threshold_rounds_up() {
+        let v = count_unlock(3000, 2500).relay_json();
+        assert_eq!((v["value"].clone(), v["threshold"].clone()), (3.into(), 3.into()));
+        assert_eq!(count_unlock(1000, 400).relay_json()["threshold"], 1);
+        assert_eq!(count_unlock(2000, 2000).relay_json()["threshold"], 2);
+    }
+
+    #[test]
+    fn count_threshold_does_not_overflow_at_i64_max() {
+        let v = count_unlock(i64::MAX, i64::MAX).relay_json();
+        assert_eq!(v["threshold"], i64::MAX / 1000 + 1);
+        assert_eq!(v["value"], i64::MAX / 1000 + 1, "飽和した値もしきい値へ寄せる");
+    }
+
+    #[test]
+    fn threshold_to_milli_keeps_fraction_as_ceil() {
+        assert_eq!(threshold_to_milli(0.0004), 1);
+        assert_eq!(threshold_to_milli(1.1), 1100);
+        assert_eq!(threshold_to_milli(2.3), 2300);
+        for (t, need) in [(0.0004, 1), (1.0004, 2), (2.5, 3), (0.4, 1), (2.0, 2), (1.1, 2)] {
+            assert_eq!(count_unlock(need * 1000, threshold_to_milli(t)).relay_json()["threshold"], need, "{t}");
+        }
+    }
+
+    /// エンジンが解除する最小の回数(`milli` と `reaches` を総当たりせず、境界の前後で確かめる)。
+    fn assert_count_matches_engine(t: f64, need: u64) {
+        assert!(reaches(milli(need), t), "{t}: {need} 回で解除される");
+        assert!(!reaches(milli(need - 1), t), "{t}: {} 回では解除されない", need - 1);
+        let v = count_unlock(milli(need), threshold_to_milli(t)).relay_json();
+        assert_eq!(v["threshold"], need, "{t}");
+        assert!(v["value"].as_i64() >= v["threshold"].as_i64(), "{t}: {v}");
+    }
+
+    #[test]
+    fn count_threshold_matches_engine_unlock() {
+        assert_count_matches_engine(1.0000000001, 2);
+        assert_count_matches_engine(2.0000000001, 3);
+        assert_count_matches_engine(1.1, 2);
+        assert_count_matches_engine(2.0, 2);
+    }
+
+    #[test]
+    fn huge_gift_count_value_is_not_below_threshold() {
+        // giftCount の SUBGIFT 個数がしきい値と同じ 9223372036854776。ミリ値は i64::MAX で飽和する。
+        assert_count_matches_engine(9223372036854776.0, 9223372036854776);
+    }
+
+    fn amount_unlock(value_milli: i64, threshold_milli: i64) -> AchievementUnlocked {
+        let mut unlock = count_unlock(value_milli, threshold_milli);
+        unlock.currency = Some("JPY".into());
+        unlock
+    }
+
+    #[test]
+    fn amount_threshold_matches_engine_unlock() {
+        for t in [16777216.006f64, 16780000.78, 1.1, 500.0] {
+            // 寄付額がしきい値と同じ。Counters と同じ丸めでミリ値にする。
+            let value = (t * 1000.0).round() as i64;
+            assert!(reaches(value, t), "{t}: エンジンは解除する");
+            let threshold = threshold_to_milli(t);
+            assert!(reaches(threshold, t) && !reaches(threshold - 1, t), "{t}: 最小の解除値");
+            let v = amount_unlock(value, threshold).relay_json();
+            assert!(v["value"].as_i64().unwrap() >= v["threshold"].as_i64().unwrap(), "{t}: {v}");
+            assert_eq!(v["threshold"], threshold);
+        }
+    }
+
+    #[test]
+    fn relay_value_is_clamped_to_threshold() {
+        let v = amount_unlock(100, 200).relay_json();
+        assert_eq!((v["value"].clone(), v["threshold"].clone()), (200.into(), 200.into()));
+    }
+}
+
 impl fmt::Debug for UnlockSubject {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("UnlockSubject")
@@ -82,6 +213,28 @@ pub struct UnlockRecord {
 
 fn zero(value: &u64) -> bool {
     *value == 0
+}
+
+/// エンジンの解除判定。配信するしきい値もこの判定から求め、両者がずれないようにする。
+fn reaches(value_milli: i64, threshold: f64) -> bool {
+    value_milli as f64 / 1000.0 >= threshold
+}
+
+/// `reaches` が真になる最小のミリ値(0 以上)。判定は値に対して単調なので二分探索で求める。
+/// 到達できない(NaN・i64 を超える)しきい値は `i64::MAX` を返す(その場合は解除されない)。
+fn threshold_to_milli(threshold: f64) -> i64 {
+    if reaches(0, threshold) {
+        return 0;
+    }
+    if !reaches(i64::MAX, threshold) {
+        return i64::MAX;
+    }
+    let (mut lo, mut hi) = (0i64, i64::MAX); // reaches(lo) は偽、reaches(hi) は真
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if reaches(mid, threshold) { hi = mid } else { lo = mid }
+    }
+    hi
 }
 
 fn milli(count: u64) -> i64 {
@@ -721,7 +874,7 @@ impl State {
                 } else {
                     self.streamer_value(condition)
                 };
-                if value as f64 / 1000.0 >= condition.threshold {
+                if reaches(value, condition.threshold) {
                     candidates.insert(
                         key.clone(),
                         self.unlock(
@@ -900,7 +1053,7 @@ impl State {
             icon: achievement.icon.clone(),
             subject,
             value_milli,
-            threshold_milli: (threshold * 1000.0).round() as i64,
+            threshold_milli: threshold_to_milli(threshold),
             currency,
             window_key: window_key.to_owned(),
             unlocked_at_ms: self.now_ms,

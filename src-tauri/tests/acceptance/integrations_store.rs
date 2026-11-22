@@ -48,7 +48,7 @@ fn sample_file() -> IntegrationsFile {
             name: "配信通知".into(),
             format: WebhookFormat::Discord,
             enabled: true,
-            triggers: WebhookTriggers { donation: true, membership: false, keyword: true },
+            triggers: WebhookTriggers { donation: true, membership: false, keyword: true, achievement: false },
             keywords: vec!["初見".into(), "Hello".into()],
             paused: None,
         }],
@@ -83,7 +83,7 @@ fn save_then_load_roundtrips_all_fields() {
         name: "汎用".into(),
         format: WebhookFormat::Generic,
         enabled: false,
-        triggers: WebhookTriggers { donation: false, membership: true, keyword: false },
+        triggers: WebhookTriggers { donation: false, membership: true, keyword: false, achievement: false },
         keywords: vec![],
         paused: Some(integrations::Paused { reason: "HTTP 404".into(), at_ms: 1234 }),
     });

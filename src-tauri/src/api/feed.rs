@@ -1,14 +1,22 @@
 //! API 専用のメモリ履歴と、接続ごとの bounded queue。
 use super::dto::api_comment_json;
-use crate::model::{Author, ChatMessage, ModerationEvent};
+use crate::{
+    bus::{relay::AchievementRelay, Bus, SequencedAchievement, SequencedChat},
+    model::{Author, ChatMessage, ModerationEvent},
+};
 use serde_json::Value;
 use std::{
     collections::VecDeque,
     sync::{Arc, Mutex, Weak},
 };
-use tokio::time::{Duration, Instant};
+use tokio::{
+    sync::broadcast,
+    time::{Duration, Instant},
+};
 
 const RECENT_DELETION_LIMIT: usize = 4096;
+// 1 tick で取り込む実績の上限。残りは次 tick に回し、chat と active ロックを占有させない。
+const MAX_ACHIEVEMENTS_PER_TICK: usize = 256;
 const RECENT_DELETION_TTL: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
@@ -48,6 +56,8 @@ pub(super) struct Entry {
 pub(super) enum Item {
     Chat(Arc<Entry>),
     Moderation(ModerationEvent),
+    /// 実績解除(K12 の JSON)。履歴・再開カーソルには載せない。
+    Achievement(Value),
 }
 // Kept in arrival (bus) order so SSE can tell which chats follow a clear.
 #[derive(Default)]
@@ -230,6 +240,21 @@ impl ApiFeed {
             }
         }
     }
+    /// 実績解除を接続中の SSE へ流す。履歴には残さない(`id:` なし、再開不可)。
+    pub fn push_achievement(&self, unlock: &crate::achievements::engine::AchievementUnlocked) {
+        let mut state = self.0.lock().unwrap();
+        if !state.enabled {
+            return;
+        }
+        let value = unlock.relay_json();
+        state.clients.retain(|client| {
+            let Some(client) = client.upgrade() else {
+                return false;
+            };
+            client.lock().unwrap().push(Item::Achievement(value.clone()));
+            true
+        });
+    }
     pub(super) fn head(&self) -> Option<u64> {
         self.0.lock().unwrap().history.back().map(|e| e.seq)
     }
@@ -261,12 +286,31 @@ impl ApiFeed {
     }
 }
 
+struct FeedSubscription {
+    chat: broadcast::Receiver<SequencedChat>,
+    moderation: broadcast::Receiver<ModerationEvent>,
+    achievement: broadcast::Receiver<SequencedAchievement>,
+    relay: AchievementRelay,
+}
+
+impl FeedSubscription {
+    fn new(bus: &Bus) -> Self {
+        let (chat, baseline) = bus.subscribe_chat_with_baseline();
+        Self {
+            chat,
+            moderation: bus.subscribe_moderation(),
+            achievement: bus.subscribe_achievements(),
+            relay: AchievementRelay::new(baseline),
+        }
+    }
+}
+
 impl ApiFeed {
     /// Bind once at setup. Gate transitions synchronously drop subscriptions and
     /// clear history; no receiver or retained comments exist while disabled.
     pub(crate) fn bind(
         &self,
-        bus: &crate::bus::Bus,
+        bus: &Bus,
         gate: &super::ApiGate,
         shutdown: tokio_util::sync::CancellationToken,
     ) {
@@ -279,7 +323,7 @@ impl ApiFeed {
         gate.on_transition(move |enabled| {
             let mut receivers = receivers.lock().unwrap();
             feed.set_enabled(enabled);
-            *receivers = enabled.then(|| (bus.subscribe(), bus.subscribe_moderation()));
+            *receivers = enabled.then(|| FeedSubscription::new(&bus));
             wake.notify_one();
         });
         let feed = self.clone();
@@ -295,8 +339,8 @@ impl ApiFeed {
                     _ = tick.tick(), if enabled => {}
                 }
                 let mut active = active.lock().unwrap();
-                if let Some((chat, moderation)) = active.as_mut() {
-                    feed.drain_bus(chat, moderation);
+                if let Some(subscription) = active.as_mut() {
+                    feed.drain_tick(subscription, || {});
                 }
             }
             *active.lock().unwrap() = None;
@@ -304,11 +348,28 @@ impl ApiFeed {
         });
     }
     // One feed tick, also driven explicitly by tests to fix cross-tick ordering.
+    fn drain_tick(&self, subscription: &mut FeedSubscription, after_chat_boundary: impl FnOnce()) {
+        let FeedSubscription {
+            chat,
+            moderation,
+            achievement,
+            relay,
+        } = subscription;
+        if let Some(seq) = self.drain_bus(chat, moderation, after_chat_boundary) {
+            relay.processed_chat(seq);
+        }
+        if chat.is_closed() && chat.is_empty() {
+            relay.close_chat();
+        }
+        self.drain_achievements(achievement, relay);
+    }
+
     fn drain_bus(
         &self,
-        chat: &mut tokio::sync::broadcast::Receiver<ChatMessage>,
-        moderation: &mut tokio::sync::broadcast::Receiver<ModerationEvent>,
-    ) {
+        chat: &mut broadcast::Receiver<SequencedChat>,
+        moderation: &mut broadcast::Receiver<ModerationEvent>,
+        after_chat_boundary: impl FnOnce(),
+    ) -> Option<u64> {
         use tokio::sync::broadcast::error::TryRecvError;
         // Expire even on idle ticks so stale conditions release their allocations.
         self.0.lock().unwrap().expire_deletions();
@@ -327,10 +388,13 @@ impl ApiFeed {
             }
         }
         let mut remaining = chat.len();
+        after_chat_boundary();
+        let mut processed = None;
         while remaining > 0 {
             match chat.try_recv() {
-                Ok(msg) => {
-                    self.push_chat(&msg);
+                Ok(chat) => {
+                    self.push_chat(&chat.message);
+                    processed = Some(chat.seq);
                     remaining -= 1;
                 }
                 Err(TryRecvError::Lagged(n)) => {
@@ -345,6 +409,35 @@ impl ApiFeed {
         }
         for event in events {
             self.push_moderation(&event);
+        }
+        processed
+    }
+    fn drain_achievements(
+        &self,
+        achievement: &mut broadcast::Receiver<SequencedAchievement>,
+        relay: &mut AchievementRelay,
+    ) {
+        let mut ready = Vec::new();
+        let (dropped, _) = relay.drain(
+            None,
+            Some(achievement),
+            MAX_ACHIEVEMENTS_PER_TICK,
+            |event| {
+                ready.push(event.unlock);
+            },
+        );
+        if dropped > 0 {
+            self.record_achievement_dropped(dropped);
+        }
+        for unlock in ready {
+            self.push_achievement(&unlock);
+        }
+    }
+    // 履歴の連番は進めず、接続中の SSE の lagged にだけ数える。
+    fn record_achievement_dropped(&self, count: u64) {
+        let state = self.0.lock().unwrap();
+        for client in state.clients.iter().filter_map(Weak::upgrade) {
+            client.lock().unwrap().dropped += count;
         }
     }
     fn record_dropped(&self, count: u64, moderation_lost: bool) {
@@ -395,16 +488,16 @@ mod tests {
         // No background tick: each drain completes before the next publish.
         if reverse {
             bus.publish_moderation(event);
-            feed.drain_bus(&mut chat, &mut moderation);
+            feed.drain_bus(&mut chat, &mut moderation, || {});
             assert_eq!(pending.lock().unwrap().moderations(), 1);
             bus.publish(message("target"));
         } else {
             bus.publish(message("target"));
-            feed.drain_bus(&mut chat, &mut moderation);
+            feed.drain_bus(&mut chat, &mut moderation, || {});
             assert_eq!(feed.snapshot().entries.len(), 1);
             bus.publish_moderation(event);
         }
-        feed.drain_bus(&mut chat, &mut moderation);
+        feed.drain_bus(&mut chat, &mut moderation, || {});
         assert!(feed.snapshot().entries.is_empty());
         if reverse {
             assert!(
@@ -414,7 +507,7 @@ mod tests {
         }
         // Same-ID combo updates arriving in a later tick are also suppressed.
         bus.publish(message("target"));
-        feed.drain_bus(&mut chat, &mut moderation);
+        feed.drain_bus(&mut chat, &mut moderation, || {});
         assert!(feed.snapshot().entries.is_empty());
     }
     #[test]
@@ -469,12 +562,12 @@ mod tests {
             feed.set_enabled(true);
             let (_, pending) = feed.subscribe().unwrap();
             bus.publish(message("before"));
-            feed.drain_bus(&mut chat, &mut moderation);
+            feed.drain_bus(&mut chat, &mut moderation, || {});
             bus.publish_moderation(event);
-            feed.drain_bus(&mut chat, &mut moderation);
+            feed.drain_bus(&mut chat, &mut moderation, || {});
             assert!(feed.snapshot().entries.is_empty());
             bus.publish(message("after"));
-            feed.drain_bus(&mut chat, &mut moderation);
+            feed.drain_bus(&mut chat, &mut moderation, || {});
             assert_eq!(feed.snapshot().entries.len(), 1);
             assert_eq!(pending.lock().unwrap().chats(), 2);
         }
@@ -564,12 +657,12 @@ mod tests {
         feed.set_enabled(true);
         let (_, pending) = feed.subscribe().unwrap();
         bus.publish_moderation(deleted("target"));
-        feed.drain_bus(&mut chat, &mut moderation);
+        feed.drain_bus(&mut chat, &mut moderation, || {});
         tokio::time::advance(RECENT_DELETION_TTL).await;
-        feed.drain_bus(&mut chat, &mut moderation);
+        feed.drain_bus(&mut chat, &mut moderation, || {});
         assert!(feed.0.lock().unwrap().recent_deletions.is_empty());
         bus.publish(message("target"));
-        feed.drain_bus(&mut chat, &mut moderation);
+        feed.drain_bus(&mut chat, &mut moderation, || {});
         assert_eq!(feed.snapshot().entries.len(), 1);
         assert_eq!(pending.lock().unwrap().chats(), 1);
     }
@@ -678,6 +771,300 @@ mod tests {
         );
         feed.record_dropped(1, true);
         assert!(feed.snapshot().entries.is_empty());
+    }
+    fn unlock(id: &str) -> crate::achievements::engine::AchievementUnlocked {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "achievementId": "a", "name": "n", "description": "", "tier": "bronze",
+            "icon": "", "subject": {"kind": "streamer"}, "valueMilli": 1000,
+            "thresholdMilli": 1000, "currency": null, "windowKey": "*", "unlockedAtMs": 1
+        }))
+        .unwrap()
+    }
+    #[tokio::test(start_paused = true)]
+    async fn achievement_published_after_chat_boundary_waits_for_next_tick() {
+        use axum::{
+            extract::{Extension, Query, State},
+            http::HeaderMap,
+        };
+        use futures_util::FutureExt;
+        use http_body_util::BodyExt;
+        let bus = bus();
+        let mut subscription = FeedSubscription::new(&bus);
+        let feed = ApiFeed::new(10);
+        feed.set_enabled(true);
+        let stop = tokio_util::sync::CancellationToken::new();
+        let deps = super::super::ApiDeps::new(super::super::ApiGate::closed(), stop.clone())
+            .with_feed(feed.clone());
+        let mut body = super::super::events::events(
+            State(deps),
+            HeaderMap::new(),
+            Extension(stop),
+            Ok(Query(Default::default())),
+        )
+        .await
+        .into_body();
+
+        feed.drain_tick(&mut subscription, || {
+            let seq = bus.publish_sequenced(message("cause"));
+            bus.publish_achievement(unlock("late"), seq);
+        });
+        let tick = Duration::from_millis(16);
+        assert!(body.frame().now_or_never().is_none());
+        tokio::time::advance(tick).await;
+        assert!(body.frame().now_or_never().is_none(), "first SSE flush");
+
+        feed.drain_tick(&mut subscription, || {});
+        tokio::time::advance(tick).await;
+        let chat = body.frame().await.unwrap().unwrap().into_data().unwrap();
+        let achievement = body.frame().await.unwrap().unwrap().into_data().unwrap();
+        assert!(chat.starts_with(b"event: chat\n"));
+        assert!(std::str::from_utf8(&chat)
+            .unwrap()
+            .contains(r#""id":"cause""#));
+        assert!(achievement.starts_with(b"event: achievement\n"));
+    }
+
+    #[test]
+    fn stats_retry_follows_its_cause_chat() {
+        let snapshot = Default::default();
+        assert_achievement_retry_order(|| crate::AchievementEvent::Stats(&snapshot));
+    }
+
+    #[test]
+    fn live_event_retry_follows_its_cause_chat() {
+        let event = crate::model::LiveEvent::Ended {
+            platform: Platform::Youtube,
+            channel_identifier: "chan".into(),
+        };
+        assert_achievement_retry_order(|| crate::AchievementEvent::Live(&event));
+    }
+
+    fn assert_achievement_retry_order<'a>(retry_event: impl Fn() -> crate::AchievementEvent<'a>) {
+        use crate::achievements::{
+            engine::AchievementEngine,
+            model::{Condition, CurrencyMode, Metric, SubjectKind, Tier, Window},
+            store::{AchievementDefs, FsIo, StoreIo},
+        };
+        use crate::{publish_achievement_event, AchievementEvent};
+        use std::{
+            cell::RefCell,
+            io,
+            path::Path,
+            sync::{
+                atomic::{AtomicBool, Ordering},
+                TryLockError,
+            },
+        };
+
+        struct FailFirstSave(AtomicBool);
+
+        impl StoreIo for FailFirstSave {
+            fn write_atomic(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
+                if self.0.swap(false, Ordering::Relaxed) {
+                    return Err(io::Error::other("実績の初回保存に失敗"));
+                }
+                FsIo.write_atomic(path, bytes)
+            }
+
+            fn create_backup(&self, src: &Path, dst: &Path) -> io::Result<()> {
+                FsIo.create_backup(src, dst)
+            }
+        }
+
+        let mut defs = AchievementDefs::default();
+        defs.enabled = true;
+        defs.achievements.truncate(1);
+        let achievement = &mut defs.achievements[0];
+        achievement.enabled = true;
+        achievement.subject = SubjectKind::Viewer;
+        achievement.tier = Tier::Bronze;
+        achievement.condition = Some(Condition {
+            window: Window::Lifetime,
+            metric: Metric::SuperChatCount,
+            threshold: 1.0,
+            currency: CurrencyMode::None,
+            platforms: vec![],
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Mutex::new(Some(Arc::new(AchievementEngine::open_with(
+            dir.path(),
+            defs,
+            1,
+            Arc::new(FailFirstSave(AtomicBool::new(true))),
+        ))));
+        let mut cause = message("cause");
+        cause.platform = Platform::Youtube;
+        cause.kind = crate::model::MessageKind::SuperChat;
+
+        let bus = bus();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (mut chat, baseline) = bus.subscribe_chat_with_baseline();
+        let mut achievements = bus.subscribe_achievements();
+        let mut webhook = AchievementRelay::new(baseline);
+        let feed = ApiFeed::new(10);
+        feed.set_enabled(true);
+        let mut subscription = FeedSubscription::new(&bus);
+        let (_, client) = feed.subscribe().unwrap();
+        let webhook_order = RefCell::new(Vec::new());
+        let mut sse_order = Vec::new();
+        let mut drain = || {
+            crate::webhook::runtime::drain_relay_round(
+                (None, None),
+                &mut webhook,
+                Some(&mut chat),
+                Some(&mut achievements),
+                256,
+                |_| webhook_order.borrow_mut().push("chat"),
+                |_| webhook_order.borrow_mut().push("achievement"),
+            );
+            feed.drain_tick(&mut subscription, || {});
+            sse_order.extend(client.lock().unwrap().items.drain(..).map(|item| match item {
+                Item::Chat(_) => "chat",
+                Item::Achievement(_) => "achievement",
+                _ => panic!("予期しない SSE イベント"),
+            }));
+        };
+        let retry = || {
+            publish_achievement_event(&engine, &bus, &cancel, retry_event(), |_| unreachable!());
+        };
+        let mut retry_waits = false;
+        publish_achievement_event(&engine, &bus, &cancel, AchievementEvent::Chat(cause), |msg| {
+            // observe 直後に再試行を試みる。待たずに入れる場合は chat 発行前に下流まで処理する。
+            match engine.try_lock() {
+                Ok(guard) => {
+                    drop(guard);
+                    retry();
+                    drain();
+                }
+                Err(TryLockError::WouldBlock) => retry_waits = true,
+                Err(error) => panic!("{error}"),
+            }
+            bus.publish_sequenced(msg)
+        });
+        if retry_waits {
+            retry();
+        }
+        drain();
+        let expected = vec!["chat", "achievement"];
+        assert_eq!(
+            (webhook_order.into_inner(), sse_order),
+            (expected.clone(), expected)
+        );
+    }
+
+    #[test]
+    fn achievement_pending_overflow_is_reported_to_sse_without_advancing_history() {
+        let bus = bus();
+        let mut subscription = FeedSubscription::new(&bus);
+        let feed = ApiFeed::new(10);
+        feed.set_enabled(true);
+        let (_, client) = feed.subscribe().unwrap();
+
+        feed.drain_tick(&mut subscription, || {
+            let seq = bus.publish_sequenced(message("cause"));
+            for i in 0..=256 {
+                let mut event = unlock(&i.to_string());
+                event.name = i.to_string();
+                bus.publish_achievement(event, seq);
+            }
+        });
+        // Consume the rest of the achievements while chat remains frozen.
+        feed.drain_achievements(&mut subscription.achievement, &mut subscription.relay);
+        {
+            let client = client.lock().unwrap();
+            assert_eq!(client.dropped, 1);
+            assert!(client.items.is_empty());
+        }
+        assert_eq!(feed.snapshot().latest_seq, 0);
+
+        feed.drain_tick(&mut subscription, || {});
+        let client = client.lock().unwrap();
+        assert_eq!(client.items.len(), 256);
+        // The pending queue dropped achievement 0. The SSE queue then dropped
+        // the oldest item (the chat) when all 256 remaining unlocks were queued.
+        assert_eq!(client.dropped, 2);
+        assert!(
+            matches!(client.items.front(), Some(Item::Achievement(value)) if value["name"] == "1")
+        );
+    }
+    #[test]
+    fn achievement_bus_lag_is_added_to_client_dropped() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(256);
+        let feed = ApiFeed::new(10);
+        feed.set_enabled(true);
+        let (_, pending) = feed.subscribe().unwrap();
+        let mut relay = AchievementRelay::default();
+        for i in 0..1025 {
+            tx.send(SequencedAchievement {
+                after_seq: 0,
+                unlock: unlock(&i.to_string()),
+            })
+            .unwrap();
+        }
+        feed.drain_achievements(&mut rx, &mut relay);
+        let p = pending.lock().unwrap();
+        assert_eq!(p.dropped, 769, "bus 側の欠落 1025 - 256 件");
+        assert_eq!(p.items.len(), 255, "Lagged も上限 256 の 1 回に数える");
+        assert_eq!(rx.len(), 1);
+    }
+    #[test]
+    fn achievement_lagged_counts_toward_tick_cap() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(MAX_ACHIEVEMENTS_PER_TICK);
+        let feed = ApiFeed::new(10);
+        feed.set_enabled(true);
+        let mut relay = AchievementRelay::default();
+        for i in 0..(MAX_ACHIEVEMENTS_PER_TICK + 5) {
+            tx.send(SequencedAchievement {
+                after_seq: 0,
+                unlock: unlock(&i.to_string()),
+            })
+            .unwrap();
+        }
+        feed.drain_achievements(&mut rx, &mut relay);
+        assert_eq!(rx.len(), 1, "Lagged 1 回 + 受信 255 件で上限に達し、残りは次 tick");
+    }
+    #[test]
+    fn achievement_drain_is_capped_per_tick() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(1024);
+        let feed = ApiFeed::new(10);
+        feed.set_enabled(true);
+        let mut relay = AchievementRelay::default();
+        for i in 0..(MAX_ACHIEVEMENTS_PER_TICK + 44) {
+            tx.send(SequencedAchievement {
+                after_seq: 0,
+                unlock: unlock(&i.to_string()),
+            })
+            .unwrap();
+        }
+        feed.drain_achievements(&mut rx, &mut relay);
+        assert_eq!(rx.len(), 44, "上限を超えた分は次 tick に残る(chat を飢えさせない)");
+        feed.drain_achievements(&mut rx, &mut relay);
+        assert_eq!(rx.len(), 0);
+    }
+    #[tokio::test]
+    async fn bus_achievement_reaches_sse_pending_through_bind() {
+        let (stats, _) = tokio::sync::watch::channel(Default::default());
+        let (timer, _) = tokio::sync::watch::channel(Default::default());
+        let bus = crate::bus::Bus::new(1234, stats, timer);
+        let feed = ApiFeed::new(10);
+        let gate = super::super::ApiGate::closed();
+        let stop = tokio_util::sync::CancellationToken::new();
+        feed.bind(&bus, &gate, stop.clone());
+        gate.open("t");
+        let (_, pending) = feed.subscribe().unwrap();
+        bus.publish_achievement(unlock("x"), bus.latest_chat_seq());
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while pending.lock().unwrap().items.is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            pending.lock().unwrap().items.front(),
+            Some(Item::Achievement(v)) if v["achievementId"] == "a"
+        ));
+        stop.cancel();
     }
     #[tokio::test]
     async fn gate_transitions_drop_bus_subscriptions_and_clear_history_synchronously() {

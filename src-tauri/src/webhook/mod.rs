@@ -15,6 +15,7 @@ pub enum Trigger {
     Donation,
     Membership,
     Keyword,
+    Achievement,
     Test,
 }
 #[derive(Clone, Debug)]
