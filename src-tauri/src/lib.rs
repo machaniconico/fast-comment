@@ -428,6 +428,21 @@ impl AppState {
         );
     }
 
+    /// 定義の保存・再読込・無効化で出た解除を流す。原因の chat が無いので、on_stats と同じく
+    /// その時点の最新の chat 番号の後に並べる。
+    fn broadcast_achievement_unlocks(
+        &self,
+        unlocks: Vec<crate::achievements::engine::AchievementUnlocked>,
+    ) {
+        if unlocks.is_empty() {
+            return;
+        }
+        let after_seq = self.bus.latest_chat_seq();
+        for unlock in unlocks {
+            self.bus.publish_achievement(unlock, after_seq);
+        }
+    }
+
     fn flush_achievements(&self) {
         let engine = self.lock_achievement_engine();
         if let Some(engine) = engine.as_deref() {
