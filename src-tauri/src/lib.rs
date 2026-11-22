@@ -3005,7 +3005,11 @@ fn spawn_achievement_tts_forwarder(
     });
 }
 
+/// Webhook forwarder の 1 ラウンドで chat・実績それぞれに処理する上限。
+const WEBHOOK_RELAY_ROUND_LIMIT: usize = 256;
+
 fn spawn_webhook_forwarder(app: AppHandle, cancel: CancellationToken) {
+    use crate::webhook::runtime::{drain_relay_round, sync_subscription, First};
     tauri::async_runtime::spawn(async move {
         let (runtime, bus) = {
             let state = app.state::<AppState>();
@@ -3014,50 +3018,56 @@ fn spawn_webhook_forwarder(app: AppHandle, cancel: CancellationToken) {
         runtime.reload().await;
         let mut rx = None;
         let mut achievement_rx = None;
+        let mut achievement_closed = false;
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut last = runtime.status();
-        let mut lagged = 0u64;
+        let mut chat_lagged = 0u64;
+        let mut achievement_lagged = 0u64;
         loop {
-            if runtime.has_active_webhooks() {
-                if rx.is_none() {
-                    rx = Some(bus.subscribe());
-                }
-                if achievement_rx.is_none() {
-                    achievement_rx = Some(bus.achievement_sender().subscribe());
-                }
-            } else {
-                rx = None;
-                achievement_rx = None;
-            }
-            tokio::select! {
+            sync_subscription(&mut rx, runtime.has_active_webhooks(), false, || bus.subscribe());
+            sync_subscription(
+                &mut achievement_rx,
+                runtime.has_achievement_webhooks(),
+                achievement_closed,
+                || bus.achievement_sender().subscribe(),
+            );
+            // chat を先に選ぶ(解除はその原因の chat より後に出す)。実績はラウンドの上限で区切る。
+            let first = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => { runtime.shutdown(); break; },
-                _ = runtime.changed() => {},
+                _ = runtime.changed() => continue,
                 _ = tick.tick() => {
                     let status = runtime.status();
                     if status != last { let _ = app.emit("webhook-status", &status); last = status; }
+                    continue;
                 },
-                unlock = async { match achievement_rx.as_mut() { Some(rx) => rx.recv().await, None => std::future::pending().await } } => {
-                    if matches!(unlock, Err(broadcast::error::RecvError::Closed)) {
-                        achievement_rx = None;
-                    }
-                    let n = runtime.relay_achievement(unlock);
-                    if n > 0 {
-                        lagged = lagged.saturating_add(n);
-                        tracing::warn!(lagged, "Webhook の実績通知を取りこぼしました");
-                    }
-                }
-                incoming = async { match rx.as_mut() { Some(rx) => rx.recv().await, None => std::future::pending().await } } => {
-                    match incoming {
-                        Ok(msg) => runtime.handle_message(&msg),
-                        Err(broadcast::error::RecvError::Lagged(n)) => {
-                            lagged = lagged.saturating_add(n);
-                            tracing::warn!(lagged, "Webhook Bus の遅延分を破棄しました");
-                        },
-                        Err(broadcast::error::RecvError::Closed) => { runtime.shutdown(); break; },
-                    }
-                }
+                incoming = async { match rx.as_mut() { Some(rx) => rx.recv().await, None => std::future::pending().await } } => First::Chat(incoming.into()),
+                unlock = async { match achievement_rx.as_mut() { Some(rx) => rx.recv().await, None => std::future::pending().await } } => First::Achievement(unlock.into()),
+            };
+            let round = drain_relay_round(
+                first,
+                rx.as_mut(),
+                achievement_rx.as_mut(),
+                WEBHOOK_RELAY_ROUND_LIMIT,
+                |msg| runtime.handle_message(&msg),
+                |unlock| runtime.handle_achievement(&unlock),
+            );
+            if round.chat_lagged > 0 {
+                chat_lagged = chat_lagged.saturating_add(round.chat_lagged);
+                tracing::warn!(lagged = chat_lagged, "Webhook Bus の遅延分を破棄しました");
+            }
+            if round.achievement_lagged > 0 {
+                achievement_lagged = achievement_lagged.saturating_add(round.achievement_lagged);
+                tracing::warn!(lagged = achievement_lagged, "Webhook の実績通知を取りこぼしました");
+            }
+            if round.achievement_closed {
+                achievement_closed = true;
+                achievement_rx = None;
+            }
+            if round.chat_closed {
+                runtime.shutdown();
+                break;
             }
         }
     });

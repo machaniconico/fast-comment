@@ -386,7 +386,11 @@ impl ApiFeed {
                     self.push_achievement(&unlock);
                     taken += 1;
                 }
-                Err(TryRecvError::Lagged(n)) => self.record_achievement_dropped(n),
+                // Lagged も 1 回と数える(続けて返っても上限で tick を抜ける)。
+                Err(TryRecvError::Lagged(n)) => {
+                    self.record_achievement_dropped(n);
+                    taken += 1;
+                }
                 Err(_) => break,
             }
         }
@@ -750,7 +754,19 @@ mod tests {
         feed.drain_achievements(&mut rx);
         let p = pending.lock().unwrap();
         assert_eq!(p.dropped, 769, "bus 側の欠落 1025 - 256 件");
-        assert_eq!(p.items.len(), 256);
+        assert_eq!(p.items.len(), 255, "Lagged も上限 256 の 1 回に数える");
+        assert_eq!(rx.len(), 1);
+    }
+    #[test]
+    fn achievement_lagged_counts_toward_tick_cap() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(MAX_ACHIEVEMENTS_PER_TICK);
+        let feed = ApiFeed::new(10);
+        feed.set_enabled(true);
+        for i in 0..(MAX_ACHIEVEMENTS_PER_TICK + 5) {
+            tx.send(unlock(&i.to_string())).unwrap();
+        }
+        feed.drain_achievements(&mut rx);
+        assert_eq!(rx.len(), 1, "Lagged 1 回 + 受信 255 件で上限に達し、残りは次 tick");
     }
     #[test]
     fn achievement_drain_is_capped_per_tick() {

@@ -77,13 +77,16 @@ impl AchievementUnlocked {
         let (value, threshold, unit) = if self.currency.is_some() {
             (self.value_milli, self.threshold_milli, "milli")
         } else {
-            // しきい値は切り上げる(1.5 回は 2 回で解除されるため)。値はミリ単位でも回数の整数倍。
+            // threshold_milli は解除される最小のミリ値なので、それ以上になる最小の回数へ切り上げる
+            // (1.5 回は 2 回で解除される)。値はミリ単位でも回数の整数倍(上限で飽和)。
             (
                 self.value_milli / 1000,
                 (self.threshold_milli / 1000 + i64::from(self.threshold_milli % 1000 > 0)).max(1),
                 "count",
             )
         };
+        // 解除通知では値がしきい値を下回らない(回数の飽和などで下回る分を寄せる)。
+        let value = value.max(threshold);
         json!({
             "type": "achievement",
             "achievementId": self.achievement_id,
@@ -125,7 +128,7 @@ mod relay_json_tests {
     fn count_threshold_does_not_overflow_at_i64_max() {
         let v = count_unlock(i64::MAX, i64::MAX).relay_json();
         assert_eq!(v["threshold"], i64::MAX / 1000 + 1);
-        assert_eq!(v["value"], i64::MAX / 1000);
+        assert_eq!(v["value"], i64::MAX / 1000 + 1, "飽和した値もしきい値へ寄せる");
     }
 
     #[test]
@@ -133,10 +136,58 @@ mod relay_json_tests {
         assert_eq!(threshold_to_milli(0.0004), 1);
         assert_eq!(threshold_to_milli(1.1), 1100);
         assert_eq!(threshold_to_milli(2.3), 2300);
-        assert_eq!(threshold_to_milli(9223372036854776.0), i64::MAX);
         for (t, need) in [(0.0004, 1), (1.0004, 2), (2.5, 3), (0.4, 1), (2.0, 2), (1.1, 2)] {
             assert_eq!(count_unlock(need * 1000, threshold_to_milli(t)).relay_json()["threshold"], need, "{t}");
         }
+    }
+
+    /// エンジンが解除する最小の回数(`milli` と `reaches` を総当たりせず、境界の前後で確かめる)。
+    fn assert_count_matches_engine(t: f64, need: u64) {
+        assert!(reaches(milli(need), t), "{t}: {need} 回で解除される");
+        assert!(!reaches(milli(need - 1), t), "{t}: {} 回では解除されない", need - 1);
+        let v = count_unlock(milli(need), threshold_to_milli(t)).relay_json();
+        assert_eq!(v["threshold"], need, "{t}");
+        assert!(v["value"].as_i64() >= v["threshold"].as_i64(), "{t}: {v}");
+    }
+
+    #[test]
+    fn count_threshold_matches_engine_unlock() {
+        assert_count_matches_engine(1.0000000001, 2);
+        assert_count_matches_engine(2.0000000001, 3);
+        assert_count_matches_engine(1.1, 2);
+        assert_count_matches_engine(2.0, 2);
+    }
+
+    #[test]
+    fn huge_gift_count_value_is_not_below_threshold() {
+        // giftCount の SUBGIFT 個数がしきい値と同じ 9223372036854776。ミリ値は i64::MAX で飽和する。
+        assert_count_matches_engine(9223372036854776.0, 9223372036854776);
+    }
+
+    fn amount_unlock(value_milli: i64, threshold_milli: i64) -> AchievementUnlocked {
+        let mut unlock = count_unlock(value_milli, threshold_milli);
+        unlock.currency = Some("JPY".into());
+        unlock
+    }
+
+    #[test]
+    fn amount_threshold_matches_engine_unlock() {
+        for t in [16777216.006f64, 16780000.78, 1.1, 500.0] {
+            // 寄付額がしきい値と同じ。Counters と同じ丸めでミリ値にする。
+            let value = (t * 1000.0).round() as i64;
+            assert!(reaches(value, t), "{t}: エンジンは解除する");
+            let threshold = threshold_to_milli(t);
+            assert!(reaches(threshold, t) && !reaches(threshold - 1, t), "{t}: 最小の解除値");
+            let v = amount_unlock(value, threshold).relay_json();
+            assert!(v["value"].as_i64().unwrap() >= v["threshold"].as_i64().unwrap(), "{t}: {v}");
+            assert_eq!(v["threshold"], threshold);
+        }
+    }
+
+    #[test]
+    fn relay_value_is_clamped_to_threshold() {
+        let v = amount_unlock(100, 200).relay_json();
+        assert_eq!((v["value"].clone(), v["threshold"].clone()), (200.into(), 200.into()));
     }
 }
 
@@ -164,12 +215,26 @@ fn zero(value: &u64) -> bool {
     *value == 0
 }
 
-/// 解除に要る最小のミリ値。浮動小数の誤差(1.1 * 1000 = 1100.0000000000002)は丸め、
-/// 本当に端数がある時(0.0004 → 0.4)は切り上げて、回数系の必要回数を過小にしない。
+/// エンジンの解除判定。配信するしきい値もこの判定から求め、両者がずれないようにする。
+fn reaches(value_milli: i64, threshold: f64) -> bool {
+    value_milli as f64 / 1000.0 >= threshold
+}
+
+/// `reaches` が真になる最小のミリ値(0 以上)。判定は値に対して単調なので二分探索で求める。
+/// 到達できない(NaN・i64 を超える)しきい値は `i64::MAX` を返す(その場合は解除されない)。
 fn threshold_to_milli(threshold: f64) -> i64 {
-    let scaled = threshold * 1000.0;
-    let nearest = scaled.round();
-    if (scaled - nearest).abs() < 1e-6 { nearest as i64 } else { scaled.ceil() as i64 }
+    if reaches(0, threshold) {
+        return 0;
+    }
+    if !reaches(i64::MAX, threshold) {
+        return i64::MAX;
+    }
+    let (mut lo, mut hi) = (0i64, i64::MAX); // reaches(lo) は偽、reaches(hi) は真
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if reaches(mid, threshold) { hi = mid } else { lo = mid }
+    }
+    hi
 }
 
 fn milli(count: u64) -> i64 {
@@ -809,7 +874,7 @@ impl State {
                 } else {
                     self.streamer_value(condition)
                 };
-                if value as f64 / 1000.0 >= condition.threshold {
+                if reaches(value, condition.threshold) {
                     candidates.insert(
                         key.clone(),
                         self.unlock(
