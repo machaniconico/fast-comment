@@ -166,6 +166,7 @@ export interface WebhookTriggers {
   donation: boolean;
   membership: boolean;
   keyword: boolean;
+  achievement: boolean;
 }
 
 export interface WebhookPaused {

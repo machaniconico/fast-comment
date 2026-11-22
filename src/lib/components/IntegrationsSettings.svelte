@@ -127,7 +127,7 @@
   onDestroy(() => { destroyed = true; unlisten?.(); });
 
   function startAdd() {
-    editing = { name: '', format: 'discord', enabled: true, triggers: { donation: true, membership: true, keyword: false }, keywords: [] };
+    editing = { name: '', format: 'discord', enabled: true, triggers: { donation: true, membership: true, keyword: false, achievement: false }, keywords: [] };
     editingPreview = null; formUrl = ''; formKeywords = '';
   }
   function startEdit(h: WebhookListItem) {
@@ -190,6 +190,7 @@
     if (h.triggers.donation) names.push('投げ銭');
     if (h.triggers.membership) names.push('メンバー加入');
     if (h.triggers.keyword) names.push('キーワード一致');
+    if (h.triggers.achievement) names.push('実績の解除');
     return names.length ? names.join(' / ') : 'きっかけなし';
   }
   const keywordCount = $derived(splitKeywords(formKeywords).length);
@@ -292,6 +293,7 @@
         <label><input type="checkbox" bind:checked={editing.triggers.donation} disabled={hooksBusy} /> 投げ銭</label>
         <label><input type="checkbox" bind:checked={editing.triggers.membership} disabled={hooksBusy} /> メンバー加入</label>
         <label><input type="checkbox" bind:checked={editing.triggers.keyword} disabled={hooksBusy} /> キーワード一致</label>
+        <label><input type="checkbox" bind:checked={editing.triggers.achievement} disabled={hooksBusy} /> 実績の解除</label>
       </div>
       <label>キーワード(1 行 1 語)
         <textarea rows="4" bind:value={formKeywords} disabled={hooksBusy}></textarea>
