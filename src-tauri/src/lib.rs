@@ -110,7 +110,6 @@ pub struct AppState {
     // 定義の保存 IPC(DefsStore::commit)は PR3 で足す。それまでは読まない。
     #[allow(dead_code)]
     achievement_defs: DefsStore,
-    achievement_unlock_tx: broadcast::Sender<AchievementUnlocked>,
     chatlog: chatlog::ChatLog,
     /// stats 集約などへ設定変更を伝える watch 送信端。
     config_tx: watch::Sender<AppConfig>,
@@ -304,9 +303,9 @@ impl AppState {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn broadcast_achievement_unlocks(&self, unlocks: Vec<AchievementUnlocked>) {
+    fn broadcast_achievement_unlocks(&self, unlocks: Vec<AchievementUnlocked>, after_seq: u64) {
         for unlock in unlocks {
-            let _ = self.achievement_unlock_tx.send(unlock);
+            self.bus.publish_achievement(unlock, after_seq);
         }
     }
 
@@ -315,7 +314,9 @@ impl AppState {
         evaluate: impl FnOnce(&AchievementEngine) -> Vec<AchievementUnlocked>,
     ) {
         let unlocks = self.collect_achievements(evaluate);
-        self.broadcast_achievement_unlocks(unlocks);
+        if !unlocks.is_empty() {
+            self.broadcast_achievement_unlocks(unlocks, self.bus.latest_chat_seq());
+        }
     }
 
     /// 評価だけして解除を返す(発行は呼び出し側。chat の publish の後に流すため)。
@@ -2983,7 +2984,7 @@ async fn regenerate_webhook_signing_secret(
 /// `announce.tts` の実績解除だけを TTS キューへ入れる。視聴者の `tts_muted` は listeners で引く。
 /// 取りこぼし(Lagged)は件数だけ warn に出して続ける。
 fn spawn_achievement_tts_forwarder(
-    mut rx: broadcast::Receiver<AchievementUnlocked>,
+    mut rx: broadcast::Receiver<bus::SequencedAchievement>,
     app: AppHandle,
     cancel: CancellationToken,
 ) {
@@ -2995,7 +2996,7 @@ fn spawn_achievement_tts_forwarder(
                     Ok(unlock) => {
                         let state = app.state::<AppState>();
                         let defs = state.achievement_defs.current();
-                        let message = announce_message(&unlock, &defs, |platform, author_id| {
+                        let message = announce_message(&unlock.unlock, &defs, |platform, author_id| {
                             state
                                 .listeners
                                 .get(participant_platform(platform), author_id)
@@ -3019,6 +3020,7 @@ fn spawn_achievement_tts_forwarder(
 const WEBHOOK_RELAY_ROUND_LIMIT: usize = 256;
 
 fn spawn_webhook_forwarder(app: AppHandle, cancel: CancellationToken) {
+    use crate::bus::relay::AchievementRelay;
     use crate::webhook::runtime::{drain_relay_round, sync_subscription};
     tauri::async_runtime::spawn(async move {
         let (runtime, bus) = {
@@ -3028,27 +3030,29 @@ fn spawn_webhook_forwarder(app: AppHandle, cancel: CancellationToken) {
         runtime.reload().await;
         let mut rx = None;
         let mut achievement_rx = None;
+        let mut chat_closed = false;
         let mut achievement_closed = false;
-        let mut pending_achievement = None;
+        let mut relay = AchievementRelay::default();
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut last = runtime.status();
         let mut chat_lagged = 0u64;
         let mut achievement_lagged = 0u64;
         loop {
-            // 実績も chat と同じく有効な送り先があれば購読し(有効化直後の解除を落とさない)、
-            // 送るかどうかは送り先ごとに判定する。
+            // 実績も chat と同じく有効な送り先があれば購読し、送り先ごとに配信を判定する。
             let active = runtime.has_active_webhooks();
-            sync_subscription(&mut rx, active, false, || bus.subscribe());
-            sync_subscription(&mut achievement_rx, active, achievement_closed, || {
-                bus.achievement_sender().subscribe()
+            sync_subscription(&mut rx, active, chat_closed, || {
+                let (chat, baseline) = bus.subscribe_chat_with_baseline();
+                relay = AchievementRelay::new(baseline);
+                chat
             });
-            if achievement_rx.is_none() {
-                pending_achievement = None;
+            sync_subscription(&mut achievement_rx, active, achievement_closed, || {
+                bus.subscribe_achievements()
+            });
+            if !active {
+                relay = AchievementRelay::default();
             }
-            // chat を先に選ぶ(解除はその原因の chat より後に出す)。select で先に拾った実績は保留し、
-            // chat を処理し切ったラウンドで出す。
-            let first_chat = tokio::select! {
+            let first = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => { runtime.shutdown(); break; },
                 _ = runtime.changed() => continue,
@@ -3057,16 +3061,13 @@ fn spawn_webhook_forwarder(app: AppHandle, cancel: CancellationToken) {
                     if status != last { let _ = app.emit("webhook-status", &status); last = status; }
                     continue;
                 },
-                incoming = async { match rx.as_mut() { Some(rx) => rx.recv().await, None => std::future::pending().await } } => Some(incoming.into()),
-                _ = std::future::ready(()), if pending_achievement.is_some() => None,
-                unlock = async { match achievement_rx.as_mut() { Some(rx) => rx.recv().await, None => std::future::pending().await } }, if pending_achievement.is_none() => {
-                    pending_achievement = Some(unlock.into());
-                    None
-                },
+                incoming = async { rx.as_mut().unwrap().recv().await }, if rx.is_some() => (Some(incoming.into()), None),
+                unlock = async { achievement_rx.as_mut().unwrap().recv().await }, if achievement_rx.is_some() => (None, Some(unlock.into())),
+                _ = std::future::ready(()), if relay.has_ready() => (None, None),
             };
             let round = drain_relay_round(
-                first_chat,
-                &mut pending_achievement,
+                first,
+                &mut relay,
                 rx.as_mut(),
                 achievement_rx.as_mut(),
                 WEBHOOK_RELAY_ROUND_LIMIT,
@@ -3077,7 +3078,7 @@ fn spawn_webhook_forwarder(app: AppHandle, cancel: CancellationToken) {
                 chat_lagged = chat_lagged.saturating_add(round.chat_lagged);
                 tracing::warn!(lagged = chat_lagged, "Webhook Bus の遅延分を破棄しました");
             }
-            if round.achievement_lagged > 0 {
+            if round.achievement_lagged > 0 && runtime.has_achievement_destinations() {
                 achievement_lagged = achievement_lagged.saturating_add(round.achievement_lagged);
                 tracing::warn!(lagged = achievement_lagged, "Webhook の実績通知を取りこぼしました");
             }
@@ -3086,8 +3087,8 @@ fn spawn_webhook_forwarder(app: AppHandle, cancel: CancellationToken) {
                 achievement_rx = None;
             }
             if round.chat_closed {
-                runtime.shutdown();
-                break;
+                chat_closed = true;
+                rx = None;
             }
         }
     });
@@ -3355,8 +3356,8 @@ fn spawn_pipeline(app: AppHandle, cancel: CancellationToken) {
                     let unlocks = state.collect_achievements(|engine| engine.observe(&msg, timer_now_ms()));
 
                     // 下流(UI/OBS)へ。解除はその原因の chat の後に流す(Webhook・SSE で順序が逆転しない)。
-                    bus.publish(msg);
-                    state.broadcast_achievement_unlocks(unlocks);
+                    let seq = bus.publish_sequenced(msg);
+                    state.broadcast_achievement_unlocks(unlocks, seq);
                 }
             }
         }
@@ -3609,7 +3610,6 @@ pub fn run() {
                     let achievement_engine = defs.enabled.then(|| {
                         Arc::new(AchievementEngine::open(&config_dir, defs, now_ms))
                     });
-                    let achievement_unlock_tx = bus.achievement_sender();
                     let state = AppState {
                         webhook,
                         integrations,
@@ -3618,7 +3618,6 @@ pub fn run() {
                         listeners: Arc::new(listeners::ListenerStore::load(&config_dir)),
                         achievement_engine: Mutex::new(achievement_engine),
                         achievement_defs,
-                        achievement_unlock_tx,
                         chatlog: chatlog::ChatLog::start(&config_dir, config.log.clone()),
                         config: Mutex::new(config.clone()),
                         startup_config_outcome: Mutex::new(Some(load_outcome)),
@@ -3732,12 +3731,12 @@ pub fn run() {
             bus.spawn_ui_forwarder(handle.clone(), app_cancel.clone());
             spawn_reaction_ui_forwarder(reaction_rx, handle.clone(), app_cancel.clone());
             spawn_achievement_ui_forwarder(
-                bus.achievement_sender().subscribe(),
+                bus.subscribe_achievements(),
                 handle.clone(),
                 app_cancel.clone(),
             );
             spawn_achievement_tts_forwarder(
-                bus.achievement_sender().subscribe(),
+                bus.subscribe_achievements(),
                 handle.clone(),
                 app_cancel.clone(),
             );

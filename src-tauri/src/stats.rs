@@ -235,7 +235,7 @@ impl YoutubeMetadataUpdate {
 /// `bus_rx` は chat bus の購読、`metadata_rx` は YouTube poller からの値、`config_rx`
 /// は設定変更通知。どれも await 中に MutexGuard を保持しない形で受け取る。
 pub fn spawn_stats_aggregator(
-    mut bus_rx: broadcast::Receiver<ChatMessage>,
+    mut bus_rx: broadcast::Receiver<crate::bus::SequencedChat>,
     stats_tx: watch::Sender<StatsSnapshot>,
     mut config_rx: watch::Receiver<AppConfig>,
     mut metadata_rx: mpsc::Receiver<YoutubeMetadataUpdate>,
@@ -268,9 +268,9 @@ pub fn spawn_stats_aggregator(
                 _ = cancel.cancelled() => break,
                 recv = bus_rx.recv() => {
                     match recv {
-                        Ok(msg) => {
+                        Ok(chat) => {
                             comments = comments.saturating_add(1);
-                            record_unique_viewer(&mut viewer_scopes, &msg);
+                            record_unique_viewer(&mut viewer_scopes, &chat.message);
                             snapshot = build_snapshot(
                                 comments,
                                 viewers_max,

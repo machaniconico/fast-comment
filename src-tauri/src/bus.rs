@@ -10,7 +10,7 @@
 
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::{
@@ -35,6 +35,8 @@ use crate::achievements::engine::AchievementUnlocked;
 use crate::model::{ChatMessage, ModerationEvent, YoutubeReaction};
 use crate::stats::{StatsSnapshot, TimerSnapshot};
 use crate::templates::{TemplateRef, TemplateStore};
+
+pub(crate) mod relay;
 
 /// broadcast チャネルの容量。UI/OBS の購読者が遅れても最新が優先される。
 const BROADCAST_CAPACITY: usize = 4096;
@@ -147,7 +149,7 @@ pub fn spawn_moderation_ui_forwarder<F>(
 ///
 /// 購読側が遅れて `Lagged(n)` を受けても件数だけ warn に出して続ける(名前・ID は出さない)。
 async fn run_achievement_forwarder<F>(
-    mut rx: broadcast::Receiver<AchievementUnlocked>,
+    mut rx: broadcast::Receiver<SequencedAchievement>,
     cancel: CancellationToken,
     mut emit: F,
 ) where
@@ -169,7 +171,7 @@ async fn run_achievement_forwarder<F>(
                 match incoming {
                     Ok(unlock) => {
                         if batch.len() < MAX_ACHIEVEMENTS_PER_UI_BATCH {
-                            batch.push(unlock);
+                            batch.push(unlock.unlock);
                         }
                         // 既に届いている分も同じフレームに入れる。tick と受信が同時に準備できた時に、
                         // 同時に送られた解除が 2 フレームに割れないようにする。
@@ -177,7 +179,7 @@ async fn run_achievement_forwarder<F>(
                             match rx.try_recv() {
                                 Ok(unlock) => {
                                     if batch.len() < MAX_ACHIEVEMENTS_PER_UI_BATCH {
-                                        batch.push(unlock);
+                                        batch.push(unlock.unlock);
                                     }
                                 }
                                 Err(broadcast::error::TryRecvError::Lagged(n)) => {
@@ -198,8 +200,8 @@ async fn run_achievement_forwarder<F>(
 }
 
 /// 実績の解除を UI へ 1 フレーム単位でまとめて `emit("achievements", batch)` する。
-pub fn spawn_achievement_ui_forwarder(
-    rx: broadcast::Receiver<AchievementUnlocked>,
+pub(crate) fn spawn_achievement_ui_forwarder(
+    rx: broadcast::Receiver<SequencedAchievement>,
     app: AppHandle,
     cancel: CancellationToken,
 ) {
@@ -214,14 +216,27 @@ pub fn spawn_achievement_ui_forwarder(
     });
 }
 
+#[derive(Clone, Debug)]
+pub struct SequencedChat {
+    pub seq: u64,
+    pub message: ChatMessage,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SequencedAchievement {
+    pub(crate) after_seq: u64,
+    pub(crate) unlock: AchievementUnlocked,
+}
+
 /// Bus のハンドル。正規化済みメッセージの投入と、UI/OBS への配信起動を担う。
 #[derive(Clone)]
 pub struct Bus {
-    tx: broadcast::Sender<ChatMessage>,
+    tx: broadcast::Sender<SequencedChat>,
+    chat_seq: Arc<Mutex<u64>>,
     /// OBS `/ws?modEvents=1` へ流す削除・BAN・ローカル非表示(配信側・アプリ発の両方)。
     mod_tx: broadcast::Sender<ModerationEvent>,
     /// 実績の解除。UI・OBS(`/ws?achievementEvents=1`)・TTS が購読する。
-    achievement_tx: broadcast::Sender<AchievementUnlocked>,
+    achievement_tx: broadcast::Sender<SequencedAchievement>,
     stats_tx: watch::Sender<StatsSnapshot>,
     timer_tx: watch::Sender<TimerSnapshot>,
     obs_port: u16,
@@ -239,6 +254,7 @@ impl Bus {
         let (achievement_tx, _achievement_rx) = broadcast::channel(ACHIEVEMENT_BROADCAST_CAPACITY);
         Bus {
             tx,
+            chat_seq: Arc::new(Mutex::new(0)),
             mod_tx,
             achievement_tx,
             stats_tx,
@@ -252,20 +268,42 @@ impl Bus {
         self.mod_tx.subscribe()
     }
 
-    /// 実績解除の送信端(エンジンの出力をここへ流す)。
-    pub fn achievement_sender(&self) -> broadcast::Sender<AchievementUnlocked> {
-        self.achievement_tx.clone()
+    pub(crate) fn subscribe_achievements(&self) -> broadcast::Receiver<SequencedAchievement> {
+        self.achievement_tx.subscribe()
+    }
+
+    pub(crate) fn publish_achievement(&self, unlock: AchievementUnlocked, after_seq: u64) {
+        let _ = self
+            .achievement_tx
+            .send(SequencedAchievement { after_seq, unlock });
     }
 
     /// 新規コメント購読者を得る。
-    pub fn subscribe(&self) -> broadcast::Receiver<ChatMessage> {
+    pub fn subscribe(&self) -> broadcast::Receiver<SequencedChat> {
         self.tx.subscribe()
+    }
+
+    pub(crate) fn subscribe_chat_with_baseline(&self) -> (broadcast::Receiver<SequencedChat>, u64) {
+        let seq = self.chat_seq.lock().unwrap();
+        (self.tx.subscribe(), *seq)
+    }
+
+    pub(crate) fn latest_chat_seq(&self) -> u64 {
+        *self.chat_seq.lock().unwrap()
     }
 
     /// 1メッセージを Bus に流す(Tauri コマンド経由のシステムメッセージ等にも使う)。
     /// 購読者が居なくてもエラーにしない。
     pub fn publish(&self, msg: ChatMessage) {
-        let _ = self.tx.send(msg);
+        self.publish_sequenced(msg);
+    }
+
+    pub(crate) fn publish_sequenced(&self, message: ChatMessage) -> u64 {
+        // 番号と broadcast 上の順序を一致させ、購読境界も同じロックで確定する。
+        let mut seq = self.chat_seq.lock().unwrap();
+        *seq += 1;
+        let _ = self.tx.send(SequencedChat { seq: *seq, message });
+        *seq
     }
 
     /// OBS の opt-in クライアントへモデレーションイベントを流す。購読者が居なくてもエラーにしない。
@@ -296,7 +334,7 @@ impl Bus {
                     }
                     recv = rx.recv() => {
                         match recv {
-                            Ok(msg) => batch.push(msg),
+                            Ok(chat) => batch.push(chat.message),
                             Err(broadcast::error::RecvError::Lagged(n)) => {
                                 // 最新優先: 取りこぼしはログのみ。
                                 tracing::debug!("UI forwarder が {n} 件 lag");
@@ -480,9 +518,9 @@ fn obs_router(state: ObsState, goals_skin_dir: &Path) -> Router {
 /// axum ハンドラ間で共有する状態。
 #[derive(Clone)]
 struct ObsState {
-    tx: Arc<broadcast::Sender<ChatMessage>>,
+    tx: Arc<broadcast::Sender<SequencedChat>>,
     mod_tx: Arc<broadcast::Sender<ModerationEvent>>,
-    achievement_tx: Arc<broadcast::Sender<AchievementUnlocked>>,
+    achievement_tx: Arc<broadcast::Sender<SequencedAchievement>>,
     stats_tx: Arc<watch::Sender<StatsSnapshot>>,
     timer_tx: Arc<watch::Sender<TimerSnapshot>>,
     templates: Arc<TemplateStore>,
@@ -517,9 +555,9 @@ fn moderation_receiver(
 
 /// opt-in のときだけ実績解除を購読する(opt-out は購読自体しない)。
 fn achievement_receiver(
-    achievement_tx: &broadcast::Sender<AchievementUnlocked>,
+    achievement_tx: &broadcast::Sender<SequencedAchievement>,
     query: &WsQuery,
-) -> Option<broadcast::Receiver<AchievementUnlocked>> {
+) -> Option<broadcast::Receiver<SequencedAchievement>> {
     mod_events_opted_in(query.achievement_events.as_deref()).then(|| achievement_tx.subscribe())
 }
 
@@ -691,9 +729,9 @@ async fn timer_ws_handler(
 /// を送る(`channel` フィルタは掛けない)。
 async fn handle_ws_client(
     mut socket: WebSocket,
-    mut rx: broadcast::Receiver<ChatMessage>,
+    mut rx: broadcast::Receiver<SequencedChat>,
     mut mod_rx: Option<broadcast::Receiver<ModerationEvent>>,
-    mut achievement_rx: Option<broadcast::Receiver<AchievementUnlocked>>,
+    mut achievement_rx: Option<broadcast::Receiver<SequencedAchievement>>,
     channel: Option<String>,
 ) {
     let mut ticker = interval(Duration::from_millis(UI_BATCH_INTERVAL_MS));
@@ -713,7 +751,8 @@ async fn handle_ws_client(
             // broadcast からの受信 → channel フィルタ後キューへ。受信は止めない。
             recv = rx.recv() => {
                 match recv {
-                    Ok(msg) => {
+                    Ok(chat) => {
+                        let msg = chat.message;
                         if let Some(ref ch) = channel {
                             if &msg.channel != ch {
                                 continue;
@@ -759,7 +798,7 @@ async fn handle_ws_client(
                         if achievement_queue.len() >= WS_CLIENT_ACHIEVEMENT_QUEUE {
                             achievement_queue.pop_front();
                         }
-                        achievement_queue.push_back(unlock);
+                        achievement_queue.push_back(unlock.unlock);
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         tracing::warn!(lagged = n, "WS 実績 forwarder が取りこぼしました");
@@ -1364,7 +1403,11 @@ mod tests {
         assert!(emits.lock().unwrap().is_empty());
         // 同一フレームの 3 件は 1 回の emit にまとまる(送信は同期的に完了する)。
         for i in 0..3 {
-            tx.send(sample_unlock(&format!("u{i}"))).unwrap();
+            tx.send(SequencedAchievement {
+                after_seq: 0,
+                unlock: sample_unlock(&format!("u{i}")),
+            })
+            .unwrap();
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(*emits.lock().unwrap(), vec![3]);
@@ -1376,7 +1419,11 @@ mod tests {
     async fn achievement_forwarder_survives_lagged() {
         let (tx, rx) = broadcast::channel(2);
         for i in 0..5 {
-            tx.send(sample_unlock(&format!("old{i}"))).unwrap();
+            tx.send(SequencedAchievement {
+                after_seq: 0,
+                unlock: sample_unlock(&format!("old{i}")),
+            })
+            .unwrap();
         }
         let cancel = CancellationToken::new();
         let emits = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
@@ -1386,7 +1433,11 @@ mod tests {
         }));
         tokio::time::sleep(Duration::from_millis(80)).await;
         // Lagged の後も購読が続き、新しい解除が届く。
-        tx.send(sample_unlock("fresh")).unwrap();
+        tx.send(SequencedAchievement {
+            after_seq: 0,
+            unlock: sample_unlock("fresh"),
+        })
+        .unwrap();
         tokio::time::sleep(Duration::from_millis(80)).await;
         let seen = emits.lock().unwrap().clone();
         assert!(seen.contains(&"fresh".to_string()), "{seen:?}");
@@ -1456,7 +1507,7 @@ mod tests {
         for query in ["", "?achievementEvents=0", "?achievementEvents=yes"] {
             let mut ws = ws_connect(&bus, query).await;
             tokio::time::sleep(Duration::from_millis(50)).await;
-            bus.achievement_sender().send(sample_unlock("u1")).ok();
+            bus.publish_achievement(sample_unlock("u1"), bus.latest_chat_seq());
             bus.publish(sample_chat("c"));
             let frames = collect_frames(&mut ws, Duration::from_millis(200)).await;
             assert_eq!(frames.len(), 1, "{query}: {frames:?}");
@@ -1470,7 +1521,7 @@ mod tests {
         let mut ws = ws_connect(&bus, "?achievementEvents=1").await;
         tokio::time::sleep(Duration::from_millis(50)).await;
         bus.publish(sample_chat("c"));
-        bus.achievement_sender().send(sample_unlock("u1")).unwrap();
+        bus.publish_achievement(sample_unlock("u1"), bus.latest_chat_seq());
         let frames = collect_frames(&mut ws, Duration::from_millis(200)).await;
         assert_eq!(frames.len(), 2, "{frames:?}");
         assert!(frames[0].starts_with('['), "{frames:?}");
@@ -1485,7 +1536,7 @@ mod tests {
         let mut ws = ws_connect(&bus, "?achievementEvents=1").await;
         tokio::time::sleep(Duration::from_millis(50)).await;
         for i in 0..5 {
-            bus.achievement_sender().send(sample_unlock("u1")).unwrap();
+            bus.publish_achievement(sample_unlock("u1"), bus.latest_chat_seq());
             bus.publish(sample_chat(&format!("c{i}")));
             tokio::time::sleep(Duration::from_millis(7)).await;
         }
@@ -1501,7 +1552,7 @@ mod tests {
         let mut ws = ws_connect(&bus, "?achievementEvents=1&channel=only-this").await;
         tokio::time::sleep(Duration::from_millis(50)).await;
         bus.publish(sample_chat("other"));
-        bus.achievement_sender().send(sample_unlock("u1")).unwrap();
+        bus.publish_achievement(sample_unlock("u1"), bus.latest_chat_seq());
         let frames = collect_frames(&mut ws, Duration::from_millis(200)).await;
         // chat は channel で絞られて届かず、実績だけが届く。
         assert_eq!(frames.len(), 1, "{frames:?}");
