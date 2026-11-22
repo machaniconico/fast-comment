@@ -1,4 +1,4 @@
-//! Preserve chat dependencies across independent broadcast receivers.
+//! chat と実績を別々に購読しても、原因の chat を先に処理する。
 use super::SequencedAchievement;
 use std::collections::VecDeque;
 use tokio::sync::broadcast::{
@@ -35,7 +35,7 @@ pub(crate) fn poll<T: Clone>(rx: &mut Receiver<T>) -> Option<Polled<T>> {
 
 #[derive(Default)]
 pub(crate) struct AchievementRelay {
-    // None when chat is unavailable. The subscription baseline covers older chat.
+    // chat を受信できない場合は None。購読開始前の chat は基準番号まで処理済みとみなす。
     processed_chat: Option<u64>,
     pending: VecDeque<SequencedAchievement>,
 }
@@ -65,8 +65,8 @@ impl AchievementRelay {
         })
     }
 
-    /// Bound both receiver polls and deliveries, including work carried over from earlier rounds.
-    /// Returns the dropped count (broadcast lag and pending overflow) and receiver closure.
+    /// 受信と配信をそれぞれ上限まで処理する。前回までの保留分も配信上限に含める。
+    /// 欠落数 (購読の遅延と保留上限超過) と受信チャネルの終了有無を返す。
     pub(crate) fn drain(
         &mut self,
         mut first: Option<Polled<SequencedAchievement>>,

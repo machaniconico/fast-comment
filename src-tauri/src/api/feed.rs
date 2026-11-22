@@ -825,6 +825,134 @@ mod tests {
     }
 
     #[test]
+    fn stats_retry_follows_its_cause_chat() {
+        let snapshot = Default::default();
+        assert_achievement_retry_order(|| crate::AchievementEvent::Stats(&snapshot));
+    }
+
+    #[test]
+    fn live_event_retry_follows_its_cause_chat() {
+        let event = crate::model::LiveEvent::Ended {
+            platform: Platform::Youtube,
+            channel_identifier: "chan".into(),
+        };
+        assert_achievement_retry_order(|| crate::AchievementEvent::Live(&event));
+    }
+
+    fn assert_achievement_retry_order<'a>(retry_event: impl Fn() -> crate::AchievementEvent<'a>) {
+        use crate::achievements::{
+            engine::AchievementEngine,
+            model::{Condition, CurrencyMode, Metric, SubjectKind, Tier, Window},
+            store::{AchievementDefs, FsIo, StoreIo},
+        };
+        use crate::{publish_achievement_event, AchievementEvent};
+        use std::{
+            cell::RefCell,
+            io,
+            path::Path,
+            sync::{
+                atomic::{AtomicBool, Ordering},
+                TryLockError,
+            },
+        };
+
+        struct FailFirstSave(AtomicBool);
+
+        impl StoreIo for FailFirstSave {
+            fn write_atomic(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
+                if self.0.swap(false, Ordering::Relaxed) {
+                    return Err(io::Error::other("実績の初回保存に失敗"));
+                }
+                FsIo.write_atomic(path, bytes)
+            }
+
+            fn create_backup(&self, src: &Path, dst: &Path) -> io::Result<()> {
+                FsIo.create_backup(src, dst)
+            }
+        }
+
+        let mut defs = AchievementDefs::default();
+        defs.enabled = true;
+        defs.achievements.truncate(1);
+        let achievement = &mut defs.achievements[0];
+        achievement.enabled = true;
+        achievement.subject = SubjectKind::Viewer;
+        achievement.tier = Tier::Bronze;
+        achievement.condition = Some(Condition {
+            window: Window::Lifetime,
+            metric: Metric::SuperChatCount,
+            threshold: 1.0,
+            currency: CurrencyMode::None,
+            platforms: vec![],
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Mutex::new(Some(Arc::new(AchievementEngine::open_with(
+            dir.path(),
+            defs,
+            1,
+            Arc::new(FailFirstSave(AtomicBool::new(true))),
+        ))));
+        let mut cause = message("cause");
+        cause.platform = Platform::Youtube;
+        cause.kind = crate::model::MessageKind::SuperChat;
+
+        let bus = bus();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (mut chat, baseline) = bus.subscribe_chat_with_baseline();
+        let mut achievements = bus.subscribe_achievements();
+        let mut webhook = AchievementRelay::new(baseline);
+        let feed = ApiFeed::new(10);
+        feed.set_enabled(true);
+        let mut subscription = FeedSubscription::new(&bus);
+        let (_, client) = feed.subscribe().unwrap();
+        let webhook_order = RefCell::new(Vec::new());
+        let mut sse_order = Vec::new();
+        let mut drain = || {
+            crate::webhook::runtime::drain_relay_round(
+                (None, None),
+                &mut webhook,
+                Some(&mut chat),
+                Some(&mut achievements),
+                256,
+                |_| webhook_order.borrow_mut().push("chat"),
+                |_| webhook_order.borrow_mut().push("achievement"),
+            );
+            feed.drain_tick(&mut subscription, || {});
+            sse_order.extend(client.lock().unwrap().items.drain(..).map(|item| match item {
+                Item::Chat(_) => "chat",
+                Item::Achievement(_) => "achievement",
+                _ => panic!("予期しない SSE イベント"),
+            }));
+        };
+        let retry = || {
+            publish_achievement_event(&engine, &bus, &cancel, retry_event(), |_| unreachable!());
+        };
+        let mut retry_waits = false;
+        publish_achievement_event(&engine, &bus, &cancel, AchievementEvent::Chat(cause), |msg| {
+            // observe 直後に再試行を試みる。待たずに入れる場合は chat 発行前に下流まで処理する。
+            match engine.try_lock() {
+                Ok(guard) => {
+                    drop(guard);
+                    retry();
+                    drain();
+                }
+                Err(TryLockError::WouldBlock) => retry_waits = true,
+                Err(error) => panic!("{error}"),
+            }
+            bus.publish_sequenced(msg)
+        });
+        if retry_waits {
+            retry();
+        }
+        drain();
+        let expected = vec!["chat", "achievement"];
+        assert_eq!(
+            (webhook_order.into_inner(), sse_order),
+            (expected.clone(), expected)
+        );
+    }
+
+    #[test]
     fn achievement_pending_overflow_is_reported_to_sse_without_advancing_history() {
         let bus = bus();
         let mut subscription = FeedSubscription::new(&bus);

@@ -49,7 +49,7 @@ use uuid::Uuid;
 
 use crate::achievements::{
     announce::announce_message,
-    engine::{AchievementEngine, AchievementUnlocked},
+    engine::AchievementEngine,
     store::DefsStore,
 };
 use crate::autopost::{
@@ -106,6 +106,7 @@ pub struct AppState {
     x_post_login: OAuthLoginGate,
     twitcasting_login: OAuthLoginGate,
     listeners: Arc<listeners::ListenerStore>,
+    /// 実績イベントは評価から Bus への発行まで、このロックで直列化する。
     achievement_engine: Mutex<Option<Arc<AchievementEngine>>>,
     // 定義の保存 IPC(DefsStore::commit)は PR3 で足す。それまでは読まない。
     #[allow(dead_code)]
@@ -290,6 +291,48 @@ struct ObsServerControl {
     cancel: CancellationToken,
 }
 
+enum AchievementEvent<'a> {
+    Chat(ChatMessage),
+    Live(&'a LiveEvent),
+    Stats(&'a StatsSnapshot),
+}
+
+fn publish_achievement_event(
+    engine: &Mutex<Option<Arc<AchievementEngine>>>,
+    bus: &Bus,
+    cancel: &CancellationToken,
+    event: AchievementEvent<'_>,
+    publish_chat: impl FnOnce(ChatMessage) -> u64,
+) {
+    // 保存結果と再試行状態は評価中に確定する。chat 発行まで同じロックを保持する。
+    let engine = engine
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let unlocks = match engine.as_deref().filter(|_| !cancel.is_cancelled()) {
+        Some(engine) => {
+            let now_ms = timer_now_ms();
+            match &event {
+                AchievementEvent::Chat(msg) => engine.observe(msg, now_ms),
+                AchievementEvent::Live(event) => engine.on_live_event(event, now_ms),
+                AchievementEvent::Stats(snapshot) => engine.on_stats(snapshot, now_ms),
+            }
+        }
+        None => Vec::new(),
+    };
+
+    // 下流(UI/OBS)へ。解除は原因の chat の後に流す。
+    let chat_seq = match event {
+        AchievementEvent::Chat(msg) => Some(publish_chat(msg)),
+        _ => None,
+    };
+    if !unlocks.is_empty() {
+        let after_seq = chat_seq.unwrap_or_else(|| bus.latest_chat_seq());
+        for unlock in unlocks {
+            bus.publish_achievement(unlock, after_seq);
+        }
+    }
+}
+
 impl AppState {
     /// チャンネルの一意キー(プラットフォーム + 識別子)。
     fn channel_key(ch: &ChannelConfig) -> String {
@@ -303,32 +346,14 @@ impl AppState {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn broadcast_achievement_unlocks(&self, unlocks: Vec<AchievementUnlocked>, after_seq: u64) {
-        for unlock in unlocks {
-            self.bus.publish_achievement(unlock, after_seq);
-        }
-    }
-
-    fn evaluate_achievements(
-        &self,
-        evaluate: impl FnOnce(&AchievementEngine) -> Vec<AchievementUnlocked>,
-    ) {
-        let unlocks = self.collect_achievements(evaluate);
-        if !unlocks.is_empty() {
-            self.broadcast_achievement_unlocks(unlocks, self.bus.latest_chat_seq());
-        }
-    }
-
-    /// 評価だけして解除を返す(発行は呼び出し側。chat の publish の後に流すため)。
-    fn collect_achievements(
-        &self,
-        evaluate: impl FnOnce(&AchievementEngine) -> Vec<AchievementUnlocked>,
-    ) -> Vec<AchievementUnlocked> {
-        let engine = self.lock_achievement_engine();
-        match engine.as_deref().filter(|_| !self.app_cancel.is_cancelled()) {
-            Some(engine) => evaluate(engine),
-            None => Vec::new(),
-        }
+    fn publish_achievement_event(&self, event: AchievementEvent<'_>) {
+        publish_achievement_event(
+            &self.achievement_engine,
+            &self.bus,
+            &self.app_cancel,
+            event,
+            |msg| self.bus.publish_sequenced(msg),
+        );
     }
 
     fn flush_achievements(&self) {
@@ -3030,7 +3055,6 @@ fn spawn_webhook_forwarder(app: AppHandle, cancel: CancellationToken) {
         runtime.reload().await;
         let mut rx = None;
         let mut achievement_rx = None;
-        let mut chat_closed = false;
         let mut achievement_closed = false;
         let mut relay = AchievementRelay::default();
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -3041,7 +3065,7 @@ fn spawn_webhook_forwarder(app: AppHandle, cancel: CancellationToken) {
         loop {
             // 実績も chat と同じく有効な送り先があれば購読し、送り先ごとに配信を判定する。
             let active = runtime.has_active_webhooks();
-            sync_subscription(&mut rx, active, chat_closed, || {
+            sync_subscription(&mut rx, active, false, || {
                 let (chat, baseline) = bus.subscribe_chat_with_baseline();
                 relay = AchievementRelay::new(baseline);
                 chat
@@ -3087,8 +3111,8 @@ fn spawn_webhook_forwarder(app: AppHandle, cancel: CancellationToken) {
                 achievement_rx = None;
             }
             if round.chat_closed {
-                chat_closed = true;
-                rx = None;
+                runtime.shutdown();
+                break;
             }
         }
     });
@@ -3313,8 +3337,6 @@ fn spawn_pipeline(app: AppHandle, cancel: CancellationToken) {
     let mut rx = app.state::<AppState>().source_tx.subscribe();
     tauri::async_runtime::spawn(async move {
         let state = app.state::<AppState>();
-        let bus = state.bus.clone();
-
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => break,
@@ -3353,11 +3375,7 @@ fn spawn_pipeline(app: AppHandle, cancel: CancellationToken) {
                     // 同期 I/O やネットワーク待ちをせず、有界キューに投入する。
                     try_enqueue_tts_message(&app, &state.config, &state.tts, msg.clone());
 
-                    let unlocks = state.collect_achievements(|engine| engine.observe(&msg, timer_now_ms()));
-
-                    // 下流(UI/OBS)へ。解除はその原因の chat の後に流す(Webhook・SSE で順序が逆転しない)。
-                    let seq = bus.publish_sequenced(msg);
-                    state.broadcast_achievement_unlocks(unlocks, seq);
+                    state.publish_achievement_event(AchievementEvent::Chat(msg));
                 }
             }
         }
@@ -3377,11 +3395,11 @@ fn spawn_achievement_events(
             tokio::select! {
                 _ = cancel.cancelled() => break,
                 Some(event) = live_rx.recv() => {
-                    state.evaluate_achievements(|engine| engine.on_live_event(&event, timer_now_ms()));
+                    state.publish_achievement_event(AchievementEvent::Live(&event));
                 }
                 Ok(()) = stats_rx.changed() => {
                     let snapshot = stats_rx.borrow_and_update().clone();
-                    state.evaluate_achievements(|engine| engine.on_stats(&snapshot, timer_now_ms()));
+                    state.publish_achievement_event(AchievementEvent::Stats(&snapshot));
                 }
             }
         }

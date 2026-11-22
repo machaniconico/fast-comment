@@ -284,12 +284,18 @@ impl Bus {
     }
 
     pub(crate) fn subscribe_chat_with_baseline(&self) -> (broadcast::Receiver<SequencedChat>, u64) {
-        let seq = self.chat_seq.lock().unwrap();
+        let seq = self
+            .chat_seq
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         (self.tx.subscribe(), *seq)
     }
 
     pub(crate) fn latest_chat_seq(&self) -> u64 {
-        *self.chat_seq.lock().unwrap()
+        *self
+            .chat_seq
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// 1メッセージを Bus に流す(Tauri コマンド経由のシステムメッセージ等にも使う)。
@@ -300,7 +306,10 @@ impl Bus {
 
     pub(crate) fn publish_sequenced(&self, message: ChatMessage) -> u64 {
         // 番号と broadcast 上の順序を一致させ、購読境界も同じロックで確定する。
-        let mut seq = self.chat_seq.lock().unwrap();
+        let mut seq = self
+            .chat_seq
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         *seq += 1;
         let _ = self.tx.send(SequencedChat { seq: *seq, message });
         *seq
