@@ -314,9 +314,19 @@ impl AppState {
         &self,
         evaluate: impl FnOnce(&AchievementEngine) -> Vec<AchievementUnlocked>,
     ) {
+        let unlocks = self.collect_achievements(evaluate);
+        self.broadcast_achievement_unlocks(unlocks);
+    }
+
+    /// 評価だけして解除を返す(発行は呼び出し側。chat の publish の後に流すため)。
+    fn collect_achievements(
+        &self,
+        evaluate: impl FnOnce(&AchievementEngine) -> Vec<AchievementUnlocked>,
+    ) -> Vec<AchievementUnlocked> {
         let engine = self.lock_achievement_engine();
-        if let Some(engine) = engine.as_deref().filter(|_| !self.app_cancel.is_cancelled()) {
-            self.broadcast_achievement_unlocks(evaluate(engine));
+        match engine.as_deref().filter(|_| !self.app_cancel.is_cancelled()) {
+            Some(engine) => evaluate(engine),
+            None => Vec::new(),
         }
     }
 
@@ -3009,7 +3019,7 @@ fn spawn_achievement_tts_forwarder(
 const WEBHOOK_RELAY_ROUND_LIMIT: usize = 256;
 
 fn spawn_webhook_forwarder(app: AppHandle, cancel: CancellationToken) {
-    use crate::webhook::runtime::{drain_relay_round, sync_subscription, First};
+    use crate::webhook::runtime::{drain_relay_round, sync_subscription};
     tauri::async_runtime::spawn(async move {
         let (runtime, bus) = {
             let state = app.state::<AppState>();
@@ -3019,21 +3029,26 @@ fn spawn_webhook_forwarder(app: AppHandle, cancel: CancellationToken) {
         let mut rx = None;
         let mut achievement_rx = None;
         let mut achievement_closed = false;
+        let mut pending_achievement = None;
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut last = runtime.status();
         let mut chat_lagged = 0u64;
         let mut achievement_lagged = 0u64;
         loop {
-            sync_subscription(&mut rx, runtime.has_active_webhooks(), false, || bus.subscribe());
-            sync_subscription(
-                &mut achievement_rx,
-                runtime.has_achievement_webhooks(),
-                achievement_closed,
-                || bus.achievement_sender().subscribe(),
-            );
-            // chat を先に選ぶ(解除はその原因の chat より後に出す)。実績はラウンドの上限で区切る。
-            let first = tokio::select! {
+            // 実績も chat と同じく有効な送り先があれば購読し(有効化直後の解除を落とさない)、
+            // 送るかどうかは送り先ごとに判定する。
+            let active = runtime.has_active_webhooks();
+            sync_subscription(&mut rx, active, false, || bus.subscribe());
+            sync_subscription(&mut achievement_rx, active, achievement_closed, || {
+                bus.achievement_sender().subscribe()
+            });
+            if achievement_rx.is_none() {
+                pending_achievement = None;
+            }
+            // chat を先に選ぶ(解除はその原因の chat より後に出す)。select で先に拾った実績は保留し、
+            // chat を処理し切ったラウンドで出す。
+            let first_chat = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => { runtime.shutdown(); break; },
                 _ = runtime.changed() => continue,
@@ -3042,11 +3057,16 @@ fn spawn_webhook_forwarder(app: AppHandle, cancel: CancellationToken) {
                     if status != last { let _ = app.emit("webhook-status", &status); last = status; }
                     continue;
                 },
-                incoming = async { match rx.as_mut() { Some(rx) => rx.recv().await, None => std::future::pending().await } } => First::Chat(incoming.into()),
-                unlock = async { match achievement_rx.as_mut() { Some(rx) => rx.recv().await, None => std::future::pending().await } } => First::Achievement(unlock.into()),
+                incoming = async { match rx.as_mut() { Some(rx) => rx.recv().await, None => std::future::pending().await } } => Some(incoming.into()),
+                _ = std::future::ready(()), if pending_achievement.is_some() => None,
+                unlock = async { match achievement_rx.as_mut() { Some(rx) => rx.recv().await, None => std::future::pending().await } }, if pending_achievement.is_none() => {
+                    pending_achievement = Some(unlock.into());
+                    None
+                },
             };
             let round = drain_relay_round(
-                first,
+                first_chat,
+                &mut pending_achievement,
                 rx.as_mut(),
                 achievement_rx.as_mut(),
                 WEBHOOK_RELAY_ROUND_LIMIT,
@@ -3332,10 +3352,11 @@ fn spawn_pipeline(app: AppHandle, cancel: CancellationToken) {
                     // 同期 I/O やネットワーク待ちをせず、有界キューに投入する。
                     try_enqueue_tts_message(&app, &state.config, &state.tts, msg.clone());
 
-                    state.evaluate_achievements(|engine| engine.observe(&msg, timer_now_ms()));
+                    let unlocks = state.collect_achievements(|engine| engine.observe(&msg, timer_now_ms()));
 
-                    // 下流(UI/OBS)へ。
+                    // 下流(UI/OBS)へ。解除はその原因の chat の後に流す(Webhook・SSE で順序が逆転しない)。
                     bus.publish(msg);
+                    state.broadcast_achievement_unlocks(unlocks);
                 }
             }
         }

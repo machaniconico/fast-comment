@@ -84,7 +84,7 @@ impl Worker {
     fn active(&self) -> bool {
         !self.cancel.is_cancelled() && self.state.lock().unwrap().status.state == "active"
     }
-    /// 実績解除を受け取る送り先か(`handle_achievement` と購読判定で同じ条件を使う)。
+    /// 実績解除を受け取る送り先か(購読は有効な送り先があれば行い、ここで送り先ごとに絞る)。
     fn accepts_achievement(&self) -> bool {
         self.active()
             && self.def.enabled
@@ -239,10 +239,6 @@ impl<S: SecretStore, T: Sender> WebhookRuntime<S, T> {
     pub fn has_active_webhooks(&self) -> bool {
         self.0.workers.lock().unwrap().values().any(|w| w.active())
     }
-    /// `achievement` を有効にした送り先が 1 つでもあるか(無ければ実績を購読しない)。
-    pub fn has_achievement_webhooks(&self) -> bool {
-        self.0.workers.lock().unwrap().values().any(|w| w.accepts_achievement())
-    }
     pub fn handle_message(&self, msg: &ChatMessage) {
         if msg.injected_test || msg.skip_tts || msg.kind == crate::model::MessageKind::System {
             return;
@@ -271,21 +267,6 @@ impl<S: SecretStore, T: Sender> WebhookRuntime<S, T> {
                 &w,
                 request(&w.def, secret, &matched, msg, self.0.clock.now_ms()),
             );
-        }
-    }
-    /// forwarder 用。受信結果を処理し、取りこぼした件数を返す(Closed は 0)。
-    pub fn relay_achievement(
-        &self,
-        incoming: Result<AchievementUnlocked, tokio::sync::broadcast::error::RecvError>,
-    ) -> u64 {
-        use tokio::sync::broadcast::error::RecvError;
-        match incoming {
-            Ok(unlock) => {
-                self.handle_achievement(&unlock);
-                0
-            }
-            Err(RecvError::Lagged(n)) => n,
-            Err(RecvError::Closed) => 0,
         }
     }
     /// 実績解除を `achievement` を有効にした送り先のキューへ積む(`handle_message` と同じく I/O しない)。
@@ -667,11 +648,6 @@ impl<T> From<Result<T, tokio::sync::broadcast::error::RecvError>> for Polled<T> 
         }
     }
 }
-/// forwarder の select で先に届いた側。
-pub enum First<C, A> {
-    Chat(Polled<C>),
-    Achievement(Polled<A>),
-}
 /// 1 ラウンドの集計(件数のみ。URL・トークンは含めない)。
 #[derive(Debug, Default, PartialEq)]
 pub struct RelayRound {
@@ -693,41 +669,43 @@ pub fn sync_subscription<T: Clone>(
         *slot = Some(subscribe());
     }
 }
-/// 1 側を `limit` 回まで取り出す(Lagged も 1 回)。戻り値は (欠落件数, Closed)。
+/// 1 側を `limit` 回まで取り出す(Lagged も 1 回)。戻り値は (欠落件数, Closed, 上限で止めたか)。
 fn drain_side<T: Clone>(
     mut next: Option<Polled<T>>,
-    rx: Option<&mut tokio::sync::broadcast::Receiver<T>>,
-    mut taken: usize,
+    mut rx: Option<&mut tokio::sync::broadcast::Receiver<T>>,
     limit: usize,
     on: &mut impl FnMut(T),
-) -> (u64, bool) {
+) -> (u64, bool, bool) {
     use tokio::sync::broadcast::error::TryRecvError;
-    let mut rx = rx;
     let mut lagged = 0u64;
+    let mut taken = 0;
     loop {
         let polled = match next.take() {
             Some(p) => p,
-            None if taken >= limit => return (lagged, false),
+            None if taken >= limit => return (lagged, false, true),
             None => match rx.as_mut().map(|rx| rx.try_recv()) {
                 Some(Ok(v)) => Polled::Item(v),
                 Some(Err(TryRecvError::Lagged(n))) => Polled::Lagged(n),
                 Some(Err(TryRecvError::Closed)) => Polled::Closed,
-                Some(Err(TryRecvError::Empty)) | None => return (lagged, false),
+                Some(Err(TryRecvError::Empty)) | None => return (lagged, false, false),
             },
         };
         taken += 1;
         match polled {
             Polled::Item(v) => on(v),
             Polled::Lagged(n) => lagged = lagged.saturating_add(n),
-            Polled::Closed => return (lagged, true),
+            Polled::Closed => return (lagged, true, false),
         }
     }
 }
-/// forwarder の 1 ラウンド。先に届いた 1 件を処理し、続けて今届いている分を chat → 実績の順に
-/// それぞれ `limit` 回まで処理する。select は chat を優先し、実績は 1 ラウンドの上限で区切るので、
-/// 解除の原因の chat が先に出て、どちらが詰まっても相手を飢えさせない(SSE の tick と同じ順序)。
+/// forwarder の 1 ラウンド。今届いている chat を `limit` 回まで処理し、chat を空にできた時だけ
+/// 実績を(保留分を先頭に)`limit` 回まで処理する。chat が上限で残っている間は実績を次ラウンドへ
+/// 回すので、解除が原因の chat を追い越さない(SSE の tick と同じ chat → 実績の順序)。
+/// select で先に拾った実績は `pending` に置いてから呼ぶ。実績が待たされるのは chat が上限を
+/// 超えて届き続ける間だけ。
 pub fn drain_relay_round<C: Clone, A: Clone>(
-    first: First<C, A>,
+    first_chat: Option<Polled<C>>,
+    pending: &mut Option<Polled<A>>,
     chat: Option<&mut tokio::sync::broadcast::Receiver<C>>,
     achievement: Option<&mut tokio::sync::broadcast::Receiver<A>>,
     limit: usize,
@@ -735,24 +713,14 @@ pub fn drain_relay_round<C: Clone, A: Clone>(
     mut on_achievement: impl FnMut(A),
 ) -> RelayRound {
     let mut round = RelayRound::default();
-    let (chat_first, achievement_taken) = match first {
-        First::Chat(p) => (Some(p), 0),
-        First::Achievement(p) => {
-            let (lagged, closed) = drain_side(Some(p), None, 0, 1, &mut on_achievement);
-            round.achievement_lagged = lagged;
-            round.achievement_closed = closed;
-            (None, 1)
-        }
-    };
-    let (lagged, closed) = drain_side(chat_first, chat, 0, limit, &mut on_chat);
+    let (lagged, closed, full) = drain_side(first_chat, chat, limit, &mut on_chat);
     round.chat_lagged = lagged;
     round.chat_closed = closed;
-    if round.achievement_closed {
+    if closed || full {
         return round;
     }
-    let (lagged, closed) =
-        drain_side(None, achievement, achievement_taken, limit, &mut on_achievement);
-    round.achievement_lagged = round.achievement_lagged.saturating_add(lagged);
+    let (lagged, closed, _) = drain_side(pending.take(), achievement, limit, &mut on_achievement);
+    round.achievement_lagged = lagged;
     round.achievement_closed = closed;
     round
 }
@@ -793,14 +761,16 @@ mod tests {
         }
     }
     fn relay_log(
-        first: First<u32, u32>,
+        first_chat: Option<Polled<u32>>,
+        pending: &mut Option<Polled<u32>>,
         chat: &mut tokio::sync::broadcast::Receiver<u32>,
         ach: &mut tokio::sync::broadcast::Receiver<u32>,
         limit: usize,
     ) -> (Vec<String>, RelayRound) {
         let log = std::cell::RefCell::new(Vec::new());
         let round = drain_relay_round(
-            first,
+            first_chat,
+            pending,
             Some(chat),
             Some(ach),
             limit,
@@ -810,26 +780,44 @@ mod tests {
         (log.into_inner(), round)
     }
     #[test]
-    fn relay_round_puts_chat_before_achievement_and_caps_each_side() {
+    fn relay_round_puts_chat_before_achievement_and_caps_achievements() {
         let (ctx, mut crx) = tokio::sync::broadcast::channel(16);
         let (atx, mut arx) = tokio::sync::broadcast::channel(16);
         for i in 1..=4 {
             atx.send(i).unwrap();
         }
         ctx.send(2).unwrap();
-        // chat と実績が同時に届いていれば chat を先に処理する。
-        let (log, round) = relay_log(First::Chat(Polled::Item(1)), &mut crx, &mut arx, 3);
+        let (log, round) = relay_log(Some(Polled::Item(1)), &mut None, &mut crx, &mut arx, 3);
         assert_eq!(log, ["c1", "c2", "a1", "a2", "a3"]);
         assert_eq!(round, RelayRound::default());
         assert_eq!(arx.len(), 1, "実績は 1 ラウンドの上限で区切り、次の select で chat に順番を回す");
-        for i in 3..=9 {
-            ctx.send(i).unwrap();
+    }
+    #[test]
+    fn achievement_waits_while_chat_hits_round_limit() {
+        // 投げ銭 257 件とその解除。chat が上限 256 で残るラウンドでは実績を処理しない。
+        for achievement_first in [false, true] {
+            let (ctx, mut crx) = tokio::sync::broadcast::channel(512);
+            let (atx, mut arx) = tokio::sync::broadcast::channel(16);
+            for i in 1..=257 {
+                ctx.send(i).unwrap();
+            }
+            atx.send(257).unwrap();
+            let mut pending = None;
+            let mut log = Vec::new();
+            // select が実績を先に拾った場合は保留に置く(chat を空にするまで出さない)。
+            let mut first = if achievement_first {
+                pending = Some(Polled::Item(arx.try_recv().unwrap()));
+                None
+            } else {
+                Some(Polled::Item(crx.try_recv().unwrap()))
+            };
+            for _ in 0..2 {
+                log.extend(relay_log(first.take(), &mut pending, &mut crx, &mut arx, 256).0);
+            }
+            assert_eq!(log.len(), 258, "{achievement_first}");
+            assert_eq!(log[255..], ["c256", "c257", "a257"], "{achievement_first}");
+            assert!(pending.is_none() && arx.is_empty());
         }
-        // select が実績を先に拾っても、その 1 件の後は chat を残りの実績より先に処理する。
-        let first = First::Achievement(Polled::Item(arx.try_recv().unwrap()));
-        let (log, _) = relay_log(first, &mut crx, &mut arx, 3);
-        assert_eq!(log, ["a4", "c3", "c4", "c5"], "chat も上限で区切る");
-        assert_eq!(crx.len(), 4);
     }
     #[test]
     fn relay_round_counts_lagged_per_side_and_toward_cap() {
@@ -839,11 +827,17 @@ mod tests {
             ctx.send(i).unwrap();
             atx.send(i).unwrap();
         }
-        let (log, round) = relay_log(First::Chat(Polled::Lagged(9)), &mut crx, &mut arx, 3);
-        // chat: Lagged(9)・Lagged(3)・1 件で上限 3。実績: Lagged(3)・2 件で上限 3。
-        assert_eq!(log, ["c3", "a3", "a4"]);
+        let (log, round) = relay_log(Some(Polled::Lagged(9)), &mut None, &mut crx, &mut arx, 5);
+        // chat: Lagged(9)・Lagged(3)・2 件(上限 5 に届かず空)。実績: Lagged(3)・2 件。
+        assert_eq!(log, ["c3", "c4", "a3", "a4"]);
         assert_eq!((round.chat_lagged, round.achievement_lagged), (12, 3));
-        assert_eq!((crx.len(), arx.len()), (1, 0));
+        let (atx2, mut arx2) = tokio::sync::broadcast::channel(2);
+        for i in 0..5 {
+            atx2.send(i).unwrap();
+        }
+        let (log, _) = relay_log(None, &mut None, &mut crx, &mut arx2, 2);
+        assert_eq!(log, ["a3"], "Lagged も上限の 1 回に数える");
+        drop((ctx, atx));
     }
     #[test]
     fn relay_round_reports_closed_achievement_and_it_is_not_resubscribed() {
@@ -851,7 +845,8 @@ mod tests {
         let (atx, mut arx) = tokio::sync::broadcast::channel::<u32>(4);
         drop(atx);
         ctx.send(1).unwrap();
-        let (log, round) = relay_log(First::Achievement(Polled::Closed), &mut crx, &mut arx, 4);
+        let mut pending = Some(Polled::Closed);
+        let (log, round) = relay_log(None, &mut pending, &mut crx, &mut arx, 4);
         assert_eq!(log, ["c1"], "実績が閉じても chat は処理する");
         assert!(round.achievement_closed && !round.chat_closed);
         let mut slot = Some(arx);
@@ -864,19 +859,34 @@ mod tests {
         assert!(slot.is_some());
     }
     #[tokio::test(start_paused = true)]
-    async fn achievement_subscription_needs_an_achievement_target() {
+    async fn disabling_achievement_trigger_stops_delivery_to_that_target() {
         let dir = tempfile::tempdir().unwrap();
         let it = Integrations::open(dir.path().into(), MemorySecretStore::new(), 1).await;
-        let rt = WebhookRuntime::new(it.clone(), Capture::default());
-        it.save_webhook(input("https://a.example.test/hook")).await.unwrap();
-        rt.reload().await;
-        assert!(rt.has_active_webhooks());
-        assert!(!rt.has_achievement_webhooks(), "donation だけの送り先では実績を購読しない");
-        let mut i = input("https://b.example.test/hook");
+        let sender = Capture::default();
+        let rt = WebhookRuntime::new(it.clone(), sender.clone());
+        it.save_webhook(input("https://b.example.test/hook")).await.unwrap();
+        let mut i = input("https://a.example.test/hook");
         i.triggers.achievement = true;
+        let saved = it.save_webhook(i).await.unwrap();
+        rt.reload().await;
+        let unlock: AchievementUnlocked = serde_json::from_value(serde_json::json!({
+            "id": "i", "achievementId": "a", "name": "n", "description": "", "tier": "bronze",
+            "icon": "", "subject": {"kind": "streamer"}, "valueMilli": 1000,
+            "thresholdMilli": 1000, "currency": null, "windowKey": "*", "unlockedAtMs": 1
+        }))
+        .unwrap();
+        rt.handle_achievement(&unlock);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(sender.0.lock().unwrap().len(), 1, "donation だけの送り先には送らない");
+        let mut i = input("https://a.example.test/hook");
+        i.id = Some(saved.definition.id.clone());
+        i.url = None;
         it.save_webhook(i).await.unwrap();
         rt.reload().await;
-        assert!(rt.has_achievement_webhooks());
+        assert!(rt.has_active_webhooks(), "購読は有効な送り先があれば続ける");
+        rt.handle_achievement(&unlock);
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        assert_eq!(sender.0.lock().unwrap().len(), 1, "achievement を外した送り先にはもう送らない");
     }
     #[tokio::test(start_paused = true)]
     async fn bus_achievement_reaches_webhook_queue() {
@@ -902,13 +912,9 @@ mod tests {
         }))
         .unwrap();
         bus.achievement_sender().send(unlock).unwrap();
-        assert_eq!(rt.relay_achievement(rx.recv().await), 0);
+        rt.handle_achievement(&rx.recv().await.unwrap());
         tokio::time::sleep(Duration::from_millis(10)).await;
         assert_eq!(sender.0.lock().unwrap().len(), 1);
-        assert_eq!(
-            rt.relay_achievement(Err(tokio::sync::broadcast::error::RecvError::Lagged(7))),
-            7
-        );
     }
     #[tokio::test(start_paused = true)]
     async fn injected_history_and_duplicates_never_reach_sender_on_any_target() {
