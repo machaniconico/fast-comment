@@ -273,6 +273,65 @@ async fn delete_listener(
     .map_err(|_| "実績のリスナー記録を削除できませんでした".to_owned())?
 }
 
+#[tauri::command]
+fn list_achievements(state: State<'_, AppState>) -> achievements::ipc::AchievementList {
+    let engine = state.lock_achievement_engine();
+    achievements::ipc::list(state.achievement_defs.current(), engine.as_deref())
+}
+
+#[tauri::command]
+fn achievement_schema() -> achievements::ipc::AchievementSchema {
+    achievements::ipc::schema()
+}
+
+#[tauri::command]
+fn commit_achievements(
+    state: State<'_, AppState>,
+    base_revision: u64,
+    enabled: bool,
+    achievements: Vec<achievements::model::Achievement>,
+    rates: achievements::currency::RateTable,
+    symbol_overrides: std::collections::BTreeMap<String, String>,
+) -> achievements::ipc::CommitReply {
+    let mut next = state.achievement_defs.current();
+    next.enabled = enabled;
+    next.achievements = achievements;
+    next.rates = rates;
+    next.symbol_overrides = symbol_overrides;
+    let (reply, unlocks) = achievements::ipc::commit(
+        &state.achievement_defs,
+        &state.achievement_engine,
+        &state.config_dir,
+        base_revision,
+        next,
+        timer_now_ms(),
+    );
+    state.broadcast_achievement_unlocks(unlocks);
+    reply
+}
+
+#[tauri::command]
+fn duplicate_achievement(state: State<'_, AppState>, id: String) -> Option<achievements::model::Achievement> {
+    achievements::ipc::duplicate_by_id(&state.achievement_defs.current(), &id)
+}
+
+#[tauri::command]
+fn reset_achievement_to_preset(state: State<'_, AppState>, id: String) -> Option<achievements::model::Achievement> {
+    achievements::ipc::reset_by_id(&state.achievement_defs.current(), &id)
+}
+
+#[tauri::command]
+fn listener_achievements(
+    state: State<'_, AppState>,
+    platform: String,
+    author_id: String,
+) -> Vec<achievements::ipc::ListenerTrophy> {
+    let engine = state.lock_achievement_engine();
+    achievements::ipc::listener_trophies(
+        &state.achievement_defs.current(), engine.as_deref(), &platform, &author_id,
+    )
+}
+
 fn delete_listener_achievement_progress(
     engine: Option<&AchievementEngine>,
     dir: &std::path::Path,
@@ -3805,6 +3864,12 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            list_achievements,
+            achievement_schema,
+            commit_achievements,
+            duplicate_achievement,
+            reset_achievement_to_preset,
+            listener_achievements,
             list_webhooks,
             save_webhook,
             delete_webhook,

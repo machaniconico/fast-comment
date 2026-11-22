@@ -658,6 +658,29 @@ impl AchievementEngine {
         self.lock().progress.records(STREAMER)
     }
 
+    /// 実績 id ごとに、解除した視聴者(重複なし)の人数。配信者の解除は含めない。
+    pub fn viewer_unlock_counts(&self) -> BTreeMap<String, u64> {
+        let streamer = encode_key_part(STREAMER);
+        let mut subjects: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for key in self.lock().progress.unlocks.keys() {
+            let Some((achievement, rest)) = key.split_once('|') else { continue };
+            let Some((subject, _)) = rest.split_once('|') else { continue };
+            if subject == streamer {
+                continue;
+            }
+            subjects
+                .entry(achievement.replace("%7C", "|").replace("%25", "%"))
+                .or_default()
+                .insert(subject.to_owned());
+        }
+        subjects.into_iter().map(|(id, set)| (id, set.len() as u64)).collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn definitions(&self) -> AchievementDefs {
+        self.lock().defs.clone()
+    }
+
     pub fn forget_listener(&self, platform: &str, author_id: &str) -> anyhow::Result<()> {
         let mut state = self.lock();
         let subject = format!("{platform}:{author_id}");

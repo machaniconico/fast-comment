@@ -1,16 +1,18 @@
 <script lang="ts">
   import { untrack } from 'svelte';
-  import { appendModerationValue, deleteListener, getListener, setListenerVoice, updateListener } from './ipc';
+  import { appendModerationValue, deleteListener, getListener, listenerAchievements, setListenerVoice, updateListener } from './ipc';
   import { store } from './stores.svelte';
   import { ui } from './ui.svelte';
   import { moderation } from './moderation.svelte';
   import { moderationAvailability, TIMEOUT_PRESETS, formatTimeoutLabel } from './moderationActions';
+  import { trophyViews, type TrophyView } from './achievementsUi';
   import { isListenerDeleted, safeAvatarUrl, type ListenerRecord, type ListenerUpdate } from './types';
 
   type LoadState = 'loading' | 'loaded' | 'error';
 
   let record: ListenerRecord | null = $state(null);
   let loadState = $state<LoadState>('loading');
+  let trophies = $state<TrophyView[]>([]);
   let nickname = $state('');
   let label = $state('');
   let memo = $state('');
@@ -187,6 +189,11 @@
     // Only events received after this fetch starts may override its result.
     seenSeq = untrack(() => store.lastListenerUpdate?.seq ?? 0);
     pending = null;
+    trophies = [];
+    listenerAchievements(t.platform, t.authorId).then(
+      (list) => { if (gen === generation) trophies = trophyViews(list); },
+      () => {},
+    );
     getListener(t.platform, t.authorId).then(
       (rec) => {
         if (gen !== generation) return;
@@ -381,6 +388,16 @@
       </header>
 
       <div class="uc-body">
+        {#if trophies.length > 0}
+          <div class="uc-trophies" aria-label="獲得したトロフィー">
+            <span class="uc-trophies-title">獲得したトロフィー({trophies.length})</span>
+            <ul>
+              {#each trophies as t (t.key)}
+                <li><span class="uc-tier uc-tier-{t.tier}">{t.tierLabel}</span> {t.icon} {t.name}{t.scope ? `(${t.scope})` : ''} <time>{t.unlockedAt}</time></li>
+              {/each}
+            </ul>
+          </div>
+        {/if}
         <label class="uc-field">ニックネーム
           <input type="text" bind:value={nickname} maxlength="64" disabled={!ready} />
         </label>
@@ -567,6 +584,15 @@
     flex-direction: column;
     gap: 8px;
   }
+  .uc-trophies { font-size: 12px; border: 1px solid var(--border, #444); border-radius: 4px; padding: 6px 8px; }
+  .uc-trophies-title { font-weight: 600; }
+  .uc-trophies ul { list-style: none; margin: 4px 0 0; padding: 0; max-height: 120px; overflow-y: auto; }
+  .uc-trophies time { opacity: 0.7; margin-left: 4px; }
+  .uc-tier { font-size: 10px; padding: 0 5px; border-radius: 8px; border: 1px solid currentColor; }
+  .uc-tier-bronze { color: #cd7f32; }
+  .uc-tier-silver { color: #c0c0c0; }
+  .uc-tier-gold { color: #ffd700; }
+  .uc-tier-platinum { color: #9fe8ff; }
   .uc-field {
     display: flex;
     flex-direction: column;
