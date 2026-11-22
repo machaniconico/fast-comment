@@ -7,7 +7,7 @@
  * - Safe to import in a plain browser (Tauri absent): all calls are no-ops.
  */
 
-import type { AchievementUnlocked, ChatMessage, ListenerRecord, ListenerUpdate, ModerationEvent, TtsVoiceOverride, TwitcastingMode, YoutubeReaction } from './types';
+import type { AchievementCommitReply, AchievementDef, AchievementList, AchievementSchema, AchievementUnlocked, ListenerTrophy, ChatMessage, ListenerRecord, ListenerUpdate, ModerationEvent, TtsVoiceOverride, TwitcastingMode, YoutubeReaction } from './types';
 import { Channel, invoke as tauriInvoke } from '@tauri-apps/api/core';
 import { emit, listen } from '@tauri-apps/api/event';
 import { getCurrentWindow, primaryMonitor } from '@tauri-apps/api/window';
@@ -1285,4 +1285,37 @@ export async function cancelTwitcastingLogin(attempt: string): Promise<void> {
 }
 export async function disconnectTwitcasting(): Promise<import('./types').TwitcastingStatus | null> {
   return invoke<import('./types').TwitcastingStatus>('disconnect_twitcasting');
+}
+
+// ── Achievements management (all aggregation/validation is done in Rust) ──
+export async function listAchievements(): Promise<AchievementList | null> {
+  return invoke<AchievementList>('list_achievements');
+}
+
+export async function achievementSchema(): Promise<AchievementSchema | null> {
+  return invoke<AchievementSchema>('achievement_schema');
+}
+
+export async function commitAchievements(
+  baseRevision: number,
+  baseToken: string,
+  enabled: boolean,
+  achievements: AchievementDef[],
+  rates: Record<string, number>,
+  symbolOverrides: Record<string, string>,
+): Promise<AchievementCommitReply | null> {
+  return invoke<AchievementCommitReply>('commit_achievements', { baseRevision, baseToken, enabled, achievements, rates, symbolOverrides });
+}
+
+/** Duplicates the current draft (not the saved copy); Rust assigns the new id. */
+export async function duplicateAchievement(achievement: AchievementDef): Promise<AchievementDef | null> {
+  return invoke<AchievementDef | null>('duplicate_achievement', { achievement });
+}
+
+export async function resetAchievementToPreset(id: string): Promise<AchievementDef | null> {
+  return invoke<AchievementDef | null>('reset_achievement_to_preset', { id });
+}
+
+export async function listenerAchievements(platform: string, authorId: string): Promise<ListenerTrophy[]> {
+  return (await invoke<ListenerTrophy[]>('listener_achievements', { platform, authorId })) ?? [];
 }

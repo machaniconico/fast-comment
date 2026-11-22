@@ -7,11 +7,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::currency::RateTable;
 use super::engine::Progress;
-use super::model::{presets, reset_to_preset, validate_all, Achievement, ValidationError};
+use super::model::{
+    presets, reset_to_preset, validate_all, validate_for_save, Achievement, ValidationError,
+};
 
 pub const DEFS_FILE: &str = "achievements.json";
 pub const PROGRESS_FILE: &str = "achievement-progress.json";
@@ -115,6 +118,16 @@ static DEFS_TRANSACTION: Mutex<()> = Mutex::new(());
 struct DefsState {
     current: AchievementDefs,
     saved_bytes: Option<Vec<u8>>,
+    /// 再読込で退避済みの壊れた内容。取り込み(flush)に失敗しても同じ内容は二度退避しない。
+    backed_up: Option<Vec<u8>>,
+}
+
+/// 読み込んだファイル内容の識別子。revision を据え置いた外部編集も見分ける。
+fn content_token(bytes: &Option<Vec<u8>>) -> String {
+    bytes
+        .as_ref()
+        .map(|b| hex::encode(Sha256::digest(b)))
+        .unwrap_or_default()
 }
 
 pub struct DefsStore {
@@ -146,6 +159,7 @@ impl DefsStore {
             state: Mutex::new(DefsState {
                 current: loaded.unwrap_or_default(),
                 saved_bytes,
+                backed_up: None,
             }),
         }
     }
@@ -158,26 +172,124 @@ impl DefsStore {
             .clone()
     }
 
-    pub fn commit(
+    /// 定義と、その元になったファイル内容のトークン。画面は保存時にトークンを返す。
+    pub fn snapshot(&self) -> (AchievementDefs, String) {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        (state.current.clone(), content_token(&state.saved_bytes))
+    }
+
+    /// ディスクの内容を読み直す(外部で更新された時、Stale のあとの再読込用)。変わったら true。
+    pub fn reload(&self, now_ms: u64) -> bool {
+        self.reload_with(now_ms, |_| Ok(())).unwrap_or(false)
+    }
+
+    /// `reload` と同じだが、取り込む前に `before_adopt` を呼ぶ。Err なら取り込まずに返す
+    /// (次の再読込でやり直す)。内容が前回と同じなら復号も退避もしない。
+    pub fn reload_with(
+        &self,
+        now_ms: u64,
+        before_adopt: impl FnOnce(&AchievementDefs) -> Result<(), CommitError>,
+    ) -> Result<bool, CommitError> {
+        if self.save_refused {
+            return Ok(false);
+        }
+        let _transaction = DEFS_TRANSACTION.lock().unwrap_or_else(|e| e.into_inner());
+        let unchanged = |bytes: &Option<Vec<u8>>| {
+            *bytes == self.state.lock().unwrap_or_else(|e| e.into_inner()).saved_bytes
+        };
+        // 読めない(他プロセスが排他で開いている等)時は「変化なし」にせずエラーにする。
+        // Ok(false) にすると古い revision の一覧のまま保存が Stale を繰り返す。
+        let bytes = match read_optional(&self.path) {
+            Ok(bytes) if !unchanged(&bytes) => bytes,
+            Ok(_) => return Ok(false),
+            Err(_) => return Err(CommitError::Io),
+        };
+        let loaded = bytes.as_deref().and_then(|b| {
+            decode_versioned(b, |defs: &AchievementDefs| validate_all(&defs.achievements).is_ok())
+        });
+        if loaded.is_none() && bytes.is_some() {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.backed_up != bytes {
+                // 退避できなければ取り込まずにエラーにする(画面に保存先の確認を促す)。
+                preserve_broken(&self.path, now_ms, self.io.as_ref())?;
+                state.backed_up.clone_from(&bytes);
+            }
+        }
+        let loaded = loaded.unwrap_or_default();
+        before_adopt(&loaded)?;
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.current = loaded;
+        state.saved_bytes = bytes;
+        Ok(true)
+    }
+
+    pub fn commit(&self, base_revision: u64, next: AchievementDefs) -> Result<u64, CommitError> {
+        self.commit_at(base_revision, None, next)
+    }
+
+    /// 書かずに `commit_at` と同じ判定(Stale・検証)だけ行う。無効化の flush より前に呼ぶ。
+    pub fn check(
         &self,
         base_revision: u64,
-        mut next: AchievementDefs,
-    ) -> Result<u64, CommitError> {
+        base_token: Option<&str>,
+        next: &AchievementDefs,
+    ) -> Result<(), CommitError> {
+        let _transaction = DEFS_TRANSACTION.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        self.check_locked(&state, base_revision, base_token, next)
+    }
+
+    /// 競合(Stale)だけを判定する。入力の正規化・検証より前に呼ぶ。
+    pub fn check_base(&self, base_revision: u64, base_token: Option<&str>) -> Result<(), CommitError> {
+        let _transaction = DEFS_TRANSACTION.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        self.check_base_locked(&state, base_revision, base_token)
+    }
+
+    fn check_base_locked(
+        &self,
+        state: &DefsState,
+        base_revision: u64,
+        base_token: Option<&str>,
+    ) -> Result<(), CommitError> {
         if self.save_refused {
             return Err(CommitError::SaveRefused);
         }
-        let _transaction = DEFS_TRANSACTION.lock().unwrap_or_else(|e| e.into_inner());
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if base_revision != state.current.revision
+            || base_token.is_some_and(|token| token != content_token(&state.saved_bytes))
             || read_optional(&self.path).map_err(|_| CommitError::Io)? != state.saved_bytes
         {
             return Err(CommitError::Stale);
         }
-        validate_all(&next.achievements)
+        Ok(())
+    }
+
+    fn check_locked(
+        &self,
+        state: &DefsState,
+        base_revision: u64,
+        base_token: Option<&str>,
+        next: &AchievementDefs,
+    ) -> Result<(), CommitError> {
+        self.check_base_locked(state, base_revision, base_token)?;
+        validate_for_save(&next.achievements)
             .map_err(|(id, reason)| CommitError::Invalid(id, reason))?;
         if next.rates.values().any(|rate| !rate.is_finite()) {
             return Err(CommitError::Io);
         }
+        Ok(())
+    }
+
+    /// `base_token` があれば、画面が読んだ内容とディスクの現内容が同じ時だけ保存する。
+    pub fn commit_at(
+        &self,
+        base_revision: u64,
+        base_token: Option<&str>,
+        mut next: AchievementDefs,
+    ) -> Result<u64, CommitError> {
+        let _transaction = DEFS_TRANSACTION.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        self.check_locked(&state, base_revision, base_token, &next)?;
 
         for achievement in &mut next.achievements {
             if let Some(mut preset) = reset_to_preset(achievement) {
@@ -213,19 +325,19 @@ pub(crate) fn load_versioned<T: DeserializeOwned>(
     let Some(bytes) = read_optional(path).map_err(|_| CommitError::SaveRefused)? else {
         return Ok((None, None));
     };
-    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-        if value.get("version").and_then(serde_json::Value::as_u64)
-            == Some(u64::from(STORE_VERSION))
-        {
-            if let Ok(data) = serde_json::from_value(value) {
-                if validate(&data) {
-                    return Ok((Some(data), Some(bytes)));
-                }
-            }
-        }
+    if let Some(data) = decode_versioned(&bytes, validate) {
+        return Ok((Some(data), Some(bytes)));
     }
     preserve_broken(path, now_ms, io)?;
     Ok((None, Some(bytes)))
+}
+
+fn decode_versioned<T: DeserializeOwned>(bytes: &[u8], validate: impl FnOnce(&T) -> bool) -> Option<T> {
+    let value = serde_json::from_slice::<serde_json::Value>(bytes).ok()?;
+    if value.get("version").and_then(serde_json::Value::as_u64) != Some(u64::from(STORE_VERSION)) {
+        return None;
+    }
+    serde_json::from_value(value).ok().filter(|data| validate(data))
 }
 
 fn preserve_broken(path: &Path, now_ms: u64, io: &dyn StoreIo) -> Result<(), CommitError> {
@@ -321,6 +433,16 @@ impl ProgressFile {
     }
 }
 
+/// 進捗ファイルを読み取り専用で読む(退避も書き込みもしない)。無い・壊れている・版違いは None。
+pub(super) fn read_progress(dir: &Path) -> Option<Progress> {
+    let bytes = read_optional(&dir.join(PROGRESS_FILE)).ok()??;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    if value.get("version").and_then(serde_json::Value::as_u64) != Some(u64::from(STORE_VERSION)) {
+        return None;
+    }
+    serde_json::from_value(value).ok()
+}
+
 /// Remove a viewer's achievements when there is no active engine.
 pub fn delete_listener_progress(
     dir: &Path,
@@ -396,5 +518,32 @@ mod tests {
         assert_eq!(loser.commit(0, loser.current()), Err(CommitError::Stale));
         assert_eq!(loser.current().revision, 0);
         assert_eq!(fs::read(path).unwrap(), saved);
+    }
+
+    #[test]
+    fn reload_does_not_back_up_the_same_broken_file_again() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(DEFS_FILE), "{broken").unwrap();
+        let store = DefsStore::load(dir.path(), 1);
+        for now in 2..5 {
+            assert!(!store.reload(now));
+        }
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2, "defs と退避 1 個だけ");
+    }
+
+    #[test]
+    fn reload_reports_unreadable_defs_instead_of_unchanged() {
+        // 読めない定義(ここではディレクトリに差し替え。実機では他プロセスの排他オープン)を
+        // 「変化なし」にすると、古い revision の一覧から保存して Stale を繰り返す。
+        let dir = tempfile::tempdir().unwrap();
+        let store = DefsStore::load(dir.path(), 0);
+        let mut next = store.current();
+        next.enabled = true;
+        assert_eq!(store.commit(0, next), Ok(1));
+        let path = dir.path().join(DEFS_FILE);
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert_eq!(store.reload_with(1, |_| Ok(())), Err(CommitError::Io));
+        assert_eq!(store.current().revision, 1, "読めない間は取り込まない");
     }
 }

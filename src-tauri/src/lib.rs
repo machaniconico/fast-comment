@@ -273,6 +273,70 @@ async fn delete_listener(
     .map_err(|_| "実績のリスナー記録を削除できませんでした".to_owned())?
 }
 
+#[tauri::command]
+fn list_achievements(state: State<'_, AppState>) -> Result<achievements::ipc::AchievementList, String> {
+    // 外部で更新されていればディスクから読み直す(Stale のあとの再読込もここを通る)。
+    // 外部の無効化で進捗を保存できない時・壊れた定義を退避できない時は取り込まず、エンジンを残したままエラーにする。
+    let unlocks = achievements::ipc::refresh(
+        &state.achievement_defs, &state.achievement_engine, &state.config_dir, timer_now_ms(),
+    )
+    .map_err(|_| "実績のデータを読み書きできませんでした。保存先を確認して再読込してください".to_owned())?;
+    state.broadcast_achievement_unlocks(unlocks);
+    let engine = state.lock_achievement_engine();
+    Ok(achievements::ipc::list(state.achievement_defs.snapshot(), engine.as_deref(), &state.config_dir))
+}
+
+#[tauri::command]
+fn achievement_schema() -> achievements::ipc::AchievementSchema {
+    achievements::ipc::schema()
+}
+
+#[tauri::command]
+fn commit_achievements(
+    state: State<'_, AppState>,
+    base_revision: u64,
+    base_token: String,
+    enabled: bool,
+    achievements: Vec<achievements::ipc::AchievementInput>,
+    rates: achievements::currency::RateTable,
+    symbol_overrides: std::collections::BTreeMap<String, String>,
+) -> achievements::ipc::CommitReply {
+    let draft = achievements::ipc::AchievementDraft { enabled, achievements, rates, symbol_overrides };
+    let (reply, unlocks) = achievements::ipc::commit_draft(
+        &state.achievement_defs,
+        &state.achievement_engine,
+        &state.config_dir,
+        base_revision,
+        Some(&base_token),
+        draft,
+        timer_now_ms(),
+    );
+    state.broadcast_achievement_unlocks(unlocks);
+    reply
+}
+
+#[tauri::command]
+fn duplicate_achievement(achievement: achievements::ipc::AchievementInput) -> Option<achievements::model::Achievement> {
+    achievements::ipc::duplicate_draft(achievement)
+}
+
+#[tauri::command]
+fn reset_achievement_to_preset(state: State<'_, AppState>, id: String) -> Option<achievements::model::Achievement> {
+    achievements::ipc::reset_by_id(&state.achievement_defs.current(), &id)
+}
+
+#[tauri::command]
+fn listener_achievements(
+    state: State<'_, AppState>,
+    platform: String,
+    author_id: String,
+) -> Vec<achievements::ipc::ListenerTrophy> {
+    let engine = state.lock_achievement_engine();
+    achievements::ipc::listener_trophies(
+        &state.achievement_defs.current(), engine.as_deref(), &state.config_dir, &platform, &author_id,
+    )
+}
+
 fn delete_listener_achievement_progress(
     engine: Option<&AchievementEngine>,
     dir: &std::path::Path,
@@ -354,6 +418,21 @@ impl AppState {
             event,
             |msg| self.bus.publish_sequenced(msg),
         );
+    }
+
+    /// 定義の保存・再読込・無効化で出た解除を流す。原因の chat が無いので、on_stats と同じく
+    /// その時点の最新の chat 番号の後に並べる。
+    fn broadcast_achievement_unlocks(
+        &self,
+        unlocks: Vec<crate::achievements::engine::AchievementUnlocked>,
+    ) {
+        if unlocks.is_empty() {
+            return;
+        }
+        let after_seq = self.bus.latest_chat_seq();
+        for unlock in unlocks {
+            self.bus.publish_achievement(unlock, after_seq);
+        }
     }
 
     fn flush_achievements(&self) {
@@ -3805,6 +3884,12 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            list_achievements,
+            achievement_schema,
+            commit_achievements,
+            duplicate_achievement,
+            reset_achievement_to_preset,
+            listener_achievements,
             list_webhooks,
             save_webhook,
             delete_webhook,

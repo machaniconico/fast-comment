@@ -411,6 +411,31 @@ impl Progress {
         removed
     }
 
+    pub(super) fn viewer_unlock_counts(&self) -> BTreeMap<String, u64> {
+        let streamer = encode_key_part(STREAMER);
+        let mut subjects: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for key in self.unlocks.keys() {
+            let Some((achievement, rest)) = key.split_once('|') else { continue };
+            let Some((subject, _)) = rest.split_once('|') else { continue };
+            if subject == streamer {
+                continue;
+            }
+            subjects
+                .entry(achievement.replace("%7C", "|").replace("%25", "%"))
+                .or_default()
+                .insert(subject.to_owned());
+        }
+        subjects.into_iter().map(|(id, set)| (id, set.len() as u64)).collect()
+    }
+
+    pub(super) fn streamer_records(&self) -> Vec<UnlockRecord> {
+        self.records(STREAMER)
+    }
+
+    pub(super) fn listener_records(&self, platform: &str, author_id: &str) -> Vec<UnlockRecord> {
+        self.records(&format!("{platform}:{author_id}"))
+    }
+
     fn records(&self, subject: &str) -> Vec<UnlockRecord> {
         let subject = encode_key_part(subject);
         self.unlocks
@@ -658,6 +683,16 @@ impl AchievementEngine {
         self.lock().progress.records(STREAMER)
     }
 
+    /// 実績 id ごとに、解除した視聴者(重複なし)の人数。配信者の解除は含めない。
+    pub fn viewer_unlock_counts(&self) -> BTreeMap<String, u64> {
+        self.lock().progress.viewer_unlock_counts()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn definitions(&self) -> AchievementDefs {
+        self.lock().defs.clone()
+    }
+
     pub fn forget_listener(&self, platform: &str, author_id: &str) -> anyhow::Result<()> {
         let mut state = self.lock();
         let subject = format!("{platform}:{author_id}");
@@ -694,6 +729,13 @@ impl AchievementEngine {
         // Publish via the next event since flush has no unlock return value.
         state.flushed_unlocks.extend(saved);
         Ok(())
+    }
+
+    /// 閉じる前の flush。保存できた解除(再試行待ちだったものを含む)を返すので、呼び出し側が配信する。
+    /// 失敗したら何も返さず、エンジンはそのまま使い続けられる。
+    pub fn close(&self) -> anyhow::Result<Vec<AchievementUnlocked>> {
+        self.flush()?;
+        Ok(std::mem::take(&mut self.lock().flushed_unlocks))
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {

@@ -3,6 +3,7 @@
 pub mod announce;
 pub mod currency;
 pub mod engine;
+pub mod ipc;
 pub mod model;
 pub mod presets;
 mod session;

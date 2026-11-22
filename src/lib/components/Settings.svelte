@@ -38,6 +38,7 @@
   import XPostSettings from './XPostSettings.svelte';
   import TwitcastingSettings from './TwitcastingSettings.svelte';
   import IntegrationsSettings from './IntegrationsSettings.svelte';
+  import AchievementsSettings from './AchievementsSettings.svelte';
   import { sanitizeXPostNumbers } from '../xAutopost';
   import { DEFAULT_TWITCASTING_CALLBACK_PORT } from '../twitcasting';
   import { appUpdate } from '../appUpdate.svelte';
@@ -2540,6 +2541,8 @@
 
   <!-- ── OBS URL ── -->
   <IntegrationsSettings bind:this={localApiSettings} />
+
+  <AchievementsSettings />
 
   <section id="settings-obs">
     <h3>OBSオーバーレイ URL</h3>

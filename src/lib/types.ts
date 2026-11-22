@@ -279,3 +279,82 @@ export interface AchievementUnlocked {
   windowKey: string;
   unlockedAtMs: number;
 }
+
+// ---------------------------------------------------------------------------
+// Achievement management UI (list/schema/commit IPC; camelCase, mirrors achievements/ipc.rs)
+// ---------------------------------------------------------------------------
+
+export type AchievementWindow = 'lifetime' | 'perStream';
+export type AchievementMetric =
+  | 'comments' | 'superChatCount' | 'donationAmount' | 'giftCount' | 'membershipEvents'
+  | 'streamsAttended' | 'uniqueCommenters' | 'peakConcurrentViewers' | 'streams';
+export type AchievementCurrencyKind = 'none' | 'jpyConverted' | 'only';
+export type AchievementCurrency = { mode: 'none' | 'jpyConverted' } | { mode: 'only'; code: string };
+
+export interface AchievementCondition {
+  window: AchievementWindow;
+  metric: AchievementMetric;
+  /** null while the input is empty; Rust reports it as a threshold field error. */
+  threshold: number | null;
+  currency: AchievementCurrency;
+  platforms: Platform[];
+}
+
+export interface AchievementDef {
+  id: string;
+  name: string;
+  description: string;
+  icon: string;
+  tier: AchievementTier;
+  subject: AchievementSubjectKind;
+  enabled: boolean;
+  builtinId: string | null;
+  edited: boolean;
+  condition: AchievementCondition | null;
+  announce: { tts: boolean };
+}
+
+export interface AchievementRow extends AchievementDef {
+  viewerUnlockCount: number;
+  streamerUnlockCount: number;
+  streamerLastUnlockedAtMs: number | null;
+}
+
+export interface AchievementList {
+  revision: number;
+  /** Token of the file contents this list was read from; pass it back when saving. */
+  contentToken: string;
+  enabled: boolean;
+  rates: Record<string, number>;
+  ratesUpdatedAtMs: number | null;
+  symbolOverrides: Record<string, string>;
+  achievements: AchievementRow[];
+}
+
+export interface AchievementMetricRule {
+  metric: AchievementMetric;
+  subjects: AchievementSubjectKind[];
+  windows: AchievementWindow[];
+  currencyModes: AchievementCurrencyKind[];
+  platforms: Platform[];
+}
+
+export interface AchievementSchema {
+  metrics: AchievementMetricRule[];
+}
+
+export type AchievementCommitReply =
+  | { result: 'ok'; revision: number }
+  | { result: 'stale' }
+  | { result: 'invalid'; id: string; field: string }
+  | { result: 'io' }
+  | { result: 'saveRefused' };
+
+export interface ListenerTrophy {
+  achievementId: string;
+  name: string;
+  icon: string;
+  tier: AchievementTier;
+  windowKey: string;
+  unlockedAtMs: number;
+}
