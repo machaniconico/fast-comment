@@ -61,15 +61,18 @@ pub(super) struct Sessions {
 }
 
 impl Sessions {
-    pub fn expire(&mut self, now_ms: u64) {
+    /// 期限切れを除く。何か変わったら true(保存が必要)。
+    pub fn expire(&mut self, now_ms: u64) -> bool {
         let mut expired_active = false;
+        let before = self.active.len();
         self.active.retain(|_, session| {
             let stale = now_ms.saturating_sub(session.last_activity_ms) >= STALE_SESSION_MS;
             expired_active |= stale && !session.ended;
             !stale
         });
+        let mut changed = self.active.len() != before;
         if self.active.values().any(|session| !session.ended) {
-            return;
+            return changed;
         }
         if expired_active
             || self
@@ -77,9 +80,11 @@ impl Sessions {
                 .as_ref()
                 .is_some_and(|epoch| now_ms.saturating_sub(epoch.last_activity_ms) >= EPOCH_IDLE_MS)
         {
+            changed |= self.epoch.is_some() || !self.active.is_empty();
             self.epoch = None;
             self.active.clear();
         }
+        changed
     }
 
     pub fn on_live_event(&mut self, event: &LiveEvent, now_ms: u64) -> Option<Platform> {

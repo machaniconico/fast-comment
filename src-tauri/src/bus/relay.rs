@@ -65,6 +65,20 @@ impl AchievementRelay {
         })
     }
 
+    /// 終了時に送らず捨てる実績の件数を数えて返す(保留中の全件と、未受信の分・受信の遅延分)。
+    pub(crate) fn discard(&mut self, mut rx: Option<&mut Receiver<SequencedAchievement>>) -> u64 {
+        let mut count = self.pending.len() as u64;
+        self.pending.clear();
+        while let Some(next) = rx.as_deref_mut().and_then(poll) {
+            match next {
+                Polled::Item(_) => count = count.saturating_add(1),
+                Polled::Lagged(n) => count = count.saturating_add(n),
+                Polled::Closed => break,
+            }
+        }
+        count
+    }
+
     /// 受信と配信をそれぞれ上限まで処理する。前回までの保留分も配信上限に含める。
     /// 欠落数 (購読の遅延と保留上限超過) と受信チャネルの終了有無を返す。
     pub(crate) fn drain(
@@ -101,5 +115,36 @@ impl AchievementRelay {
                 Polled::Closed => return (dropped, true),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::broadcast;
+
+    fn event(id: &str, after_seq: u64) -> SequencedAchievement {
+        SequencedAchievement {
+            after_seq,
+            unlock: serde_json::from_value(serde_json::json!({
+                "id": id, "achievementId": "a", "name": "n", "description": "", "tier": "bronze",
+                "icon": "", "subject": {"kind": "streamer"}, "valueMilli": 1000,
+                "thresholdMilli": 1000, "currency": null, "windowKey": "*", "unlockedAtMs": 1
+            }))
+            .unwrap(),
+        }
+    }
+
+    #[test]
+    fn discard_counts_pending_and_unreceived_without_sending() {
+        let (tx, mut rx) = broadcast::channel(8);
+        let mut relay = AchievementRelay::new(0);
+        tx.send(event("pending", 1)).unwrap();
+        tx.send(event("unreceived", 1)).unwrap();
+        relay.drain(poll(&mut rx), None, 1, |_| unreachable!("原因の chat が未処理"));
+        relay.processed_chat(1);
+        assert!(relay.has_ready());
+        assert_eq!(relay.discard(Some(&mut rx)), 2);
+        assert!(!relay.has_ready());
     }
 }
