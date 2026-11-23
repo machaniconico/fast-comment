@@ -161,6 +161,31 @@ export function checkRateRows(rows: RateRow[]): { rates: Record<string, number> 
   return { rates };
 }
 
+export interface SymbolRow {
+  symbol: string;
+  code: string;
+}
+
+export const symbolRowsOf = (overrides: Record<string, string>): SymbolRow[] =>
+  Object.entries(overrides).map(([symbol, code]) => ({ symbol, code }));
+
+/** Pre-save check of the symbol overrides. Rust validates the code format and limits and has the final say. */
+export function checkSymbolRows(rows: SymbolRow[]): { overrides: Record<string, string> } | { error: string } {
+  const overrides: Record<string, string> = {};
+  // Errors name the row, never the typed symbol: a pasted URL or token must not be shown back.
+  for (const [i, row] of rows.entries()) {
+    const symbol = row.symbol.trim();
+    const code = row.code.trim();
+    if (!symbol && !code) continue;
+    const at = `通貨記号の上書きの ${i + 1} 行目`;
+    if (!symbol) return { error: `${at}の記号が空です。` };
+    if (!code) return { error: `${at}の通貨コードが空です。` };
+    if (Object.hasOwn(overrides, symbol)) return { error: `${at}の記号が重複しています。` };
+    overrides[symbol] = code;
+  }
+  return { overrides };
+}
+
 const SUBJECT_LABELS: Record<AchievementSubjectKind, string> = { viewer: '視聴者', streamer: '配信者' };
 
 /**

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import {
-  canDelete, canDuplicate, checkRateRows, coerceCondition, findDraftError, invalidFieldMessage, withSubject, currencyOptions, DAY_MS, metricOptions, parseRate, platformOptions, ratesNotice, ratesStale,
+  canDelete, canDuplicate, checkRateRows, checkSymbolRows, symbolRowsOf, coerceCondition, findDraftError, invalidFieldMessage, withSubject, currencyOptions, DAY_MS, metricOptions, parseRate, platformOptions, ratesNotice, ratesStale,
   trophyViews, windowOptions,
 } from './achievementsUi.ts';
 import type { AchievementDef, AchievementSchema, ListenerTrophy } from './types.ts';
@@ -144,4 +144,22 @@ test('draft errors point at the position, never the typed name', () => {
   assert.ok(!invalid.includes('TEST_ONLY'), invalid);
   assert.match(invalid, /視聴者の 2 番目の実績の通貨/);
   assert.ok(!invalidFieldMessage(drafts, secret, 'name').includes('TEST_ONLY'));
+});
+
+test('symbol override rows round trip with the map and drop fully blank rows', () => {
+  assert.deepEqual(symbolRowsOf({ 'R$': 'BRL', '฿': 'THB' }), [{ symbol: 'R$', code: 'BRL' }, { symbol: '฿', code: 'THB' }]);
+  assert.deepEqual(symbolRowsOf({}), []);
+  const ok = checkSymbolRows([{ symbol: ' R$ ', code: ' BRL ' }, { symbol: ' ', code: '' }, { symbol: '฿', code: 'THB' }]);
+  assert.deepEqual(ok, { overrides: { 'R$': 'BRL', '฿': 'THB' } });
+  assert.deepEqual(checkSymbolRows([]), { overrides: {} });
+});
+
+test('symbol override rows reject empty sides and trimmed duplicates without echoing input', () => {
+  const secret = 'https://example.test/?token=abc';
+  const empty = checkSymbolRows([{ symbol: 'R$', code: 'BRL' }, { symbol: '', code: 'USD' }]);
+  assert.ok('error' in empty && empty.error.includes('2 行目') && empty.error.includes('記号'));
+  const noCode = checkSymbolRows([{ symbol: secret, code: ' ' }]);
+  assert.ok('error' in noCode && noCode.error.includes('1 行目') && !noCode.error.includes(secret));
+  const dup = checkSymbolRows([{ symbol: secret, code: 'USD' }, { symbol: `${secret} `, code: 'EUR' }]);
+  assert.ok('error' in dup && dup.error.includes('2 行目') && !dup.error.includes(secret));
 });

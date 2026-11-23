@@ -14,7 +14,7 @@ import { ZOOM_DEFAULT, clampZoom, normalizeZoom, stepZoom, type ZoomAction } fro
 
 export type Tab = 'comments' | 'donations' | 'firstComments' | 'participation' | 'settings';
 export type ViewMode = 'unified' | 'columns';
-export type ToolSettingsView = 'goals' | 'danmaku';
+export type ToolSettingsView = 'goals' | 'danmaku' | 'achievements';
 
 /** Settings sections that the command palette can jump to. */
 export type SettingsAnchor =

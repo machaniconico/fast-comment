@@ -7,7 +7,7 @@
  * - Safe to import in a plain browser (Tauri absent): all calls are no-ops.
  */
 
-import type { AchievementCommitReply, AchievementDef, AchievementList, AchievementSchema, AchievementUnlocked, ListenerTrophy, ChatMessage, ListenerRecord, ListenerUpdate, ModerationEvent, TtsVoiceOverride, TwitcastingMode, YoutubeReaction } from './types';
+import type { AchievementCommitReply, AchievementDef, AchievementSubjectKind, AchievementList, AchievementSchema, AchievementUnlocked, ListenerTrophy, ChatMessage, ListenerRecord, ListenerUpdate, ModerationEvent, TtsVoiceOverride, TwitcastingMode, YoutubeReaction } from './types';
 import { Channel, invoke as tauriInvoke } from '@tauri-apps/api/core';
 import { emit, listen } from '@tauri-apps/api/event';
 import { getCurrentWindow, primaryMonitor } from '@tauri-apps/api/window';
@@ -1308,6 +1308,10 @@ export async function commitAchievements(
 }
 
 /** Duplicates the current draft (not the saved copy); Rust assigns the new id. */
+export async function newAchievement(subject: AchievementSubjectKind): Promise<AchievementDef | null> {
+  return invoke<AchievementDef | null>('new_achievement', { subject });
+}
+
 export async function duplicateAchievement(achievement: AchievementDef): Promise<AchievementDef | null> {
   return invoke<AchievementDef | null>('duplicate_achievement', { achievement });
 }

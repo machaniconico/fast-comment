@@ -14,7 +14,7 @@
   ];
 
   const actions = [
-    { control: 'ツール', label: 'タイマー/抽選/振り返りを開く' },
+    { control: 'ツール', label: 'タイマー/抽選/振り返り/実績などを開く' },
     { control: '×', label: 'コメント一覧をクリア' },
     { control: 'text / .*', label: 'コメント検索のテキスト/正規表現モード切替' },
   ];

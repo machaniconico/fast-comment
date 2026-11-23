@@ -1,17 +1,22 @@
+<script module lang="ts">
+  // 一覧の開閉はセッション中だけ覚える(設定画面とツールメニューで画面が作り直されても保つ)。
+  const listOpen = $state<Record<'viewer' | 'streamer', boolean>>({ viewer: true, streamer: true });
+</script>
+
 <script lang="ts">
   import { onMount } from 'svelte';
   import {
-    achievementSchema, commitAchievements, duplicateAchievement, listAchievements, resetAchievementToPreset,
+    achievementSchema, commitAchievements, duplicateAchievement, listAchievements, newAchievement, resetAchievementToPreset,
   } from '../ipc';
   import {
-    TIER_LABELS, canDelete, canDuplicate, checkRateRows, coerceCondition, currencyOptions, findDraftError,
-    formatDate, invalidFieldMessage, metricOptions, platformOptions, ratesNotice, windowOptions, withSubject,
+    TIER_LABELS, canDelete, canDuplicate, checkRateRows, checkSymbolRows, coerceCondition, currencyOptions, findDraftError,
+    formatDate, invalidFieldMessage, metricOptions, platformOptions, ratesNotice, symbolRowsOf, windowOptions, withSubject,
   } from '../achievementsUi';
   import type {
     AchievementCondition, AchievementCurrencyKind, AchievementDef, AchievementList, AchievementMetric,
     AchievementRow, AchievementSchema, AchievementSubjectKind, Platform,
   } from '../types';
-  import type { RateRow } from '../achievementsUi';
+  import type { RateRow, SymbolRow } from '../achievementsUi';
 
   const METRIC_LABELS: Record<AchievementMetric, string> = {
     comments: 'コメント数', superChatCount: 'スーパーチャット回数', donationAmount: '金額', giftCount: 'ギフト数',
@@ -29,6 +34,7 @@
   let drafts = $state<AchievementDef[]>([]);
   let enabled = $state(false);
   let rateRows = $state<RateRow[]>([]);
+  let symbolRows = $state<SymbolRow[]>([]);
   let tab = $state<AchievementSubjectKind>('viewer');
   let editingId = $state<string | null>(null);
   let busy = $state(false);
@@ -45,6 +51,7 @@
     drafts = list.achievements.map(({ viewerUnlockCount: _v, streamerUnlockCount: _s, streamerLastUnlockedAtMs: _l, ...def }) => def);
     enabled = list.enabled;
     rateRows = Object.entries(list.rates).map(([code, rate]) => ({ code, text: String(rate) }));
+    symbolRows = symbolRowsOf(list.symbolOverrides);
     if (editingId && !drafts.some((a) => a.id === editingId)) editingId = null;
   }
 
@@ -69,7 +76,9 @@
       if (draftError) { message = draftError.message; editingId = draftError.id; return; }
       const checked = checkRateRows(rateRows);
       if ('error' in checked) { message = checked.error; return; }
-      const reply = await commitAchievements(loaded.revision, loaded.contentToken, enabled, $state.snapshot(drafts), checked.rates, loaded.symbolOverrides);
+      const symbols = checkSymbolRows(symbolRows);
+      if ('error' in symbols) { message = symbols.error; return; }
+      const reply = await commitAchievements(loaded.revision, loaded.contentToken, enabled, $state.snapshot(drafts), checked.rates, symbols.overrides);
       if (!reply) return;
       switch (reply.result) {
         case 'ok': message = '保存しました。'; await reload(); break;
@@ -82,6 +91,8 @@
             message = reply.field === 'rateCode'
               ? 'レート表の通貨コードが空か重複しています(「$」と「USD」のように同じ通貨になる行も重複です)。'
               : 'レート表に 0 より大きい数値でないレートがあります。';
+          } else if (reply.field === 'symbolOverrides') {
+            message = '通貨記号の上書きに誤りがあります(記号は 16 文字まで、通貨コードは英字 3 文字、行は 64 件までで、同じ記号は重複できません)。';
           } else {
             message = invalidFieldMessage(drafts, reply.id, reply.field);
             editingId = reply.id;
@@ -92,6 +103,17 @@
     });
   }
 
+  async function addNew() {
+    await run(async () => {
+      const created = await newAchievement(tab);
+      if (!created) { message = '実績を追加できませんでした。'; return; }
+      drafts.push(created);
+      listOpen[tab] = true;
+      editingId = created.id;
+      message = '実績を追加しました。保存すると反映されます。';
+    });
+  }
+
   async function duplicate(id: string) {
     await run(async () => {
       const src = drafts.find((a) => a.id === id);
@@ -99,6 +121,7 @@
       if (!copy) { message = '複製できませんでした(プラチナは複製できません。しきい値も確認してください)。'; return; }
       const at = drafts.findIndex((a) => a.id === id);
       drafts.splice(at + 1, 0, copy);
+      listOpen[copy.subject] = true;
       editingId = copy.id;
       message = '複製しました。保存すると反映されます。';
     });
@@ -161,7 +184,12 @@
     <p>読み込み中…</p>
   {:else}
     <fieldset class="lock" disabled={busy}>
-    <ul class="list">
+    <h4 class="list-heading">
+      <button class="toggle" aria-expanded={listOpen[tab]} aria-controls="achievements-list" onclick={() => (listOpen[tab] = !listOpen[tab])}>
+        {listOpen[tab] ? '▾' : '▸'} {tab === 'viewer' ? '視聴者' : '配信者'}の実績({rows.length})
+      </button>
+    </h4>
+    <ul class="list" id="achievements-list" hidden={!listOpen[tab]}>
       {#each rows as a (a.id)}
         <li class:selected={a.id === editingId}>
           <span class="tier tier-{a.tier}">{TIER_LABELS[a.tier]}</span>
@@ -172,6 +200,7 @@
         </li>
       {/each}
     </ul>
+    <div class="row"><button onclick={addNew}>実績を追加</button></div>
 
     {#if editing && schema}
       <div class="editor">
@@ -252,6 +281,18 @@
     {/each}
     <div class="row"><button onclick={addRate}>通貨を追加</button></div>
 
+    <h4>通貨記号の上書き</h4>
+    <p>寄付の通貨記号が誤って換算される時に、記号を通貨コード(英字 3 文字)へ置き換えます。</p>
+    {#each symbolRows as row, i}
+      <div class="row">
+        <input type="text" bind:value={row.symbol} placeholder="R$" size="8" maxlength="16" aria-label="通貨記号" />
+        <span aria-hidden="true">→</span>
+        <input type="text" bind:value={row.code} placeholder="BRL" size="6" aria-label="通貨コード" />
+        <button onclick={() => symbolRows.splice(i, 1)}>削除</button>
+      </div>
+    {/each}
+    <div class="row"><button onclick={() => symbolRows.push({ symbol: '', code: '' })}>記号を追加</button></div>
+
     <div class="row">
       <button class="primary" onclick={save}>保存</button>
       <button onclick={() => run(reload)}>破棄して再読込</button>
@@ -268,6 +309,9 @@
   p { font-size: 12px; }
   .tabs { display: flex; gap: 4px; margin: 10px 0; }
   .tabs button.active { background: #3a5a8a; color: #fff; }
+  .list-heading { margin: 8px 0 4px; }
+  .toggle { background: none; border: 0; color: inherit; font: inherit; cursor: pointer; padding: 0; }
+  .list[hidden] { display: none; }
   .list { list-style: none; margin: 0; padding: 0; }
   .list li { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 5px 6px; border-bottom: 1px solid #333; }
   .list li.selected { background: #2a2f3a; }

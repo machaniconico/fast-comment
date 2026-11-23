@@ -256,6 +256,69 @@ fn normalize_rates(
     Ok(out)
 }
 
+const SYMBOL_MAX_CHARS: usize = 16;
+const SYMBOL_MAX_ENTRIES: usize = 64;
+
+/// 通貨記号の上書き(受信記号 → ISO コード)を正規化する。記号・コードとも trim し、コードは大文字化。
+/// 空の記号・コード、英大文字 3 字でないコード、trim 後の記号の重複、長すぎる記号、多すぎる件数は弾く。
+/// エラーの id は空にする(記号は利用者が貼った文字列で、画面に返さない)。
+fn normalize_symbol_overrides(
+    raw: BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>, CommitReply> {
+    let invalid = || CommitReply::Invalid { id: String::new(), field: "symbolOverrides" };
+    if raw.len() > SYMBOL_MAX_ENTRIES {
+        return Err(invalid());
+    }
+    let mut out = BTreeMap::new();
+    for (symbol, code) in raw {
+        let symbol = symbol.trim();
+        let code = code.trim();
+        if symbol.is_empty()
+            || symbol.chars().count() > SYMBOL_MAX_CHARS
+            || code.len() != 3
+            || !code.bytes().all(|b| b.is_ascii_alphabetic())
+        {
+            return Err(invalid());
+        }
+        if out.insert(symbol.to_owned(), code.to_ascii_uppercase()).is_some() {
+            return Err(invalid());
+        }
+    }
+    Ok(out)
+}
+
+/// 新規の実績(未保存)。id は Rust が振る。条件は schema の先頭の指標・期間・通貨モードで決定的に作る。
+pub fn new_achievement(subject: SubjectKind) -> Achievement {
+    let rule = schema()
+        .metrics
+        .into_iter()
+        .find(|rule| rule.subjects.contains(&subject))
+        .expect("every subject has at least one metric");
+    let currency = match rule.currency_modes.first() {
+        Some(CurrencyKind::JpyConverted) => CurrencyMode::JpyConverted,
+        _ => CurrencyMode::None,
+    };
+    Achievement {
+        id: Uuid::new_v4().to_string(),
+        name: "新しい実績".to_owned(),
+        description: String::new(),
+        icon: "🏆".to_owned(),
+        tier: Tier::Bronze,
+        subject,
+        enabled: true,
+        builtin_id: None,
+        edited: false,
+        condition: Some(Condition {
+            window: rule.windows[0],
+            metric: rule.metric,
+            threshold: 1.0,
+            currency,
+            platforms: Vec::new(),
+        }),
+        announce: Announce { tts: false },
+    }
+}
+
 /// 定義の状態に合わせてエンジンを開閉・再評価する。無効→有効では既存の進捗も再評価する。
 /// 無効化は呼ぶ前に `close_engine` を済ませておく(ここでは破棄だけ)。
 fn apply_to_engine(
@@ -343,6 +406,10 @@ pub fn commit(
         return (reply_of(error), Vec::new());
     }
     let current = store.current();
+    next.symbol_overrides = match normalize_symbol_overrides(next.symbol_overrides) {
+        Ok(overrides) => overrides,
+        Err(reply) => return (reply, Vec::new()),
+    };
     next.rates = match normalize_rates(next.rates, &next.symbol_overrides) {
         Ok(rates) => rates,
         Err(reply) => return (reply, Vec::new()),
@@ -474,7 +541,7 @@ pub fn listener_trophies(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::achievements::model::{Announce, Condition, CurrencyMode, validate_all};
+    use crate::achievements::model::{Announce, Condition, CurrencyMode, validate_all, validate_for_save};
 
     fn probe(metric: Metric, subject: SubjectKind, window: Window, currency: CurrencyMode) -> Achievement {
         Achievement {
@@ -767,6 +834,66 @@ mod tests {
         let mut a = probe(Metric::DonationAmount, SubjectKind::Viewer, Window::Lifetime, CurrencyMode::JpyConverted);
         a.condition.as_mut().unwrap().platforms = vec![Platform::X];
         assert!(validate_all(&[a]).is_ok());
+    }
+
+    #[test]
+    fn new_achievement_is_a_valid_unsaved_user_definition_for_each_subject() {
+        for subject in [SubjectKind::Viewer, SubjectKind::Streamer] {
+            let a = new_achievement(subject);
+            let b = new_achievement(subject);
+            assert_ne!(a.id, b.id);
+            assert!(Uuid::parse_str(&a.id).is_ok());
+            assert_eq!(a.subject, subject);
+            assert_eq!(a.builtin_id, None);
+            assert!(!a.edited && a.enabled && !a.announce.tts);
+            assert_eq!(a.tier, Tier::Bronze);
+            assert!(!a.name.trim().is_empty());
+            assert!(a.condition.is_some());
+            assert!(validate_for_save(&[a]).is_ok(), "{subject:?}");
+        }
+    }
+
+    #[test]
+    fn symbol_overrides_are_trimmed_uppercased_and_saved() {
+        let (dir, store, slot) = setup(false);
+        let mut next = store.current();
+        next.symbol_overrides = BTreeMap::from([(" R$ ".to_owned(), " brl ".to_owned())]);
+        let (reply, _) = commit(&store, &slot, dir.path(), 0, None, next, 1);
+        assert_eq!(reply, CommitReply::Ok { revision: 1 });
+        assert_eq!(store.current().symbol_overrides, BTreeMap::from([("R$".to_owned(), "BRL".to_owned())]));
+    }
+
+    #[test]
+    fn symbol_override_errors_are_field_errors_without_write_or_echo() {
+        let (dir, store, slot) = setup(false);
+        let long = "x".repeat(17);
+        let many: Vec<(String, String)> = (0..65).map(|i| (format!("s{i}"), "USD".to_owned())).collect();
+        let cases: Vec<Vec<(String, String)>> = vec![
+            vec![(" ".into(), "USD".into())],
+            vec![("R$".into(), " ".into())],
+            vec![("R$".into(), "BR".into())],
+            vec![("R$".into(), "B1L".into())],
+            vec![("R$".into(), "BRLL".into())],
+            vec![("R$".into(), "BRL".into()), (" R$".into(), "USD".into())],
+            vec![(long, "USD".into())],
+            many,
+        ];
+        for case in cases {
+            let mut next = store.current();
+            next.symbol_overrides = case.iter().cloned().collect();
+            let (reply, _) = commit(&store, &slot, dir.path(), 0, None, next, 1);
+            assert_eq!(reply, CommitReply::Invalid { id: String::new(), field: "symbolOverrides" }, "{case:?}");
+        }
+        assert_eq!(store.current().revision, 0);
+    }
+
+    #[test]
+    fn symbol_override_limits_allow_the_boundary() {
+        let (dir, store, slot) = setup(false);
+        let mut next = store.current();
+        next.symbol_overrides = (0..64).map(|i| (format!("{i:0>16}"), "USD".to_owned())).collect();
+        let (reply, _) = commit(&store, &slot, dir.path(), 0, None, next, 1);
+        assert_eq!(reply, CommitReply::Ok { revision: 1 });
     }
 
     #[test]

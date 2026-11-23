@@ -47,7 +47,7 @@
 
   interface Props {
     onConfigSaved?: (config: AppConfig, revision: number) => void;
-    focus?: 'all' | 'goals' | 'danmaku';
+    focus?: 'all' | 'goals' | 'danmaku' | 'achievements';
   }
 
   let { onConfigSaved, focus = 'all' }: Props = $props();
@@ -1584,8 +1584,9 @@
   class="settings"
   class:focus-goals={focus === 'goals'}
   class:focus-danmaku={focus === 'danmaku'}
+  class:focus-achievements={focus === 'achievements'}
 >
-  <h2>{focus === 'goals' ? '目標設定' : focus === 'danmaku' ? '弾幕・OBS設定' : '設定'}</h2>
+  <h2>{focus === 'goals' ? '目標設定' : focus === 'danmaku' ? '弾幕・OBS設定' : focus === 'achievements' ? '実績' : '設定'}</h2>
 
   <fieldset class="settings-fields" disabled={allFieldsLocked}>
   <section id="settings-appearance">
@@ -2542,7 +2543,7 @@
   <!-- ── OBS URL ── -->
   <IntegrationsSettings bind:this={localApiSettings} />
 
-  <AchievementsSettings />
+  <div class="achievements-wrap"><AchievementsSettings /></div>
 
   <section id="settings-obs">
     <h3>OBSオーバーレイ URL</h3>
@@ -3210,7 +3211,11 @@
   .settings-fields { display: contents; }
 
   .settings.focus-goals > .settings-fields > section:not(#settings-goals),
-  .settings.focus-danmaku > .settings-fields > section:not(#settings-danmaku) {
+  .settings.focus-danmaku > .settings-fields > section:not(#settings-danmaku),
+  .settings.focus-achievements > .settings-fields > section,
+  .settings.focus-achievements > .settings-fields > .save-row,
+  .settings.focus-goals > .settings-fields > .achievements-wrap,
+  .settings.focus-danmaku > .settings-fields > .achievements-wrap {
     display: none;
   }
 
