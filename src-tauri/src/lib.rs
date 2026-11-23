@@ -3123,6 +3123,18 @@ fn spawn_achievement_tts_forwarder(
 /// Webhook forwarder の 1 ラウンドで chat・実績それぞれに処理する上限。
 const WEBHOOK_RELAY_ROUND_LIMIT: usize = 256;
 
+/// 終了前に、送り出せる保留中の実績を送り、送れない分は欠落数としてログに残す(数値のみ)。
+fn finish_webhook_relay(
+    runtime: &webhook::WebhookRuntime<integrations::KeyringSecretStore, webhook::ReqwestSender>,
+    relay: &mut bus::relay::AchievementRelay,
+    achievement_rx: Option<&mut tokio::sync::broadcast::Receiver<bus::SequencedAchievement>>,
+) {
+    let dropped = relay.finish(achievement_rx, |event| runtime.handle_achievement(&event.unlock));
+    if dropped > 0 && runtime.has_achievement_destinations() {
+        tracing::warn!(lagged = dropped, "終了時に Webhook の実績通知を送れませんでした");
+    }
+}
+
 fn spawn_webhook_forwarder(app: AppHandle, cancel: CancellationToken) {
     use crate::bus::relay::AchievementRelay;
     use crate::webhook::runtime::{drain_relay_round, sync_subscription};
@@ -3157,7 +3169,11 @@ fn spawn_webhook_forwarder(app: AppHandle, cancel: CancellationToken) {
             }
             let first = tokio::select! {
                 biased;
-                _ = cancel.cancelled() => { runtime.shutdown(); break; },
+                _ = cancel.cancelled() => {
+                    finish_webhook_relay(&runtime, &mut relay, achievement_rx.as_mut());
+                    runtime.shutdown();
+                    break;
+                },
                 _ = runtime.changed() => continue,
                 _ = tick.tick() => {
                     let status = runtime.status();
@@ -3190,6 +3206,7 @@ fn spawn_webhook_forwarder(app: AppHandle, cancel: CancellationToken) {
                 achievement_rx = None;
             }
             if round.chat_closed {
+                finish_webhook_relay(&runtime, &mut relay, achievement_rx.as_mut());
                 runtime.shutdown();
                 break;
             }

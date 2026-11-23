@@ -65,6 +65,19 @@ impl AchievementRelay {
         })
     }
 
+    /// 終了前の最後の配信。受信済み・未受信の実績のうち、原因の chat が処理済みの分を送り出し、
+    /// 送れない残りは捨てて欠落数に数える(受信の遅延分も含む)。
+    pub(crate) fn finish(
+        &mut self,
+        rx: Option<&mut Receiver<SequencedAchievement>>,
+        send: impl FnMut(SequencedAchievement),
+    ) -> u64 {
+        let (dropped, _) = self.drain(None, rx, usize::MAX, send);
+        let rest = self.pending.len() as u64;
+        self.pending.clear();
+        dropped.saturating_add(rest)
+    }
+
     /// 受信と配信をそれぞれ上限まで処理する。前回までの保留分も配信上限に含める。
     /// 欠落数 (購読の遅延と保留上限超過) と受信チャネルの終了有無を返す。
     pub(crate) fn drain(
@@ -101,5 +114,39 @@ impl AchievementRelay {
                 Polled::Closed => return (dropped, true),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::broadcast;
+
+    fn event(id: &str, after_seq: u64) -> SequencedAchievement {
+        SequencedAchievement {
+            after_seq,
+            unlock: serde_json::from_value(serde_json::json!({
+                "id": id, "achievementId": "a", "name": "n", "description": "", "tier": "bronze",
+                "icon": "", "subject": {"kind": "streamer"}, "valueMilli": 1000,
+                "thresholdMilli": 1000, "currency": null, "windowKey": "*", "unlockedAtMs": 1
+            }))
+            .unwrap(),
+        }
+    }
+
+    #[test]
+    fn finish_sends_eligible_pending_and_counts_the_rest() {
+        let (tx, mut rx) = broadcast::channel(8);
+        let mut relay = AchievementRelay::new(0);
+        tx.send(event("ready", 1)).unwrap();
+        tx.send(event("waiting", 2)).unwrap();
+        // 1 件は保留に入れ、もう 1 件は未受信のまま終了を迎える。
+        relay.drain(poll(&mut rx), None, 1, |_| unreachable!("原因の chat が未処理"));
+        relay.processed_chat(1);
+        let mut sent = Vec::new();
+        let dropped = relay.finish(Some(&mut rx), |e| sent.push(e.unlock.id));
+        assert_eq!(sent, ["ready"]);
+        assert_eq!(dropped, 1);
+        assert!(!relay.has_ready());
     }
 }

@@ -355,6 +355,8 @@ pub fn commit(
         };
     let mut unlocks = Vec::new();
     let mut result = store.check(base_revision, base_token, &next);
+    // 無効化の保存(close_engine の flush)の最中に定義ファイルが外部で編集されると、下の commit_at が
+    // Stale を返しても進捗ファイルは書かれている。書かれるのは正常な進捗保存で値は正しいので、挙動は変えない。
     if result.is_ok() && !next.enabled {
         match close_engine(&slot) {
             Ok(closed) => unlocks = closed,

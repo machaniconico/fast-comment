@@ -504,6 +504,8 @@ struct State {
     retry: BTreeSet<String>,
     closed_epoch_retries: Candidates,
     flushed_unlocks: Vec<AchievementUnlocked>,
+    /// 前回の保存から進捗が変わった(または一度も保存していない)。false なら定期 flush は書かない。
+    dirty: bool,
     now_ms: u64,
 }
 
@@ -519,6 +521,7 @@ impl AchievementEngine {
 
     pub fn open_with(dir: &Path, defs: AchievementDefs, now_ms: u64, io: Arc<dyn StoreIo>) -> Self {
         let (file, progress) = ProgressFile::open(dir, now_ms, io);
+        let dirty = progress.is_none();
         let mut progress = progress.unwrap_or_else(|| Progress::new(now_ms));
         progress.sessions.expire(now_ms);
         Self {
@@ -530,6 +533,7 @@ impl AchievementEngine {
                 retry: BTreeSet::new(),
                 closed_epoch_retries: Candidates::new(),
                 flushed_unlocks: Vec::new(),
+                dirty,
                 now_ms,
             }),
         }
@@ -701,6 +705,7 @@ impl AchievementEngine {
         next.remove_listener(&subject);
         self.file.save(&next)?;
         state.progress = next;
+        state.dirty = false;
         state.retry.remove(&subject);
         let other_listener = |unlock: &AchievementUnlocked| {
             unlock.subject.platform.map(platform_key) != Some(platform)
@@ -756,6 +761,7 @@ impl AchievementEngine {
         // Retry the previous window before applying any epoch rollover for this event.
         state.evaluate_retries(&mut candidates);
         state.progress.sessions.expire(state.now_ms);
+        state.dirty = true;
         update(state, &mut candidates);
         let mut result = std::mem::take(&mut state.flushed_unlocks);
         if let Ok(saved) = self.persist(state, candidates, false) {
@@ -771,7 +777,7 @@ impl AchievementEngine {
         flush: bool,
     ) -> Result<Vec<AchievementUnlocked>, CommitError> {
         state.retry.clear();
-        if candidates.is_empty() && !flush {
+        if candidates.is_empty() && !(flush && state.dirty) {
             return Ok(Vec::new());
         }
         for (key, unlock) in &candidates {
@@ -805,6 +811,7 @@ impl AchievementEngine {
             }
             return Err(error);
         }
+        state.dirty = false;
         Ok(candidates.into_values().collect())
     }
 }
@@ -1238,17 +1245,63 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let defs = AchievementDefs::default();
         let engine = AchievementEngine::open(dir.path(), defs.clone(), 1);
-        engine
-            .lock()
-            .progress
-            .viewers
-            .insert("twitch:u".to_owned(), ViewerProgress::default());
+        engine.lock().progress.viewers.insert("twitch:u".to_owned(), ViewerProgress::default());
+        engine.lock().dirty = true;
         engine.flush().unwrap();
 
         let older = AchievementEngine::open(dir.path(), defs, 2);
+        older.lock().dirty = true;
         assert!(super::super::store::delete_listener_progress(dir.path(), "twitch", "u").unwrap());
         assert!(older.flush().is_err());
         assert!(!super::super::store::delete_listener_progress(dir.path(), "twitch", "u").unwrap());
+    }
+
+    struct CountWrites(AtomicUsize);
+
+    impl StoreIo for CountWrites {
+        fn write_atomic(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            FsIo.write_atomic(path, bytes)
+        }
+
+        fn create_backup(&self, src: &Path, dst: &Path) -> std::io::Result<()> {
+            FsIo.create_backup(src, dst)
+        }
+    }
+
+    #[test]
+    fn flush_without_changes_does_not_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let io = Arc::new(CountWrites(AtomicUsize::new(0)));
+        let engine =
+            AchievementEngine::open_with(dir.path(), AchievementDefs::default(), 1, io.clone());
+        engine.flush().unwrap();
+        let first = io.0.load(Ordering::Relaxed);
+        assert_eq!(first, 1, "未作成のファイルは 1 回だけ書く");
+        engine.flush().unwrap();
+        engine.close().unwrap();
+        assert_eq!(io.0.load(Ordering::Relaxed), first, "変更なしの flush は書かない");
+
+        engine.lock().dirty = true;
+        engine.flush().unwrap();
+        assert_eq!(io.0.load(Ordering::Relaxed), first + 1, "変更があれば書く");
+        engine.flush().unwrap();
+        assert_eq!(io.0.load(Ordering::Relaxed), first + 1);
+    }
+
+    #[test]
+    fn observed_message_makes_next_flush_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let io = Arc::new(CountWrites(AtomicUsize::new(0)));
+        let mut defs = AchievementDefs::default();
+        defs.enabled = true;
+        let engine = AchievementEngine::open_with(dir.path(), defs, 1, io.clone());
+        engine.flush().unwrap();
+        let before = io.0.load(Ordering::Relaxed);
+        let msg: ChatMessage = serde_json::from_value(serde_json::json!({"id":"m1","platform":"youtube","channel":"c","author":{"id":"a","name":"A"},"kind":"normal","timestampMs":1,"fragments":[{"type":"text","text":"x"}]})).unwrap();
+        engine.observe(&msg, 2);
+        engine.flush().unwrap();
+        assert!(io.0.load(Ordering::Relaxed) > before);
     }
 
     #[test]
@@ -1264,6 +1317,7 @@ mod tests {
                 .progress
                 .viewers
                 .insert("twitch:u".to_owned(), ViewerProgress::default());
+            engine.lock().dirty = true;
             assert!(
                 !super::super::store::delete_listener_progress(dir.path(), "twitch", "u").unwrap()
             );

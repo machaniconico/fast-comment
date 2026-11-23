@@ -588,3 +588,8 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
 
 - 設計書からの補足: Discord の title にも 256 文字の上限を適用する(全体 6000 文字だけでは HTTP 400 になるため。[公式 Embed Limits](https://discord.com/developers/docs/resources/message#embed-object-embed-limits))。
 - 設定 UI(PR5): 設定画面「Webhook」(`id="settings-webhooks"`)。一覧は名前・形式・有効/無効・状態ラベル(active/disabled/paused/noUrl)・URL の伏せ字プレビュー・件数・直近の結果を出し、状態は `list_webhooks` の `status` で取得、以降は `webhook-status` イベントで更新する。追加・編集フォームは名前・形式・URL(伏せ字入力。編集時に空欄なら `url` を送らず保存済みの URL を維持)・きっかけ 3 種・キーワード(1 行 1 語。trim して空行を除く。重複は除かない)・有効。10 件で追加を無効化。削除と署名シークレット再生成は確認つき。汎用 JSON のみ署名シークレットの表示・コピー・再生成。停止中は理由(unauthorized / notFound / redirected / unreachable)を日本語で出して「再開」を出す。エラーは IPC の種別(InvalidWebhook 等)を固定文に変換して表示する。使い方・署名の検証例は README「Webhook の設定」。
+
+## 17. 実績の進捗保存(補足)
+
+- 5 秒ごとの定期 flush は、前回の保存から進捗が変わっていない時は書かない(終了時・無効化時の flush も同じで、変更が無ければ何もせず成功を返す。ただし進捗ファイルが未作成なら 1 回は書く)。Webhook の転送は終了時(chat の Closed・アプリ終了)に、原因の chat が処理済みの保留実績を送り出し、送れない残りは欠落数としてログに数値だけ残す。
+- 無効化の保存が競合で Stale になっても、進捗の保存は行われることがある(進捗は正しい値)。
