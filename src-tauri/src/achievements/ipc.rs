@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::model::Platform;
 
-use super::currency::{normalize_currency, RateTable};
+use super::currency::{is_iso_code, normalize_currency, RateTable};
 use super::engine::{AchievementEngine, AchievementUnlocked, UnlockRecord};
 use super::model::{
     allowed_platforms, duplicate, reset_to_preset, Achievement, Announce, Condition, CurrencyMode,
@@ -256,18 +256,17 @@ fn normalize_rates(
     Ok(out)
 }
 
-fn is_iso_code(s: &str) -> bool {
-    s.len() == 3 && s.bytes().all(|b| b.is_ascii_alphabetic())
-}
-
 const SYMBOL_MAX_CHARS: usize = 16;
 const SYMBOL_MAX_ENTRIES: usize = 64;
 
-/// 通貨記号の上書き(受信記号 → ISO コード)を正規化する。記号・コードとも trim し、コードは大文字化。
-/// 空の記号・コード、英大文字 3 字でないコード、trim 後の記号の重複、長すぎる記号、多すぎる件数は弾く。
+/// 通貨記号の上書き(受信記号 → ISO コード)を正規化する。記号・コードとも trim して ASCII 大文字化する
+/// (`normalize_currency` は大文字化した形で引く)。空の記号・コード、英大文字 3 字でないコード、正規化後の記号の重複、
+/// 長すぎる記号、多すぎる件数は弾く。ISO 形式の記号は、`saved` に同じ組で保存済みの物だけ通す(実行時は使われない。
+/// 以前の版や手編集で残った物が、関係ない保存を止めないようにする)。
 /// エラーの id は空にする(記号は利用者が貼った文字列で、画面に返さない)。
 fn normalize_symbol_overrides(
     raw: BTreeMap<String, String>,
+    saved: &BTreeMap<String, String>,
 ) -> Result<BTreeMap<String, String>, CommitReply> {
     let invalid = || CommitReply::Invalid { id: String::new(), field: "symbolOverrides" };
     if raw.len() > SYMBOL_MAX_ENTRIES {
@@ -275,17 +274,22 @@ fn normalize_symbol_overrides(
     }
     let mut out = BTreeMap::new();
     for (symbol, code) in raw {
-        let symbol = symbol.trim();
-        let code = code.trim();
-        // ISO 形式の記号は上書きできない(別コードへの読み替えは用途が無く、保存し直すたびにレートのキーが動く)。
+        let symbol = symbol.trim().to_ascii_uppercase();
+        let code = code.trim().to_ascii_uppercase();
+        // ISO 形式の記号の新規追加・変更は不可(ISO コードは上書きされないので、保存しても効かない)。
+        let kept = || {
+            saved.iter().any(|(s, c)| {
+                s.trim().eq_ignore_ascii_case(&symbol) && c.trim().eq_ignore_ascii_case(&code)
+            })
+        };
         if symbol.is_empty()
             || symbol.chars().count() > SYMBOL_MAX_CHARS
-            || is_iso_code(symbol)
-            || !is_iso_code(code)
+            || (is_iso_code(&symbol) && !kept())
+            || !is_iso_code(&code)
         {
             return Err(invalid());
         }
-        if out.insert(symbol.to_owned(), code.to_ascii_uppercase()).is_some() {
+        if out.insert(symbol, code).is_some() {
             return Err(invalid());
         }
     }
@@ -411,7 +415,7 @@ pub fn commit(
         return (reply_of(error), Vec::new());
     }
     let current = store.current();
-    next.symbol_overrides = match normalize_symbol_overrides(next.symbol_overrides) {
+    next.symbol_overrides = match normalize_symbol_overrides(next.symbol_overrides, &current.symbol_overrides) {
         Ok(overrides) => overrides,
         Err(reply) => return (reply, Vec::new()),
     };
@@ -909,6 +913,75 @@ mod tests {
         assert_eq!(reply, CommitReply::Ok { revision: 2 });
         assert_eq!(store.current().rates, saved.rates);
         assert_eq!(store.current().symbol_overrides, saved.symbol_overrides);
+    }
+
+    /// 手で編集されたファイルや以前の版が残した ISO 形式の上書きを、検証を通さずに保存済みにする。
+    fn save_raw_overrides(store: &DefsStore, pairs: &[(&str, &str)]) {
+        let mut defs = store.current();
+        defs.symbol_overrides = pairs.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect();
+        store.commit_at(store.current().revision, None, defs).unwrap();
+    }
+
+    #[test]
+    fn saved_iso_override_does_not_block_unrelated_saves() {
+        let (dir, store, slot) = setup(false);
+        save_raw_overrides(&store, &[("BRL", "USD")]);
+        let mut next = store.current();
+        next.rates = BTreeMap::from([("brl".to_owned(), 30.0)]);
+        let (reply, _) = commit(&store, &slot, dir.path(), 1, None, next, 1);
+        assert_eq!(reply, CommitReply::Ok { revision: 2 });
+        assert_eq!(store.current().symbol_overrides, BTreeMap::from([("BRL".to_owned(), "USD".to_owned())]));
+        // ISO コードは上書きされないので、レートは BRL のまま。
+        assert_eq!(store.current().rates, BTreeMap::from([("BRL".to_owned(), 30.0)]));
+    }
+
+    #[test]
+    fn new_or_changed_iso_override_is_invalid_even_next_to_a_saved_one() {
+        let (dir, store, slot) = setup(false);
+        save_raw_overrides(&store, &[("BRL", "USD")]);
+        let cases: [&[(&str, &str)]; 3] =
+            [&[("BRL", "EUR")], &[("BRL", "USD"), ("EUR", "USD")], &[("BRL", "USD"), (" jpy ", "USD")]];
+        for case in cases {
+            let mut next = store.current();
+            next.symbol_overrides = case.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect();
+            let (reply, _) = commit(&store, &slot, dir.path(), 1, None, next, 1);
+            assert_eq!(reply, CommitReply::Invalid { id: String::new(), field: "symbolOverrides" }, "{case:?}");
+        }
+        assert_eq!(store.current().revision, 1);
+    }
+
+    #[test]
+    fn rate_keys_stay_the_same_across_save_load_save() {
+        let cases: [(&[(&str, f64)], &[(&str, &str)]); 5] = [
+            (&[("pt", 20.0)], &[("PT", "USD")]),
+            (&[("PT", 20.0)], &[("pt", "USD")]),
+            (&[("r$", 30.0), ("brl", 31.0)], &[("R$", "EUR")]),
+            (&[("￥", 1.0), ("$", 150.0)], &[("￥", "CNY")]),
+            (&[("__proto__", 2.0), ("ｂｒｌ", 3.0)], &[("__proto__", "EUR")]),
+        ];
+        for (rates, overrides) in cases {
+            let (dir, store, slot) = setup(false);
+            let mut next = store.current();
+            next.rates = rates.iter().map(|(k, v)| ((*k).to_owned(), *v)).collect();
+            next.symbol_overrides = overrides.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect();
+            let (reply, _) = commit(&store, &slot, dir.path(), 0, None, next, 1);
+            assert_eq!(reply, CommitReply::Ok { revision: 1 }, "{rates:?}");
+            let first = store.current();
+            let reloaded = DefsStore::load(dir.path(), 0).current();
+            assert_eq!(reloaded.rates, first.rates, "{rates:?}");
+            let (reply, _) = commit(&store, &slot, dir.path(), 1, None, reloaded, 2);
+            assert_eq!(reply, CommitReply::Ok { revision: 2 }, "{rates:?}");
+            assert_eq!(store.current().rates, first.rates, "{rates:?}");
+            assert_eq!(store.current().symbol_overrides, first.symbol_overrides, "{rates:?}");
+        }
+        let (dir, store, slot) = setup(false);
+        let mut next = store.current();
+        next.rates = BTreeMap::from([("pt".to_owned(), 20.0)]);
+        next.symbol_overrides = BTreeMap::from([("pt".to_owned(), "usd".to_owned())]);
+        let (reply, _) = commit(&store, &slot, dir.path(), 0, None, next, 1);
+        assert_eq!(reply, CommitReply::Ok { revision: 1 });
+        assert_eq!(store.current().rates, BTreeMap::from([("USD".to_owned(), 20.0)]));
+        assert_eq!(store.current().symbol_overrides, BTreeMap::from([("PT".to_owned(), "USD".to_owned())]));
     }
 
     #[test]

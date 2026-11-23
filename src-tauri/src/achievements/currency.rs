@@ -111,10 +111,19 @@ pub fn amount_from_micros(micros: i64, iso: &str) -> ParsedAmount {
     }
 }
 
+/// 受信した通貨表記を通貨コードにする。上書きは trim と ASCII 大文字化をした形で引き(保存時に大文字化するが、
+/// 手で編集した小文字のキーにも効かせる)、その形が ISO 形式(英字 3 字)の入力と、行き先が ISO 形式でない上書きは
+/// 使わない。上書きの行き先は常に ISO 形式になるので、2 回かけても結果は変わらない(保存し直してもレートのキーが動かない)。
 pub fn normalize_currency(raw: &str, overrides: &BTreeMap<String, String>) -> String {
     let raw = raw.trim();
-    if let Some(code) = overrides.get(raw) {
-        return canonical_code(code.trim());
+    if !is_iso_code(raw) {
+        let code = overrides
+            .iter()
+            .find(|(symbol, _)| symbol.trim().eq_ignore_ascii_case(raw))
+            .map(|(_, code)| code.trim().to_ascii_uppercase());
+        if let Some(code) = code.filter(|code| is_iso_code(code)) {
+            return code;
+        }
     }
     match raw {
         "¥" | "￥" | "JP¥" => "JPY".to_owned(),
@@ -131,8 +140,13 @@ pub fn normalize_currency(raw: &str, overrides: &BTreeMap<String, String>) -> St
     }
 }
 
+/// 英字 3 字(大文字・小文字を問わない)。
+pub fn is_iso_code(s: &str) -> bool {
+    s.len() == 3 && s.bytes().all(|b| b.is_ascii_alphabetic())
+}
+
 fn canonical_code(raw: &str) -> String {
-    if (raw.len() == 3 && raw.bytes().all(|b| b.is_ascii_alphabetic()))
+    if is_iso_code(raw)
         || raw.eq_ignore_ascii_case("pt")
         || raw.eq_ignore_ascii_case("bits")
     {
@@ -247,6 +261,51 @@ mod tests {
             ("¥".to_owned(), -1),
         ]));
         assert_eq!(totals.only_milli("JPY", &BTreeMap::new()), i64::MAX);
+    }
+
+    fn ov(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect()
+    }
+
+    #[test]
+    fn normalize_currency_is_idempotent_for_every_symbol_and_override() {
+        let raws = [
+            "pt", "PT", " pt ", "R$", "r$", "￥", "¥", "$", "brl", "BRL", "ｂｒｌ", "ＵＳＤ", "Ｐｔ", "__proto__",
+            "__PROTO__", "zł", "bits", "X1", "Y2", "",
+        ];
+        let tables = [
+            ov(&[]),
+            ov(&[("PT", "USD")]),
+            ov(&[("R$", "BRL")]),
+            ov(&[("￥", "CNY")]),
+            ov(&[("$", "MXN")]),
+            ov(&[("BRL", "USD")]),
+            ov(&[("__PROTO__", "EUR")]),
+            ov(&[("Ｐｔ", "KRW")]),
+            ov(&[("X1", "Y2"), ("Y2", "Z3")]),
+            ov(&[("PT", "USD"), ("USD", "EUR"), ("R$", "BRL"), ("BRL", "JPY"), ("BITS", "USD")]),
+        ];
+        for overrides in &tables {
+            for raw in raws {
+                let once = normalize_currency(raw, overrides);
+                assert_eq!(normalize_currency(&once, overrides), once, "{raw:?} {overrides:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn overrides_match_case_insensitively_and_never_rewrite_iso_codes() {
+        let pt = ov(&[("PT", "USD")]);
+        for raw in ["pt", "PT", " Pt "] {
+            assert_eq!(normalize_currency(raw, &pt), "USD", "{raw}");
+        }
+        assert_eq!(normalize_currency("pt", &ov(&[("pt", "usd")])), "USD");
+        assert_eq!(normalize_currency("r$", &ov(&[("R$", "BRL")])), "BRL");
+        let iso = ov(&[("BRL", "USD"), ("usd", "EUR")]);
+        assert_eq!(normalize_currency("brl", &iso), "BRL");
+        assert_eq!(normalize_currency(" BRL ", &iso), "BRL");
+        assert_eq!(normalize_currency("usd", &iso), "USD");
+        assert_eq!(normalize_currency("$", &ov(&[("$", "MXN")])), "MXN");
     }
 
     #[test]

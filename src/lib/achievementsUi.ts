@@ -143,7 +143,8 @@ export interface RateRow {
 
 /** Pre-save check of the rate table. Rust normalizes keys and has the final say. */
 export function checkRateRows(rows: RateRow[]): { rates: Record<string, number> } | { error: string } {
-  const rates: Record<string, number> = {};
+  // A Map, not a plain object: a code like `__proto__` must stay an own key instead of vanishing into the prototype.
+  const rates = new Map<string, number>();
   const seen = new Set<string>();
   // Errors name the row, never the typed code: a pasted URL or token must not be shown back.
   for (const [i, row] of rows.entries()) {
@@ -156,9 +157,9 @@ export function checkRateRows(rows: RateRow[]): { rates: Record<string, number> 
     const key = code.toUpperCase();
     if (seen.has(key)) return { error: `${at}の通貨コードが重複しています。` };
     seen.add(key);
-    rates[code] = rate;
+    rates.set(code, rate);
   }
-  return { rates };
+  return { rates: Object.fromEntries(rates) };
 }
 
 export interface SymbolRow {

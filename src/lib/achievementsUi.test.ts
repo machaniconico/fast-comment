@@ -162,6 +162,13 @@ test('symbol override rows keep __proto__ as an own key in the JSON sent to Rust
   assert.deepEqual(symbolRowsOf(JSON.parse('{"__proto__":"USD"}')), [{ symbol: '__proto__', code: 'USD' }]);
 });
 
+test('rate rows keep __proto__ as an own key in the JSON sent to Rust', () => {
+  const ok = checkRateRows([{ code: '__proto__', text: '2' }, { code: 'USD', text: '150' }]);
+  assert.ok('rates' in ok);
+  assert.deepEqual(JSON.parse(JSON.stringify(ok.rates)), JSON.parse('{"__proto__":2,"USD":150}'));
+  assert.ok(JSON.stringify(ok.rates).includes('"__proto__":2'));
+});
+
 test('symbol length is judged by Rust only: the UI neither truncates nor rejects at the boundary', () => {
   const edge = ` ${'💰'.repeat(16)} `;
   const over = '💰'.repeat(17);
