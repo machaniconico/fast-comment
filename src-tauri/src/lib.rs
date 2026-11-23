@@ -3131,7 +3131,7 @@ fn discard_webhook_relay(
 ) {
     let dropped = relay.discard(achievement_rx);
     if dropped > 0 && runtime.has_achievement_destinations() {
-        tracing::warn!(dropped, "終了時に保留中の実績通知を送らず破棄しました");
+        tracing::warn!(dropped, "終了時に保留中の実績通知を送らず破棄しました(件数は概数)");
     }
 }
 
