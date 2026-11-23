@@ -154,6 +154,22 @@ test('symbol override rows round trip with the map and drop fully blank rows', (
   assert.deepEqual(checkSymbolRows([]), { overrides: {} });
 });
 
+test('symbol override rows keep __proto__ as an own key in the JSON sent to Rust', () => {
+  const ok = checkSymbolRows([{ symbol: '__proto__', code: 'USD' }, { symbol: 'R$', code: 'BRL' }]);
+  assert.ok('overrides' in ok);
+  assert.deepEqual(JSON.parse(JSON.stringify(ok.overrides)), JSON.parse('{"__proto__":"USD","R$":"BRL"}'));
+  assert.ok(JSON.stringify(ok.overrides).includes('"__proto__":"USD"'));
+  assert.deepEqual(symbolRowsOf(JSON.parse('{"__proto__":"USD"}')), [{ symbol: '__proto__', code: 'USD' }]);
+});
+
+test('symbol length is judged by Rust only: the UI neither truncates nor rejects at the boundary', () => {
+  const edge = ` ${'💰'.repeat(16)} `;
+  const over = '💰'.repeat(17);
+  const ok = checkSymbolRows([{ symbol: edge, code: 'USD' }, { symbol: over, code: 'EUR' }]);
+  assert.ok('overrides' in ok);
+  assert.deepEqual(Object.keys(ok.overrides), ['💰'.repeat(16), over]);
+});
+
 test('symbol override rows reject empty sides and trimmed duplicates without echoing input', () => {
   const secret = 'https://example.test/?token=abc';
   const empty = checkSymbolRows([{ symbol: 'R$', code: 'BRL' }, { symbol: '', code: 'USD' }]);

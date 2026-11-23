@@ -171,7 +171,8 @@ export const symbolRowsOf = (overrides: Record<string, string>): SymbolRow[] =>
 
 /** Pre-save check of the symbol overrides. Rust validates the code format and limits and has the final say. */
 export function checkSymbolRows(rows: SymbolRow[]): { overrides: Record<string, string> } | { error: string } {
-  const overrides: Record<string, string> = {};
+  // A Map, not a plain object: a symbol like `__proto__` must stay an own key instead of vanishing into the prototype.
+  const overrides = new Map<string, string>();
   // Errors name the row, never the typed symbol: a pasted URL or token must not be shown back.
   for (const [i, row] of rows.entries()) {
     const symbol = row.symbol.trim();
@@ -180,10 +181,10 @@ export function checkSymbolRows(rows: SymbolRow[]): { overrides: Record<string, 
     const at = `通貨記号の上書きの ${i + 1} 行目`;
     if (!symbol) return { error: `${at}の記号が空です。` };
     if (!code) return { error: `${at}の通貨コードが空です。` };
-    if (Object.hasOwn(overrides, symbol)) return { error: `${at}の記号が重複しています。` };
-    overrides[symbol] = code;
+    if (overrides.has(symbol)) return { error: `${at}の記号が重複しています。` };
+    overrides.set(symbol, code);
   }
-  return { overrides };
+  return { overrides: Object.fromEntries(overrides) };
 }
 
 const SUBJECT_LABELS: Record<AchievementSubjectKind, string> = { viewer: '視聴者', streamer: '配信者' };

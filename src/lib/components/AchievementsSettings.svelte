@@ -92,7 +92,7 @@
               ? 'レート表の通貨コードが空か重複しています(「$」と「USD」のように同じ通貨になる行も重複です)。'
               : 'レート表に 0 より大きい数値でないレートがあります。';
           } else if (reply.field === 'symbolOverrides') {
-            message = '通貨記号の上書きに誤りがあります(記号は 16 文字まで、通貨コードは英字 3 文字、行は 64 件までで、同じ記号は重複できません)。';
+            message = '通貨記号の上書きに誤りがあります(記号は 16 文字まで(英字 3 文字の通貨コードは記号にできません)、通貨コードは英字 3 文字、行は 64 件までで、同じ記号は重複できません)。';
           } else {
             message = invalidFieldMessage(drafts, reply.id, reply.field);
             editingId = reply.id;
@@ -105,10 +105,11 @@
 
   async function addNew() {
     await run(async () => {
-      const created = await newAchievement(tab);
+      const subject = tab; // 応答を待つ間にタブが切り替わっても、押した時点の対象で扱う
+      const created = await newAchievement(subject);
       if (!created) { message = '実績を追加できませんでした。'; return; }
       drafts.push(created);
-      listOpen[tab] = true;
+      listOpen[subject] = true;
       editingId = created.id;
       message = '実績を追加しました。保存すると反映されます。';
     });
@@ -176,8 +177,8 @@
   <label><input type="checkbox" bind:checked={enabled} disabled={busy} /> 実績機能を有効にする</label>
 
   <div class="tabs" role="tablist">
-    <button role="tab" aria-selected={tab === 'viewer'} class:active={tab === 'viewer'} onclick={() => (tab = 'viewer')}>視聴者</button>
-    <button role="tab" aria-selected={tab === 'streamer'} class:active={tab === 'streamer'} onclick={() => (tab = 'streamer')}>配信者</button>
+    <button role="tab" aria-selected={tab === 'viewer'} class:active={tab === 'viewer'} onclick={() => (tab = 'viewer')} disabled={busy}>視聴者</button>
+    <button role="tab" aria-selected={tab === 'streamer'} class:active={tab === 'streamer'} onclick={() => (tab = 'streamer')} disabled={busy}>配信者</button>
   </div>
 
   {#if !loaded}
@@ -285,7 +286,7 @@
     <p>寄付の通貨記号が誤って換算される時に、記号を通貨コード(英字 3 文字)へ置き換えます。</p>
     {#each symbolRows as row, i}
       <div class="row">
-        <input type="text" bind:value={row.symbol} placeholder="R$" size="8" maxlength="16" aria-label="通貨記号" />
+        <input type="text" bind:value={row.symbol} placeholder="R$" size="8" aria-label="通貨記号" />
         <span aria-hidden="true">→</span>
         <input type="text" bind:value={row.code} placeholder="BRL" size="6" aria-label="通貨コード" />
         <button onclick={() => symbolRows.splice(i, 1)}>削除</button>

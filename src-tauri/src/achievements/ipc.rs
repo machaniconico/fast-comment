@@ -256,6 +256,10 @@ fn normalize_rates(
     Ok(out)
 }
 
+fn is_iso_code(s: &str) -> bool {
+    s.len() == 3 && s.bytes().all(|b| b.is_ascii_alphabetic())
+}
+
 const SYMBOL_MAX_CHARS: usize = 16;
 const SYMBOL_MAX_ENTRIES: usize = 64;
 
@@ -273,10 +277,11 @@ fn normalize_symbol_overrides(
     for (symbol, code) in raw {
         let symbol = symbol.trim();
         let code = code.trim();
+        // ISO 形式の記号は上書きできない(別コードへの読み替えは用途が無く、保存し直すたびにレートのキーが動く)。
         if symbol.is_empty()
             || symbol.chars().count() > SYMBOL_MAX_CHARS
-            || code.len() != 3
-            || !code.bytes().all(|b| b.is_ascii_alphabetic())
+            || is_iso_code(symbol)
+            || !is_iso_code(code)
         {
             return Err(invalid());
         }
@@ -876,6 +881,9 @@ mod tests {
             vec![("R$".into(), "BRLL".into())],
             vec![("R$".into(), "BRL".into()), (" R$".into(), "USD".into())],
             vec![(long, "USD".into())],
+            vec![("BRL".into(), "USD".into())],
+            vec![(" brl ".into(), "EUR".into())],
+            vec![("💰".repeat(17), "USD".into())],
             many,
         ];
         for case in cases {
@@ -888,10 +896,31 @@ mod tests {
     }
 
     #[test]
+    fn saving_the_same_rates_and_overrides_again_keeps_every_key() {
+        let (dir, store, slot) = setup(false);
+        let mut next = store.current();
+        next.rates = BTreeMap::from([("R$".to_owned(), 30.0)]);
+        next.symbol_overrides = BTreeMap::from([("R$".to_owned(), "BRL".to_owned())]);
+        let (reply, _) = commit(&store, &slot, dir.path(), 0, None, next, 1);
+        assert_eq!(reply, CommitReply::Ok { revision: 1 });
+        let saved = store.current();
+        assert_eq!(saved.rates.get("BRL"), Some(&30.0));
+        let (reply, _) = commit(&store, &slot, dir.path(), 1, None, saved.clone(), 2);
+        assert_eq!(reply, CommitReply::Ok { revision: 2 });
+        assert_eq!(store.current().rates, saved.rates);
+        assert_eq!(store.current().symbol_overrides, saved.symbol_overrides);
+    }
+
+    #[test]
     fn symbol_override_limits_allow_the_boundary() {
         let (dir, store, slot) = setup(false);
         let mut next = store.current();
         next.symbol_overrides = (0..64).map(|i| (format!("{i:0>16}"), "USD".to_owned())).collect();
+        let (reply, _) = commit(&store, &slot, dir.path(), 0, None, next, 1);
+        assert_eq!(reply, CommitReply::Ok { revision: 1 });
+        let (dir, store, slot) = setup(false);
+        let mut next = store.current();
+        next.symbol_overrides = BTreeMap::from([(format!(" {} ", "💰".repeat(16)), "usd".to_owned())]);
         let (reply, _) = commit(&store, &slot, dir.path(), 0, None, next, 1);
         assert_eq!(reply, CommitReply::Ok { revision: 1 });
     }
