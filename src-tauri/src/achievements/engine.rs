@@ -521,9 +521,9 @@ impl AchievementEngine {
 
     pub fn open_with(dir: &Path, defs: AchievementDefs, now_ms: u64, io: Arc<dyn StoreIo>) -> Self {
         let (file, progress) = ProgressFile::open(dir, now_ms, io);
-        let dirty = progress.is_none();
+        let mut dirty = progress.is_none();
         let mut progress = progress.unwrap_or_else(|| Progress::new(now_ms));
-        progress.sessions.expire(now_ms);
+        dirty |= progress.sessions.expire(now_ms);
         Self {
             file,
             state: Mutex::new(State {
@@ -568,6 +568,7 @@ impl AchievementEngine {
                 return;
             }
 
+            state.dirty = true;
             let progress = &mut state.progress;
             let epoch = progress.sessions.observe(msg, state.now_ms);
             epoch.streamer.add_message(msg);
@@ -600,6 +601,8 @@ impl AchievementEngine {
     pub fn on_live_event(&self, ev: &LiveEvent, now_ms: u64) -> Vec<AchievementUnlocked> {
         let mut state = self.lock();
         self.process(&mut state, now_ms, |state, candidates| {
+            // 配信の開始・終了は稀なので、セッションに触れたら保存対象にする。
+            state.dirty = true;
             let progress = &mut state.progress;
             if let Some(platform) = progress.sessions.on_live_event(ev, state.now_ms) {
                 let platform = platform_key(platform);
@@ -640,6 +643,7 @@ impl AchievementEngine {
                             .saturating_add(u64::from(channel.viewers.unwrap_or_default()));
                     }
                 }
+                let mut raised = false;
                 // Keep the peak of each simultaneous platform sum for later definition changes.
                 for mask in 1..=ALL_PLATFORMS {
                     let sum = totals
@@ -649,12 +653,15 @@ impl AchievementEngine {
                         .fold(0u64, |sum, (_, viewers)| sum.saturating_add(*viewers));
                     if sum != 0 && mask != ALL_PLATFORMS {
                         let peak = peaks.entry(mask.to_string()).or_default();
+                        raised |= sum > *peak;
                         *peak = (*peak).max(sum);
                     } else if mask == ALL_PLATFORMS {
                         let peak = &mut epoch.streamer.peak_concurrent_viewers;
+                        raised |= sum > *peak;
                         *peak = (*peak).max(sum);
                     }
                 }
+                state.dirty |= raised;
                 state.evaluate(STREAMER, candidates);
             }
         })
@@ -760,8 +767,7 @@ impl AchievementEngine {
         let mut candidates = std::mem::take(&mut state.closed_epoch_retries);
         // Retry the previous window before applying any epoch rollover for this event.
         state.evaluate_retries(&mut candidates);
-        state.progress.sessions.expire(state.now_ms);
-        state.dirty = true;
+        state.dirty |= state.progress.sessions.expire(state.now_ms);
         update(state, &mut candidates);
         let mut result = std::mem::take(&mut state.flushed_unlocks);
         if let Ok(saved) = self.persist(state, candidates, false) {
@@ -1289,19 +1295,89 @@ mod tests {
         assert_eq!(io.0.load(Ordering::Relaxed), first + 1);
     }
 
+    fn chat_message(id: &str) -> ChatMessage {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "platform": "youtube",
+            "channel": "c",
+            "author": {"id": "a", "name": "A"},
+            "kind": "normal",
+            "timestampMs": 1,
+            "fragments": [{"type": "text", "text": "x"}],
+        }))
+        .unwrap()
+    }
+
+    fn enabled_defs() -> AchievementDefs {
+        AchievementDefs { enabled: true, ..AchievementDefs::default() }
+    }
+
     #[test]
     fn observed_message_makes_next_flush_write() {
         let dir = tempfile::tempdir().unwrap();
         let io = Arc::new(CountWrites(AtomicUsize::new(0)));
-        let mut defs = AchievementDefs::default();
-        defs.enabled = true;
-        let engine = AchievementEngine::open_with(dir.path(), defs, 1, io.clone());
+        let engine = AchievementEngine::open_with(dir.path(), enabled_defs(), 1, io.clone());
         engine.flush().unwrap();
         let before = io.0.load(Ordering::Relaxed);
-        let msg: ChatMessage = serde_json::from_value(serde_json::json!({"id":"m1","platform":"youtube","channel":"c","author":{"id":"a","name":"A"},"kind":"normal","timestampMs":1,"fragments":[{"type":"text","text":"x"}]})).unwrap();
-        engine.observe(&msg, 2);
+        engine.observe(&chat_message("m1"), 2);
         engine.flush().unwrap();
         assert!(io.0.load(Ordering::Relaxed) > before);
+        engine.observe(&chat_message("m1"), 3);
+        engine.flush().unwrap();
+        assert_eq!(io.0.load(Ordering::Relaxed), before + 1, "重複は進捗を変えない");
+    }
+
+    #[test]
+    fn periodic_stats_do_not_dirty_unless_peak_rises() {
+        let dir = tempfile::tempdir().unwrap();
+        let io = Arc::new(CountWrites(AtomicUsize::new(0)));
+        let engine = AchievementEngine::open_with(dir.path(), enabled_defs(), 1, io.clone());
+        engine.observe(&chat_message("m1"), 2);
+        engine.flush().unwrap();
+        let base = io.0.load(Ordering::Relaxed);
+
+        engine.on_stats(&StatsSnapshot::default(), 3);
+        engine.flush().unwrap();
+        assert_eq!(io.0.load(Ordering::Relaxed), base, "既定のスナップショットでは書かない");
+
+        let snapshot = StatsSnapshot {
+            channel_status: vec![ChannelStatus {
+                platform: "youtube".to_owned(),
+                viewers: Some(3),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        engine.on_stats(&snapshot, 4);
+        engine.flush().unwrap();
+        assert_eq!(io.0.load(Ordering::Relaxed), base + 1, "ピーク上昇は書く");
+        engine.on_stats(&snapshot, 5);
+        engine.flush().unwrap();
+        assert_eq!(io.0.load(Ordering::Relaxed), base + 1, "同じ値では書かない");
+    }
+
+    #[test]
+    fn expired_epoch_removed_on_open_is_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = AchievementEngine::open(dir.path(), enabled_defs(), 1);
+        engine.observe(&chat_message("m1"), 2);
+        engine.flush().unwrap();
+        assert!(super::super::store::read_progress(dir.path()).unwrap().sessions.epoch.is_some());
+        drop(engine);
+
+        let reopened = AchievementEngine::open(dir.path(), enabled_defs(), 2 + EPOCH_IDLE_MS);
+        reopened.flush().unwrap();
+        assert!(super::super::store::read_progress(dir.path()).unwrap().sessions.epoch.is_none());
+    }
+
+    #[test]
+    fn failed_save_keeps_dirty_for_next_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let io = Arc::new(FailTwice(AtomicUsize::new(1)));
+        let engine = AchievementEngine::open_with(dir.path(), AchievementDefs::default(), 1, io);
+        assert!(engine.flush().is_err());
+        engine.flush().unwrap();
+        assert!(super::super::store::read_progress(dir.path()).is_some());
     }
 
     #[test]

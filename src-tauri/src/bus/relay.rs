@@ -65,17 +65,18 @@ impl AchievementRelay {
         })
     }
 
-    /// 終了前の最後の配信。受信済み・未受信の実績のうち、原因の chat が処理済みの分を送り出し、
-    /// 送れない残りは捨てて欠落数に数える(受信の遅延分も含む)。
-    pub(crate) fn finish(
-        &mut self,
-        rx: Option<&mut Receiver<SequencedAchievement>>,
-        send: impl FnMut(SequencedAchievement),
-    ) -> u64 {
-        let (dropped, _) = self.drain(None, rx, usize::MAX, send);
-        let rest = self.pending.len() as u64;
+    /// 終了時に送らず捨てる実績の件数を数えて返す(保留中の全件と、未受信の分・受信の遅延分)。
+    pub(crate) fn discard(&mut self, mut rx: Option<&mut Receiver<SequencedAchievement>>) -> u64 {
+        let mut count = self.pending.len() as u64;
         self.pending.clear();
-        dropped.saturating_add(rest)
+        while let Some(next) = rx.as_deref_mut().and_then(poll) {
+            match next {
+                Polled::Item(_) => count = count.saturating_add(1),
+                Polled::Lagged(n) => count = count.saturating_add(n),
+                Polled::Closed => break,
+            }
+        }
+        count
     }
 
     /// 受信と配信をそれぞれ上限まで処理する。前回までの保留分も配信上限に含める。
@@ -135,18 +136,15 @@ mod tests {
     }
 
     #[test]
-    fn finish_sends_eligible_pending_and_counts_the_rest() {
+    fn discard_counts_pending_and_unreceived_without_sending() {
         let (tx, mut rx) = broadcast::channel(8);
         let mut relay = AchievementRelay::new(0);
-        tx.send(event("ready", 1)).unwrap();
-        tx.send(event("waiting", 2)).unwrap();
-        // 1 件は保留に入れ、もう 1 件は未受信のまま終了を迎える。
+        tx.send(event("pending", 1)).unwrap();
+        tx.send(event("unreceived", 1)).unwrap();
         relay.drain(poll(&mut rx), None, 1, |_| unreachable!("原因の chat が未処理"));
         relay.processed_chat(1);
-        let mut sent = Vec::new();
-        let dropped = relay.finish(Some(&mut rx), |e| sent.push(e.unlock.id));
-        assert_eq!(sent, ["ready"]);
-        assert_eq!(dropped, 1);
+        assert!(relay.has_ready());
+        assert_eq!(relay.discard(Some(&mut rx)), 2);
         assert!(!relay.has_ready());
     }
 }
