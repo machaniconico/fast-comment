@@ -398,6 +398,11 @@
     closeToolsMenu();
   }
 
+  function selectAchievementsSettings() {
+    ui.openToolSettings('achievements');
+    closeToolsMenu();
+  }
+
   function selectGoalsSettings() {
     ui.openToolSettings('goals');
     closeToolsMenu();
@@ -702,6 +707,12 @@
               class:active={ui.toolSettingsView === 'goals'}
               onclick={selectGoalsSettings}
             >目標設定</button>
+            <button
+              role="menuitem"
+              class="tools-menu-item"
+              class:active={ui.toolSettingsView === 'achievements'}
+              onclick={selectAchievementsSettings}
+            >実績</button>
           </div>
         {/if}
       </div>
@@ -879,6 +890,8 @@
       <Settings focus="goals" onConfigSaved={onSettingsSaved} />
     {:else if ui.toolSettingsView === 'danmaku'}
       <Settings focus="danmaku" onConfigSaved={onSettingsSaved} />
+    {:else if ui.toolSettingsView === 'achievements'}
+      <Settings focus="achievements" onConfigSaved={onSettingsSaved} />
     {:else if ui.showTimer}
       <Timer />
     {:else if ui.showDashboard}

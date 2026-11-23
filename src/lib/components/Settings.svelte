@@ -47,7 +47,7 @@
 
   interface Props {
     onConfigSaved?: (config: AppConfig, revision: number) => void;
-    focus?: 'all' | 'goals' | 'danmaku';
+    focus?: 'all' | 'goals' | 'danmaku' | 'achievements';
   }
 
   let { onConfigSaved, focus = 'all' }: Props = $props();
@@ -1585,8 +1585,18 @@
   class:focus-goals={focus === 'goals'}
   class:focus-danmaku={focus === 'danmaku'}
 >
-  <h2>{focus === 'goals' ? '目標設定' : focus === 'danmaku' ? '弾幕・OBS設定' : '設定'}</h2>
+  <h2>{focus === 'goals' ? '目標設定' : focus === 'danmaku' ? '弾幕・OBS設定' : focus === 'achievements' ? '実績' : '設定'}</h2>
 
+  {#if focus === 'achievements'}
+  <!-- 実績だけの画面。実績は config に依存しないので、設定の取得に失敗しても描画し、再読み込みできるようにする。 -->
+  <AchievementsSettings />
+  {#if !config || configSync.reloadRequired}
+  <div class="save-row">
+    {#if saveBlockedReason}<span class="save-warn" role="status">{saveBlockedReason}</span>{/if}
+    <button class="save-btn" onclick={reloadImportedConfig} disabled={manualReloadDisabled}>設定を再読み込み</button>
+  </div>
+  {/if}
+  {:else}
   <fieldset class="settings-fields" disabled={allFieldsLocked}>
   <section id="settings-appearance">
     <h3>外観</h3>
@@ -2542,7 +2552,7 @@
   <!-- ── OBS URL ── -->
   <IntegrationsSettings bind:this={localApiSettings} />
 
-  <AchievementsSettings />
+  <div class="achievements-wrap"><AchievementsSettings /></div>
 
   <section id="settings-obs">
     <h3>OBSオーバーレイ URL</h3>
@@ -3197,6 +3207,7 @@
   </div>
   {/if}
   </fieldset>
+  {/if}
 </div>
 
 <style>
@@ -3210,7 +3221,9 @@
   .settings-fields { display: contents; }
 
   .settings.focus-goals > .settings-fields > section:not(#settings-goals),
-  .settings.focus-danmaku > .settings-fields > section:not(#settings-danmaku) {
+  .settings.focus-danmaku > .settings-fields > section:not(#settings-danmaku),
+  .settings.focus-goals > .settings-fields > .achievements-wrap,
+  .settings.focus-danmaku > .settings-fields > .achievements-wrap {
     display: none;
   }
 

@@ -316,6 +316,11 @@ fn commit_achievements(
 }
 
 #[tauri::command]
+fn new_achievement(subject: achievements::model::SubjectKind) -> achievements::model::Achievement {
+    achievements::ipc::new_achievement(subject)
+}
+
+#[tauri::command]
 fn duplicate_achievement(achievement: achievements::ipc::AchievementInput) -> Option<achievements::model::Achievement> {
     achievements::ipc::duplicate_draft(achievement)
 }
@@ -3904,6 +3909,7 @@ pub fn run() {
             list_achievements,
             achievement_schema,
             commit_achievements,
+            new_achievement,
             duplicate_achievement,
             reset_achievement_to_preset,
             listener_achievements,

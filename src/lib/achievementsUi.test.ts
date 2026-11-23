@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import {
-  canDelete, canDuplicate, checkRateRows, coerceCondition, findDraftError, invalidFieldMessage, withSubject, currencyOptions, DAY_MS, metricOptions, parseRate, platformOptions, ratesNotice, ratesStale,
+  canDelete, canDuplicate, checkRateRows, checkSymbolRows, symbolRowsOf, coerceCondition, findDraftError, invalidFieldMessage, withSubject, currencyOptions, DAY_MS, metricOptions, parseRate, platformOptions, ratesNotice, ratesStale,
   trophyViews, windowOptions,
 } from './achievementsUi.ts';
 import type { AchievementDef, AchievementSchema, ListenerTrophy } from './types.ts';
@@ -95,10 +95,12 @@ test('duplicate and delete are gated by tier and origin', () => {
 });
 
 test('rate rows reject empty codes, bad values and duplicates before saving', () => {
-  assert.deepEqual(checkRateRows([{ code: 'USD', text: '150.5' }, { code: ' ', text: '' }]), { rates: { USD: 150.5 } });
+  assert.deepEqual(checkRateRows([{ code: 'USD', text: '150.5' }, { code: '', text: '' }]), { rates: { USD: 150.5 } });
   assert.ok('error' in checkRateRows([{ code: '', text: '150' }]));
   assert.ok('error' in checkRateRows([{ code: 'USD', text: '' }]));
-  assert.ok('error' in checkRateRows([{ code: 'USD', text: '1' }, { code: 'usd', text: '2' }]));
+  assert.ok('error' in checkRateRows([{ code: 'USD', text: '1' }, { code: 'USD', text: '2' }]));
+  // Case variants are left to Rust: a saved `R$` / `r$` pair must load and save again unchanged.
+  assert.deepEqual(checkRateRows([{ code: 'R$', text: '1' }, { code: 'r$', text: '2' }]), { rates: { R$: 1, r$: 2 } });
 });
 
 test('empty threshold and empty name are caught before saving', () => {
@@ -113,7 +115,7 @@ test('rate errors name the row, never the typed code', () => {
   for (const rows of [
     [{ code: secret, text: '0' }],
     [{ code: 'USD', text: '1' }, { code: secret, text: '' }],
-    [{ code: secret, text: '1' }, { code: secret.toLowerCase(), text: '2' }],
+    [{ code: secret, text: '1' }, { code: secret, text: '2' }],
   ]) {
     const r = checkRateRows(rows);
     assert.ok('error' in r);
@@ -144,4 +146,67 @@ test('draft errors point at the position, never the typed name', () => {
   assert.ok(!invalid.includes('TEST_ONLY'), invalid);
   assert.match(invalid, /視聴者の 2 番目の実績の通貨/);
   assert.ok(!invalidFieldMessage(drafts, secret, 'name').includes('TEST_ONLY'));
+});
+
+test('symbol override rows round trip with the map and drop fully blank rows', () => {
+  assert.deepEqual(symbolRowsOf({ 'R$': 'BRL', '฿': 'THB' }), [{ symbol: 'R$', code: 'BRL' }, { symbol: '฿', code: 'THB' }]);
+  assert.deepEqual(symbolRowsOf({}), []);
+  const ok = checkSymbolRows([{ symbol: ' R$ ', code: ' BRL ' }, { symbol: '', code: '' }, { symbol: '฿', code: 'THB' }]);
+  assert.deepEqual(ok, { overrides: { ' R$ ': ' BRL ', '฿': 'THB' } });
+  assert.deepEqual(checkSymbolRows([]), { overrides: {} });
+});
+
+test('symbol override rows keep __proto__ as an own key in the JSON sent to Rust', () => {
+  const ok = checkSymbolRows([{ symbol: '__proto__', code: 'USD' }, { symbol: 'R$', code: 'BRL' }]);
+  assert.ok('overrides' in ok);
+  assert.deepEqual(JSON.parse(JSON.stringify(ok.overrides)), JSON.parse('{"__proto__":"USD","R$":"BRL"}'));
+  assert.ok(JSON.stringify(ok.overrides).includes('"__proto__":"USD"'));
+  assert.deepEqual(symbolRowsOf(JSON.parse('{"__proto__":"USD"}')), [{ symbol: '__proto__', code: 'USD' }]);
+});
+
+test('rate rows keep __proto__ as an own key in the JSON sent to Rust', () => {
+  const ok = checkRateRows([{ code: '__proto__', text: '2' }, { code: 'USD', text: '150' }]);
+  assert.ok('rates' in ok);
+  assert.deepEqual(JSON.parse(JSON.stringify(ok.rates)), JSON.parse('{"__proto__":2,"USD":150}'));
+  assert.ok(JSON.stringify(ok.rates).includes('"__proto__":2'));
+});
+
+test('symbol length is judged by Rust only: the UI neither truncates nor rejects at the boundary', () => {
+  const edge = ` ${'💰'.repeat(16)} `;
+  const over = '💰'.repeat(17);
+  const ok = checkSymbolRows([{ symbol: edge, code: 'USD' }, { symbol: over, code: 'EUR' }]);
+  assert.ok('overrides' in ok);
+  assert.deepEqual(Object.keys(ok.overrides), [edge, over]);
+});
+
+test('symbol override rows reject empty sides and ASCII-case duplicates without echoing input', () => {
+  const secret = 'https://example.test/?token=abc';
+  const empty = checkSymbolRows([{ symbol: 'R$', code: 'BRL' }, { symbol: '', code: 'USD' }]);
+  assert.ok('error' in empty && empty.error.includes('2 行目') && empty.error.includes('記号'));
+  const noCode = checkSymbolRows([{ symbol: secret, code: '' }]);
+  assert.ok('error' in noCode && noCode.error.includes('1 行目') && !noCode.error.includes(secret));
+  const dup = checkSymbolRows([{ symbol: secret, code: 'USD' }, { symbol: secret.toUpperCase(), code: 'EUR' }]);
+  assert.ok('error' in dup && dup.error.includes('2 行目') && !dup.error.includes(secret));
+  const pt = checkSymbolRows([{ symbol: 'R$', code: 'BRL' }, { symbol: 'pt', code: 'USD' }, { symbol: 'PT', code: 'EUR' }]);
+  assert.ok('error' in pt && pt.error.includes('3 行目'));
+  // Rate codes are not case-folded in the UI (Rust keeps non-ISO symbols case-sensitive); only exact repeats are caught.
+  const rates = checkRateRows([{ code: 'pt', text: '1' }, { code: 'pt', text: '2' }]);
+  assert.ok('error' in rates && rates.error.includes('2 行目'));
+});
+
+test('rate and symbol rows reach Rust untransformed: no trim, no case change, only all-empty rows dropped', () => {
+  const odd = ['uſd', '\u0085brl\u0085', '\uFEFFpt', 'ｂｒｌ', ' R$ '];
+  const rates = checkRateRows([...odd.map((code, i) => ({ code, text: String(i + 1) })), { code: '', text: '' }]);
+  assert.ok('rates' in rates);
+  assert.deepEqual(Object.keys(JSON.parse(JSON.stringify(rates.rates))), odd);
+  const ok = checkRateRows([{ code: 'USD', text: '1' }, { code: 'uſd', text: '2' }]);
+  assert.ok('rates' in ok, 'ſ is not ASCII, so uſd and USD are different codes');
+  const symbols = checkSymbolRows([
+    { symbol: 'ſ', code: 'uſd' }, { symbol: '\uFEFFR$\u0085', code: '\u0085brl' }, { symbol: 'ｐｔ', code: ' usd ' }, { symbol: 's', code: 'USD' },
+  ]);
+  assert.ok('overrides' in symbols);
+  assert.deepEqual(JSON.parse(JSON.stringify(symbols.overrides)), {
+    'ſ': 'uſd', '\uFEFFR$\u0085': '\u0085brl', 'ｐｔ': ' usd ', s: 'USD',
+  });
+  assert.ok('error' in checkRateRows([{ code: ' ', text: '' }]), 'a whitespace-only row is not dropped');
 });
