@@ -111,18 +111,23 @@ pub fn amount_from_micros(micros: i64, iso: &str) -> ParsedAmount {
     }
 }
 
-/// 受信した通貨表記を通貨コードにする。上書きは trim と ASCII 大文字化をした形で引き(保存時に大文字化するが、
-/// 手で編集した小文字のキーにも効かせる)、その形が ISO 形式(英字 3 字)の入力と、行き先が ISO 形式でない上書きは
-/// 使わない。上書きの行き先は常に ISO 形式になるので、2 回かけても結果は変わらない(保存し直してもレートのキーが動かない)。
+/// 通貨表記・コードの前後を落とす。Unicode の White_Space(U+0085・U+3000 などを含む)と BOM(U+FEFF)を対象にする。
+/// UI は値を変形せずに送るので、どの経路の trim もこれに揃える。
+pub fn trim_currency(s: &str) -> &str {
+    s.trim_matches(|c: char| c.is_whitespace() || c == '\u{FEFF}')
+}
+
+/// 受信した通貨表記を通貨コードにする。上書きは trim した表記の完全一致を優先し、無ければ ASCII の大小文字を無視して
+/// 引く(保存時に大文字化するが、以前の版や手編集の小文字のキーにも効かせる)。一致した候補の行き先が食い違う時、
+/// 表記が ISO 形式(英字 3 字)の時、行き先が ISO 形式でない時は上書きを使わない。上書きの行き先は常に ISO 形式で、
+/// 候補が食い違う時は表記をそのまま返すので、2 回かけても結果は変わらない(保存し直してもレートのキーが動かない)。
 pub fn normalize_currency(raw: &str, overrides: &BTreeMap<String, String>) -> String {
-    let raw = raw.trim();
+    let raw = trim_currency(raw);
     if !is_iso_code(raw) {
-        let code = overrides
-            .iter()
-            .find(|(symbol, _)| symbol.trim().eq_ignore_ascii_case(raw))
-            .map(|(_, code)| code.trim().to_ascii_uppercase());
-        if let Some(code) = code.filter(|code| is_iso_code(code)) {
-            return code;
+        match override_for(raw, overrides) {
+            Override::Code(code) => return code,
+            Override::Conflict => return raw.to_owned(),
+            Override::None => {}
         }
     }
     match raw {
@@ -137,6 +142,33 @@ pub fn normalize_currency(raw: &str, overrides: &BTreeMap<String, String>) -> St
         "HK$" => "HKD".to_owned(),
         "₹" => "INR".to_owned(),
         _ => canonical_code(raw),
+    }
+}
+
+enum Override {
+    None,
+    Code(String),
+    Conflict,
+}
+
+fn override_for(raw: &str, overrides: &BTreeMap<String, String>) -> Override {
+    let pick = |matches: &dyn Fn(&str) -> bool| {
+        let mut codes = overrides
+            .iter()
+            .filter(|(symbol, _)| matches(trim_currency(symbol)))
+            .map(|(_, code)| trim_currency(code).to_ascii_uppercase());
+        let Some(first) = codes.next() else { return Override::None };
+        if codes.any(|code| code != first) {
+            Override::Conflict
+        } else if is_iso_code(&first) {
+            Override::Code(first)
+        } else {
+            Override::None
+        }
+    };
+    match pick(&|symbol| symbol == raw) {
+        Override::None => pick(&|symbol| symbol.eq_ignore_ascii_case(raw)),
+        found => found,
     }
 }
 
@@ -199,7 +231,7 @@ impl AmountTotals {
     }
 
     pub fn only_milli(&self, code: &str, overrides: &BTreeMap<String, String>) -> i64 {
-        let code = canonical_code(code.trim());
+        let code = canonical_code(trim_currency(code));
         let total = self
             .0
             .iter()
@@ -271,7 +303,8 @@ mod tests {
     fn normalize_currency_is_idempotent_for_every_symbol_and_override() {
         let raws = [
             "pt", "PT", " pt ", "R$", "r$", "￥", "¥", "$", "brl", "BRL", "ｂｒｌ", "ＵＳＤ", "Ｐｔ", "__proto__",
-            "__PROTO__", "zł", "bits", "X1", "Y2", "",
+            "__PROTO__", "zł", "bits", "X1", "Y2", "", "Pt", "pT", "uſd", "ſ", "s", "S", "\u{85}brl\u{85}",
+            "\u{FEFF}pt", "\u{FEFF}R$\u{85}", "\u{FEFF}",
         ];
         let tables = [
             ov(&[]),
@@ -283,6 +316,10 @@ mod tests {
             ov(&[("__PROTO__", "EUR")]),
             ov(&[("Ｐｔ", "KRW")]),
             ov(&[("X1", "Y2"), ("Y2", "Z3")]),
+            ov(&[("R$", "BRL"), ("r$", "USD")]),
+            ov(&[("PT", "USD"), ("pt", "EUR")]),
+            ov(&[("ſ", "USD"), ("S", "EUR")]),
+            ov(&[("R$", "BRL"), (" R$ ", "USD")]),
             ov(&[("PT", "USD"), ("USD", "EUR"), ("R$", "BRL"), ("BRL", "JPY"), ("BITS", "USD")]),
         ];
         for overrides in &tables {
@@ -306,6 +343,34 @@ mod tests {
         assert_eq!(normalize_currency(" BRL ", &iso), "BRL");
         assert_eq!(normalize_currency("usd", &iso), "USD");
         assert_eq!(normalize_currency("$", &ov(&[("$", "MXN")])), "MXN");
+    }
+
+    #[test]
+    fn exact_override_wins_and_conflicting_case_variants_apply_none() {
+        let legacy = ov(&[("R$", "BRL"), ("r$", "USD")]);
+        assert_eq!(normalize_currency("r$", &legacy), "USD");
+        assert_eq!(normalize_currency(" R$ ", &legacy), "BRL");
+        let mut totals = AmountTotals::default();
+        totals.add("r$", 2.0);
+        totals.add("R$", 3.0);
+        assert_eq!(totals.only_milli("BRL", &legacy), 3_000);
+        assert_eq!(totals.only_milli("USD", &legacy), 2_000);
+        // 完全一致が無く、大小文字を無視した候補の行き先が食い違う時は上書きしない。
+        let conflict = ov(&[("PT", "USD"), ("pt", "EUR")]);
+        assert_eq!(normalize_currency("pt", &conflict), "EUR");
+        let pt = normalize_currency("Pt", &conflict);
+        assert!(pt != "USD" && pt != "EUR", "{pt}");
+        assert_eq!(normalize_currency("r$", &ov(&[("R$", "BRL"), ("R$\u{85}", "BRL")])), "BRL");
+        // ſ は ASCII ではないので s / S の上書きに当たらない。
+        assert_eq!(normalize_currency("ſ", &ov(&[("S", "EUR")])), "ſ");
+    }
+
+    #[test]
+    fn currency_trim_covers_unicode_white_space_and_bom() {
+        assert_eq!(normalize_currency("\u{FEFF}pt\u{85}", &BTreeMap::new()), "PT");
+        assert_eq!(normalize_currency("\u{3000}brl\u{2028}", &BTreeMap::new()), "BRL");
+        assert_eq!(normalize_currency("\u{FEFF}R$", &ov(&[("R$\u{85}", "\u{FEFF}brl")])), "BRL");
+        assert_eq!(normalize_currency("\u{200B}pt", &BTreeMap::new()), "\u{200B}pt");
     }
 
     #[test]

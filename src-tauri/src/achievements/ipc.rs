@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::model::Platform;
 
-use super::currency::{is_iso_code, normalize_currency, RateTable};
+use super::currency::{is_iso_code, normalize_currency, trim_currency, RateTable};
 use super::engine::{AchievementEngine, AchievementUnlocked, UnlockRecord};
 use super::model::{
     allowed_platforms, duplicate, reset_to_preset, Achievement, Announce, Condition, CurrencyMode,
@@ -274,12 +274,12 @@ fn normalize_symbol_overrides(
     }
     let mut out = BTreeMap::new();
     for (symbol, code) in raw {
-        let symbol = symbol.trim().to_ascii_uppercase();
-        let code = code.trim().to_ascii_uppercase();
+        let symbol = trim_currency(&symbol).to_ascii_uppercase();
+        let code = trim_currency(&code).to_ascii_uppercase();
         // ISO 形式の記号の新規追加・変更は不可(ISO コードは上書きされないので、保存しても効かない)。
         let kept = || {
             saved.iter().any(|(s, c)| {
-                s.trim().eq_ignore_ascii_case(&symbol) && c.trim().eq_ignore_ascii_case(&code)
+                trim_currency(s).eq_ignore_ascii_case(&symbol) && trim_currency(c).eq_ignore_ascii_case(&code)
             })
         };
         if symbol.is_empty()
@@ -982,6 +982,35 @@ mod tests {
         assert_eq!(reply, CommitReply::Ok { revision: 1 });
         assert_eq!(store.current().rates, BTreeMap::from([("USD".to_owned(), 20.0)]));
         assert_eq!(store.current().symbol_overrides, BTreeMap::from([("PT".to_owned(), "USD".to_owned())]));
+    }
+
+    #[test]
+    fn untransformed_ui_input_is_normalized_once_and_stays_across_save_load_save() {
+        let (dir, store, slot) = setup(false);
+        let mut next = store.current();
+        next.rates = [("pt", 20.0), ("uſd", 1.0), ("\u{85}brl\u{85}", 3.0), ("\u{FEFF}ｐｔ", 4.0), (" R$ ", 5.0)]
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), *v))
+            .collect();
+        next.symbol_overrides = [("PT", "USD"), ("\u{FEFF}R$\u{85}", "\u{85}eur"), ("ſ", " jpy ")]
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+        let (reply, _) = commit(&store, &slot, dir.path(), 0, None, next, 1);
+        assert_eq!(reply, CommitReply::Ok { revision: 1 });
+        let first = store.current();
+        let rate = |k: &str, v: f64| (k.to_owned(), v);
+        assert_eq!(
+            first.rates,
+            BTreeMap::from([rate("USD", 20.0), rate("uſd", 1.0), rate("BRL", 3.0), rate("ｐｔ", 4.0), rate("EUR", 5.0)])
+        );
+        let code = |k: &str, v: &str| (k.to_owned(), v.to_owned());
+        assert_eq!(first.symbol_overrides, BTreeMap::from([code("PT", "USD"), code("R$", "EUR"), code("ſ", "JPY")]));
+        let reloaded = DefsStore::load(dir.path(), 0).current();
+        let (reply, _) = commit(&store, &slot, dir.path(), 1, None, reloaded, 2);
+        assert_eq!(reply, CommitReply::Ok { revision: 2 });
+        assert_eq!(store.current().rates, first.rates);
+        assert_eq!(store.current().symbol_overrides, first.symbol_overrides);
     }
 
     #[test]

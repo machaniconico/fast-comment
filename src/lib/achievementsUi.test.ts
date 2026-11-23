@@ -95,7 +95,7 @@ test('duplicate and delete are gated by tier and origin', () => {
 });
 
 test('rate rows reject empty codes, bad values and duplicates before saving', () => {
-  assert.deepEqual(checkRateRows([{ code: 'USD', text: '150.5' }, { code: ' ', text: '' }]), { rates: { USD: 150.5 } });
+  assert.deepEqual(checkRateRows([{ code: 'USD', text: '150.5' }, { code: '', text: '' }]), { rates: { USD: 150.5 } });
   assert.ok('error' in checkRateRows([{ code: '', text: '150' }]));
   assert.ok('error' in checkRateRows([{ code: 'USD', text: '' }]));
   assert.ok('error' in checkRateRows([{ code: 'USD', text: '1' }, { code: 'usd', text: '2' }]));
@@ -149,8 +149,8 @@ test('draft errors point at the position, never the typed name', () => {
 test('symbol override rows round trip with the map and drop fully blank rows', () => {
   assert.deepEqual(symbolRowsOf({ 'R$': 'BRL', '฿': 'THB' }), [{ symbol: 'R$', code: 'BRL' }, { symbol: '฿', code: 'THB' }]);
   assert.deepEqual(symbolRowsOf({}), []);
-  const ok = checkSymbolRows([{ symbol: ' R$ ', code: ' BRL ' }, { symbol: ' ', code: '' }, { symbol: '฿', code: 'THB' }]);
-  assert.deepEqual(ok, { overrides: { 'R$': 'BRL', '฿': 'THB' } });
+  const ok = checkSymbolRows([{ symbol: ' R$ ', code: ' BRL ' }, { symbol: '', code: '' }, { symbol: '฿', code: 'THB' }]);
+  assert.deepEqual(ok, { overrides: { ' R$ ': ' BRL ', '฿': 'THB' } });
   assert.deepEqual(checkSymbolRows([]), { overrides: {} });
 });
 
@@ -174,15 +174,36 @@ test('symbol length is judged by Rust only: the UI neither truncates nor rejects
   const over = '💰'.repeat(17);
   const ok = checkSymbolRows([{ symbol: edge, code: 'USD' }, { symbol: over, code: 'EUR' }]);
   assert.ok('overrides' in ok);
-  assert.deepEqual(Object.keys(ok.overrides), ['💰'.repeat(16), over]);
+  assert.deepEqual(Object.keys(ok.overrides), [edge, over]);
 });
 
-test('symbol override rows reject empty sides and trimmed duplicates without echoing input', () => {
+test('symbol override rows reject empty sides and ASCII-case duplicates without echoing input', () => {
   const secret = 'https://example.test/?token=abc';
   const empty = checkSymbolRows([{ symbol: 'R$', code: 'BRL' }, { symbol: '', code: 'USD' }]);
   assert.ok('error' in empty && empty.error.includes('2 行目') && empty.error.includes('記号'));
-  const noCode = checkSymbolRows([{ symbol: secret, code: ' ' }]);
+  const noCode = checkSymbolRows([{ symbol: secret, code: '' }]);
   assert.ok('error' in noCode && noCode.error.includes('1 行目') && !noCode.error.includes(secret));
-  const dup = checkSymbolRows([{ symbol: secret, code: 'USD' }, { symbol: `${secret} `, code: 'EUR' }]);
+  const dup = checkSymbolRows([{ symbol: secret, code: 'USD' }, { symbol: secret.toUpperCase(), code: 'EUR' }]);
   assert.ok('error' in dup && dup.error.includes('2 行目') && !dup.error.includes(secret));
+  const pt = checkSymbolRows([{ symbol: 'R$', code: 'BRL' }, { symbol: 'pt', code: 'USD' }, { symbol: 'PT', code: 'EUR' }]);
+  assert.ok('error' in pt && pt.error.includes('3 行目'));
+  const rates = checkRateRows([{ code: 'pt', text: '1' }, { code: 'PT', text: '2' }]);
+  assert.ok('error' in rates && rates.error.includes('2 行目'));
+});
+
+test('rate and symbol rows reach Rust untransformed: no trim, no case change, only all-empty rows dropped', () => {
+  const odd = ['uſd', '\u0085brl\u0085', '\uFEFFpt', 'ｂｒｌ', ' R$ '];
+  const rates = checkRateRows([...odd.map((code, i) => ({ code, text: String(i + 1) })), { code: '', text: '' }]);
+  assert.ok('rates' in rates);
+  assert.deepEqual(Object.keys(JSON.parse(JSON.stringify(rates.rates))), odd);
+  const ok = checkRateRows([{ code: 'USD', text: '1' }, { code: 'uſd', text: '2' }]);
+  assert.ok('rates' in ok, 'ſ is not ASCII, so uſd and USD are different codes');
+  const symbols = checkSymbolRows([
+    { symbol: 'ſ', code: 'uſd' }, { symbol: '\uFEFFR$\u0085', code: '\u0085brl' }, { symbol: 'ｐｔ', code: ' usd ' }, { symbol: 's', code: 'USD' },
+  ]);
+  assert.ok('overrides' in symbols);
+  assert.deepEqual(JSON.parse(JSON.stringify(symbols.overrides)), {
+    'ſ': 'uſd', '\uFEFFR$\u0085': '\u0085brl', 'ｐｔ': ' usd ', s: 'USD',
+  });
+  assert.ok('error' in checkRateRows([{ code: ' ', text: '' }]), 'a whitespace-only row is not dropped');
 });

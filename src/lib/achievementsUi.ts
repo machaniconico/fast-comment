@@ -141,23 +141,28 @@ export interface RateRow {
   text: string;
 }
 
-/** Pre-save check of the rate table. Rust normalizes keys and has the final say. */
+/** Duplicate key for the pre-save checks only: ASCII letters compared case-insensitively, nothing else changed. */
+const asciiUpper = (s: string): string => s.replace(/[a-z]/g, (c) => c.toUpperCase());
+
+/**
+ * Pre-save check of the rate table. Codes are sent exactly as typed: Rust trims, normalizes and has the final say
+ * (a JS trim or toUpperCase would disagree with it, e.g. `ſ` → `S`, U+0085, U+FEFF). Only all-empty rows are dropped.
+ */
 export function checkRateRows(rows: RateRow[]): { rates: Record<string, number> } | { error: string } {
   // A Map, not a plain object: a code like `__proto__` must stay an own key instead of vanishing into the prototype.
   const rates = new Map<string, number>();
   const seen = new Set<string>();
   // Errors name the row, never the typed code: a pasted URL or token must not be shown back.
   for (const [i, row] of rows.entries()) {
-    const code = row.code.trim();
-    if (!code && !row.text.trim()) continue;
+    if (row.code === '' && row.text === '') continue;
     const at = `レート表の ${i + 1} 行目`;
-    if (!code) return { error: `${at}の通貨コードが空です。` };
+    if (row.code === '') return { error: `${at}の通貨コードが空です。` };
     const rate = parseRate(row.text);
     if (rate === null) return { error: `${at}のレートは 0 より大きい数値にしてください。` };
-    const key = code.toUpperCase();
+    const key = asciiUpper(row.code);
     if (seen.has(key)) return { error: `${at}の通貨コードが重複しています。` };
     seen.add(key);
-    rates.set(code, rate);
+    rates.set(row.code, rate);
   }
   return { rates: Object.fromEntries(rates) };
 }
@@ -170,20 +175,21 @@ export interface SymbolRow {
 export const symbolRowsOf = (overrides: Record<string, string>): SymbolRow[] =>
   Object.entries(overrides).map(([symbol, code]) => ({ symbol, code }));
 
-/** Pre-save check of the symbol overrides. Rust validates the code format and limits and has the final say. */
+/** Pre-save check of the symbol overrides. Sent exactly as typed (see `checkRateRows`); Rust validates and has the final say. */
 export function checkSymbolRows(rows: SymbolRow[]): { overrides: Record<string, string> } | { error: string } {
   // A Map, not a plain object: a symbol like `__proto__` must stay an own key instead of vanishing into the prototype.
   const overrides = new Map<string, string>();
+  const seen = new Set<string>();
   // Errors name the row, never the typed symbol: a pasted URL or token must not be shown back.
   for (const [i, row] of rows.entries()) {
-    const symbol = row.symbol.trim();
-    const code = row.code.trim();
-    if (!symbol && !code) continue;
+    if (row.symbol === '' && row.code === '') continue;
     const at = `通貨記号の上書きの ${i + 1} 行目`;
-    if (!symbol) return { error: `${at}の記号が空です。` };
-    if (!code) return { error: `${at}の通貨コードが空です。` };
-    if (overrides.has(symbol)) return { error: `${at}の記号が重複しています。` };
-    overrides.set(symbol, code);
+    if (row.symbol === '') return { error: `${at}の記号が空です。` };
+    if (row.code === '') return { error: `${at}の通貨コードが空です。` };
+    const key = asciiUpper(row.symbol);
+    if (seen.has(key)) return { error: `${at}の記号が重複しています。` };
+    seen.add(key);
+    overrides.set(row.symbol, row.code);
   }
   return { overrides: Object.fromEntries(overrides) };
 }
