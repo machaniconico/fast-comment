@@ -120,29 +120,36 @@ pub fn trim_currency(s: &str) -> &str {
 /// 受信した通貨表記を通貨コードにする。上書きは trim した表記の完全一致を優先し、無ければ ASCII の大小文字を無視して
 /// 引く(保存時に大文字化するが、以前の版や手編集の小文字のキーにも効かせる)。一致した候補の行き先が食い違う時、
 /// 表記が ISO 形式(英字 3 字)の時、行き先が ISO 形式でない時は上書きを使わない。上書きの行き先は常に ISO 形式で、
-/// 候補が食い違う時は表記をそのまま返すので、2 回かけても結果は変わらない(保存し直してもレートのキーが動かない)。
+/// 候補が食い違う時は既知の記号(`US$` など)だけ標準のコードにし、それ以外は表記をそのまま返すので、2 回かけても
+/// 結果は変わらない(保存し直してもレートのキーが動かない)。
 pub fn normalize_currency(raw: &str, overrides: &BTreeMap<String, String>) -> String {
     let raw = trim_currency(raw);
     if !is_iso_code(raw) {
         match override_for(raw, overrides) {
             Override::Code(code) => return code,
-            Override::Conflict => return raw.to_owned(),
+            Override::Conflict => {
+                return known_symbol(raw).map_or_else(|| raw.to_owned(), str::to_owned);
+            }
             Override::None => {}
         }
     }
-    match raw {
-        "¥" | "￥" | "JP¥" => "JPY".to_owned(),
-        "$" | "US$" => "USD".to_owned(),
-        "CA$" => "CAD".to_owned(),
-        "A$" => "AUD".to_owned(),
-        "€" => "EUR".to_owned(),
-        "£" => "GBP".to_owned(),
-        "₩" => "KRW".to_owned(),
-        "NT$" => "TWD".to_owned(),
-        "HK$" => "HKD".to_owned(),
-        "₹" => "INR".to_owned(),
-        _ => canonical_code(raw),
-    }
+    known_symbol(raw).map_or_else(|| canonical_code(raw), str::to_owned)
+}
+
+fn known_symbol(raw: &str) -> Option<&'static str> {
+    Some(match raw {
+        "¥" | "￥" | "JP¥" => "JPY",
+        "$" | "US$" => "USD",
+        "CA$" => "CAD",
+        "A$" => "AUD",
+        "€" => "EUR",
+        "£" => "GBP",
+        "₩" => "KRW",
+        "NT$" => "TWD",
+        "HK$" => "HKD",
+        "₹" => "INR",
+        _ => return None,
+    })
 }
 
 enum Override {
@@ -304,7 +311,7 @@ mod tests {
         let raws = [
             "pt", "PT", " pt ", "R$", "r$", "￥", "¥", "$", "brl", "BRL", "ｂｒｌ", "ＵＳＤ", "Ｐｔ", "__proto__",
             "__PROTO__", "zł", "bits", "X1", "Y2", "", "Pt", "pT", "uſd", "ſ", "s", "S", "\u{85}brl\u{85}",
-            "\u{FEFF}pt", "\u{FEFF}R$\u{85}", "\u{FEFF}",
+            "\u{FEFF}pt", "\u{FEFF}R$\u{85}", "\u{FEFF}", "US$", "us$", "Us$",
         ];
         let tables = [
             ov(&[]),
@@ -318,6 +325,7 @@ mod tests {
             ov(&[("X1", "Y2"), ("Y2", "Z3")]),
             ov(&[("R$", "BRL"), ("r$", "USD")]),
             ov(&[("PT", "USD"), ("pt", "EUR")]),
+            ov(&[("us$", "EUR"), ("Us$", "CAD")]),
             ov(&[("ſ", "USD"), ("S", "EUR")]),
             ov(&[("R$", "BRL"), (" R$ ", "USD")]),
             ov(&[("PT", "USD"), ("USD", "EUR"), ("R$", "BRL"), ("BRL", "JPY"), ("BITS", "USD")]),
@@ -363,6 +371,12 @@ mod tests {
         assert_eq!(normalize_currency("r$", &ov(&[("R$", "BRL"), ("R$\u{85}", "BRL")])), "BRL");
         // ſ は ASCII ではないので s / S の上書きに当たらない。
         assert_eq!(normalize_currency("ſ", &ov(&[("S", "EUR")])), "ſ");
+        // 候補が食い違っても、既知の記号は標準のコードとして数える(US$ の投げ銭が USD 限定の実績から漏れない)。
+        let us = ov(&[("us$", "EUR"), ("Us$", "CAD")]);
+        assert_eq!(normalize_currency("US$", &us), "USD");
+        let mut totals = AmountTotals::default();
+        totals.add("US$", 1.0);
+        assert_eq!(totals.only_milli("USD", &us), 1_000);
     }
 
     #[test]

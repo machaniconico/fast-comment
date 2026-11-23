@@ -150,8 +150,9 @@ const asciiUpper = (s: string): string => s.replace(/[a-z]/g, (c) => c.toUpperCa
  */
 export function checkRateRows(rows: RateRow[]): { rates: Record<string, number> } | { error: string } {
   // A Map, not a plain object: a code like `__proto__` must stay an own key instead of vanishing into the prototype.
+  // No duplicate check here: Rust keeps non-ISO symbols case-sensitive (`R$` and `r$` are different keys), so only it
+  // can tell which codes collide after normalizing.
   const rates = new Map<string, number>();
-  const seen = new Set<string>();
   // Errors name the row, never the typed code: a pasted URL or token must not be shown back.
   for (const [i, row] of rows.entries()) {
     if (row.code === '' && row.text === '') continue;
@@ -159,9 +160,7 @@ export function checkRateRows(rows: RateRow[]): { rates: Record<string, number> 
     if (row.code === '') return { error: `${at}の通貨コードが空です。` };
     const rate = parseRate(row.text);
     if (rate === null) return { error: `${at}のレートは 0 より大きい数値にしてください。` };
-    const key = asciiUpper(row.code);
-    if (seen.has(key)) return { error: `${at}の通貨コードが重複しています。` };
-    seen.add(key);
+    if (rates.has(row.code)) return { error: `${at}の通貨コードが重複しています。` };
     rates.set(row.code, rate);
   }
   return { rates: Object.fromEntries(rates) };

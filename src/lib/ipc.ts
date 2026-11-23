@@ -1307,7 +1307,7 @@ export async function commitAchievements(
   return invoke<AchievementCommitReply>('commit_achievements', { baseRevision, baseToken, enabled, achievements, rates, symbolOverrides });
 }
 
-/** Duplicates the current draft (not the saved copy); Rust assigns the new id. */
+/** A fresh, unsaved achievement for `subject` with valid defaults; Rust assigns the id. */
 export async function newAchievement(subject: AchievementSubjectKind): Promise<AchievementDef | null> {
   return invoke<AchievementDef | null>('new_achievement', { subject });
 }

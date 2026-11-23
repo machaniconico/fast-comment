@@ -98,7 +98,9 @@ test('rate rows reject empty codes, bad values and duplicates before saving', ()
   assert.deepEqual(checkRateRows([{ code: 'USD', text: '150.5' }, { code: '', text: '' }]), { rates: { USD: 150.5 } });
   assert.ok('error' in checkRateRows([{ code: '', text: '150' }]));
   assert.ok('error' in checkRateRows([{ code: 'USD', text: '' }]));
-  assert.ok('error' in checkRateRows([{ code: 'USD', text: '1' }, { code: 'usd', text: '2' }]));
+  assert.ok('error' in checkRateRows([{ code: 'USD', text: '1' }, { code: 'USD', text: '2' }]));
+  // Case variants are left to Rust: a saved `R$` / `r$` pair must load and save again unchanged.
+  assert.deepEqual(checkRateRows([{ code: 'R$', text: '1' }, { code: 'r$', text: '2' }]), { rates: { R$: 1, r$: 2 } });
 });
 
 test('empty threshold and empty name are caught before saving', () => {
@@ -113,7 +115,7 @@ test('rate errors name the row, never the typed code', () => {
   for (const rows of [
     [{ code: secret, text: '0' }],
     [{ code: 'USD', text: '1' }, { code: secret, text: '' }],
-    [{ code: secret, text: '1' }, { code: secret.toLowerCase(), text: '2' }],
+    [{ code: secret, text: '1' }, { code: secret, text: '2' }],
   ]) {
     const r = checkRateRows(rows);
     assert.ok('error' in r);
@@ -187,7 +189,8 @@ test('symbol override rows reject empty sides and ASCII-case duplicates without 
   assert.ok('error' in dup && dup.error.includes('2 行目') && !dup.error.includes(secret));
   const pt = checkSymbolRows([{ symbol: 'R$', code: 'BRL' }, { symbol: 'pt', code: 'USD' }, { symbol: 'PT', code: 'EUR' }]);
   assert.ok('error' in pt && pt.error.includes('3 行目'));
-  const rates = checkRateRows([{ code: 'pt', text: '1' }, { code: 'PT', text: '2' }]);
+  // Rate codes are not case-folded in the UI (Rust keeps non-ISO symbols case-sensitive); only exact repeats are caught.
+  const rates = checkRateRows([{ code: 'pt', text: '1' }, { code: 'pt', text: '2' }]);
   assert.ok('error' in rates && rates.error.includes('2 行目'));
 });
 
