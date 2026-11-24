@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
 // Comment templates that tag their root element with data-* attributes.
-// ranking / goals / timer only show aggregates and are intentionally excluded.
+// ranking / goals / timer / poll only show aggregates and are intentionally excluded.
 const TEMPLATES = ['default', 'simple', 'bubble', 'ticker', 'donation', 'danmaku'];
 const BEGIN = '  // ---- fc-attrs:begin ----';
 const END = '  // ---- fc-attrs:end ----';

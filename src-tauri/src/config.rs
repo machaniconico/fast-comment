@@ -1422,6 +1422,8 @@ pub struct AppConfig {
     pub goals: GoalsConfig,
     #[serde(default)]
     pub timer: TimerConfig,
+    #[serde(default, deserialize_with = "crate::poll::PollPreferences::load")]
+    pub poll: crate::poll::PollPreferences,
     #[serde(default)]
     pub effects: EffectsConfig,
     #[serde(default)]
@@ -1462,6 +1464,7 @@ impl Default for AppConfig {
             obs: ObsConfig::default(),
             goals: GoalsConfig::default(),
             timer: TimerConfig::default(),
+            poll: crate::poll::PollPreferences::default(),
             effects: EffectsConfig::default(),
             welcome: WelcomeConfig::default(),
             tts: TtsConfig::default(),
@@ -2080,6 +2083,15 @@ mod tests {
                 enabled: true,
                 default_duration_sec: 900,
                 mode: "elapsed".to_string(),
+            },
+            poll: crate::poll::PollPreferences {
+                question: "質問".into(),
+                options: vec!["A".into(), "B".into()],
+                settings: crate::poll::PollDisplaySettings {
+                    display: crate::poll::PollDisplay::Donut,
+                    show_percent: false,
+                    show_counts: true,
+                },
             },
             effects: EffectsConfig {
                 enabled: true,

@@ -24,6 +24,7 @@ pub mod keyword_effects;
 pub mod listeners;
 pub mod live_fanout;
 pub mod model;
+pub mod poll;
 pub mod moderation;
 pub mod sound_effects;
 mod moderation_error;
@@ -73,6 +74,9 @@ use crate::model::{
     Platform, Roles, YoutubeReaction,
 };
 use crate::moderation::{Moderator, Verdict};
+use crate::poll::{
+    Poll, PollDisplay, PollDisplaySettings, PollError, PollSnapshot, PollStart, PreferenceChange,
+};
 use crate::moderation_error::{ModerationError, ModerationErrorCode};
 use crate::sources::twitcasting_auth::{
     effective_client_id, AuthOptions, TwitcastingAuth, TwitcastingAuthError,
@@ -125,6 +129,7 @@ pub struct AppState {
     config_tx: watch::Sender<AppConfig>,
     /// Timer overlay へ基準スナップショットを配る watch 送信端。
     timer_tx: watch::Sender<TimerSnapshot>,
+    poll: Arc<Poll>,
     /// 設定の保存先ディレクトリ(app config dir)。
     config_dir: PathBuf,
     /// Source → パイプラインへ流す内部 broadcast 送信端。
@@ -624,6 +629,20 @@ impl api::AppOps for TauriAppOps {
 impl AppState {
     fn commit_config(&self, current: &mut AppConfig, next: AppConfig) -> Result<u64, ConfigCommitError> {
         commit_config(&self.config_dir, &self.config_revision, &self.config_tx, current, next, None)
+    }
+
+    fn save_poll_preferences(&self, change: PreferenceChange<'_>) -> Result<(), PollError> {
+        let mut current = self.config.lock().unwrap();
+        let mut next = current.clone();
+        match change {
+            PreferenceChange::Started(preferences) => next.poll = preferences.clone(),
+            PreferenceChange::Display(settings) => next.poll.settings = settings,
+        }
+        if current.poll != next.poll {
+            self.commit_config(&mut current, next)
+                .map_err(|_| PollError::Save)?;
+        }
+        Ok(())
     }
 }
 
@@ -2606,6 +2625,66 @@ fn get_obs_timer_url(state: State<'_, AppState>) -> Result<String, String> {
     ))
 }
 
+#[tauri::command]
+fn get_obs_poll_url(state: State<'_, AppState>) -> String {
+    let port = state.obs_server.lock().unwrap().port;
+    format!("http://127.0.0.1:{port}/?template=poll&ws=ws://127.0.0.1:{port}/poll")
+}
+
+#[tauri::command]
+fn poll_state(state: State<'_, AppState>) -> PollSnapshot {
+    state.poll.snapshot()
+}
+
+#[tauri::command]
+fn poll_start(
+    state: State<'_, AppState>,
+    question: String,
+    options: Vec<String>,
+    duration_secs: Option<u32>,
+    display: PollDisplay,
+    show_percent: bool,
+    show_counts: bool,
+) -> Result<PollSnapshot, String> {
+    let request = PollStart {
+        question,
+        options,
+        duration_secs,
+        display,
+        show_percent,
+        show_counts,
+    };
+    request
+        .validate()
+        .and_then(|start| state.poll.start(start))
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn poll_stop(state: State<'_, AppState>) -> PollSnapshot {
+    state.poll.stop()
+}
+
+#[tauri::command]
+fn poll_reset(state: State<'_, AppState>) -> PollSnapshot {
+    state.poll.reset()
+}
+
+#[tauri::command]
+fn poll_set_display(
+    state: State<'_, AppState>,
+    display: PollDisplay,
+    show_percent: bool,
+    show_counts: bool,
+) -> Result<PollSnapshot, String> {
+    let settings = PollDisplaySettings {
+        display,
+        show_percent,
+        show_counts,
+    };
+    state.poll.set_display(settings).map_err(|error| error.to_string())
+}
+
 fn timer_now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -3301,6 +3380,7 @@ fn restart_obs_server_if_needed(
             api::ApiDeps::new(state.integrations.gate(), cancel.clone())
                 .with_feed(state.api_feed.clone())
                 .with_ops(Arc::new(TauriAppOps(app.clone())))
+                .with_poll(state.poll.clone())
                 .with_rate_limit(state.api_rate_limit.clone()),
             new_port,
         )),
@@ -3531,6 +3611,7 @@ fn spawn_pipeline(app: AppHandle, cancel: CancellationToken) {
                     }
 
                     register_participant_if_needed(&app, &state, &msg);
+                    state.poll.record(&msg, &verdict);
 
                     // 同期 I/O やネットワーク待ちをせず、有界キューに投入する。
                     try_enqueue_tts_message(&app, &state.config, &state.tts, msg.clone());
@@ -3779,7 +3860,15 @@ pub fn run() {
             );
 
             // 下流 Bus(パイプライン → UI/OBS)。
-            let bus = Bus::new(obs_port, stats_tx.clone(), timer_tx.clone());
+            let poll_config_app = handle.clone();
+            let poll_event_app = handle.clone();
+            let poll = Arc::new(Poll::new(
+                move |change| poll_config_app.state::<AppState>().save_poll_preferences(change),
+                move |snapshot| {
+                    let _ = poll_event_app.emit("poll-updated", snapshot);
+                },
+            ));
+            let bus = Bus::new(obs_port, stats_tx.clone(), timer_tx.clone()).with_poll(poll.sender());
 
             // モデレータ。
             let moderator = Moderator::new(&config.moderation);
@@ -3825,6 +3914,7 @@ pub fn run() {
                         api::ApiDeps::new(integrations.gate(), obs_cancel.clone())
                             .with_feed(api_feed.clone())
                             .with_ops(Arc::new(TauriAppOps(handle.clone())))
+                            .with_poll(poll.clone())
                             .with_rate_limit(api_rate_limit.clone()),
                         obs_port,
                     );
@@ -3852,6 +3942,7 @@ pub fn run() {
                         config_revision: AtomicU64::new(0),
                         config_tx,
                         timer_tx,
+                        poll: poll.clone(),
                         config_dir,
                         source_tx: source_tx.clone(),
                         bus: bus.clone(),
@@ -3999,6 +4090,7 @@ pub fn run() {
             );
 
             // moderation + TTS パイプライン起動。
+            tauri::async_runtime::spawn(poll.run(app_cancel.clone()));
             spawn_pipeline(handle.clone(), app_cancel.clone());
             spawn_webhook_forwarder(handle.clone(), app_cancel.clone());
 
@@ -4076,6 +4168,12 @@ pub fn run() {
             get_obs_url,
             get_obs_goals_url,
             get_obs_timer_url,
+            get_obs_poll_url,
+            poll_state,
+            poll_start,
+            poll_stop,
+            poll_reset,
+            poll_set_display,
             control_timer,
             list_templates,
             read_template_file,

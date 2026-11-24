@@ -4,6 +4,7 @@
   import type { Platform } from './lib/types';
   import CommentList from './lib/components/CommentList.svelte';
   import Dashboard from './lib/components/Dashboard.svelte';
+  import Poll from './lib/components/Poll.svelte';
   import Raffle from './lib/components/Raffle.svelte';
   import Timer from './lib/components/Timer.svelte';
   import MultiColumnView from './lib/components/MultiColumnView.svelte';
@@ -169,7 +170,7 @@
   const showWelcome = $derived(isWelcomeEnabled(config));
   const ttsConfigured = $derived(isTtsConfigured(config));
   const standaloneOpen = $derived(
-    ui.showDashboard || ui.showRaffle || ui.showTimer || ui.toolSettingsView !== null
+    ui.showDashboard || ui.showRaffle || ui.showTimer || ui.showPoll || ui.toolSettingsView !== null
   );
   const showGoalsControls = $derived(
     ui.activeTab === 'comments'
@@ -345,6 +346,11 @@
 
   function selectRaffle() {
     ui.toggleRaffle();
+    closeToolsMenu();
+  }
+
+  function selectPoll() {
+    ui.togglePoll();
     closeToolsMenu();
   }
 
@@ -686,6 +692,12 @@
             <button
               role="menuitem"
               class="tools-menu-item"
+              class:active={ui.showPoll}
+              onclick={selectPoll}
+            >アンケート</button>
+            <button
+              role="menuitem"
+              class="tools-menu-item"
               class:active={ui.showDashboard}
               onclick={selectDashboard}
             >振り返り</button>
@@ -898,6 +910,8 @@
       <Dashboard />
     {:else if ui.showRaffle}
       <Raffle />
+    {:else if ui.showPoll}
+      <Poll />
     {:else if ui.activeTab === 'comments'}
       <PinnedStrip />
       {#if ui.viewMode === 'columns'}
