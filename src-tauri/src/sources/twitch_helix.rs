@@ -405,7 +405,7 @@ async fn fetch_device_login_stream_metadata(
     };
     let result = fetch_stream_metadata(http, login, &access.token, &access.client_id).await;
     if matches!(&result, Err(e) if is_auth_failure(e)) {
-        device_auth.invalidate_access_token().await;
+        device_auth.invalidate_access_token(&access.token).await;
     }
     Some(result)
 }

@@ -25,6 +25,7 @@ pub mod listeners;
 pub mod live_fanout;
 pub mod model;
 pub mod poll;
+mod poll_control;
 pub mod moderation;
 pub mod sound_effects;
 mod moderation_error;
@@ -75,7 +76,8 @@ use crate::model::{
 };
 use crate::moderation::{Moderator, Verdict};
 use crate::poll::{
-    Poll, PollDisplay, PollDisplaySettings, PollError, PollSnapshot, PollStart, PreferenceChange,
+    Poll, PollDisplay, PollDisplaySettings, PollError, PollSnapshot, PollSource, PollStart,
+    PreferenceChange,
 };
 use crate::moderation_error::{ModerationError, ModerationErrorCode};
 use crate::sources::twitcasting_auth::{
@@ -130,6 +132,7 @@ pub struct AppState {
     /// Timer overlay へ基準スナップショットを配る watch 送信端。
     timer_tx: watch::Sender<TimerSnapshot>,
     poll: Arc<Poll>,
+    poll_control: Arc<poll_control::PollControl>,
     /// 設定の保存先ディレクトリ(app config dir)。
     config_dir: PathBuf,
     /// Source → パイプラインへ流す内部 broadcast 送信端。
@@ -1105,8 +1108,8 @@ async fn begin_twitch_login(state: State<'_, AppState>) -> Result<TwitchDeviceLo
         .to_string();
     let login = state.twitch_auth.begin_login(&client_id).await?;
     // ブラウザを開けなくても、UI に出したコードと URL で手動認証できるので続行する。
-    if let Err(error) = crate::update::open_url(login.verification_uri.clone()) {
-        tracing::warn!("Twitchの認証ページを開けませんでした: {error}");
+    if crate::update::open_url(login.verification_uri.clone()).is_err() {
+        tracing::warn!("Twitchの認証ページを開けませんでした");
     }
     Ok(login)
 }
@@ -2637,8 +2640,9 @@ fn poll_state(state: State<'_, AppState>) -> PollSnapshot {
 }
 
 #[tauri::command]
-fn poll_start(
+async fn poll_start(
     state: State<'_, AppState>,
+    source: Option<PollSource>,
     question: String,
     options: Vec<String>,
     duration_secs: Option<u32>,
@@ -2647,6 +2651,7 @@ fn poll_start(
     show_counts: bool,
 ) -> Result<PollSnapshot, String> {
     let request = PollStart {
+        source: source.unwrap_or_default(),
         question,
         options,
         duration_secs,
@@ -2654,24 +2659,34 @@ fn poll_start(
         show_percent,
         show_counts,
     };
-    request
-        .validate()
-        .and_then(|start| state.poll.start(start))
+    let start = request.validate().map_err(|error| error.to_string())?;
+    state
+        .poll_control
+        .start(start)
+        .await
         .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
-fn poll_stop(state: State<'_, AppState>) -> PollSnapshot {
-    state.poll.stop()
+async fn poll_stop(state: State<'_, AppState>) -> Result<PollSnapshot, String> {
+    state
+        .poll_control
+        .stop()
+        .await
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
-fn poll_reset(state: State<'_, AppState>) -> PollSnapshot {
-    state.poll.reset()
+async fn poll_reset(state: State<'_, AppState>) -> Result<PollSnapshot, String> {
+    state
+        .poll_control
+        .reset()
+        .await
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
-fn poll_set_display(
+async fn poll_set_display(
     state: State<'_, AppState>,
     display: PollDisplay,
     show_percent: bool,
@@ -2682,7 +2697,11 @@ fn poll_set_display(
         show_percent,
         show_counts,
     };
-    state.poll.set_display(settings).map_err(|error| error.to_string())
+    state
+        .poll_control
+        .set_display(settings)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 fn timer_now_ms() -> u64 {
@@ -3380,7 +3399,7 @@ fn restart_obs_server_if_needed(
             api::ApiDeps::new(state.integrations.gate(), cancel.clone())
                 .with_feed(state.api_feed.clone())
                 .with_ops(Arc::new(TauriAppOps(app.clone())))
-                .with_poll(state.poll.clone())
+                .with_poll(state.poll_control.clone())
                 .with_rate_limit(state.api_rate_limit.clone()),
             new_port,
         )),
@@ -3875,6 +3894,15 @@ pub fn run() {
 
             // アプリ全体の停止トークン(将来 on_window_event 等から cancel 可能)。
             let app_cancel = CancellationToken::new();
+            let twitch_auth = Arc::new(
+                TwitchAuth::new().expect("Twitch認証用HTTPクライアントの作成に失敗しました"),
+            );
+            let poll_control = Arc::new(poll_control::PollControl::new(
+                poll.clone(),
+                twitch_auth.clone(),
+                config_tx.subscribe(),
+                app_cancel.clone(),
+            ));
             let obs_cancel = app_cancel.child_token();
             let templates =
                 TemplateStore::new(resolve_templates_dir(&handle), config_dir.join("templates"));
@@ -3914,7 +3942,7 @@ pub fn run() {
                         api::ApiDeps::new(integrations.gate(), obs_cancel.clone())
                             .with_feed(api_feed.clone())
                             .with_ops(Arc::new(TauriAppOps(handle.clone())))
-                            .with_poll(poll.clone())
+                            .with_poll(poll_control.clone())
                             .with_rate_limit(api_rate_limit.clone()),
                         obs_port,
                     );
@@ -3943,6 +3971,7 @@ pub fn run() {
                         config_tx,
                         timer_tx,
                         poll: poll.clone(),
+                        poll_control,
                         config_dir,
                         source_tx: source_tx.clone(),
                         bus: bus.clone(),
@@ -3972,9 +4001,7 @@ pub fn run() {
                         participants: Mutex::new(Vec::new()),
                         youtube_auth: YoutubeAuth::new()
                             .expect("YouTube投稿用HTTPクライアントの作成に失敗しました"),
-                        twitch_auth: Arc::new(
-                            TwitchAuth::new().expect("Twitch認証用HTTPクライアントの作成に失敗しました"),
-                        ),
+                        twitch_auth,
                     };
                     let listener_store = state.listeners.clone();
                     move || {

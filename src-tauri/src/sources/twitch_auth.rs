@@ -21,10 +21,11 @@ const TOKEN_URL: &str = "https://id.twitch.tv/oauth2/token";
 const VALIDATE_URL: &str = "https://id.twitch.tv/oauth2/validate";
 const KEYRING_USER: &str = "twitch-oauth-refresh-token";
 const DEVICE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
-const REQUIRED_SCOPES: [&str; 2] = [
+pub const REQUIRED_SCOPES: [&str; 2] = [
     "moderator:manage:banned_users",
     "moderator:manage:chat_messages",
 ];
+pub const POLL_SCOPES: &[&str] = &["channel:manage:polls"];
 const VALIDATE_TTL: Duration = Duration::from_secs(60 * 60);
 const DEFAULT_ACCESS_TTL_SECS: u64 = 4 * 60 * 60;
 const DEFAULT_DEVICE_EXPIRES_SECS: u64 = 1800;
@@ -39,7 +40,7 @@ pub struct TwitchDeviceLogin {
     pub expires_in_secs: u64,
 }
 
-/// Twitch モデレーション用 OAuth の状態。
+/// Twitch モデレーションとアンケート用 OAuth の状態。
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TwitchOauthStatus {
@@ -47,6 +48,7 @@ pub struct TwitchOauthStatus {
     pub connected: bool,
     pub login: Option<String>,
     pub scopes_ok: bool,
+    pub polls_scope_ok: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -63,7 +65,7 @@ pub(super) struct StoredTwitchToken {
 impl std::fmt::Debug for StoredTwitchToken {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StoredTwitchToken")
-            .field("client_id", &self.client_id)
+            .field("client_id", &"<redacted>")
             .field("refresh_token", &"<redacted>")
             .field("user_id", &self.user_id)
             .field("login", &self.login)
@@ -74,7 +76,7 @@ impl std::fmt::Debug for StoredTwitchToken {
 
 /// Helix 呼び出しに必要な認証済み情報。
 #[derive(Clone)]
-pub(super) struct TwitchAccess {
+pub(crate) struct TwitchAccess {
     pub client_id: String,
     pub token: String,
     pub user_id: String,
@@ -85,7 +87,7 @@ pub(super) struct TwitchAccess {
 impl std::fmt::Debug for TwitchAccess {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TwitchAccess")
-            .field("client_id", &self.client_id)
+            .field("client_id", &"<redacted>")
             .field("token", &"<redacted>")
             .field("user_id", &self.user_id)
             .field("login", &self.login)
@@ -291,7 +293,7 @@ struct ValidateInfo {
 
 /// Twitch 認証専用の軽量状態。バックグラウンドタスクは持たない。
 pub struct TwitchAuth {
-    pub(super) http: reqwest::Client,
+    pub(crate) http: reqwest::Client,
     access_token: Mutex<Option<CachedAccessToken>>,
     login: Mutex<Option<ActiveLogin>>,
     /// begin 同士を直列化し、複数のブラウザ認証を同時に走らせない。cancel は取らない。
@@ -410,6 +412,7 @@ impl TwitchAuth {
                 connected: false,
                 login: None,
                 scopes_ok: false,
+                polls_scope_ok: false,
             });
         }
         if self.epoch().signed_out {
@@ -419,6 +422,7 @@ impl TwitchAuth {
                 connected: false,
                 login: None,
                 scopes_ok: false,
+                polls_scope_ok: false,
             });
         }
 
@@ -429,6 +433,7 @@ impl TwitchAuth {
                 connected: false,
                 login: None,
                 scopes_ok: false,
+                polls_scope_ok: false,
             }),
         }
     }
@@ -449,21 +454,26 @@ impl TwitchAuth {
             previous.cancel.cancel();
         }
 
-        let scopes = REQUIRED_SCOPES.join(" ");
+        let scopes = login_scopes().join(" ");
         let response = self
             .http
             .post(DEVICE_URL)
             .form(&[("client_id", client_id), ("scopes", scopes.as_str())])
             .send()
             .await
-            .map_err(|e| format!("Twitchのデバイス認証を開始できませんでした: {e}"))?;
+            .map_err(|e| {
+                format!(
+                    "Twitchのデバイス認証を開始できませんでした: {}",
+                    e.without_url()
+                )
+            })?;
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
         if !status.is_success() {
-            let detail =
-                error_message(&body).unwrap_or_else(|| format!("Twitch API エラー ({status})"));
-            return Err(format!("Twitchのデバイス認証を開始できませんでした: {detail}"));
+            return Err(format!(
+                "Twitchのデバイス認証を開始できませんでした (HTTP {status})"
+            ));
         }
+        let body = response.text().await.unwrap_or_default();
         let value = serde_json::from_str::<Value>(&body)
             .map_err(|e| format!("Twitchの応答を解析できませんでした: {e}"))?;
         let device_code = string_field(&value, "device_code")
@@ -525,7 +535,7 @@ impl TwitchAuth {
             }
         };
         let generation = self.generation();
-        let scopes = REQUIRED_SCOPES.join(" ");
+        let scopes = login_scopes().join(" ");
         let mut interval = login.interval;
 
         loop {
@@ -557,18 +567,18 @@ impl TwitchAuth {
                 .await
             {
                 Ok(response) => response,
-                Err(error) => {
+                Err(_) => {
                     // 一時的な通信失敗は、認証コードの期限内なら次の間隔で再試行する。
-                    tracing::warn!("Twitchのログイン状態を確認できませんでした(再試行します): {error}");
+                    tracing::warn!("Twitchのログイン状態を確認できませんでした(再試行します)");
                     continue;
                 }
             };
             let status = response.status();
             let body = match response.text().await {
                 Ok(body) => body,
-                Err(error) => {
+                Err(_) => {
                     // 本文の読取り失敗も一時的な通信失敗として扱い、取消・期限を確認しつつ継続する。
-                    tracing::warn!("Twitchのログイン応答を読めませんでした(再試行します): {error}");
+                    tracing::warn!("Twitchのログイン応答を読めませんでした(再試行します)");
                     continue;
                 }
             };
@@ -711,7 +721,44 @@ impl TwitchAuth {
             connected: false,
             login: None,
             scopes_ok: false,
+            polls_scope_ok: false,
         })
+    }
+
+    pub(crate) async fn with_token_retry<T, E, F, Fut>(
+        &self,
+        client_id: &str,
+        client_secret: &str,
+        required_scopes: &[&str],
+        unauthorized: impl Fn(&E) -> bool,
+        mut action: F,
+    ) -> Result<T, E>
+    where
+        E: From<ModerationError>,
+        F: FnMut(TwitchAccess) -> Fut,
+        Fut: std::future::Future<Output = Result<T, E>>,
+    {
+        let mut retried = false;
+        loop {
+            let mut access = self.access(client_id, client_secret).await?;
+            self.maybe_validate(client_id.trim(), &mut access).await;
+            if !scopes_satisfied(required_scopes, &access.scopes) {
+                return Err(ModerationError::new(
+                    ModerationErrorCode::ScopeMissing,
+                    "Twitchの認証に必要なスコープがありません。設定からTwitchへ再接続してください",
+                )
+                .into());
+            }
+
+            let token = access.token.clone();
+            match action(access).await {
+                Err(error) if !retried && unauthorized(&error) => {
+                    retried = true;
+                    self.invalidate_access_token(&token).await;
+                }
+                result => return result,
+            }
+        }
     }
 
     /// 有効な access token と利用者情報を返す。必要なら refresh して即保存する。
@@ -779,7 +826,7 @@ impl TwitchAuth {
             .map_err(|e| {
                 ModerationError::new(
                     ModerationErrorCode::Network,
-                    format!("Twitchの認証更新に失敗しました: {e}"),
+                    format!("Twitchの認証更新に失敗しました: {}", e.without_url()),
                 )
             })?;
         let status = response.status();
@@ -792,7 +839,7 @@ impl TwitchAuth {
             ));
         }
         if !status.is_success() {
-            return Err(map_token_error(status, &body));
+            return Err(map_token_error(status));
         }
         let value = serde_json::from_str::<Value>(&body).map_err(|e| {
             ModerationError::new(
@@ -853,8 +900,15 @@ impl TwitchAuth {
         Ok(access)
     }
 
-    pub(super) async fn invalidate_access_token(&self) {
-        *self.access_token.lock().await = None;
+    pub(super) async fn invalidate_access_token(&self, rejected_token: &str) {
+        let mut cache = self.access_token.lock().await;
+        // 別の操作が先に更新したトークンは、遅れて返った 401 で破棄しない。
+        if cache
+            .as_ref()
+            .is_some_and(|entry| entry.access.token == rejected_token)
+        {
+            *cache = None;
+        }
     }
 
     /// 前回の成功から 1 時間を超えていれば validate する。失敗しても操作は続行する。
@@ -897,7 +951,7 @@ impl TwitchAuth {
             }
             Err(ValidateFailure::Unauthorized) => {
                 // 次の API 呼び出しで 401 になれば 1 回だけ refresh される。
-                *self.access_token.lock().await = None;
+                self.invalidate_access_token(&access.token).await;
             }
             Err(ValidateFailure::Other(_)) => {}
         }
@@ -943,7 +997,12 @@ impl TwitchAuth {
             .bearer_auth(access_token)
             .send()
             .await
-            .map_err(|e| ValidateFailure::Other(format!("Twitchの認証確認に失敗しました: {e}")))?;
+            .map_err(|e| {
+                ValidateFailure::Other(format!(
+                    "Twitchの認証確認に失敗しました: {}",
+                    e.without_url()
+                ))
+            })?;
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         if status == StatusCode::UNAUTHORIZED {
@@ -994,7 +1053,8 @@ fn status_from_stored(stored: &StoredTwitchToken) -> TwitchOauthStatus {
         configured: true,
         connected: true,
         login: Some(stored.login.clone()).filter(|login| !login.trim().is_empty()),
-        scopes_ok: scopes_satisfied(&stored.scopes),
+        scopes_ok: scopes_satisfied(&REQUIRED_SCOPES, &stored.scopes),
+        polls_scope_ok: scopes_satisfied(POLL_SCOPES, &stored.scopes),
     }
 }
 
@@ -1046,20 +1106,21 @@ fn refresh_save_failed() -> ModerationError {
     )
 }
 
-/// refresh が 400 / 401 で拒否されたときの文言。Twitch の本文があれば添える。
+/// refresh が 400 / 401 で拒否されたときの文言。既知の理由だけを添える。
 fn refresh_rejected_message(body: &str) -> String {
     let base = "Twitchの認証の有効期限が切れています。設定からTwitchへ再接続してください";
     match error_message(body) {
-        Some(detail) => format!("{base}(Twitch: {detail})"),
-        None => base.to_string(),
+        Some(detail) if detail == "Invalid refresh token" => {
+            format!("{base}(Twitch: Invalid refresh token)")
+        }
+        _ => base.to_string(),
     }
 }
 
-fn map_token_error(status: StatusCode, body: &str) -> ModerationError {
-    let detail = error_message(body).unwrap_or_else(|| format!("HTTP {status}"));
+fn map_token_error(status: StatusCode) -> ModerationError {
     ModerationError::new(
         ModerationErrorCode::Network,
-        format!("Twitchの認証更新に失敗しました: {detail}"),
+        format!("Twitchの認証更新に失敗しました (HTTP {status})"),
     )
 }
 
@@ -1105,11 +1166,7 @@ pub(crate) fn classify_device_poll(status: StatusCode, body: &str) -> DevicePoll
         return DevicePoll::Failed("Twitchのログインが拒否されました".to_string());
     }
 
-    if message.trim().is_empty() {
-        DevicePoll::Failed(format!("Twitchのログインに失敗しました (HTTP {status})"))
-    } else {
-        DevicePoll::Failed(format!("Twitchのログインに失敗しました: {message}"))
-    }
+    DevicePoll::Failed(format!("Twitchのログインに失敗しました (HTTP {status})"))
 }
 
 /// refresh リクエストの form。クライアントシークレットは非空のときだけ付ける。
@@ -1131,10 +1188,20 @@ pub(crate) fn refresh_form(
 }
 
 /// 必須スコープをすべて持っているか。
-pub(crate) fn scopes_satisfied(scopes: &[String]) -> bool {
-    REQUIRED_SCOPES
+pub fn scopes_satisfied(required: &[&str], granted: &[String]) -> bool {
+    required
         .iter()
-        .all(|required| scopes.iter().any(|scope| scope == required))
+        .all(|scope| granted.iter().any(|grant| grant == scope))
+}
+
+pub fn login_scopes() -> Vec<&'static str> {
+    let mut scopes = Vec::new();
+    for &scope in REQUIRED_SCOPES.iter().chain(POLL_SCOPES) {
+        if !scopes.contains(&scope) {
+            scopes.push(scope);
+        }
+    }
+    scopes
 }
 
 /// 要求開始時の認証世代が現在も同じか。
@@ -1227,12 +1294,15 @@ mod tests {
             .iter()
             .map(|scope| scope.to_string())
             .collect::<Vec<_>>();
-        assert!(scopes_satisfied(&both));
+        assert!(scopes_satisfied(&REQUIRED_SCOPES, &both));
 
         let one = vec![REQUIRED_SCOPES[0].to_string()];
-        assert!(!scopes_satisfied(&one));
-        assert!(!scopes_satisfied(&[]));
-        assert!(!scopes_satisfied(&["chat:read".to_string()]));
+        assert!(!scopes_satisfied(&REQUIRED_SCOPES, &one));
+        assert!(!scopes_satisfied(&REQUIRED_SCOPES, &[]));
+        assert!(!scopes_satisfied(
+            &REQUIRED_SCOPES,
+            &["chat:read".to_string()]
+        ));
     }
 
     fn sample_access(token: &str) -> TwitchAccess {
@@ -1284,6 +1354,23 @@ mod tests {
             !cached.usable("client", 3, now + Duration::from_secs(61)),
             "期限切れは使わない"
         );
+    }
+
+    #[tokio::test]
+    async fn stale_unauthorized_preserves_refreshed_access() {
+        let auth = TwitchAuth::new().unwrap();
+        *auth.access_token.lock().await = Some(CachedAccessToken {
+            client_id: "client".to_owned(),
+            access: sample_access("refreshed"),
+            valid_until: Instant::now() + Duration::from_secs(600),
+            generation: auth.generation(),
+        });
+
+        auth.invalidate_access_token("stale").await;
+        assert!(auth.access_token.lock().await.is_some());
+
+        auth.invalidate_access_token("refreshed").await;
+        assert!(auth.access_token.lock().await.is_none());
     }
 
     #[tokio::test]

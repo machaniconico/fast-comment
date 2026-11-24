@@ -21,7 +21,7 @@ pub struct ApiDeps {
     pub(crate) shutdown: CancellationToken,
     pub(crate) feed: ApiFeed,
     pub(crate) ops: Option<Arc<dyn AppOps>>,
-    poll: Option<Arc<crate::poll::Poll>>,
+    poll: Option<Arc<crate::poll_control::PollControl>>,
     pub(crate) rate_limit: Arc<ops::RateLimit>,
 }
 impl ApiDeps {
@@ -45,7 +45,7 @@ impl ApiDeps {
         self.ops = Some(ops);
         self
     }
-    pub(crate) fn with_poll(mut self, poll: Arc<crate::poll::Poll>) -> Self {
+    pub(crate) fn with_poll(mut self, poll: Arc<crate::poll_control::PollControl>) -> Self {
         self.poll = Some(poll);
         self
     }

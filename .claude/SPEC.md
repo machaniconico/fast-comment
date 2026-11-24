@@ -275,7 +275,7 @@ trait TtsBackend { async fn speak(&self, text: String) -> Result<()>; fn availab
 - **ハイライトルール**(ユーザー/キーワード)→ flag 付与。
 - **ローカル非表示**(手動): UIで個別コメントを隠す。
 - **配信側モデレーション(P6 Phase 1・YouTube)**: コメント右クリック / ユーザーカードから、コメント削除(`LCC.` 形式 ID = API キー設定時の公式 stream 受信分のみ)・タイムアウト(1分/10分/1時間/24時間)・永久 BAN(確認ダイアログ)・BAN 解除(同セッションで行った BAN のみ)。既存の Google OAuth(`youtube.force-ssl`)を使う。実行後は該当コメントを減光 +「削除済み」「タイムアウト」「BAN済み」ラベルで残す(UI のみ)。X / niconico は対象外。
-- **配信側モデレーション(P6 Phase 2・Twitch)**: 同じメニュー / ユーザーカードで、コメント削除(IRC `id` タグ = `nativeId` が true のメッセージのみ)・タイムアウト・永久 BAN・BAN 解除(**Twitch では常に表示**)。Twitch Helix を使い、認証は Device Code Flow(設定 >「Twitch モデレーション」の [Twitch にログイン] でコード表示、ブラウザは Rust 側で開く)。必要スコープは `moderator:manage:banned_users` `moderator:manage:chat_messages`。前提: Twitch 開発者コンソールの既存アプリで Device Code Grant が使えること(`credentials.twitchClientId` 必須)。スコープ不足時は設定に「再ログイン」警告。エラーは Rust の `ModerationError` をそのままトースト表示。
+- **配信側モデレーション(P6 Phase 2・Twitch)**: 同じメニュー / ユーザーカードで、コメント削除(IRC `id` タグ = `nativeId` が true のメッセージのみ)・タイムアウト・永久 BAN・BAN 解除(**Twitch では常に表示**)。Twitch Helix を使い、認証は Device Code Flow(設定 >「Twitch モデレーション」の [Twitch にログイン] でコード表示、ブラウザは Rust 側で開く)。必要スコープは `moderator:manage:banned_users` `moderator:manage:chat_messages`。前提: Twitch 開発者コンソールの既存アプリで Device Code Grant が使えること(`credentials.twitchClientId` 必須)。新規ログインと再ログインではこれらに `channel:manage:polls` を加えて要求する。認証状態の `scopesOk` はモデレーション用 2 スコープ、`pollsScopeOk` は Polls 用スコープを個別に判定する。設定の「権限が不足しています」はモデレーション用スコープが不足した場合に表示する。モデレーション用 2 スコープだけで接続済みのアカウントも削除・BAN 等を続けられる。エラーは Rust の `ModerationError` をそのままトースト表示。
 - **配信側操作の反映(P6 Phase 3)**: 公式 UI・他モデレーターの操作を `ModerationEvent`(`messageDeleted` / `userCleared{durationSecs}` / `chatCleared`、serde tag=`type`)としてアプリへ反映。
   - 共通フィールド: userCleared の `certain`(false = タイムアウト/BAN の別が不明。UI は既存のタイムアウト・BAN 印を上書きせず、印が無ければ「BAN済み」)、userCleared / chatCleared の `beforeMs`(サーバー時刻の適用境界。`timestampMs <= beforeMs` のコメントだけが対象、null = 境界なし。TTS 除外も同じ判定)。
   - Twitch(匿名 IRC のまま): `CLEARMSG` の `target-msg-id` → messageDeleted。`CLEARCHAT` + `target-user-id` → userCleared(`ban-duration` 秒、無ければ永久 BAN=null、非数値/0 は 0 秒=期間不明のタイムアウト、`certain`=true)。対象タグ無しかつ trailing も無し → chatCleared。`target-user-id` 欠落で login だけの形は無視。`beforeMs` は `tmi-sent-ts`(PRIVMSG の `timestampMs` と同じサーバー時刻)。
@@ -634,11 +634,19 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
 - **対象外 (v1)**: チャンネルポイントの引き換えと接続断の音は将来の候補。
 
 
-## 19. アンケート (PR1)
+## 19. アンケート (コメント投票 / Twitch 公式 Polls)
 
-- アプリ全体で同時に 1 件のコメント投票を扱う。`PollSnapshot` は `id`・`source:"chat"`・`status`(`idle`/`open`/`closed`)・`question`・`options`(`label`・`votes`・`percent`・`leading`)・`totalVoters`・`startedAtMs`・任意の `endsAtMs`・`display`・`showPercent`・`showCounts` を持つ。票が 0 の時の割合は 0。割合・最多の判定は Rust で計算する。
-- `poll_start` は trim 後の質問 1〜100 文字、選択肢 2〜10 件(各 1〜40 文字、大小文字を無視して一意)と表示設定を受け付ける。`durationSecs` は 10〜3600 秒。省略時は手動終了。期限は Rust の単調時計で管理する。`poll_stop` は結果を保持したまま閉じ、`poll_reset` は待機状態に戻す。`poll_set_display` は表示形式(`bar-h`/`bar-v`/`pie`/`donut`/`number`)と割合・票数の表示を変更する。
-- 受付中はモデレーション後のコメントを判定する。System・非表示・履歴やバックフィル(`route.uncounted`)・空の著者 ID を除外し、`injected_test` のテスト注入は数える。`plain_text()` の前後の空白と見えない文字(Twitch のクライアントが連投のために付ける U+E0000、BOM、ゼロ幅文字)を落とし、番号 1〜N(全角数字可)を優先し、該当しなければラベルと大小文字を無視して全文一致で照合する。投票者のキーはプラットフォームと著者 ID の組。最新の選択肢で上書きし、同じ選択肢の連投は集計を変えない。最大 100,000 人。上限到達後も既存の投票者は変更できる。
-- 状態はメモリ内の `watch` に公開する。`poll_state` で現在値を取得でき、票による `poll-updated` と OBS 更新は最大 100ms に 1 回。操作や自動終了は即時反映する。`config.json` の `poll` に最後に使った質問・選択肢・表示設定を保存する。欠落・破損時は既定値を使う。票・結果は再起動で消える。アンケートの通知・ログ・エラーに投票者の名前や ID を含めない。
+- アプリ全体で同時に 1 件の投票を扱う。`PollSnapshot` は `id`・`source`(`"chat"` / `"twitch"`)・`status`(`idle`/`open`/`closed`)・`question`・`options`(`label`・`votes`・`percent`・`leading`)・`totalVoters`・`startedAtMs`・任意の `endsAtMs`・`display`・`showPercent`・`showCounts` を持つ。票が 0 の時の割合は 0。割合・最多の判定は Rust で計算する。
+- **コメント方式 (`source: "chat"`、省略時の既定値)** の `poll_start` は trim 後の質問 1〜100 文字、選択肢 2〜10 件(各 1〜40 文字、大小文字を無視して一意)と表示設定を受け付ける。`durationSecs` は 10〜3600 秒。省略時は手動終了。期限は Rust の単調時計で管理する。`poll_stop` は結果を保持したまま閉じ、`poll_reset` は待機状態に戻す。`poll_set_display` は表示形式(`bar-h`/`bar-v`/`pie`/`donut`/`number`)と割合・票数の表示を変更する。
+- コメント方式の受付中はモデレーション後のコメントを判定する。System・非表示・履歴やバックフィル(`route.uncounted`)・空の著者 ID を除外し、`injected_test` のテスト注入は数える。`plain_text()` の前後の空白と見えない文字(Twitch のクライアントが連投のために付ける U+E0000、BOM、ゼロ幅文字)を落とし、番号 1〜N(全角数字可)を優先し、該当しなければラベルと大小文字を無視して全文一致で照合する。投票者のキーはプラットフォームと著者 ID の組。最新の選択肢で上書きし、同じ選択肢の連投は集計を変えない。最大 100,000 人。上限到達後も既存の投票者は変更できる。
+- 状態はメモリ内の `watch` に公開する。`poll_state` で現在値を取得でき、票による `poll-updated` と OBS 更新は最大 100ms に 1 回。操作や自動終了は即時反映する。`config.json` の `poll` に最後に使った方式・質問・選択肢・表示設定を保存する。欠落・破損時は既定値を使う。票・結果は再起動で消える。アンケートの通知・ログ・エラーに投票者の名前や ID を含めない。
 - ローカル API は §15。OBS は設定の OBS 節またはアンケート画面から URL をコピーする。`/poll` WS は接続時と更新時に最新のスナップショットを送る。透過テンプレートは質問・残り時間・総投票者数・グラフを表示する。待機中は非表示、終了後は「結果」として最多の選択肢をすべて強調する。
-- PR2 は Twitch 公式 Polls、PR3 は YouTube 公式投票を同じ PollSnapshot とグラフへ接続する。
+
+### 19.1 Twitch 方式 (`source: "twitch"`)
+
+- アンケート画面の方式で Twitch を選択する。質問は trim 後 1〜60 文字、選択肢は 2〜5 件で各 1〜25 文字。文字数は Unicode スカラー値で数え、期間は 15〜1800 秒で必須。視聴者は Twitch 側で投票する。
+- 「自分の配信」に設定した Twitch チャンネルが 1 件必要。Device Code Flow でログインし、`pollsScopeOk` が true で、Helix のユーザー検索で得た配信者 ID がログイン中のユーザー ID と一致した場合に作成する。Polls 権限が不足している場合はアンケート画面から Twitch のログイン設定を開ける。Twitch の作成に成功した時点でアプリの投票を開始する。
+- Helix の `GET /polls` を 3 秒ごとに実行し、選択肢順の票数を上書きする。総投票者数はその合計。Twitch の状態が受付中以外なら最終値で閉じる。通信失敗時は前回の票を保持し、レート制限時は `Ratelimit-Reset` まで待つ。401 は認証を更新して 1 回再試行する。アプリの終了トークンとローカルの投票 ID に連動し、リセットされた投票への反映を防ぐ。
+- 手動終了は `TERMINATED` を要求して最終結果を取得する。リセットでは Twitch 上で受付中の投票を `ARCHIVED` にして待機状態へ戻す。終了済みの投票は Twitch 上に残す。IPC とローカル API は同じ操作を使い、画面と OBS は同じスナップショットを表示する。通信エラーに資格情報やリクエスト URL を含めない。
+
+PR3 は YouTube 公式投票を同じスナップショットとグラフへ接続する。

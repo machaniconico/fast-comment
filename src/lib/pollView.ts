@@ -1,4 +1,5 @@
 export type PollDisplay = 'bar-h' | 'bar-v' | 'pie' | 'donut' | 'number';
+export type PollSource = 'chat' | 'twitch';
 export type PollStatus = 'idle' | 'open' | 'closed';
 
 export interface PollDisplaySettings {
@@ -8,6 +9,7 @@ export interface PollDisplaySettings {
 }
 
 export interface PollPreferences extends PollDisplaySettings {
+  source?: PollSource;
   question: string;
   options: string[];
 }
@@ -25,7 +27,7 @@ export interface PollOption {
 
 export interface PollSnapshot extends PollDisplaySettings {
   id: string;
-  source: string;
+  source: PollSource;
   status: PollStatus;
   question: string;
   options: PollOption[];

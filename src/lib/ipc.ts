@@ -505,6 +505,7 @@ export interface TwitchOauthStatus {
   connected: boolean;
   login: string | null;
   scopesOk: boolean;
+  pollsScopeOk: boolean;
 }
 
 export interface GoalsConfig {

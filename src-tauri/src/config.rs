@@ -2085,6 +2085,7 @@ mod tests {
                 mode: "elapsed".to_string(),
             },
             poll: crate::poll::PollPreferences {
+                source: crate::poll::PollSource::Chat,
                 question: "質問".into(),
                 options: vec!["A".into(), "B".into()],
                 settings: crate::poll::PollDisplaySettings {

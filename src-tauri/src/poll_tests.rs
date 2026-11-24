@@ -3,6 +3,7 @@ use crate::{api::TestCommentRequest, inject::build_test_messages};
 
 fn request() -> PollStart {
     PollStart {
+        source: PollSource::Chat,
         question: " 質問 ".into(),
         options: vec![" Alpha ".into(), "Beta".into()],
         duration_secs: None,
