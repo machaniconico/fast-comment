@@ -20,6 +20,7 @@ pub mod autopost;
 pub mod bus;
 pub mod chatlog;
 pub mod config;
+pub mod keyword_effects;
 pub mod listeners;
 pub mod live_fanout;
 pub mod model;
@@ -59,7 +60,7 @@ use crate::autopost::{
     XPostError, XPostErrorCode, XPostStatus,
 };
 use crate::bus::{
-    spawn_achievement_ui_forwarder, spawn_moderation_ui_forwarder, spawn_reaction_ui_forwarder, Bus,
+    spawn_achievement_ui_forwarder, spawn_effect_ui_forwarder, spawn_moderation_ui_forwarder, spawn_reaction_ui_forwarder, Bus,
 };
 use crate::templates::{TemplateInfo, TemplateRef, TemplateStore};
 use crate::config::{
@@ -118,6 +119,8 @@ pub struct AppState {
     sounds: sounds::SoundStore,
     /// 効果音のアプリ全体の最小間隔。
     sound_gate: Mutex<sound_effects::SoundGate>,
+    /// キーワードエフェクトの判定器(規則のコンパイル結果とクールダウン)。
+    keyword_effects: Mutex<keyword_effects::KeywordEffects>,
     /// stats 集約などへ設定変更を伝える watch 送信端。
     config_tx: watch::Sender<AppConfig>,
     /// Timer overlay へ基準スナップショットを配る watch 送信端。
@@ -3532,12 +3535,43 @@ fn spawn_pipeline(app: AppHandle, cancel: CancellationToken) {
                     // 同期 I/O やネットワーク待ちをせず、有界キューに投入する。
                     try_enqueue_tts_message(&app, &state.config, &state.tts, msg.clone());
 
+                    let effects = keyword_effects_for(&state, &msg);
                     state.publish_achievement_event(AchievementEvent::Chat(msg));
+                    // 演出は原因のコメントの後に流す。
+                    for effect in effects {
+                        state.bus.publish_effect(effect);
+                    }
                 }
             }
         }
         tracing::info!("moderation/TTS パイプライン終了");
     });
+}
+
+/// キーワードエフェクトを判定する(非表示判定の後に呼ぶ)。
+fn keyword_effects_for(state: &AppState, msg: &ChatMessage) -> Vec<keyword_effects::EffectTriggered> {
+    let cfg = state.config.lock().unwrap();
+    if !cfg.effects.enabled {
+        return Vec::new();
+    }
+    let mut effects = state
+        .keyword_effects
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    effects.evaluate(&cfg.effects, msg, std::time::Instant::now())
+}
+
+/// 設定画面の「テスト」ボタン: 1 規則をクールダウン無視で 1 回、表示先へ流す。
+#[tauri::command]
+fn test_keyword_effect(
+    state: State<'_, AppState>,
+    index: u32,
+    rule: config::EffectRule,
+) -> Result<(), String> {
+    let event = keyword_effects::test_trigger(index, &rule)
+        .ok_or_else(|| "表示物が空です".to_string())?;
+    state.bus.publish_effect(event);
+    Ok(())
 }
 
 /// 効果音を判定して `msg.sound` に入れる。設定と実績のレート表は必要な時だけ読む。
@@ -3812,6 +3846,7 @@ pub fn run() {
                         chatlog: chatlog::ChatLog::start(&config_dir, config.log.clone()),
                         sounds: sounds::SoundStore::new(&config_dir),
                         sound_gate: Mutex::new(sound_effects::SoundGate::default()),
+                        keyword_effects: Mutex::new(keyword_effects::KeywordEffects::default()),
                         config: Mutex::new(config.clone()),
                         startup_config_outcome: Mutex::new(Some(load_outcome)),
                         config_revision: AtomicU64::new(0),
@@ -3928,6 +3963,7 @@ pub fn run() {
                 handle.clone(),
                 app_cancel.clone(),
             );
+            spawn_effect_ui_forwarder(bus.subscribe_effects(), handle.clone(), app_cancel.clone());
             spawn_achievement_tts_forwarder(
                 bus.subscribe_achievements(),
                 handle.clone(),
@@ -4058,6 +4094,7 @@ pub fn run() {
             remove_participant,
             clear_participants,
             inject_test_comment,
+            test_keyword_effect,
             check_for_update,
             open_url,
             get_x_autopost_status,

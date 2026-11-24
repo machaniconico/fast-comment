@@ -322,7 +322,7 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
 - **配信振り返りダッシュボード** (`Dashboard.svelte`, `Sparkline.svelte`): コメント数・視聴者推移などの集計表示。
 - **タイマー/ゴール/エフェクト/マイルストーン** (`Timer.svelte`, `GoalsBar.svelte`, `Effects.svelte`, `Milestone.svelte`): 配信演出系。OBS テンプレ `timer`/`goals` と連動。
   - Goals はコメント、視聴者、高評価、リアクションを表示できる。リアクションは YouTube 絵文字リアクション累計で、YouTube のみ有効(`reactionsAvailable=false` で自動非表示)。
-  - アプリ内エフェクト有効時は、YouTube匿名リアクションの絵文字別増分を専用16msバッチIPCで受け、右端寄りに浮上・フェード表示する。初回pollはrolling windowの再送分なので、再接続時の重複を避けるため統計・演出とも更新しない。描画数は画面幅別の上限を設け、`prefers-reduced-motion` では演出を省略する。コメント/TTS/OBSには混ぜない。
+  - キーワードエフェクトは §9.2。アプリ内エフェクト有効時は、YouTube匿名リアクションの絵文字別増分を専用16msバッチIPCで受け、右端寄りに浮上・フェード表示する。初回pollはrolling windowの再送分なので、再接続時の重複を避けるため統計・演出とも更新しない。描画数は画面幅別の上限を設け、`prefers-reduced-motion` では演出を省略する。コメント/TTS/OBSには混ぜない。
 - **マルチカラム表示** (`MultiColumnView.svelte`): チャンネル/種別ごとの複数列ビュー。
 - **設定/モデレーションのポータビリティ** (`ConfigPortability.svelte`, `ModerationPortability.svelte`): 設定・NG/ハイライトのエクスポート/インポート。
 - **ウィンドウ最前面ピン**: メインウィンドウを最前面固定するトグル(`core:window:allow-set-always-on-top`)。
@@ -345,6 +345,7 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
   | `timer` | カウントダウン/アップタイマー |
   | `danmaku` | ニコ生風に画面を横切る弾幕(後述 §8.1) |
   | `trophy` | 実績解除を等級別のアイコン・色で1件ずつ表示(チャット非表示、`?duration=<秒>` 既定5秒) |
+  | `effects` | キーワードエフェクト(透過背景に絵文字等を CSS アニメで描く。推奨 1920x1080。§9.2) |
 
 - 共通クエリパラメータ: `ws`(接続先), `channel`(フィルタ), `only=gift`(投げ銭のみ) 等。テンプレ間で `max` の意味が異なる点に注意 — 通常overlayでは「表示行数の上限」、`danmaku` では「同時アニメDOM数の上限(MAX_ACTIVE)」。`danmaku` 専用: `dur`(横断秒数)/`size`(文字px)/`opacity`/`name`(名前前置)/`outline`(縁取り)/`area`(`full`/`top`/`bottom` 表示縦帯)/`coalesce`(連投まとめ ×N、`0`で無効)/`pin`(投げ銭を上部固定強調、`0`で無効)。弾幕URL生成(`Settings.svelte` の `withDanmaku()`)は弾幕に無関係なパラメータ(`max`/`ttl`/`font`/`bg`/`pos`/`icon`)を allowlist で除外する。
 - システム種別(`kind==='system'` 接続通知等)は配信画面に流さない(全テンプレで除外)。
@@ -417,6 +418,24 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
   - **最上位フォルダ**: 最上位が単一フォルダなら 1 段はがして展開する。`zip` crate の `extract()` は使わず、1 エントリずつ検証して staging へ書き、成功時だけ rename で公開する。
   - **CSP を付けない理由と信頼境界**: カスタムのテンプレの JS は `127.0.0.1` のオリジンで実行され、`/ws` のチャットを読める。ただし OBS サーバは CORS 全許可で、任意の Web ページも同じ `/ws` を読める。取り込んだ JS が届く範囲はそれと同じで、CSP で守れる物がほぼ無い(画像 URL 経由の送信も防げない)。一方で CSP を付けると Google Fonts・CDN・インラインスクリプトを使う自作テンプレが壊れる。よって CSP は付けず、**信頼できる配布元の zip だけ取り込む**運用とする。プレビュー iframe の sandbox は既存テンプレのプレビュー(WebSocket・音声)が動くことを実機で確かめる(壊れたら外し、ここに書く)。
 - **移行の注意(リリースノート用)**: これまで内蔵テンプレを直接編集していた分は引き継がれない。内蔵は読み取り専用になったので、複製してから編集する。複製したカスタムは、以後の内蔵テンプレの修正(バグ修正・新機能)を受け取らない。
+
+
+### 9.2 キーワードエフェクト(`keyword_effects.rs`)
+
+コメント本文に規則のキーワードが含まれたら、アプリ内と OBS(内蔵 `effects`)へ演出を出す。判定・クールダウン・除外は Rust だけが行い、UI(`Effects.svelte`)と `effects` テンプレは受け取った物を描くだけ。
+
+- **規則(`config.json` の `effects.rules[]`、`EffectRule`)**: `keyword` / `emoji`(表示物。絵文字以外の短い文字でもよい。画像は内蔵テンプレートの対象外。カスタムテンプレートなら zip 内の画像を使える)/ `enabled`(既定 true。false の規則は発火しない。「テスト」は発火する)/ `count` / `target` / `animation` / `durationMs` / `cooldownMs`。旧 config(`keyword`・`emoji`・`count` だけ)は足りない値を既定で補って読み込み、`target="app"` として従来どおり動く。キーワードは読み込み時に trim する。旧 config の `count: 0`(旧 UI での無効化)は `enabled=false`・`count=1` として読む。新しい版で保存した config を旧版に戻して読むと `enabled` は無視される(更新は新しい版へだけ進む前提で、戻した時の互換は保証しない)。
+  - `target`: `app` | `obs` | `both`、既定 `app`(未知の値も `app`)。
+  - `count`: 1〜50(既定 12)。`durationMs`: 500〜15000(既定 3000、OBS のみ)。`cooldownMs`: 0〜60000(既定 2000)。範囲外は `normalize_all`(ロード・保存時)と発火時に丸める。`emoji` は 16 文字まで。
+  - `animation`(OBS のみ。未知の値は `float`): `rain`(降る)・`burst`(弾ける)・`float`(浮かぶ)・`bounce`(跳ねる)・`spin`(回る)・`big`(中央に大きく)。CSS アニメだけで描く。
+  - 表示物かキーワードが空(空白のみ含む)の規則は無効。
+- **判定**: `moderator` の Hide 除外の後(パイプライン)。対象外は System・`injected_test`・履歴/バックフィル(`route.uncounted`、効果音と同じ基準)・`effects.enabled=false`。キーワードは `regex::escape` + 大文字小文字無視の部分一致で、`text_fragments` ごとに照合(エモート名・著者名は対象外、断片をまたぐ一致はしない。Webhook と共用の `webhook::rules::keyword_regex` / `text_matches`)。1 コメントが複数の規則に当たれば規則ごとに 1 回、同じ規則は 1 コメントで最大 1 回。
+- **クールダウン**: 規則ごと、`Instant`(単調時計)で管理。発火した時刻から `cooldownMs` 未満の一致は捨てる(溜めない・窓も延ばさない)。`target` に関係なく共通。規則を編集しても、キーワード(trim + 小文字)が同じ規則はクールダウンを引き継ぐ(同じキーワードの規則が複数ある時は、その中で最後に発火した時刻をどれにも引き継ぐ)。キーワードを変えた規則・新しい規則だけがリセットされる。「テスト」はクールダウンを無視する。
+- **配信**: 発火は Bus の `EffectTriggered { ruleId(規則の index), emoji, count, animation, durationMs }` になる(`target` は配信先の振り分け専用でシリアライズしない)。chat の発行の後に流す。
+  - OBS: `/ws?effectEvents=1`(`1` / `true` のみ opt-in。判定は `modEvents` と同じ)のクライアントにだけ、`target` が `obs` / `both` の物を chat 配列の後に `{"effects":[EffectTriggered…]}` として 16ms tick 単位で送る(1 tick 1 フレーム、chat のバッチは分割しない、channel フィルタなし、原因の chat の後になるよう 1 tick 保留)。内蔵 `effects` がこれだけを使う。
+  - アプリ: `target` が `app` / `both` の物を 16ms バッチで `emit("keyword-effects", [...])`。UI は判定をせず描画のみ(見た目は従来どおり、`prefers-reduced-motion` では省略)。
+- **`effects` テンプレ**: 背景透過。1 件につき `count` 個の要素をプリセットの CSS アニメで描き、`delay + 描画時間 = durationMs` 以内に DOM から消す。同時表示は 300 要素まで(超えたら古い物から消す)。再接続は `trophy` と同じ(指数バックオフ 1〜16 秒)。純関数は `fc-effects:begin`〜`end` に置き `templates/effects.test.mjs` が検証する。
+- **設定 UI**: 設定の「キーワードエフェクト」節で規則ごとに キーワード・表示物・個数・表示先・アニメ・表示時間・間隔 を編集し、「テスト」(IPC `test_keyword_effect(index, rule)`、保存前の内容でクールダウン無視、`target` どおり OBS とアプリへ)で 1 回流せる。同節に `effects` テンプレの OBS URL(推奨 1920x1080)を載せる。
 
 ## 10. 設定永続化 (`config.rs`)
 

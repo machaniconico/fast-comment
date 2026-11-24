@@ -1,0 +1,98 @@
+/* OBS Browser Source overlay - transparent background (recommended 1920x1080) */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body {
+  width: 100%;
+  height: 100%;
+  background: transparent;
+  overflow: hidden;
+}
+
+.stage {
+  position: fixed;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.fx {
+  position: absolute;
+  left: var(--x);
+  top: var(--y);
+  font-size: var(--size);
+  line-height: 1;
+  white-space: nowrap;
+  opacity: 0;
+  user-select: none;
+  will-change: transform, opacity;
+  animation-duration: var(--dur);
+  animation-delay: var(--delay);
+  animation-fill-mode: both;
+  animation-timing-function: ease-out;
+}
+
+.fx-rain {
+  animation-name: fx-rain;
+  animation-timing-function: linear;
+}
+.fx-burst { animation-name: fx-burst; }
+.fx-float { animation-name: fx-float; }
+.fx-bounce {
+  animation-name: fx-bounce;
+  animation-timing-function: linear;
+}
+.fx-spin { animation-name: fx-spin; }
+.fx-big { animation-name: fx-big; }
+
+@keyframes fx-rain {
+  0% { opacity: 1; transform: translate(-50%, -50%) translate(0, 0) rotate(0deg); }
+  90% { opacity: 1; }
+  100% { opacity: 0; transform: translate(-50%, -50%) translate(var(--dx), var(--dy)) rotate(var(--rot)); }
+}
+
+@keyframes fx-burst {
+  0% { opacity: 1; transform: translate(-50%, -50%) translate(0, 0) scale(0.3) rotate(0deg); }
+  70% { opacity: 1; }
+  100% { opacity: 0; transform: translate(-50%, -50%) translate(var(--dx), var(--dy)) scale(1.1) rotate(var(--rot)); }
+}
+
+@keyframes fx-float {
+  0% { opacity: 0; transform: translate(-50%, -50%) translate(0, 0) scale(0.9) rotate(0deg); }
+  12% { opacity: 1; }
+  100% { opacity: 0; transform: translate(-50%, -50%) translate(var(--dx), var(--dy)) scale(1.1) rotate(var(--rot)); }
+}
+
+@keyframes fx-bounce {
+  0% { opacity: 1; transform: translate(-50%, -100%) rotate(0deg); animation-timing-function: ease-out; }
+  20% { transform: translate(-50%, -100%) translateY(var(--dy)) rotate(calc(var(--rot) * -1)); animation-timing-function: ease-in; }
+  40% { transform: translate(-50%, -100%) translateY(0) rotate(var(--rot)); animation-timing-function: ease-out; }
+  58% { transform: translate(-50%, -100%) translateY(calc(var(--dy) * 0.6)); animation-timing-function: ease-in; }
+  76% { opacity: 1; transform: translate(-50%, -100%) translateY(0); }
+  100% { opacity: 0; transform: translate(-50%, -100%) translateY(0); }
+}
+
+@keyframes fx-spin {
+  0% { opacity: 0; transform: translate(-50%, -50%) scale(0.2) rotate(0deg); }
+  20% { opacity: 1; }
+  80% { opacity: 1; }
+  100% { opacity: 0; transform: translate(-50%, -50%) scale(1.2) rotate(var(--rot)); }
+}
+
+@keyframes fx-big {
+  0% { opacity: 0; transform: translate(-50%, -50%) scale(0.2) rotate(0deg); }
+  20% { opacity: 1; transform: translate(-50%, -50%) scale(1) rotate(var(--rot)); }
+  80% { opacity: 1; transform: translate(-50%, -50%) scale(1.05) rotate(var(--rot)); }
+  100% { opacity: 0; transform: translate(-50%, -50%) scale(1.3) rotate(var(--rot)); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .fx { animation-duration: 1ms; }
+}

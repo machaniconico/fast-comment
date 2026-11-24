@@ -1,12 +1,12 @@
 <script lang="ts">
   import { onMount, onDestroy, untrack } from 'svelte';
   import type {
-    AppConfig, EffectRule, EffectsConfig, GoalsConfig, InjectTestCommentOptions, TtsDictEntry, TtsOptions,
+    AppConfig, EffectRule, EffectsConfig, EffectTarget, GoalsConfig, InjectTestCommentOptions, TtsDictEntry, TtsOptions,
     TimerConfig, WelcomeConfig, YoutubeOauthStatus, TwitchOauthStatus, TwitchDeviceLogin, OAuthService,
     ConfigCommit, OAuthClientSaved
   } from '../ipc';
   import {
-    isTauri, getConfigSnapshot, setConfig, configChangedError, getObsUrl, getObsGoalsUrl, getObsTimerUrl, exportCommentsCsv, injectTestComment,
+    isTauri, getConfigSnapshot, setConfig, configChangedError, getObsUrl, getObsGoalsUrl, getObsTimerUrl, exportCommentsCsv, injectTestComment, testKeywordEffect,
     setTtsPaused, clearTtsQueue, skipCurrentTts, testTts, probeTtsEngine, getYoutubeOauthStatus,
     connectYoutubeOauth, disconnectYoutubeOauth, getTwitchOauthStatus, beginTwitchLogin,
     awaitTwitchLogin, cancelTwitchLogin, disconnectTwitchOauth, getGoalSkinInfo, openUrl,
@@ -564,9 +564,11 @@
     if (copiedGiftObsTimer !== null) clearTimeout(copiedGiftObsTimer);
     if (copiedDanmakuObsTimer !== null) clearTimeout(copiedDanmakuObsTimer);
     if (copiedGoalsObsTimer !== null) clearTimeout(copiedGoalsObsTimer);
+    if (copiedEffectsObsTimer !== null) clearTimeout(copiedEffectsObsTimer);
     if (copiedTimerObsTimer !== null) clearTimeout(copiedTimerObsTimer);
     if (copiedCsvPathTimer !== null) clearTimeout(copiedCsvPathTimer);
     if (testCommentMsgTimer !== null) clearTimeout(testCommentMsgTimer);
+    if (effectTestMsgTimer !== null) clearTimeout(effectTestMsgTimer);
     if (ttsControlMsgTimer !== null) clearTimeout(ttsControlMsgTimer);
     if (speechVoicesListenerAttached && typeof window !== 'undefined' && 'speechSynthesis' in window) {
       window.speechSynthesis.removeEventListener('voiceschanged', refreshSpeechVoices);
@@ -586,6 +588,27 @@
   const danmakuObsUrl = $derived.by(() => {
     return withDanmaku(obsUrl, config?.obs ?? null);
   });
+
+  // キーワードエフェクト用の OBS URL(`effects` テンプレート。推奨サイズ 1920x1080)。
+  const effectsObsUrl = $derived.by(() => {
+    try {
+      const u = new URL(obsBaseUrl);
+      u.search = '';
+      u.searchParams.set('template', 'effects');
+      return u.toString();
+    } catch {
+      return obsBaseUrl;
+    }
+  });
+  let copiedEffectsObs: boolean = $state(false);
+  let copiedEffectsObsTimer: ReturnType<typeof setTimeout> | null = null;
+  function onCopyEffectsObs() {
+    copyText(effectsObsUrl, () => {
+      copiedEffectsObs = true;
+      if (copiedEffectsObsTimer !== null) clearTimeout(copiedEffectsObsTimer);
+      copiedEffectsObsTimer = setTimeout(() => { copiedEffectsObs = false; copiedEffectsObsTimer = null; }, 1500);
+    });
+  }
 
   const goalsObsUrl = $derived.by(() => {
     return withGoalsParams(obsGoalsBaseUrl, config?.obs ?? null, config?.goals ?? null);
@@ -874,12 +897,49 @@
     editable.effects.rules = normalizeEffectRules(editable.effects.rules);
   }
 
+  const EFFECT_ANIMATIONS: { value: string; label: string }[] = [
+    { value: 'rain', label: '降る' },
+    { value: 'burst', label: '弾ける' },
+    { value: 'float', label: '浮かぶ' },
+    { value: 'bounce', label: '跳ねる' },
+    { value: 'spin', label: '回る' },
+    { value: 'big', label: '中央に大きく' }
+  ];
+  const EFFECT_TARGETS: { value: EffectTarget; label: string }[] = [
+    { value: 'app', label: 'アプリ' },
+    { value: 'obs', label: 'OBS' },
+    { value: 'both', label: '両方' }
+  ];
+
+  // 範囲の丸めは Rust(保存時)が正。ここは編集中の表示を壊さないための入力補正だけ。
   function normalizeEffectRules(rules: Partial<EffectRule>[] | undefined): EffectRule[] {
     return (rules ?? []).map((rule) => ({
+      enabled: rule.enabled !== false,
       keyword: typeof rule.keyword === 'string' ? rule.keyword : '',
       emoji: typeof rule.emoji === 'string' ? rule.emoji : '',
-      count: clampInt(rule.count, 12, 0, 4294967295)
+      count: clampInt(rule.count, 12, 1, 50),
+      target: rule.target === 'obs' || rule.target === 'both' ? rule.target : 'app',
+      animation: EFFECT_ANIMATIONS.some((a) => a.value === rule.animation) ? (rule.animation as string) : 'float',
+      durationMs: clampInt(rule.durationMs, 3000, 500, 15000),
+      cooldownMs: clampInt(rule.cooldownMs, 2000, 0, 60000)
     }));
+  }
+
+  let effectTestMsg: string = $state('');
+  let effectTestMsgTimer: ReturnType<typeof setTimeout> | null = null;
+
+  async function onTestEffect(index: number) {
+    if (!config) return;
+    const rule = config.effects.rules[index];
+    if (!rule) return;
+    try {
+      await testKeywordEffect(index, $state.snapshot(rule) as EffectRule);
+      effectTestMsg = 'テストを送りました';
+    } catch (e) {
+      effectTestMsg = e instanceof Error ? e.message : String(e);
+    }
+    if (effectTestMsgTimer !== null) clearTimeout(effectTestMsgTimer);
+    effectTestMsgTimer = setTimeout(() => { effectTestMsg = ''; effectTestMsgTimer = null; }, 2500);
   }
 
   function defaultWelcome(): WelcomeConfig {
@@ -912,7 +972,10 @@
   function addEffectRule() {
     if (!config) return;
     normalizeEffectsConfig();
-    config.effects.rules = [...config.effects.rules, { keyword: '', emoji: '🎉', count: 12 }];
+    config.effects.rules = [
+      ...config.effects.rules,
+      { enabled: true, keyword: '', emoji: '🎉', count: 12, target: 'app', animation: 'float', durationMs: 3000, cooldownMs: 2000 }
+    ];
   }
 
   function removeEffectRule(index: number) {
@@ -2827,12 +2890,22 @@
 
   <!-- ── Effects ── -->
   <section id="settings-effects">
-    <h3>アプリ内エフェクト</h3>
+    <h3>キーワードエフェクト</h3>
     <div class="field-row">
       <label for="effects-enabled">エフェクトを有効化</label>
       <input id="effects-enabled" type="checkbox" bind:checked={config.effects.enabled} class="chk" />
     </div>
-    <p class="hint">キーワード一致とYouTubeの匿名リアクションを、アプリ上の短いアニメーションで表示します。</p>
+    <p class="hint">
+      コメント本文にキーワードが含まれると、アプリ上とOBS(<code>effects</code>テンプレート)で短いアニメーションを表示します。
+      YouTubeの匿名リアクションもアプリ上で表示します。履歴・テスト投入のコメントでは出ません。
+    </p>
+    <div class="obs-label">OBSエフェクト用URL(推奨サイズ 1920x1080)</div>
+    <div class="obs-row">
+      <input type="text" value={effectsObsUrl} readonly class="obs-input" />
+      <button class="copy-btn" class:copied={copiedEffectsObs} onclick={onCopyEffectsObs}>
+        {copiedEffectsObs ? 'コピー済' : 'コピー'}
+      </button>
+    </div>
 
     <div class="dict-editor">
       <div class="dict-header">
@@ -2840,7 +2913,7 @@
         <button type="button" class="copy-btn" onclick={addEffectRule}>行追加</button>
       </div>
       {#if config.effects.rules.length === 0}
-        <p class="hint">コメント本文にキーワードが含まれると、指定した文字列をアプリ内に表示します。</p>
+        <p class="hint">コメント本文にキーワードが含まれると、指定した文字列を表示します(大文字小文字は区別しません)。</p>
       {/if}
       {#each config.effects.rules as rule, index (rule)}
         <div class="effect-row">
@@ -2852,7 +2925,7 @@
             class="id-input dict-input"
             placeholder="キーワード"
           />
-          <label for={`effect-emoji-${index}`} class="dict-label">emoji</label>
+          <label for={`effect-emoji-${index}`} class="dict-label">表示物</label>
           <input
             id={`effect-emoji-${index}`}
             type="text"
@@ -2860,19 +2933,63 @@
             class="id-input effect-emoji-input"
             placeholder="🎉"
           />
-          <label for={`effect-count-${index}`} class="dict-label">count</label>
+          <label for={`effect-count-${index}`} class="dict-label">個数</label>
           <input
             id={`effect-count-${index}`}
             type="number"
-            min="0"
-            max="4294967295"
+            min="1"
+            max="50"
             step="1"
             bind:value={rule.count}
             class="num-input"
           />
           <button type="button" class="copy-btn dict-delete" onclick={() => removeEffectRule(index)}>削除</button>
         </div>
+        <div class="effect-row effect-row-sub">
+          <label for={`effect-enabled-${index}`} class="dict-label">有効</label>
+          <input id={`effect-enabled-${index}`} type="checkbox" bind:checked={rule.enabled} class="chk" />
+          <label for={`effect-target-${index}`} class="dict-label">表示先</label>
+          <select id={`effect-target-${index}`} bind:value={rule.target} class="platform-select">
+            {#each EFFECT_TARGETS as t (t.value)}
+              <option value={t.value}>{t.label}</option>
+            {/each}
+          </select>
+          <label for={`effect-animation-${index}`} class="dict-label">アニメ</label>
+          <select id={`effect-animation-${index}`} bind:value={rule.animation} class="platform-select">
+            {#each EFFECT_ANIMATIONS as a (a.value)}
+              <option value={a.value}>{a.label}</option>
+            {/each}
+          </select>
+          <label for={`effect-duration-${index}`} class="dict-label">表示時間ms</label>
+          <input
+            id={`effect-duration-${index}`}
+            type="number"
+            min="500"
+            max="15000"
+            step="100"
+            bind:value={rule.durationMs}
+            class="num-input"
+          />
+          <label for={`effect-cooldown-${index}`} class="dict-label">間隔ms</label>
+          <input
+            id={`effect-cooldown-${index}`}
+            type="number"
+            min="0"
+            max="60000"
+            step="100"
+            bind:value={rule.cooldownMs}
+            class="num-input"
+          />
+          <button type="button" class="copy-btn" onclick={() => onTestEffect(index)}>テスト</button>
+        </div>
       {/each}
+      {#if effectTestMsg}
+        <p class="hint" role="status">{effectTestMsg}</p>
+      {/if}
+      <p class="hint">
+        アニメと表示時間はOBSのみに効きます。「間隔」は同じルールが続けて出るまでの最短時間です。
+        「テスト」は保存前の内容を、間隔を無視して表示先へ1回流します。
+      </p>
     </div>
   </section>
 
@@ -3474,6 +3591,10 @@
     margin-top: 6px;
   }
 
+  .effect-row-sub {
+    grid-template-columns: auto auto auto minmax(90px, 1fr) auto minmax(90px, 1fr) auto 90px auto 90px auto;
+  }
+
   .dict-label {
     color: #9e9e9e;
     font-size: 11px;
@@ -3672,7 +3793,8 @@
       grid-template-columns: auto minmax(0, 1fr);
     }
 
-    .effect-row {
+    .effect-row,
+    .effect-row-sub {
       grid-template-columns: auto minmax(0, 1fr);
     }
 

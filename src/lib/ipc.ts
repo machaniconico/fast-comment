@@ -240,6 +240,18 @@ export async function onAchievements(cb: (unlocks: AchievementUnlocked[]) => voi
 }
 
 /**
+ * Listen to 'keyword-effects' (KeywordEffect[], judged in Rust and batched per frame).
+ * Returns an unlisten function; no-op in browser-only mode.
+ */
+export async function onKeywordEffects(cb: (effects: KeywordEffect[]) => void): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  const unlisten = await listen<KeywordEffect[]>('keyword-effects', (event) => {
+    cb(event.payload);
+  });
+  return unlisten;
+}
+
+/**
  * Listen to the 'stats' event from Tauri (StatsSnapshot, emitted ~1/s).
  * Returns an unlisten function; no-op in browser-only mode.
  */
@@ -514,10 +526,34 @@ export interface TimerConfig {
   mode: string;
 }
 
+export type EffectTarget = 'app' | 'obs' | 'both';
+
 export interface EffectRule {
+  /** 規則ごとの有効/無効(無効でも「テスト」は押せる)。 */
+  enabled: boolean;
   keyword: string;
   emoji: string;
   count: number;
+  target: EffectTarget;
+  /** OBS テンプレート `effects` のプリセット名。 */
+  animation: string;
+  durationMs: number;
+  cooldownMs: number;
+}
+
+/** Rust が判定した 1 回分の演出(`keyword-effects` イベント、1 フレーム単位でバッチ)。 */
+export interface KeywordEffect {
+  ruleId: number;
+  emoji: string;
+  count: number;
+  animation: string;
+  durationMs: number;
+}
+
+/** 設定画面の「テスト」: 1 規則をクールダウン無視で 1 回、表示先(アプリ/OBS)へ流す。 */
+export async function testKeywordEffect(index: number, rule: EffectRule): Promise<void> {
+  if (!isTauri()) return;
+  await invoke('test_keyword_effect', { index, rule });
 }
 
 export interface EffectsConfig {

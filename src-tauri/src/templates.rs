@@ -1192,6 +1192,24 @@ mod tests {
     }
 
     #[test]
+    fn effects_template_is_builtin_readonly_and_listed() {
+        let root = std::env::temp_dir()
+            .join(format!("fast-comment-effects-{}", uuid::Uuid::new_v4()));
+        let builtin = Path::new(env!("CARGO_MANIFEST_DIR")).join("../templates");
+        let store = TemplateStore::new(builtin.clone(), root.join("config/templates"));
+        let t = TemplateRef::parse("effects").unwrap();
+        assert!(matches!(t, TemplateRef::Builtin(_)));
+        for file in ["index.html", "app.js", "style.css"] {
+            assert!(builtin.join("effects").join(file).is_file(), "{file}");
+        }
+        assert!(store.list().unwrap().iter().any(|info| info.name == "effects"));
+        let err = store.write(&t, "style.css", "change").unwrap_err();
+        assert!(err.contains("読み取り専用"));
+        assert!(store.delete(&t).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn delete_removes_custom() {
         let f = Fixture::new();
         let t = f.template(true, "foo");

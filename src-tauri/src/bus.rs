@@ -32,6 +32,7 @@ use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 
 use crate::achievements::engine::AchievementUnlocked;
+use crate::keyword_effects::EffectTriggered;
 use crate::model::{ChatMessage, ModerationEvent, YoutubeReaction};
 use crate::stats::{StatsSnapshot, TimerSnapshot};
 use crate::templates::{TemplateRef, TemplateStore};
@@ -58,6 +59,12 @@ const ACHIEVEMENT_BROADCAST_CAPACITY: usize = 1024;
 const MAX_ACHIEVEMENTS_PER_UI_BATCH: usize = 1024;
 /// opt-in WS クライアントごとの実績待ち上限(溢れたら古いものから drop)。
 const WS_CLIENT_ACHIEVEMENT_QUEUE: usize = 1024;
+/// キーワードエフェクトの broadcast 容量。落ちるのは演出だけ。
+const EFFECT_BROADCAST_CAPACITY: usize = 1024;
+/// 1回のエフェクト IPC に載せる件数上限(異常流量時の保険)。
+const MAX_EFFECTS_PER_UI_BATCH: usize = 256;
+/// opt-in WS クライアントごとのエフェクト待ち上限(溢れたら古いものから drop)。
+const WS_CLIENT_EFFECT_QUEUE: usize = 256;
 
 /// YouTube リアクションをUIへ1フレーム単位でまとめて送る。
 ///
@@ -216,6 +223,61 @@ pub(crate) fn spawn_achievement_ui_forwarder(
     });
 }
 
+/// アプリ内表示向けのキーワードエフェクトを購読して 1 フレーム単位でまとめ、`emit` へ渡す。
+/// 表示先に app を含まない物は捨てる。空のフレームでは呼ばない。
+async fn run_effect_forwarder<F>(
+    mut rx: broadcast::Receiver<EffectTriggered>,
+    cancel: CancellationToken,
+    mut emit: F,
+) where
+    F: FnMut(&[EffectTriggered]),
+{
+    let mut ticker = interval(Duration::from_millis(UI_BATCH_INTERVAL_MS));
+    let mut batch = Vec::<EffectTriggered>::with_capacity(8);
+
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            _ = ticker.tick() => {
+                if !batch.is_empty() {
+                    emit(&batch);
+                    batch.clear();
+                }
+            }
+            incoming = rx.recv() => {
+                match incoming {
+                    Ok(event) => {
+                        if event.target.includes_app() && batch.len() < MAX_EFFECTS_PER_UI_BATCH {
+                            batch.push(event);
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(lagged = n, "キーワードエフェクトの通知を取りこぼしました");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }
+    }
+}
+
+/// キーワードエフェクトを UI へ 1 フレーム単位でまとめて `emit("keyword-effects", batch)` する。
+pub(crate) fn spawn_effect_ui_forwarder(
+    rx: broadcast::Receiver<EffectTriggered>,
+    app: AppHandle,
+    cancel: CancellationToken,
+) {
+    tauri::async_runtime::spawn(async move {
+        run_effect_forwarder(rx, cancel, |batch| {
+            if let Err(e) = app.emit("keyword-effects", batch) {
+                tracing::warn!("キーワードエフェクトのUI emitに失敗: {e}");
+            }
+        })
+        .await;
+        tracing::info!("effect forwarder 終了");
+    });
+}
+
 #[derive(Clone, Debug)]
 pub struct SequencedChat {
     pub seq: u64,
@@ -237,6 +299,8 @@ pub struct Bus {
     mod_tx: broadcast::Sender<ModerationEvent>,
     /// 実績の解除。UI・OBS(`/ws?achievementEvents=1`)・TTS が購読する。
     achievement_tx: broadcast::Sender<SequencedAchievement>,
+    /// キーワードエフェクト。UI(target に app)と OBS(`/ws?effectEvents=1`、target に obs)が購読する。
+    effect_tx: broadcast::Sender<EffectTriggered>,
     stats_tx: watch::Sender<StatsSnapshot>,
     timer_tx: watch::Sender<TimerSnapshot>,
     obs_port: u16,
@@ -252,11 +316,13 @@ impl Bus {
         let (tx, _rx) = broadcast::channel(BROADCAST_CAPACITY);
         let (mod_tx, _mod_rx) = broadcast::channel(MODERATION_BROADCAST_CAPACITY);
         let (achievement_tx, _achievement_rx) = broadcast::channel(ACHIEVEMENT_BROADCAST_CAPACITY);
+        let (effect_tx, _effect_rx) = broadcast::channel(EFFECT_BROADCAST_CAPACITY);
         Bus {
             tx,
             chat_seq: Arc::new(Mutex::new(0)),
             mod_tx,
             achievement_tx,
+            effect_tx,
             stats_tx,
             timer_tx,
             obs_port,
@@ -276,6 +342,15 @@ impl Bus {
         let _ = self
             .achievement_tx
             .send(SequencedAchievement { after_seq, unlock });
+    }
+
+    pub(crate) fn subscribe_effects(&self) -> broadcast::Receiver<EffectTriggered> {
+        self.effect_tx.subscribe()
+    }
+
+    /// キーワードエフェクトを流す。呼び出し側は原因の chat を先に発行しておく。
+    pub(crate) fn publish_effect(&self, event: EffectTriggered) {
+        let _ = self.effect_tx.send(event);
     }
 
     /// 新規コメント購読者を得る。
@@ -491,6 +566,7 @@ impl Bus {
             tx: Arc::new(self.tx.clone()),
             mod_tx: Arc::new(self.mod_tx.clone()),
             achievement_tx: Arc::new(self.achievement_tx.clone()),
+            effect_tx: Arc::new(self.effect_tx.clone()),
             stats_tx: Arc::new(self.stats_tx.clone()),
             timer_tx: Arc::new(self.timer_tx.clone()),
             templates: Arc::new(templates),
@@ -530,6 +606,7 @@ struct ObsState {
     tx: Arc<broadcast::Sender<SequencedChat>>,
     mod_tx: Arc<broadcast::Sender<ModerationEvent>>,
     achievement_tx: Arc<broadcast::Sender<SequencedAchievement>>,
+    effect_tx: Arc<broadcast::Sender<EffectTriggered>>,
     stats_tx: Arc<watch::Sender<StatsSnapshot>>,
     timer_tx: Arc<watch::Sender<TimerSnapshot>>,
     templates: Arc<TemplateStore>,
@@ -547,6 +624,10 @@ struct WsQuery {
     /// 解除には channel が無いので `channel` フィルタは掛けない。
     #[serde(rename = "achievementEvents")]
     achievement_events: Option<String>,
+    /// `effectEvents=1`(または `true`)のクライアントにだけ `{"effects":[…]}` を送る。
+    /// エフェクトには channel が無いので `channel` フィルタは掛けない。
+    #[serde(rename = "effectEvents")]
+    effect_events: Option<String>,
 }
 
 /// `modEvents` クエリ値が opt-in か。
@@ -568,6 +649,28 @@ fn achievement_receiver(
     query: &WsQuery,
 ) -> Option<broadcast::Receiver<SequencedAchievement>> {
     mod_events_opted_in(query.achievement_events.as_deref()).then(|| achievement_tx.subscribe())
+}
+
+/// opt-in のときだけキーワードエフェクトを購読する(opt-out は購読自体しない)。
+fn effect_receiver(
+    effect_tx: &broadcast::Sender<EffectTriggered>,
+    query: &WsQuery,
+) -> Option<broadcast::Receiver<EffectTriggered>> {
+    mod_events_opted_in(query.effect_events.as_deref()).then(|| effect_tx.subscribe())
+}
+
+/// 1 tick 分のエフェクトを `{"effects":[…]}` へ。空なら送らない。
+fn effect_frame(events: &[EffectTriggered]) -> Option<String> {
+    if events.is_empty() {
+        return None;
+    }
+    match serde_json::to_string(&serde_json::json!({ "effects": events })) {
+        Ok(json) => Some(json),
+        Err(e) => {
+            tracing::warn!("WS 向けエフェクト JSON 化失敗: {e}");
+            None
+        }
+    }
 }
 
 /// 1 tick 分の実績解除を `{"achievements":[…]}` へ。空なら送らない。
@@ -702,8 +805,9 @@ async fn ws_handler(
     let rx = state.tx.subscribe();
     let mod_rx = moderation_receiver(&state.mod_tx, &query);
     let achievement_rx = achievement_receiver(&state.achievement_tx, &query);
+    let effect_rx = effect_receiver(&state.effect_tx, &query);
     ws.on_upgrade(move |socket| {
-        handle_ws_client(socket, rx, mod_rx, achievement_rx, query.channel)
+        handle_ws_client(socket, rx, mod_rx, achievement_rx, effect_rx, query.channel)
     })
 }
 
@@ -736,11 +840,14 @@ async fn timer_ws_handler(
 /// **後に** `{"moderation":[…]}` を送り、chat との順序を同じソケット上で保つ。
 /// `achievement_rx` は `?achievementEvents=1` の opt-in だけ Some。その後に `{"achievements":[…]}`
 /// を送る(`channel` フィルタは掛けない)。
+/// `effect_rx` は `?effectEvents=1` の opt-in だけ Some。最後に `{"effects":[…]}` を送る
+/// (`channel` フィルタは掛けず、表示先に obs を含む物だけ)。
 async fn handle_ws_client(
     mut socket: WebSocket,
     mut rx: broadcast::Receiver<SequencedChat>,
     mut mod_rx: Option<broadcast::Receiver<ModerationEvent>>,
     mut achievement_rx: Option<broadcast::Receiver<SequencedAchievement>>,
+    mut effect_rx: Option<broadcast::Receiver<EffectTriggered>>,
     channel: Option<String>,
 ) {
     let mut ticker = interval(Duration::from_millis(UI_BATCH_INTERVAL_MS));
@@ -753,6 +860,12 @@ async fn handle_ws_client(
     // 受信した解除は 1 tick 保留する。原因のコメントは解除より後に publish されうるので、
     // 次の tick でチャットを送った後に出す。
     let mut achievement_held: std::collections::VecDeque<AchievementUnlocked> =
+        std::collections::VecDeque::new();
+
+    let mut effect_queue: std::collections::VecDeque<EffectTriggered> =
+        std::collections::VecDeque::new();
+    // 実績と同じく 1 tick 保留し、原因のコメントを先に送る。
+    let mut effect_held: std::collections::VecDeque<EffectTriggered> =
         std::collections::VecDeque::new();
 
     loop {
@@ -815,6 +928,23 @@ async fn handle_ws_client(
                     Err(broadcast::error::RecvError::Closed) => achievement_rx = None,
                 }
             }
+            // opt-in クライアントだけ: キーワードエフェクトをキューへ(channel フィルタなし)。
+            recv = async { effect_rx.as_mut().unwrap().recv().await }, if effect_rx.is_some() => {
+                match recv {
+                    Ok(event) => {
+                        if event.target.includes_obs() {
+                            if effect_queue.len() >= WS_CLIENT_EFFECT_QUEUE {
+                                effect_queue.pop_front();
+                            }
+                            effect_queue.push_back(event);
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(lagged = n, "WS エフェクト forwarder が取りこぼしました");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => effect_rx = None,
+                }
+            }
             // ~16ms ごとに溜まった分を1つの JSON 配列としてまとめて送る。
             _ = ticker.tick() => {
                 if !queue.is_empty() {
@@ -839,6 +969,14 @@ async fn handle_ws_client(
                 let unlocks: Vec<AchievementUnlocked> = achievement_held.drain(..).collect();
                 achievement_held.append(&mut achievement_queue);
                 if let Some(json) = achievement_frame(&unlocks) {
+                    if socket.send(WsMessage::Text(json.into())).await.is_err() {
+                        return;
+                    }
+                }
+                // 最後にエフェクト(1 tick 1 フレーム)。
+                let effects: Vec<EffectTriggered> = effect_held.drain(..).collect();
+                effect_held.append(&mut effect_queue);
+                if let Some(json) = effect_frame(&effects) {
                     if socket.send(WsMessage::Text(json.into())).await.is_err() {
                         return;
                     }
@@ -1146,6 +1284,7 @@ mod tests {
     fn query(mod_events: Option<&str>) -> WsQuery {
         WsQuery {
             achievement_events: None,
+            effect_events: None,
             channel: None,
             mod_events: mod_events.map(str::to_string),
         }
@@ -1567,5 +1706,103 @@ mod tests {
         assert_eq!(frames.len(), 1, "{frames:?}");
         let value: serde_json::Value = serde_json::from_str(&frames[0]).unwrap();
         assert_eq!(value["achievements"][0]["id"], "u1");
+    }
+
+    fn sample_effect(rule_id: u32, target: crate::config::EffectTarget) -> EffectTriggered {
+        EffectTriggered {
+            rule_id,
+            emoji: "🎉".into(),
+            count: 5,
+            animation: "burst".into(),
+            duration_ms: 2500,
+            target,
+        }
+    }
+
+    #[tokio::test]
+    async fn ws_without_param_receives_no_effect_frames() {
+        let bus = test_bus();
+        for query in ["", "?effectEvents=0", "?effectEvents=yes", "?achievementEvents=1"] {
+            let mut ws = ws_connect(&bus, query).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            bus.publish_effect(sample_effect(0, crate::config::EffectTarget::Both));
+            bus.publish(sample_chat("c"));
+            let frames = collect_frames(&mut ws, Duration::from_millis(200)).await;
+            assert_eq!(frames.len(), 1, "{query}: {frames:?}");
+            assert!(frames[0].starts_with('['), "{query}: {frames:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn ws_with_param_receives_effects_after_unsplit_chat() {
+        let bus = test_bus();
+        for query in ["?effectEvents=1", "?effectEvents=true"] {
+            let mut ws = ws_connect(&bus, query).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            bus.publish(sample_chat("c"));
+            bus.publish(sample_chat("c"));
+            bus.publish_effect(sample_effect(3, crate::config::EffectTarget::Obs));
+            let frames = collect_frames(&mut ws, Duration::from_millis(200)).await;
+            assert_eq!(frames.len(), 2, "{query}: {frames:?}");
+            let chats: serde_json::Value = serde_json::from_str(&frames[0]).unwrap();
+            assert_eq!(chats.as_array().unwrap().len(), 2, "chat batch must not be split");
+            let value: serde_json::Value = serde_json::from_str(&frames[1]).unwrap();
+            assert_eq!(
+                value,
+                serde_json::json!({"effects":[{
+                    "ruleId":3,"emoji":"🎉","count":5,"animation":"burst","durationMs":2500
+                }]})
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ws_effects_follow_chat_published_after_them() {
+        let bus = test_bus();
+        let mut ws = ws_connect(&bus, "?effectEvents=1").await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        for i in 0..5 {
+            bus.publish_effect(sample_effect(0, crate::config::EffectTarget::Both));
+            bus.publish(sample_chat(&format!("c{i}")));
+            tokio::time::sleep(Duration::from_millis(7)).await;
+        }
+        let frames = collect_frames(&mut ws, Duration::from_millis(300)).await;
+        let first_effect = frames.iter().position(|f| f.starts_with("{\"effects\"")).unwrap();
+        let first_chat = frames.iter().position(|f| f.starts_with('[')).unwrap();
+        assert!(first_chat < first_effect, "{frames:?}");
+    }
+
+    #[tokio::test]
+    async fn ws_effects_skip_app_only_rules_and_ignore_channel_filter() {
+        let bus = test_bus();
+        let mut ws = ws_connect(&bus, "?effectEvents=1&channel=only-this").await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        bus.publish(sample_chat("other"));
+        bus.publish_effect(sample_effect(1, crate::config::EffectTarget::App));
+        bus.publish_effect(sample_effect(2, crate::config::EffectTarget::Both));
+        let frames = collect_frames(&mut ws, Duration::from_millis(200)).await;
+        assert_eq!(frames.len(), 1, "{frames:?}");
+        let value: serde_json::Value = serde_json::from_str(&frames[0]).unwrap();
+        assert_eq!(value["effects"].as_array().unwrap().len(), 1);
+        assert_eq!(value["effects"][0]["ruleId"], 2);
+    }
+
+    #[tokio::test]
+    async fn ui_forwarder_batches_one_emit_per_frame_and_skips_obs_only() {
+        let (tx, rx) = broadcast::channel(EFFECT_BROADCAST_CAPACITY);
+        let cancel = CancellationToken::new();
+        let emits = Arc::new(std::sync::Mutex::new(Vec::<Vec<u32>>::new()));
+        let seen = emits.clone();
+        let task = tokio::spawn(run_effect_forwarder(rx, cancel.clone(), move |batch| {
+            seen.lock().unwrap().push(batch.iter().map(|e| e.rule_id).collect());
+        }));
+        tx.send(sample_effect(1, crate::config::EffectTarget::App)).unwrap();
+        tx.send(sample_effect(2, crate::config::EffectTarget::Obs)).unwrap();
+        tx.send(sample_effect(3, crate::config::EffectTarget::Both)).unwrap();
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        cancel.cancel();
+        task.await.unwrap();
+        let emits = emits.lock().unwrap();
+        assert_eq!(*emits, vec![vec![1, 3]]);
     }
 }
