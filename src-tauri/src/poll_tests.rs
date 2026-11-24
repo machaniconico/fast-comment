@@ -187,11 +187,24 @@ fn stops_accepting_new_voters_at_the_limit() {
 #[test]
 fn ignores_invisible_suffixes_that_chat_clients_add_to_repeated_messages() {
     let labels = request().validate().unwrap().labels;
-    for text in ["1\u{E0000}", "1 \u{E0000}", "\u{FEFF}2", "2\u{200B}", "Beta\u{E0000}"] {
-        assert!(vote_index(text, &labels).is_some(), "{text:?}");
+    for (text, expected) in [
+        ("1\u{E0000}", Some(0)),
+        ("1 \u{E0000}", Some(0)),
+        ("\u{FEFF}2", Some(1)),
+        ("2\u{200B}", Some(1)),
+        ("Beta\u{E0000}", Some(1)),
+        // 落とすのは前後だけ。途中の見えない文字は残るので一致しない。
+        ("Be\u{200B}ta", None),
+    ] {
+        assert_eq!(vote_index(text, &labels), expected, "{text:?}");
     }
-    assert_eq!(vote_index("1\u{E0000}", &labels), Some(0));
-    assert_eq!(vote_index("Beta\u{E0000}", &labels), Some(1));
+    // ラベルにも同じ前処理をかけるので、見えない文字だけが違う選択肢は重複として拒否する。
+    let dup = PollStart {
+        options: vec!["青\u{200B}".into(), "青".into()],
+        ..request()
+    }
+    .validate();
+    assert!(dup.is_err());
 }
 
 #[test]
@@ -221,6 +234,9 @@ async fn an_old_deadline_does_not_close_a_poll_restarted_after_reset() {
         },
     )
     .unwrap();
+    // ワーカーに最初の 10 秒の期限を読ませ、待機に入らせてからリセットする。
+    tokio::time::advance(Duration::from_secs(1)).await;
+    tokio::task::yield_now().await;
     poll.reset();
     start(&poll, request()).unwrap();
     rx.borrow_and_update();

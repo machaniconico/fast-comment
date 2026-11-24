@@ -92,7 +92,8 @@ impl PollPreferences {
             return Err(PollError::Invalid("選択肢は2〜10件で入力してください"));
         }
         for label in &mut self.options {
-            *label = label.trim().to_owned();
+            // 投票と同じ前処理(見えない文字も落とす)。そろえないと「青\u{200B}」と「青」が別ラベルで登録できてしまう。
+            *label = trim_vote(label).to_owned();
             if !(1..=40).contains(&label.chars().count()) {
                 return Err(PollError::Invalid("各選択肢は1〜40文字で入力してください"));
             }
