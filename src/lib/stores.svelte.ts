@@ -12,7 +12,7 @@
 
 import { isListenerDeleted, type ChatMessage, type ListenerUpdate, type ModerationEvent, type Platform, type RemovedState, type UiChatMessage } from './types';
 import { activeFilterCount, prependCapped, defaultDisplayFilter, isDefaultFilter, matchesDisplayFilter, normalizeDisplayFilter, type DisplayFilter } from './displayFilter';
-import { needsBeep, soundToPlay } from './soundEffects';
+import { alertFor } from './soundEffects';
 import { carryModeration, moderationMatcher, RecentModerationLog } from './moderationEvents';
 import { onChatBatch, onModerationBatch, startModerationListener, startChatListener, startListenerUpdatedListener, startTtsSpeakListener, startTtsCancelListener, startTtsAudioListener, getConfig } from './ipc';
 
@@ -423,9 +423,9 @@ class CommentStore {
       // highlight), so check it separately from the donation tally below.
       const highlighted = msg.author.badges.some((b) => b.kind === 'highlight');
       if (highlighted) highlightDelta += 1;
-      if (needsBeep(highlighted, msg.sound)) beepDelta += 1;
-      const cue = soundToPlay(uiMsg);
-      if (cue) cues.push(cue);
+      const alert = alertFor(highlighted, uiMsg);
+      if (alert.beep) beepDelta += 1;
+      if (alert.sound) cues.push(alert.sound);
       const donationKind = getDonationKind(msg);
       if (donationKind === 'membership') {
         memberships += 1;

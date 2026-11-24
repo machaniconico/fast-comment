@@ -90,8 +90,14 @@ impl<'de> Deserialize<'de> for SoundEffectsConfig {
             if let Some(volume) = obj.get("volume").and_then(serde_json::Value::as_f64) {
                 cfg.volume = volume as f32;
             }
-            if let Some(ms) = obj.get("minIntervalMs").and_then(serde_json::Value::as_u64) {
-                cfg.min_interval_ms = ms.min(u64::from(MAX_MIN_INTERVAL_MS)) as u32;
+            // 符号付きで読み、負は下限 0 に丸める(i64 に収まらない大きな正は u64 で読む)。
+            let ms = obj.get("minIntervalMs").and_then(|v| {
+                v.as_i64()
+                    .map(|n| n.clamp(0, i64::from(MAX_MIN_INTERVAL_MS)) as u32)
+                    .or_else(|| v.as_u64().map(|n| n.min(u64::from(MAX_MIN_INTERVAL_MS)) as u32))
+            });
+            if let Some(ms) = ms {
+                cfg.min_interval_ms = ms;
             }
             cfg.super_chat.merge(obj.get("superChat"));
             cfg.bits.merge(obj.get("bits"));
@@ -338,6 +344,15 @@ mod tests {
     }
 
     #[test]
+    fn negative_min_interval_clamps_to_zero_not_default() {
+        let from = |v: serde_json::Value| serde_json::from_value::<SoundEffectsConfig>(v).unwrap();
+        assert_eq!(from(serde_json::json!({ "minIntervalMs": -1 })).min_interval_ms, 0);
+        assert_eq!(from(serde_json::json!({ "minIntervalMs": i64::MIN })).min_interval_ms, 0);
+        assert_eq!(from(serde_json::json!({ "minIntervalMs": u64::MAX })).min_interval_ms, MAX_MIN_INTERVAL_MS);
+        assert_eq!(from(serde_json::json!({ "minIntervalMs": 120 })).min_interval_ms, 120);
+    }
+
+    #[test]
     fn disabled_by_default_and_when_master_off() {
         let m = money(MessageKind::SuperChat, 500.0, "JPY");
         assert!(!SoundEffectsConfig::default().enabled);
@@ -562,7 +577,7 @@ mod tests {
         let from = |v: serde_json::Value| serde_json::from_value::<SoundEffectsConfig>(v).unwrap();
         assert_eq!(from(serde_json::json!({})), SoundEffectsConfig::default());
         let broken = from(serde_json::json!({
-            "enabled": "yes", "volume": "loud", "minIntervalMs": -5,
+            "enabled": "yes", "volume": "loud", "minIntervalMs": "fast",
             "superChat": 7, "bits": {"enabled": null, "sound": 3, "minJpy": "x"},
             "gift": {"sound": "../../etc/passwd"}, "membership": {"sound": "custom:not-a-uuid"}
         }));

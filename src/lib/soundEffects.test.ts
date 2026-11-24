@@ -3,9 +3,8 @@ import test from 'node:test';
 import {
   BUILTIN_SOUNDS,
   createSoundPlayer,
-  needsBeep,
+  alertFor,
   replaceRemovedSound,
-  soundToPlay,
   normalizeMinJpy,
   parseSoundRef,
   soundLabel,
@@ -166,10 +165,10 @@ test('dispose revokes urls and closes the context', async () => {
 });
 
 test('beep is skipped only when the same message carries a sound effect', () => {
-  assert.equal(needsBeep(true, undefined), true);
-  assert.equal(needsBeep(true, ''), true);
-  assert.equal(needsBeep(true, 'builtin:chime'), false);
-  assert.equal(needsBeep(false, undefined), false);
+  assert.equal(alertFor(true, {}).beep, true);
+  assert.equal(alertFor(true, { sound: '' }).beep, true);
+  assert.equal(alertFor(true, { sound: 'builtin:chime' }).beep, false);
+  assert.equal(alertFor(false, {}).beep, false);
 });
 
 test('normalizeMinJpy keeps whole non-negative yen', () => {
@@ -214,12 +213,64 @@ test('a user-initiated preview waits for the unlock and plays', async () => {
   assert.ok(log.oscillators.length > 0);
 });
 
-test('soundToPlay skips comments that carry a removal mark', () => {
-  assert.equal(soundToPlay({ sound: 'builtin:pop' }), 'builtin:pop');
-  assert.equal(soundToPlay({ sound: 'builtin:pop', removed: 'deleted' }), undefined);
-  assert.equal(soundToPlay({ sound: 'builtin:pop', removed: 'banned' }), undefined);
-  assert.equal(soundToPlay({ removed: undefined }), undefined);
-  assert.equal(soundToPlay({ sound: '' }), undefined);
+test('alertFor plays the sound effect only for comments without a removal mark', () => {
+  assert.equal(alertFor(false, { sound: 'builtin:pop' }).sound, 'builtin:pop');
+  assert.equal(alertFor(false, { sound: 'builtin:pop', removed: 'deleted' }).sound, undefined);
+  assert.equal(alertFor(false, { sound: 'builtin:pop', removed: 'banned' }).sound, undefined);
+  assert.equal(alertFor(false, { removed: undefined }).sound, undefined);
+  assert.equal(alertFor(false, { sound: '' }).sound, undefined);
+});
+
+test('removed highlighted comments beep for none of timeout / banned / deleted', () => {
+  for (const removed of ['timeout', 'banned', 'deleted']) {
+    assert.deepEqual(alertFor(true, { removed }), { beep: false, sound: undefined }, removed);
+    assert.deepEqual(alertFor(true, { sound: 'builtin:pop', removed }), { beep: false, sound: undefined }, removed);
+  }
+});
+
+test('a custom sound requested while suspended stays silent even if unlocked during its load', async () => {
+  let finish!: () => void;
+  const gate = new Promise<void>((resolve) => { finish = resolve; });
+  const { player, log, unlock } = harness({ suspended: true, load: async () => { await gate; return { mime: 'audio/wav', bytes: new Uint8Array([1]) }; } });
+  const result = player.play(`custom:${ID}`, 1);
+  unlock();
+  finish();
+  assert.equal(await result, false);
+  assert.equal(log.audios.length, 0);
+  assert.equal(log.oscillators.length, 0);
+  assert.ok(log.resumes >= 1);
+});
+
+test('a custom sound requested while running plays after a delayed load', async () => {
+  let finish!: () => void;
+  const gate = new Promise<void>((resolve) => { finish = resolve; });
+  const { player, log } = harness({ load: async () => { await gate; return { mime: 'audio/wav', bytes: new Uint8Array([1]) }; } });
+  const result = player.play(`custom:${ID}`, 1);
+  finish();
+  assert.equal(await result, true);
+  assert.equal(log.audios.length, 1);
+});
+
+test('a custom preview while suspended still plays once loaded', async () => {
+  let finish!: () => void;
+  const gate = new Promise<void>((resolve) => { finish = resolve; });
+  const { player, log } = harness({ suspended: true, load: async () => { await gate; return { mime: 'audio/wav', bytes: new Uint8Array([1]) }; } });
+  const result = player.play(`custom:${ID}`, 1, true);
+  finish();
+  assert.equal(await result, true);
+  assert.equal(log.audios.length, 1);
+});
+
+test('volume 0 or below makes no oscillator, no audio and no load', async () => {
+  for (const v of [0, -1]) {
+    const { player, log } = harness();
+    assert.equal(await player.play('builtin:pop', v), false);
+    assert.equal(await player.play(`custom:${ID}`, v), false);
+    assert.equal(await player.play(`custom:${ID}`, v, true), false);
+    assert.equal(log.oscillators.length, 0);
+    assert.equal(log.audios.length, 0);
+    assert.equal(log.loads.length, 0);
+  }
 });
 
 test('replaceRemovedSound changes only the rows that used the removed sound', () => {

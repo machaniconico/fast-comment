@@ -246,11 +246,29 @@ export function createSoundPlayer(deps: SoundPlayerDeps): SoundPlayer {
     }
   }
 
+  /** 要求した時点で止まっているか。止まっていれば解除を試みる(この音は鳴らさない)。 */
+  function suspendedNow(): boolean {
+    try {
+      ctx ??= deps.createContext();
+      if (ctx.state !== 'suspended') return false;
+      void Promise.resolve(ctx.resume()).catch(() => {});
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   return {
     async play(sound, volume, unlock = false) {
       const v = clampVolume(volume);
+      // 音量 0 は無音。発振器も Audio も作らない。
+      if (v <= 0) return false;
       const ref = parseSoundRef(sound);
-      if (ref?.kind === 'custom' && (await playCustom(ref.id, v))) return true;
+      if (ref?.kind === 'custom') {
+        // 読み込み中に解除されても、要求時に止まっていた音は鳴らさない(試し鳴らしは除く)。
+        if (!unlock && suspendedNow()) return false;
+        if (await playCustom(ref.id, v)) return true;
+      }
       if (ref?.kind === 'builtin') return synth(ref.name, v, unlock);
       return synth(FALLBACK_SOUND.slice('builtin:'.length), v, unlock);
     },
@@ -264,14 +282,16 @@ export function createSoundPlayer(deps: SoundPlayerDeps): SoundPlayer {
   };
 }
 
-/** 既存のハイライト通知音(ビープ)を鳴らす対象か。同じメッセージに効果音が付いた時は効果音を優先する。 */
-export function needsBeep(highlighted: boolean, sound: string | undefined): boolean {
-  return highlighted && !sound;
-}
-
-/** 鳴らす音。削除の印(`removed`)が付いたコメントは鳴らさない。 */
-export function soundToPlay(msg: { sound?: string; removed?: string }): string | undefined {
-  return msg.sound && msg.removed === undefined ? msg.sound : undefined;
+/**
+ * 1 件のコメントで鳴らす物。削除の印(`removed`)が付いたコメントはビープも効果音も鳴らさない。
+ * 既存のハイライト通知音(ビープ)は、同じメッセージに効果音が付いた時は効果音を優先して鳴らさない。
+ */
+export function alertFor(
+  highlighted: boolean,
+  msg: { sound?: string; removed?: string },
+): { beep: boolean; sound: string | undefined } {
+  if (msg.removed !== undefined) return { beep: false, sound: undefined };
+  return { beep: highlighted && !msg.sound, sound: msg.sound || undefined };
 }
 
 /** 削除したカスタム音源を使っているフォームの行だけを既定音にする。ほかの項目は触らない。 */
