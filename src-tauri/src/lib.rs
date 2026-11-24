@@ -1595,6 +1595,8 @@ async fn update_config(
         },
     );
     new_config.normalize_all();
+    // 削除済みのカスタム効果音を指す規則は既定の内蔵音にして保存する(保存値は画面へ返る)。
+    new_config.sound_effects.resolve_missing(|id| state.sounds.contains(id));
     validate_x_post_mode(&state, &new_config).await?;
     let (
         revision,
@@ -2682,7 +2684,7 @@ async fn import_template_zip(
 
 /// カスタム効果音の一覧。
 #[tauri::command]
-fn list_custom_sounds(state: State<'_, AppState>) -> Vec<sounds::SoundEntry> {
+fn list_custom_sounds(state: State<'_, AppState>) -> Result<Vec<sounds::SoundEntry>, String> {
     state.sounds.list()
 }
 
@@ -2718,27 +2720,12 @@ fn read_custom_sound(state: State<'_, AppState>, id: String) -> Result<tauri::ip
     state.sounds.read(&id).map(|data| tauri::ipc::Response::new(data.bytes))
 }
 
-/// カスタム効果音を削除する。使っていた規則は内蔵の既定音へ戻し、保存した設定を通知する。
+/// カスタム効果音を削除する。設定は書き換えない(使っていた規則は保存時と再生時に既定音へ寄る)。
+/// 設定の保存と順序を揃えるため、保存と同じ書込ロックを取る。
 #[tauri::command]
-async fn remove_custom_sound(
-    state: State<'_, AppState>,
-    id: String,
-    on_config_saved: tauri::ipc::Channel<ConfigCommit<serde_json::Value>>,
-) -> Result<bool, String> {
+async fn remove_custom_sound(state: State<'_, AppState>, id: String) -> Result<bool, String> {
     let _write = state.config_write.lock().await;
-    let removed = state.sounds.remove(&id)?;
-    let mut cfg = state.config.lock().unwrap();
-    let mut next = cfg.clone();
-    if next.sound_effects.reset_removed_custom(&id) {
-        match state.commit_config(&mut cfg, next) {
-            Ok(revision) => {
-                let saved = serde_json::json!({ "soundEffects": cfg.sound_effects });
-                let _ = on_config_saved.send(ConfigCommit::new(Some(revision), saved));
-            }
-            Err(e) => tracing::warn!("効果音の削除後の設定保存に失敗: {e}"),
-        }
-    }
-    Ok(removed)
+    state.sounds.remove(&id)
 }
 
 #[derive(Serialize)]
@@ -3566,7 +3553,7 @@ fn stamp_message_sound(state: &AppState, msg: &mut ChatMessage, verdict: &Verdic
         Default::default()
     };
     let mut gate = state.sound_gate.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    sound_effects::stamp_sound(msg, verdict, &cfg, (&rates, &symbols), &mut gate, std::time::Instant::now());
+    sound_effects::stamp_sound(msg, verdict, &cfg, (&rates, &symbols), |id| state.sounds.contains(id), &mut gate, std::time::Instant::now());
 }
 
 fn spawn_achievement_events(

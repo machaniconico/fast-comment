@@ -937,14 +937,9 @@ function soundMime(bytes: Uint8Array): string {
   return 'audio/mpeg';
 }
 
-/** 削除する。使っていた規則は Rust が内蔵の既定音へ戻して保存し、`onConfigSaved` に知らせる。 */
-export async function removeCustomSound(
-  id: string,
-  onConfigSaved?: ConfigSavedHandler<{ soundEffects: SoundEffectsConfig }>,
-): Promise<boolean> {
-  return (await invokeWithConfigSaved<boolean, { soundEffects: SoundEffectsConfig }>(
-    'remove_custom_sound', { id }, onConfigSaved,
-  )) ?? false;
+/** 削除する。設定は書き換えない(使っていた規則は保存時と再生時に既定音へ寄る)。 */
+export async function removeCustomSound(id: string): Promise<boolean> {
+  return (await invoke<boolean>('remove_custom_sound', { id })) ?? false;
 }
 
 export interface GoalSkinInfo {

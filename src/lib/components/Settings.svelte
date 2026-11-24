@@ -3147,11 +3147,6 @@
     <SoundEffectsSettings
       bind:value={config.soundEffects}
       onVolume={(volume) => store.setSoundVolume(volume)}
-      onRemovedCommit={(commit, late) =>
-        applyCommit(commit.revision, () => {
-          if (config) config.soundEffects = commit.soundEffects;
-          store.setSoundVolume(commit.soundEffects.volume);
-        }, late)}
     />
   </section>
 

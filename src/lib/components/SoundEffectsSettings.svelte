@@ -1,13 +1,13 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte';
   import { addCustomSound, listCustomSounds, readCustomSound, removeCustomSound } from '../ipc';
-  import type { ConfigCommit } from '../ipc';
   import {
     BUILTIN_SOUNDS,
     MAX_CUSTOM_SOUNDS,
     RULES,
     createSoundPlayer,
     normalizeMinJpy,
+    replaceRemovedSound,
     soundLabel,
     validateSoundFile,
     type CustomSound,
@@ -17,11 +17,9 @@
   interface Props {
     value: SoundEffectsConfig;
     onVolume: (volume: number) => void;
-    /** 削除で規則が既定音に戻り、Rust が保存した時の通知。 */
-    onRemovedCommit: (commit: ConfigCommit<{ soundEffects: SoundEffectsConfig }>, late: boolean) => void;
   }
 
-  let { value = $bindable(), onVolume, onRemovedCommit }: Props = $props();
+  let { value = $bindable(), onVolume }: Props = $props();
 
   let custom: CustomSound[] = $state([]);
   let msg = $state('');
@@ -37,7 +35,11 @@
   });
 
   async function refresh() {
-    custom = await listCustomSounds();
+    try {
+      custom = await listCustomSounds();
+    } catch {
+      msg = 'カスタム効果音の一覧を読み込めません';
+    }
   }
 
   onMount(() => void refresh());
@@ -48,7 +50,7 @@
   }
 
   function preview(sound: string) {
-    void player.play(sound, value.volume);
+    void player.play(sound, value.volume, true);
   }
 
   async function onPick(event: Event & { currentTarget: HTMLInputElement }) {
@@ -78,10 +80,12 @@
     busy = true;
     msg = '';
     try {
-      await removeCustomSound(entry.id, onRemovedCommit);
+      await removeCustomSound(entry.id);
       player.forget(entry.id);
+      // 未保存の編集は残し、この音源を使っていた行だけ既定音にする。
+      value = replaceRemovedSound(value, entry.id);
       await refresh();
-      msg = '削除しました(使っていた種別は既定の音に戻しました)';
+      msg = '削除しました(使っていた種別は既定の音に戻しました。保存すると反映されます)';
     } catch (e) {
       msg = `削除に失敗しました: ${errorText(e)}`;
     } finally {

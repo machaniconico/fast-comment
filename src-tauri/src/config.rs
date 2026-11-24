@@ -3161,18 +3161,4 @@ mod tests {
         let old: ChannelOverrides = serde_json::from_str(r#"{"ttsEnabled":false}"#).unwrap();
         assert_eq!(old.sound_enabled, None);
     }
-
-    #[test]
-    fn removing_a_custom_sound_resets_only_rules_that_used_it() {
-        let id = "0b1c2d3e-4f50-4a6b-8c7d-9e0f1a2b3c4d";
-        let other = "1b1c2d3e-4f50-4a6b-8c7d-9e0f1a2b3c4d";
-        let mut cfg = crate::sound_effects::SoundEffectsConfig::default();
-        cfg.super_chat.sound = format!("custom:{id}");
-        cfg.gift.sound = format!("custom:{other}");
-        assert!(cfg.reset_removed_custom(id));
-        let d = crate::sound_effects::SoundEffectsConfig::default();
-        assert_eq!(cfg.super_chat.sound, d.super_chat.sound);
-        assert_eq!(cfg.gift.sound, format!("custom:{other}"));
-        assert!(!cfg.reset_removed_custom(id));
-    }
 }

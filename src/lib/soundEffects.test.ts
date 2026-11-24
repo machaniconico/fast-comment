@@ -4,25 +4,29 @@ import {
   BUILTIN_SOUNDS,
   createSoundPlayer,
   needsBeep,
+  replaceRemovedSound,
+  soundToPlay,
   normalizeMinJpy,
   parseSoundRef,
   soundLabel,
+  type SoundEffectsConfig,
   validateSoundFile,
 } from './soundEffects.ts';
 
 const ID = '0b1c2d3e-4f50-4a6b-8c7d-9e0f1a2b3c4d';
 
-function harness(options: { load?: (id: string) => Promise<{ mime: string; bytes: Uint8Array } | null>; playFails?: boolean } = {}) {
-  const log = { oscillators: [] as Array<{ freq: number; type: string }>, gains: [] as number[], audios: [] as Array<{ src: string; volume: number }>, created: 0, revoked: [] as string[], loads: [] as string[], closed: 0, contexts: 0 };
+function harness(options: { load?: (id: string) => Promise<{ mime: string; bytes: Uint8Array } | null>; playFails?: boolean; suspended?: boolean } = {}) {
+  let ctxState = options.suspended ? 'suspended' : 'running';
+  const log = { resumes: 0, oscillators: [] as Array<{ freq: number; type: string }>, gains: [] as number[], audios: [] as Array<{ src: string; volume: number }>, created: 0, revoked: [] as string[], loads: [] as string[], closed: 0, contexts: 0 };
   let blobs = 0;
   const player = createSoundPlayer({
     createContext: () => {
       log.contexts += 1;
       return {
         currentTime: 10,
-        state: 'suspended',
+        get state() { return ctxState; },
         destination: {},
-        resume: async () => {},
+        resume: async () => { log.resumes += 1; },
         close: async () => { log.closed += 1; },
         createOscillator: () => {
           const rec = { freq: 0, type: '' };
@@ -60,7 +64,7 @@ function harness(options: { load?: (id: string) => Promise<{ mime: string; bytes
     createObjectUrl: () => { log.created += 1; blobs += 1; return `blob:${blobs}`; },
     revokeObjectUrl: (url) => { log.revoked.push(url); },
   });
-  return { player, log };
+  return { player, log, unlock: () => { ctxState = 'running'; } };
 }
 
 test('parseSoundRef accepts only builtin names and custom uuids', () => {
@@ -191,4 +195,53 @@ test('soundLabel names builtins, known customs and removed customs', () => {
   assert.equal(soundLabel(`custom:${ID}`, [{ id: ID, name: 'ピンポン.wav', ext: 'wav', size: 1 }]), 'ピンポン.wav');
   assert.equal(soundLabel(`custom:${ID}`, []), '(削除済みの音源)');
   assert.equal(soundLabel('x', []), '(不明)');
+});
+
+test('sounds arriving while the audio context is suspended are dropped, not queued', async () => {
+  const { player, log, unlock } = harness({ suspended: true });
+  for (let i = 0; i < 4; i += 1) assert.equal(await player.play('builtin:pop', 1), false);
+  assert.equal(log.oscillators.length, 0);
+  assert.ok(log.resumes >= 1);
+  unlock();
+  assert.equal(await player.play('builtin:pop', 1), true);
+  // 解除後は 1 回分だけ。溜まっていた分は鳴らない。
+  assert.equal(log.oscillators.length, 1);
+});
+
+test('a user-initiated preview waits for the unlock and plays', async () => {
+  const { player, log } = harness({ suspended: true });
+  assert.equal(await player.play('builtin:chime', 1, true), true);
+  assert.ok(log.oscillators.length > 0);
+});
+
+test('soundToPlay skips comments that carry a removal mark', () => {
+  assert.equal(soundToPlay({ sound: 'builtin:pop' }), 'builtin:pop');
+  assert.equal(soundToPlay({ sound: 'builtin:pop', removed: 'deleted' }), undefined);
+  assert.equal(soundToPlay({ sound: 'builtin:pop', removed: 'banned' }), undefined);
+  assert.equal(soundToPlay({ removed: undefined }), undefined);
+  assert.equal(soundToPlay({ sound: '' }), undefined);
+});
+
+test('replaceRemovedSound changes only the rows that used the removed sound', () => {
+  const rule = (sound: string, minJpy = 0) => ({ enabled: true, sound, minJpy });
+  const cfg: SoundEffectsConfig = {
+    enabled: true,
+    volume: 0.3,
+    minIntervalMs: 700,
+    superChat: rule(`custom:${ID}`, 50),
+    bits: rule('builtin:bell', 1000),
+    gift: rule(`custom:${ID}`),
+    membership: rule('custom:1b1c2d3e-4f50-4a6b-8c7d-9e0f1a2b3c4d'),
+    firstComment: rule('builtin:chime'),
+  };
+  const next = replaceRemovedSound(cfg, ID);
+  assert.deepEqual(next, {
+    ...cfg,
+    superChat: rule('builtin:coin', 50),
+    gift: rule('builtin:bell'),
+  });
+  assert.equal(next.bits, cfg.bits);
+  assert.equal(next.membership, cfg.membership);
+  assert.equal(cfg.superChat.sound, `custom:${ID}`);
+  assert.deepEqual(replaceRemovedSound(cfg, '2b1c2d3e-4f50-4a6b-8c7d-9e0f1a2b3c4d'), cfg);
 });

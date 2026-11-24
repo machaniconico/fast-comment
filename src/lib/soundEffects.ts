@@ -49,6 +49,15 @@ export const BUILTIN_SOUNDS: ReadonlyArray<{ name: string; label: string }> = [
   { name: 'coin', label: 'コイン' },
 ];
 
+/** Rust `SoundEffectsConfig::default()` の各規則の音。削除済みの音源を差し替える先。 */
+export const DEFAULT_RULE_SOUNDS: Record<RuleKey, string> = {
+  superChat: 'builtin:coin',
+  bits: 'builtin:pop',
+  gift: 'builtin:bell',
+  membership: 'builtin:chime',
+  firstComment: 'builtin:pop',
+};
+
 export const FALLBACK_SOUND = 'builtin:chime';
 export const MAX_CUSTOM_SOUND_BYTES = 2 * 1024 * 1024;
 export const MAX_CUSTOM_SOUNDS = 32;
@@ -139,8 +148,12 @@ export interface SoundPlayerDeps {
 }
 
 export interface SoundPlayer {
-  /** 鳴らせたら true。カスタムが読めない時は内蔵の既定音で代用する。 */
-  play(sound: string, volume: number): Promise<boolean>;
+  /**
+   * 鳴らせたら true。カスタムが読めない時は内蔵の既定音で代用する。
+   * AudioContext が止まっている間(自動再生の制限)の音は溜めずに捨て、解除を試みる。
+   * 利用者の操作中(試し鳴らし)は `unlock` を true にして、解除を待ってから鳴らす。
+   */
+  play(sound: string, volume: number, unlock?: boolean): Promise<boolean>;
   /** 削除したカスタム音源の Blob URL を捨てる。 */
   forget(id: string): void;
   dispose(): void;
@@ -150,12 +163,19 @@ export function createSoundPlayer(deps: SoundPlayerDeps): SoundPlayer {
   let ctx: AudioContextLike | null = null;
   const urls = new Map<string, Promise<string | null>>();
 
-  async function synth(name: string, volume: number): Promise<boolean> {
+  async function synth(name: string, volume: number, unlock: boolean): Promise<boolean> {
     const tones = TONES[name];
     if (!tones) return false;
     try {
       ctx ??= deps.createContext();
-      if (ctx.state === 'suspended') await ctx.resume();
+      if (ctx.state === 'suspended') {
+        if (!unlock) {
+          // 古い通知が解除後にまとめて鳴らないよう、この音は捨てる。
+          void Promise.resolve(ctx.resume()).catch(() => {});
+          return false;
+        }
+        await ctx.resume();
+      }
       const base = ctx.currentTime;
       for (const tone of tones) {
         const osc = ctx.createOscillator();
@@ -227,12 +247,12 @@ export function createSoundPlayer(deps: SoundPlayerDeps): SoundPlayer {
   }
 
   return {
-    async play(sound, volume) {
+    async play(sound, volume, unlock = false) {
       const v = clampVolume(volume);
       const ref = parseSoundRef(sound);
       if (ref?.kind === 'custom' && (await playCustom(ref.id, v))) return true;
-      if (ref?.kind === 'builtin' && (await synth(ref.name, v))) return true;
-      return synth(FALLBACK_SOUND.slice('builtin:'.length), v);
+      if (ref?.kind === 'builtin') return synth(ref.name, v, unlock);
+      return synth(FALLBACK_SOUND.slice('builtin:'.length), v, unlock);
     },
     forget: revoke,
     dispose() {
@@ -247,6 +267,21 @@ export function createSoundPlayer(deps: SoundPlayerDeps): SoundPlayer {
 /** 既存のハイライト通知音(ビープ)を鳴らす対象か。同じメッセージに効果音が付いた時は効果音を優先する。 */
 export function needsBeep(highlighted: boolean, sound: string | undefined): boolean {
   return highlighted && !sound;
+}
+
+/** 鳴らす音。削除の印(`removed`)が付いたコメントは鳴らさない。 */
+export function soundToPlay(msg: { sound?: string; removed?: string }): string | undefined {
+  return msg.sound && msg.removed === undefined ? msg.sound : undefined;
+}
+
+/** 削除したカスタム音源を使っているフォームの行だけを既定音にする。ほかの項目は触らない。 */
+export function replaceRemovedSound(cfg: SoundEffectsConfig, id: string): SoundEffectsConfig {
+  const removed = `custom:${id}`;
+  const next = { ...cfg };
+  for (const { key } of RULES) {
+    if (cfg[key].sound === removed) next[key] = { ...cfg[key], sound: DEFAULT_RULE_SOUNDS[key] };
+  }
+  return next;
 }
 
 /** 「円」入力の欄を 0〜上限の整数にする。空・負・NaN は 0。 */

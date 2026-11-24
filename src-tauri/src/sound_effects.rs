@@ -123,9 +123,9 @@ impl SoundEffectsConfig {
         }
     }
 
-    /// 削除したカスタム音源を使う規則を、その規則の既定の内蔵音へ戻す。変えたら true。
-    pub fn reset_removed_custom(&mut self, id: &str) -> bool {
-        let removed = format!("custom:{id}");
+    /// 保管庫に無い `custom:<id>` を使う規則を、その規則の既定の内蔵音にする。変えたら true。
+    /// 削除済みの音源が設定に残っても、保存時と実行時にここで既定音へ寄せる。
+    pub fn resolve_missing(&mut self, exists: impl Fn(&str) -> bool) -> bool {
         let defaults = Self::default();
         let mut changed = false;
         for (rule, default) in [
@@ -135,9 +135,11 @@ impl SoundEffectsConfig {
             (&mut self.membership, defaults.membership),
             (&mut self.first_comment, defaults.first_comment),
         ] {
-            if rule.sound == removed {
-                rule.sound = default.sound;
-                changed = true;
+            if let Some(id) = rule.sound.strip_prefix("custom:") {
+                if !exists(id) {
+                    rule.sound = default.sound;
+                    changed = true;
+                }
             }
         }
         changed
@@ -250,6 +252,7 @@ pub fn stamp_sound(
     verdict: &Verdict,
     cfg: &AppConfig,
     defs: (&RateTable, &BTreeMap<String, String>),
+    custom_exists: impl Fn(&str) -> bool,
     gate: &mut SoundGate,
     now: Instant,
 ) {
@@ -257,7 +260,10 @@ pub fn stamp_sound(
         return;
     }
     let overrides = crate::tts::origin_overrides(cfg, msg);
-    let Some(cue) = select_sound(msg, &cfg.sound_effects, defs.0, defs.1, overrides) else { return };
+    // 削除済みのカスタム音源を指す規則は既定の内蔵音として扱う。
+    let mut resolved = cfg.sound_effects.clone();
+    resolved.resolve_missing(custom_exists);
+    let Some(cue) = select_sound(msg, &resolved, defs.0, defs.1, overrides) else { return };
     if gate.admit(now, cfg.sound_effects.min_interval_ms) {
         msg.sound = Some(cue.0);
     }
@@ -473,23 +479,62 @@ mod tests {
         let mut gate = SoundGate::default();
 
         let mut hidden = money(MessageKind::SuperChat, 100.0, "JPY");
-        stamp_sound(&mut hidden, &Verdict::Hide, &cfg, (&r, &s), &mut gate, t0);
+        stamp_sound(&mut hidden, &Verdict::Hide, &cfg, (&r, &s), |_| true, &mut gate, t0);
         assert_eq!(hidden.sound, None);
 
         let mut a = money(MessageKind::SuperChat, 100.0, "JPY");
-        stamp_sound(&mut a, &Verdict::Show, &cfg, (&r, &s), &mut gate, t0);
+        stamp_sound(&mut a, &Verdict::Show, &cfg, (&r, &s), |_| true, &mut gate, t0);
         assert!(a.sound.is_some());
 
         let mut b = money(MessageKind::SuperChat, 100.0, "JPY");
-        stamp_sound(&mut b, &Verdict::Highlight, &cfg, (&r, &s), &mut gate, t0 + Duration::from_millis(10));
+        stamp_sound(&mut b, &Verdict::Highlight, &cfg, (&r, &s), |_| true, &mut gate, t0 + Duration::from_millis(10));
         assert_eq!(b.sound, None);
 
         // 鳴らない種別は間隔を消費しない。
         let mut normal = msg(MessageKind::Normal);
-        stamp_sound(&mut normal, &Verdict::Show, &cfg, (&r, &s), &mut gate, t0 + Duration::from_millis(400));
+        stamp_sound(&mut normal, &Verdict::Show, &cfg, (&r, &s), |_| true, &mut gate, t0 + Duration::from_millis(400));
         let mut c = money(MessageKind::SuperChat, 100.0, "JPY");
-        stamp_sound(&mut c, &Verdict::Show, &cfg, (&r, &s), &mut gate, t0 + Duration::from_millis(400));
+        stamp_sound(&mut c, &Verdict::Show, &cfg, (&r, &s), |_| true, &mut gate, t0 + Duration::from_millis(400));
         assert!(c.sound.is_some());
+    }
+
+    #[test]
+    fn deleted_custom_sound_is_resolved_to_the_default_on_save_and_at_runtime() {
+        let live = "0b1c2d3e-4f50-4a6b-8c7d-9e0f1a2b3c4d";
+        let gone = "1b1c2d3e-4f50-4a6b-8c7d-9e0f1a2b3c4d";
+        let d = SoundEffectsConfig::default();
+        let mut cfg = on();
+        cfg.super_chat.sound = format!("custom:{gone}");
+        cfg.gift.sound = format!("custom:{live}");
+        // 保存時
+        let mut saved = cfg.clone();
+        assert!(saved.resolve_missing(|id| id == live));
+        assert_eq!(saved.super_chat.sound, d.super_chat.sound);
+        assert_eq!(saved.gift.sound, format!("custom:{live}"));
+        assert!(!saved.resolve_missing(|id| id == live));
+        // 実行時: 設定は削除済みの id のままでも既定音で鳴る。
+        let mut app = AppConfig::default();
+        app.sound_effects = cfg;
+        let (r, s) = (rates(), BTreeMap::new());
+        let mut sc = money(MessageKind::SuperChat, 100.0, "JPY");
+        stamp_sound(&mut sc, &Verdict::Show, &app, (&r, &s), |id| id == live, &mut SoundGate::default(), Instant::now());
+        assert_eq!(sc.sound, Some(d.super_chat.sound));
+        let mut gift = money(MessageKind::Gift, 100.0, "JPY");
+        stamp_sound(&mut gift, &Verdict::Show, &app, (&r, &s), |id| id == live, &mut SoundGate::default(), Instant::now());
+        assert_eq!(gift.sound, Some(format!("custom:{live}")));
+    }
+
+    #[test]
+    fn out_of_range_values_are_clamped_on_load() {
+        let c: SoundEffectsConfig = serde_json::from_value(serde_json::json!({
+            "volume": 7, "minIntervalMs": 6000, "superChat": {"minJpy": 99999999999u64}
+        }))
+        .unwrap();
+        assert_eq!(c.volume, 1.0);
+        assert_eq!(c.min_interval_ms, MAX_MIN_INTERVAL_MS);
+        assert_eq!(c.super_chat.min_jpy, MAX_MIN_JPY);
+        let neg: SoundEffectsConfig = serde_json::from_value(serde_json::json!({"volume": -2})).unwrap();
+        assert_eq!(neg.volume, 0.0);
     }
 
     #[test]
@@ -508,7 +553,7 @@ mod tests {
         let (r, s) = (rates(), BTreeMap::new());
         let mut m = money(MessageKind::SuperChat, 100.0, "JPY");
         m.route.origin_key = Some(key);
-        stamp_sound(&mut m, &Verdict::Show, &cfg, (&r, &s), &mut SoundGate::default(), Instant::now());
+        stamp_sound(&mut m, &Verdict::Show, &cfg, (&r, &s), |_| true, &mut SoundGate::default(), Instant::now());
         assert_eq!(m.sound, None);
     }
 
