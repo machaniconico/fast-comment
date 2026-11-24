@@ -500,6 +500,56 @@ test('comment NG append preserves both OAuth settings committed before its save'
   assert.equal(await page.evaluate(() => window.mock.writes.length), 0);
 }, 'app'));
 
+function listenerComment(id, authorId, paid = false) {
+  return {
+    id, platform: 'youtube', channel: 'test-stream', kind: paid ? 'superChat' : 'normal',
+    timestampMs: Date.now(),
+    author: { id: authorId, name: authorId, badges: [], roles: {} },
+    fragments: [{ type: 'text', text: id }],
+    amount: paid ? { value: 1.5, currency: 'JPY', rawText: '¥1.5' } : undefined,
+  };
+}
+
+async function openDonationCard(page, milli) {
+  await page.getByRole('checkbox', { name: 'コメビュに表示' }).waitFor();
+  await page.evaluate(milli => {
+    window.mock.listenerDonation = {
+      totals: [{ currency: 'JPY', milli }], jpyEstimateMilli: milli, unconvertible: [],
+    };
+  }, milli);
+  await page.evaluate(msg => window.mock.pushComment(msg), listenerComment('first-comment', 'Alice'));
+  await page.getByRole('button', { name: 'Alice', exact: true }).click();
+  await page.locator('.uc-donation-amount').waitFor();
+}
+
+test('listener card rounds the yen estimate while keeping the currency total precise', async t => withSettings(t, async page => {
+  await openDonationCard(page, 1500);
+  assert.equal(await page.locator('.uc-donation-amount').textContent(), '¥1.5');
+  await page.getByText('円の目安 ¥2', { exact: true }).waitFor();
+}, 'app'));
+
+test('listener card refreshes when a batch contains a gift for its listener', async t => withSettings(t, async page => {
+  await openDonationCard(page, 5000);
+  const reads = await page.evaluate(() => {
+    window.mock.listenerDonation = {
+      totals: [{ currency: 'JPY', milli: 6500 }], jpyEstimateMilli: 6500, unconvertible: [],
+    };
+    return window.mock.donationReads;
+  });
+  await page.evaluate(messages => window.mock.pushComments(messages), [
+    listenerComment('other-gift', 'Bob', true),
+    listenerComment('ordinary-comment', 'Alice'),
+  ]);
+  assert.equal(await page.evaluate(() => window.mock.donationReads), reads);
+
+  await page.evaluate(messages => window.mock.pushComments(messages), [
+    listenerComment('own-gift-1', 'Alice', true),
+    listenerComment('own-gift-2', 'Alice', true),
+  ]);
+  await page.locator('.uc-donation-amount').filter({ hasText: /^¥6\.5$/ }).waitFor();
+  assert.equal(await page.evaluate(() => window.mock.donationReads), reads + 1);
+}, 'app'));
+
 test('moderation import preserves both OAuth settings committed before its save', async t => withSettings(t, async page => {
   const moderation = { ngWords: ['spam'], ngUsers: ['bot'], highlights: ['important'] };
   await page.evaluate(() => {

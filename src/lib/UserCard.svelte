@@ -239,6 +239,15 @@
   }
 
   onMount(() => {
+    const stopBatches = store.subscribeBatches((messages) => {
+      const t = ui.userCard;
+      if (t && messages.some((msg) =>
+        msg.platform === t.platform && msg.author.id === t.authorId && msg.amount &&
+        (msg.kind === 'superChat' || msg.kind === 'bits' || msg.kind === 'gift')
+      )) {
+        void refreshDonation();
+      }
+    });
     let disposed = false;
     let unlisten: (() => void) | undefined;
     startListenerDonationChangedListener(() => { void refreshDonation(); }).then((stop) => {
@@ -247,6 +256,7 @@
     }, () => {});
     return () => {
       disposed = true;
+      stopBatches();
       unlisten?.();
     };
   });
@@ -373,6 +383,7 @@
 
   const donationNumber = new Intl.NumberFormat('ja-JP', { maximumFractionDigits: 3 });
   const currencyNumber = new Intl.NumberFormat('ja-JP', { minimumFractionDigits: 2, maximumFractionDigits: 3 });
+  const yenEstimateNumber = new Intl.NumberFormat('ja-JP', { maximumFractionDigits: 0 });
 
   function fmtDonation(currency: string, milli: number): string {
     const value = milli / 1000;
@@ -563,7 +574,7 @@
                 {/if}
               </div>
               <div class="uc-dim">
-                円の目安 {donation.jpyEstimateMilli === null ? '—' : fmtDonation('JPY', donation.jpyEstimateMilli)}
+                円の目安 {donation.jpyEstimateMilli === null ? '—' : `¥${yenEstimateNumber.format(donation.jpyEstimateMilli / 1000)}`}
                 {#if donation.unconvertible.length}
                   （換算できない通貨 {donation.unconvertible.map((currency) => currency || '通貨不明').join('、')}）
                 {/if}

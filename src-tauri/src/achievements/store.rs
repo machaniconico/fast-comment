@@ -10,7 +10,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use super::currency::RateTable;
+use super::currency::{normalize_currency, RateTable};
 use super::engine::Progress;
 use super::model::{
     presets, reset_to_preset, validate_all, validate_for_save, Achievement, ValidationError,
@@ -170,6 +170,11 @@ impl DefsStore {
             .unwrap_or_else(|e| e.into_inner())
             .current
             .clone()
+    }
+
+    pub(crate) fn normalize_currency(&self, raw: &str) -> String {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        normalize_currency(raw, &state.current.symbol_overrides)
     }
 
     /// 定義と、その元になったファイル内容のトークン。画面は保存時にトークンを返す。

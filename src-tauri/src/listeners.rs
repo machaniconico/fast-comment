@@ -1,13 +1,15 @@
 //! Persistent listener records. Message processing only changes memory; flush snapshots on a worker.
 use crate::achievements::currency::{normalize_currency, trim_currency, AmountTotals, RateTable};
+use crate::achievements::store::DefsStore;
 use crate::model::{ChatMessage, ListenerInfo, MessageKind, Platform};
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use std::{
     collections::{BTreeMap, HashMap},
     fs,
     io::Write,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -58,6 +60,7 @@ pub struct ListenerRecord {
     pub memo: Option<String>,
     pub comment_count: u64,
     pub gift_count: u64,
+    #[serde(default, deserialize_with = "deserialize_donation")]
     pub donation: BTreeMap<String, i64>,
     pub first_seen_ms: u64,
     pub last_seen_ms: u64,
@@ -65,6 +68,22 @@ pub struct ListenerRecord {
     pub tts_muted: bool,
     #[serde(default)]
     pub tts_voice: Option<TtsVoiceOverride>,
+}
+
+fn deserialize_donation<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeMap<String, i64>, D::Error> {
+    let raw = Box::<RawValue>::deserialize(deserializer)?;
+    // Read each amount separately so even numbers outside JSON's f64 range can be skipped.
+    let entries =
+        serde_json::from_str::<BTreeMap<String, &RawValue>>(raw.get()).unwrap_or_default();
+    Ok(entries
+        .into_iter()
+        .filter_map(|(currency, raw)| {
+            let milli = serde_json::from_str::<i64>(raw.get()).ok()?;
+            (milli >= 0).then_some((currency, milli))
+        })
+        .collect())
 }
 
 impl ListenerRecord {
@@ -99,16 +118,21 @@ pub fn donation_summary(
     rates: &RateTable,
     overrides: &BTreeMap<String, String>,
 ) -> DonationSummary {
-    let unconvertible: Vec<_> = donation
-        .keys()
-        .filter(|currency| {
-            let code = normalize_currency(currency, overrides);
-            !rates.get(&code).is_some_and(|rate| rate.is_finite())
-        })
-        .cloned()
-        .collect();
-    let jpy_estimate_milli = (unconvertible.len() < donation.len())
-        .then(|| AmountTotals(donation.clone()).jpy_milli(rates, overrides));
+    let mut convertible = BTreeMap::new();
+    let mut unconvertible = Vec::new();
+    for (currency, &milli) in donation {
+        let code = normalize_currency(currency, overrides);
+        if rates
+            .get(&code)
+            .is_some_and(|rate| rate.is_finite() && *rate > 0.0)
+        {
+            convertible.insert(currency.clone(), milli);
+        } else {
+            unconvertible.push(currency.clone());
+        }
+    }
+    let jpy_estimate_milli =
+        (!convertible.is_empty()).then(|| AmountTotals(convertible).jpy_milli(rates, overrides));
     let mut totals: Vec<_> = donation
         .iter()
         .map(|(code, &milli)| (code.clone(), milli))
@@ -137,6 +161,7 @@ impl Records {
 
 pub struct ListenerStore {
     path: PathBuf,
+    achievement_defs: Option<Arc<DefsStore>>,
     records: Mutex<Records>,
     // Serializes periodic and exit saves, without blocking observe on disk I/O.
     saving: Mutex<()>,
@@ -179,6 +204,11 @@ impl ListenerStore {
         Self::load_with_backup(dir, backup_corrupt)
     }
 
+    pub(crate) fn with_achievement_defs(mut self, defs: Arc<DefsStore>) -> Self {
+        self.achievement_defs = Some(defs);
+        self
+    }
+
     fn load_with_backup(
         dir: &Path,
         backup: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
@@ -188,8 +218,8 @@ impl ListenerStore {
         let entries = match fs::read(&path) {
             Ok(bytes) => match serde_json::from_slice::<HashMap<String, ListenerRecord>>(&bytes) {
                 Ok(entries) => entries,
-                Err(e) => {
-                    tracing::error!("リスナー記録のJSONが壊れています・空で開始: {e}");
+                Err(_) => {
+                    tracing::error!("リスナー記録のJSONが壊れています・空で開始");
                     if let Err(e) =
                         backup(&path, &dir.join(format!("listeners.json.bak.{}", now_ms())))
                     {
@@ -209,6 +239,7 @@ impl ListenerStore {
         };
         Self {
             path,
+            achievement_defs: None,
             flush_blocked,
             records: Mutex::new(Records {
                 entries,
@@ -242,16 +273,21 @@ impl ListenerStore {
             .amount
             .as_ref()
             .filter(|amount| {
-                matches!(
-                    msg.kind,
-                    MessageKind::SuperChat | MessageKind::Bits | MessageKind::Gift
-                ) && amount.value.is_finite()
+                !msg.route.uncounted
+                    && matches!(
+                        msg.kind,
+                        MessageKind::SuperChat | MessageKind::Bits | MessageKind::Gift
+                    )
+                    && amount.value.is_finite()
                     && amount.value > 0.0
                     && !trim_currency(&amount.currency).eq_ignore_ascii_case("SUBGIFT")
             })
             .map(|amount| {
                 (
-                    normalize_currency(&amount.currency, &BTreeMap::new()),
+                    match &self.achievement_defs {
+                        Some(defs) => defs.normalize_currency(&amount.currency),
+                        None => normalize_currency(&amount.currency, &BTreeMap::new()),
+                    },
                     (amount.value * 1000.0).round() as i64,
                 )
             });
@@ -408,6 +444,9 @@ impl ListenerStore {
 
     pub fn reset_donation(&self, platform: &str, author_id: &str) -> bool {
         let mut records = self.records.lock().unwrap();
+        if records.closed {
+            return false;
+        }
         let Some(record) = records.entries.get_mut(&key(platform, author_id)) else {
             return false;
         };
@@ -420,6 +459,9 @@ impl ListenerStore {
 
     pub fn reset_all_donations(&self) -> usize {
         let mut records = self.records.lock().unwrap();
+        if records.closed {
+            return 0;
+        }
         let mut count = 0;
         for record in records
             .entries
@@ -522,6 +564,138 @@ mod tests {
             route: Default::default(),
             sound: None,
         }
+    }
+
+    fn super_chat(currency: &str) -> ChatMessage {
+        let mut msg = message();
+        msg.platform = Platform::Youtube;
+        msg.kind = MessageKind::SuperChat;
+        msg.amount = Some(Amount {
+            currency: currency.into(),
+            value: 5.0,
+            raw_text: String::new(),
+        });
+        msg
+    }
+
+    #[test]
+    fn donation_ignores_uncounted_super_chat() {
+        let dir = TestDir::new();
+        let store = dir.store();
+        let mut msg = super_chat("JPY");
+        msg.route.uncounted = true;
+        store.observe(&mut msg);
+        assert!(store.get("youtube", "user").unwrap().donation.is_empty());
+    }
+
+    #[test]
+    fn donation_uses_saved_overrides_for_new_gifts_only() {
+        let dir = TestDir::new();
+        let defs = DefsStore::load(&dir.0, 0);
+        let mut settings = defs.current();
+        settings.symbol_overrides.insert("$".into(), "MXN".into());
+        settings
+            .rates
+            .extend([("MXN".into(), 8.0), ("USD".into(), 150.0)]);
+        defs.commit(settings.revision, settings).unwrap();
+
+        let defs = Arc::new(DefsStore::load(&dir.0, 0));
+        let store = dir.store().with_achievement_defs(defs.clone());
+        store.observe(&mut super_chat("$"));
+        assert_eq!(
+            store.donation("youtube", "user"),
+            BTreeMap::from([("MXN".into(), 5_000)])
+        );
+
+        let mut settings = defs.current();
+        settings.symbol_overrides.clear();
+        defs.commit(settings.revision, settings).unwrap();
+        store.observe(&mut super_chat("$"));
+        store.flush().unwrap();
+        let donation = dir.store().donation("youtube", "user");
+        assert_eq!(
+            donation,
+            BTreeMap::from([("MXN".into(), 5_000), ("USD".into(), 5_000)])
+        );
+        assert_eq!(
+            donation_summary(&donation, &defs.current().rates, &BTreeMap::new()).jpy_estimate_milli,
+            Some(790_000)
+        );
+    }
+
+    #[test]
+    fn donation_load_discards_only_invalid_entries() {
+        let dir = TestDir::new();
+        let path = dir.0.join("listeners.json");
+        fs::write(
+            &path,
+            br#"{
+            "youtube:user": {
+                "nickname": "Alice",
+                "donation": {
+                    "JPY": 5000, "USD": 9223372036854775807, "zero": 0,
+                    "string": "private", "negative": -1, "fraction": 1.5,
+                    "overflow": 9223372036854775808, "huge": 1e400,
+                    "bool": false, "null": null, "object": {"x": 1}, "array": [1]
+                }
+            },
+            "youtube:other": {"memo": "keep", "donation": {"BITS": 1000}},
+            "youtube:empty": {"name": "keep too", "donation": false}
+        }"#,
+        )
+        .unwrap();
+        let store = dir.store();
+        let record = store.get("youtube", "user").unwrap();
+        assert_eq!(record.nickname.as_deref(), Some("Alice"));
+        assert_eq!(
+            record.donation,
+            BTreeMap::from([
+                ("JPY".into(), 5000),
+                ("USD".into(), i64::MAX),
+                ("zero".into(), 0)
+            ])
+        );
+        let other = store.get("youtube", "other").unwrap();
+        assert_eq!(other.memo.as_deref(), Some("keep"));
+        assert_eq!(other.donation, BTreeMap::from([("BITS".into(), 1000)]));
+        assert!(store.get("youtube", "empty").unwrap().donation.is_empty());
+        assert_eq!(fs::read_dir(&dir.0).unwrap().count(), 1);
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn donation_summary_skips_nonpositive_rates() {
+        let rates = BTreeMap::from([
+            ("JPY".into(), 1.0),
+            ("USD".into(), 0.0),
+            ("EUR".into(), -2.0),
+        ]);
+        let mut donation = BTreeMap::from([("USD".into(), 1000), ("EUR".into(), 1000)]);
+        let overrides = BTreeMap::new();
+        let summary = donation_summary(&donation, &rates, &overrides);
+        assert_eq!(summary.unconvertible, ["EUR", "USD"]);
+        assert_eq!(summary.jpy_estimate_milli, None);
+
+        donation.insert("JPY".into(), 1500);
+        let summary = donation_summary(&donation, &rates, &overrides);
+        assert_eq!(summary.unconvertible, ["EUR", "USD"]);
+        assert_eq!(summary.jpy_estimate_milli, Some(1500));
+    }
+
+    #[test]
+    fn donation_reset_is_refused_after_shutdown() {
+        let dir = TestDir::new();
+        let store = dir.store();
+        store.observe(&mut super_chat("JPY"));
+        store.shutdown().unwrap();
+
+        let count = store.reset_all_donations();
+        let reset = store.reset_donation("youtube", "user");
+        assert_eq!((reset, count), (false, 0));
+        assert_eq!(
+            store.donation("youtube", "user"),
+            BTreeMap::from([("JPY".into(), 5000)])
+        );
     }
 
     #[test]
