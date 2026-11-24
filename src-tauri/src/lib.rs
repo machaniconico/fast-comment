@@ -24,8 +24,10 @@ pub mod listeners;
 pub mod live_fanout;
 pub mod model;
 pub mod moderation;
+pub mod sound_effects;
 mod moderation_error;
 mod secret_store;
+mod sounds;
 mod template_import;
 pub mod sources;
 pub mod stats;
@@ -112,6 +114,10 @@ pub struct AppState {
     #[allow(dead_code)]
     achievement_defs: DefsStore,
     chatlog: chatlog::ChatLog,
+    /// カスタム効果音の保管庫。
+    sounds: sounds::SoundStore,
+    /// 効果音のアプリ全体の最小間隔。
+    sound_gate: Mutex<sound_effects::SoundGate>,
     /// stats 集約などへ設定変更を伝える watch 送信端。
     config_tx: watch::Sender<AppConfig>,
     /// Timer overlay へ基準スナップショットを配る watch 送信端。
@@ -775,6 +781,7 @@ fn tts_speak_text(app: AppHandle, state: State<'_, AppState>, text: String) -> R
         skip_tts: false,
         injected_test: false,
         route: Default::default(),
+        sound: None,
     };
 
     try_enqueue_tts_message(&app, &state.config, &state.tts, msg);
@@ -1588,6 +1595,8 @@ async fn update_config(
         },
     );
     new_config.normalize_all();
+    // 削除済みのカスタム効果音を指す規則は既定の内蔵音にして保存する(保存値は画面へ返る)。
+    new_config.sound_effects.resolve_missing(|id| state.sounds.contains(id));
     validate_x_post_mode(&state, &new_config).await?;
     let (
         revision,
@@ -2673,6 +2682,52 @@ async fn import_template_zip(
         .map_err(|e| format!("取り込み処理が異常終了しました: {e}"))?
 }
 
+/// カスタム効果音の一覧。
+#[tauri::command]
+fn list_custom_sounds(state: State<'_, AppState>) -> Result<Vec<sounds::SoundEntry>, String> {
+    state.sounds.list()
+}
+
+/// 音声ファイルのバイト列(raw body)を取り込む。表示名はヘッダ `x-sound-name`(URI エンコード)。
+/// ファイルパスは受け取らない。保存名は Rust が UUID で付ける。
+#[tauri::command]
+async fn add_custom_sound(
+    state: State<'_, AppState>,
+    request: tauri::ipc::Request<'_>,
+) -> Result<sounds::SoundEntry, String> {
+    let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else {
+        return Err("音声のバイト列(raw body)を渡してください".to_string());
+    };
+    let name = request
+        .headers()
+        .get("x-sound-name")
+        .and_then(|v| v.to_str().ok())
+        .map(decode_sound_name)
+        .unwrap_or_default();
+    state.sounds.add(&name, bytes)
+}
+
+fn decode_sound_name(encoded: &str) -> String {
+    url::form_urlencoded::parse(format!("n={encoded}").as_bytes())
+        .next()
+        .map(|(_, v)| v.into_owned())
+        .unwrap_or_default()
+}
+
+/// 再生用に中身を返す。ID を検証した物だけが読める。
+#[tauri::command]
+fn read_custom_sound(state: State<'_, AppState>, id: String) -> Result<tauri::ipc::Response, String> {
+    state.sounds.read(&id).map(|data| tauri::ipc::Response::new(data.bytes))
+}
+
+/// カスタム効果音を削除する。設定は書き換えない(使っていた規則は保存時と再生時に既定音へ寄る)。
+/// 設定の保存と順序を揃えるため、保存と同じ書込ロックを取る。
+#[tauri::command]
+async fn remove_custom_sound(state: State<'_, AppState>, id: String) -> Result<bool, String> {
+    let _write = state.config_write.lock().await;
+    state.sounds.remove(&id)
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct GoalSkinInfo {
@@ -3454,6 +3509,7 @@ fn spawn_pipeline(app: AppHandle, cancel: CancellationToken) {
                     // 判定はロックを短く保持して取り出す(MutexGuard を await 跨ぎで持たない)。
                     state.listeners.observe(&mut msg);
                     let verdict = state.moderator.lock().unwrap().judge(&msg);
+                    stamp_message_sound(&state, &mut msg, &verdict);
                     let log_config = state.config.lock().unwrap().log.clone();
                     if log_config.enabled && (!matches!(verdict, Verdict::Hide) || log_config.include_hidden) {
                         state.chatlog.try_send(msg.clone(), matches!(verdict, Verdict::Hide));
@@ -3482,6 +3538,22 @@ fn spawn_pipeline(app: AppHandle, cancel: CancellationToken) {
         }
         tracing::info!("moderation/TTS パイプライン終了");
     });
+}
+
+/// 効果音を判定して `msg.sound` に入れる。設定と実績のレート表は必要な時だけ読む。
+fn stamp_message_sound(state: &AppState, msg: &mut ChatMessage, verdict: &Verdict) {
+    let cfg = state.config.lock().unwrap();
+    if !cfg.sound_effects.enabled {
+        return;
+    }
+    let (rates, symbols) = if msg.amount.is_some() {
+        let defs = state.achievement_defs.current();
+        (defs.rates, defs.symbol_overrides)
+    } else {
+        Default::default()
+    };
+    let mut gate = state.sound_gate.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    sound_effects::stamp_sound(msg, verdict, &cfg, (&rates, &symbols), |id| state.sounds.contains(id), &mut gate, std::time::Instant::now());
 }
 
 fn spawn_achievement_events(
@@ -3738,6 +3810,8 @@ pub fn run() {
                         achievement_engine: Mutex::new(achievement_engine),
                         achievement_defs,
                         chatlog: chatlog::ChatLog::start(&config_dir, config.log.clone()),
+                        sounds: sounds::SoundStore::new(&config_dir),
+                        sound_gate: Mutex::new(sound_effects::SoundGate::default()),
                         config: Mutex::new(config.clone()),
                         startup_config_outcome: Mutex::new(Some(load_outcome)),
                         config_revision: AtomicU64::new(0),
@@ -3973,6 +4047,10 @@ pub fn run() {
             duplicate_template,
             delete_template,
             import_template_zip,
+            list_custom_sounds,
+            add_custom_sound,
+            read_custom_sound,
+            remove_custom_sound,
             get_goal_skin_info,
             get_participants,
             pick_next_participant,
@@ -4014,6 +4092,18 @@ pub fn run() {
                 state.flush_achievements();
             }
         });
+}
+
+#[cfg(test)]
+mod sound_command_tests {
+    use super::decode_sound_name;
+
+    #[test]
+    fn sound_name_header_is_percent_decoded_literally() {
+        assert_eq!(decode_sound_name("%E3%83%94%E3%83%B3.wav"), "ピン.wav");
+        assert_eq!(decode_sound_name("a%2Bb%20c.mp3"), "a+b c.mp3");
+        assert_eq!(decode_sound_name(""), "");
+    }
 }
 
 #[cfg(test)]

@@ -582,6 +582,7 @@ fn comment_to_chat(v: &Value, ctx: &MapContext<'_>) -> Option<ChatMessage> {
         skip_tts: false,
         injected_test: false,
         route: Default::default(),
+        sound: None,
     })
 }
 
@@ -637,6 +638,7 @@ fn gift_to_chat(v: &Value, ctx: &MapContext<'_>) -> Option<ChatMessage> {
         skip_tts: false,
         injected_test: false,
         route: Default::default(),
+        sound: None,
     })
 }
 

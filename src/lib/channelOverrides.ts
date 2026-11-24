@@ -8,6 +8,8 @@ export type TtsBackend = 'bouyomi' | 'voicevox' | 'webSpeech' | 'none';
  */
 export interface OverridesForm {
   ttsDisabled: boolean;
+  /** 効果音を鳴らさない(false だけを保存する。チェックなし = 全体に従う)。 */
+  soundDisabled: boolean;
   voice: string | number | null | undefined;
 }
 
@@ -36,6 +38,7 @@ function voiceValue(voice: ChannelTtsVoice | undefined, backend: TtsBackend): st
 export function toFormState(overrides: ChannelOverrides | undefined, backend: TtsBackend): OverridesForm {
   return {
     ttsDisabled: overrides?.ttsEnabled === false,
+    soundDisabled: overrides?.soundEnabled === false,
     voice: voiceValue(overrides?.ttsVoice, backend),
   };
 }
@@ -48,6 +51,7 @@ export function fromFormState(
 ): ChannelOverrides {
   const out: ChannelOverrides = {};
   if (form.ttsDisabled) out.ttsEnabled = false;
+  if (form.soundDisabled) out.soundEnabled = false;
   const voice: ChannelTtsVoice = { ...prev?.ttsVoice };
   if (backend === 'voicevox') delete voice.voicevoxSpeaker;
   else if (backend === 'bouyomi') delete voice.bouyomiVoice;
@@ -80,6 +84,8 @@ export function reapplyPendingForm(
   const voiceChanged = String(pending.voice ?? '') !== String(previousBase.voice ?? '');
   return {
     ttsDisabled: pending.ttsDisabled !== previousBase.ttsDisabled ? pending.ttsDisabled : nextBase.ttsDisabled,
+    soundDisabled:
+      pending.soundDisabled !== previousBase.soundDisabled ? pending.soundDisabled : nextBase.soundDisabled,
     voice: voiceChanged && !backendChanged ? pending.voice : nextBase.voice,
   };
 }
@@ -103,9 +109,12 @@ export function voiceOptions(backend: TtsBackend, sources: VoiceSources = {}): V
   return options;
 }
 
-/** チップの印。読まない枠だけ出す。 */
+/** チップの印。読まない枠・効果音を切った枠だけ出す。 */
 export function chipBadge(ch: ChannelConfig): string | null {
-  return ch.overrides?.ttsEnabled === false ? '読まない' : null;
+  const marks: string[] = [];
+  if (ch.overrides?.ttsEnabled === false) marks.push('読まない');
+  if (ch.overrides?.soundEnabled === false) marks.push('効果音なし');
+  return marks.length > 0 ? marks.join('・') : null;
 }
 
 /** 行を書く IPC の応答で、画面の行を丸ごと置き換える(Rust が正規化した値が正)。 */

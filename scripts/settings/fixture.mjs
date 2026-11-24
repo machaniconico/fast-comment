@@ -17,6 +17,14 @@ const initial = {
   tts: { backend: 'none', options: {} },
   moderation: { ngWords: [], ngUsers: [], highlights: [] },
   ui: { maxBuffer: 2000, notifySound: false, notifyVolume: 0.5 },
+  soundEffects: {
+    enabled: false, volume: 0.6, minIntervalMs: 300,
+    superChat: { enabled: true, sound: 'builtin:coin', minJpy: 0 },
+    bits: { enabled: true, sound: 'builtin:pop', minJpy: 0 },
+    gift: { enabled: true, sound: 'builtin:bell', minJpy: 0 },
+    membership: { enabled: true, sound: 'builtin:chime', minJpy: 0 },
+    firstComment: { enabled: false, sound: 'builtin:pop', minJpy: 0 },
+  },
   credentials: { twitcastingClientId: 'saved-tc', xPostClientId: 'saved-x' },
   twitcasting: { callbackPort: 39822 },
   xPost: {

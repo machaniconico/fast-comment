@@ -12,6 +12,7 @@
 
 import { isListenerDeleted, type ChatMessage, type ListenerUpdate, type ModerationEvent, type Platform, type RemovedState, type UiChatMessage } from './types';
 import { activeFilterCount, prependCapped, defaultDisplayFilter, isDefaultFilter, matchesDisplayFilter, normalizeDisplayFilter, type DisplayFilter } from './displayFilter';
+import { alertFor } from './soundEffects';
 import { carryModeration, moderationMatcher, RecentModerationLog } from './moderationEvents';
 import { onChatBatch, onModerationBatch, startModerationListener, startChatListener, startListenerUpdatedListener, startTtsSpeakListener, startTtsCancelListener, startTtsAudioListener, getConfig } from './ipc';
 
@@ -145,10 +146,16 @@ class CommentStore {
   // Monotonically increasing count of highlight-badge messages received — drives
   // the keyword notification (sound/flash). Never reset, like _received.
   private _highlightSeq: number = $state(0);
+  // Highlights that need the legacy beep (no sound effect on the same message). Never reset.
+  private _beepSeq: number = $state(0);
 
   // Notification prefs, loaded from config.ui at init and updated live by Settings.
   notifySound: boolean = $state(false);
   notifyVolume: number = $state(0.5);
+  // Sound-effect playback. Rust decides *which* sound (msg.sound) and throttles; the UI only plays it.
+  soundVolume: number = $state(0.6);
+  /** Set by Notifier. Plain field (not reactive): called once per message that carries a sound. */
+  soundHandler: ((sound: string, volume: number) => void) | null = null;
 
   // Public filter state
   filterPlatform: Platform | 'all' = $state('all');
@@ -250,6 +257,7 @@ class CommentStore {
 
   // Derived: monotonically increasing highlight-message count (notification trigger)
   readonly highlightCount: number = $derived(this._highlightSeq);
+  readonly beepCount: number = $derived(this._beepSeq);
 
   // Latest 'listener-updated' payload with a monotonically increasing receive number,
   // so the user card can tell already-seen events from new ones.
@@ -366,6 +374,8 @@ class CommentStore {
     let memberships = don.memberships;
     let donChanged = false;
     let highlightDelta = 0;
+    let beepDelta = 0;
+    const cues: string[] = [];
     const incoming: BufEntry[] = [];
     let baseBuffer = this._buf;
     let copiedForGiftUpdate = false;
@@ -411,7 +421,11 @@ class CommentStore {
 
       // Highlight detection is independent of kind (a SuperChat can also be a
       // highlight), so check it separately from the donation tally below.
-      if (msg.author.badges.some((b) => b.kind === 'highlight')) highlightDelta += 1;
+      const highlighted = msg.author.badges.some((b) => b.kind === 'highlight');
+      if (highlighted) highlightDelta += 1;
+      const alert = alertFor(highlighted, uiMsg);
+      if (alert.beep) beepDelta += 1;
+      if (alert.sound) cues.push(alert.sound);
       const donationKind = getDonationKind(msg);
       if (donationKind === 'membership') {
         memberships += 1;
@@ -432,6 +446,8 @@ class CommentStore {
     this._received += incoming.length;
     if (donChanged) this._donations = { byCurrency, memberships };
     if (highlightDelta) this._highlightSeq += highlightDelta;
+    if (beepDelta) this._beepSeq += beepDelta;
+    for (const cue of cues) this.soundHandler?.(cue, this.soundVolume);
 
     this._firstComments = prependCapped(
       this._firstComments,
@@ -551,6 +567,11 @@ class CommentStore {
     if (Number.isFinite(volume)) this.notifyVolume = Math.min(1, Math.max(0, volume));
   }
 
+  /** Update the sound-effect volume live (called by Settings and at init). */
+  setSoundVolume(volume: number): void {
+    if (Number.isFinite(volume)) this.soundVolume = Math.min(1, Math.max(0, volume));
+  }
+
   clearMessages(): void {
     this._buf = [];
     this._msgs = [];
@@ -585,6 +606,7 @@ class CommentStore {
     }
     if (config) {
       this.setNotify(config.ui.notifySound ?? false, config.ui.notifyVolume ?? 0.5);
+      this.setSoundVolume(config.soundEffects?.volume ?? 0.6);
     }
     // allSettled: if one listener fails to register, release the ones that did.
     const results = await Promise.allSettled([

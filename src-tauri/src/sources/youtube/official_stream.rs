@@ -348,6 +348,7 @@ fn to_chat_message(item: LiveChatMessage, video_id: &str) -> Option<ChatMessage>
         skip_tts: false,
         injected_test: false,
         route: Default::default(),
+        sound: None,
     })
 }
 
@@ -1056,6 +1057,7 @@ mod tests {
             skip_tts: false,
             injected_test: false,
             route: Default::default(),
+            sound: None,
         }
     }
 }

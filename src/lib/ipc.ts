@@ -12,6 +12,7 @@ import { Channel, invoke as tauriInvoke } from '@tauri-apps/api/core';
 import { emit, listen } from '@tauri-apps/api/event';
 import { getCurrentWindow, primaryMonitor } from '@tauri-apps/api/window';
 import { createTtsAudioPlayer } from './ttsAudio';
+import type { CustomSound, SoundEffectsConfig } from './soundEffects';
 
 // ---- Tauri availability guard ----
 // @tauri-apps/api throws when window.__TAURI_INTERNALS__ is absent (browser dev).
@@ -427,6 +428,8 @@ export interface AppConfig {
     notifyVolume: number;
   };
   participation: ParticipationConfig;
+  /** 種別ごとの効果音。Rust は常に送る。 */
+  soundEffects: SoundEffectsConfig;
   log?: LogConfig;
   youtubeOverrides?: { apiKey?: string; clientVersion?: string; paths?: Record<string, string> };
   xOverrides?: { bearerToken?: string; endpoints?: Record<string, string> };
@@ -618,6 +621,8 @@ export interface ChannelTtsVoice {
 /** Rust `ChannelOverrides`。`ttsEnabled` は false(この枠は読まない)だけ保存される。 */
 export interface ChannelOverrides {
   ttsEnabled?: boolean;
+  /** false だけを保存する(効果音を鳴らさない枠)。 */
+  soundEnabled?: boolean;
   ttsVoice?: ChannelTtsVoice;
 }
 
@@ -898,6 +903,43 @@ export async function importTemplateZip(name: string, bytes: Uint8Array): Promis
   return tauriInvoke<TemplateImportResult>('import_template_zip', bytes, {
     headers: { 'x-template-name': name }
   });
+}
+
+/** カスタム効果音の一覧。 */
+export async function listCustomSounds(): Promise<CustomSound[]> {
+  return (await invoke<CustomSound[]>('list_custom_sounds')) ?? [];
+}
+
+/** 音声のバイト列を raw body で渡して取り込む。名前は表示用だけで、保存名は Rust が付ける。 */
+export async function addCustomSound(name: string, bytes: Uint8Array): Promise<CustomSound> {
+  if (!isTauri()) throw new Error('Tauri環境でのみ取り込めます');
+  return tauriInvoke<CustomSound>('add_custom_sound', bytes, {
+    headers: { 'x-sound-name': encodeURIComponent(name) },
+  });
+}
+
+/** 再生用の中身。無い・読めない時は null。 */
+export async function readCustomSound(id: string): Promise<{ mime: string; bytes: Uint8Array } | null> {
+  if (!isTauri()) return null;
+  try {
+    const buffer = await tauriInvoke<ArrayBuffer>('read_custom_sound', { id });
+    const bytes = new Uint8Array(buffer);
+    return { mime: soundMime(bytes), bytes };
+  } catch {
+    return null;
+  }
+}
+
+function soundMime(bytes: Uint8Array): string {
+  const tag = (offset: number, text: string) => text.split('').every((c, i) => bytes[offset + i] === c.charCodeAt(0));
+  if (tag(0, 'RIFF') && tag(8, 'WAVE')) return 'audio/wav';
+  if (tag(0, 'OggS')) return 'audio/ogg';
+  return 'audio/mpeg';
+}
+
+/** 削除する。設定は書き換えない(使っていた規則は保存時と再生時に既定音へ寄る)。 */
+export async function removeCustomSound(id: string): Promise<boolean> {
+  return (await invoke<boolean>('remove_custom_sound', { id })) ?? false;
 }
 
 export interface GoalSkinInfo {
