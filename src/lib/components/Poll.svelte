@@ -3,9 +3,9 @@
   import { listen } from '@tauri-apps/api/event';
   import {
     copyTextToClipboard, getConfig, getObsPollUrl, getPollState, getTwitchOauthStatus, isTauri,
-    resetPoll, setPollDisplay, startPoll, stopPoll,
+    getYoutubeOauthStatus, resetPoll, setPollDisplay, startPoll, stopPoll,
   } from '../ipc';
-  import type { TwitchOauthStatus } from '../ipc';
+  import type { TwitchOauthStatus, YoutubeOauthStatus } from '../ipc';
   import { ui } from '../ui.svelte';
   import { isWinner, pollRows, roundPercent, sector, timeLeft } from '../pollView';
   import type { PollDisplay, PollPreferences, PollSnapshot, PollSource } from '../pollView';
@@ -18,6 +18,7 @@
 
   let source = $state<PollSource>('chat');
   let oauth = $state<TwitchOauthStatus | null>(null);
+  let youtubeOauth = $state<YoutubeOauthStatus | null>(null);
   let snapshot = $state<PollSnapshot | null>(null);
   let question = $state('');
   let options = $state<string[]>(Array.from({ length: 10 }, () => ''));
@@ -35,6 +36,8 @@
   let now = $state(Date.now());
 
   const twitch = $derived(source === 'twitch');
+  const youtube = $derived(source === 'youtube');
+  const maxOptions = $derived(twitch ? 5 : youtube ? 4 : 10);
   const open = $derived(snapshot?.status === 'open');
   const rows = $derived(pollRows(snapshot?.options ?? []));
   const settings = $derived({ display, showPercent, showCounts });
@@ -59,9 +62,21 @@
     return () => { disposed = true; };
   });
 
+  $effect(() => {
+    if (!ready || !youtube) return;
+    let disposed = false;
+    youtubeOauth = null;
+    void getYoutubeOauthStatus().then((status) => {
+      if (!disposed) youtubeOauth = status;
+    }).catch(() => {
+      // 開始時にも認証状態を確認し、Rust のエラーを表示する。
+    });
+    return () => { disposed = true; };
+  });
+
   function selectSource(value: string) {
-    source = value === 'twitch' ? 'twitch' : 'chat';
-    if (source === 'twitch') optionCount = Math.min(optionCount, 5);
+    source = value === 'twitch' || value === 'youtube' ? value : 'chat';
+    optionCount = Math.min(optionCount, maxOptions);
   }
 
   function loadPreferences(saved: PollPreferences) {
@@ -157,15 +172,19 @@
         <select value={source} onchange={(event) => selectSource(event.currentTarget.value)}>
           <option value="chat">コメント</option>
           <option value="twitch">Twitch</option>
+          <option value="youtube">YouTube 公式投票</option>
         </select>
       </label>
       {#if twitch}
         <p>質問は60文字まで、選択肢は2〜5件で各25文字までです。</p>
+      {:else if youtube}
+        <p>質問は100文字まで、選択肢は2〜4件で各40文字までです。期間は任意です（10〜3600秒）。</p>
+        <p>受付中は10秒ごとに YouTube API の割り当てを5ユニット消費します。上限に達すると集計を終了します。</p>
       {/if}
       <label>質問 <textarea rows="1" bind:value={question}></textarea></label>
       <label>選択肢の数
         <select bind:value={optionCount}>
-          {#each options.slice(1, twitch ? 5 : 10) as _, index (index)}
+          {#each options.slice(1, maxOptions) as _, index (index)}
             <option value={index + 2}>{index + 2}</option>
           {/each}
         </select>
@@ -218,6 +237,14 @@
       <p>
         {oauth.connected ? 'Twitch で再ログインしてください' : 'Twitch にログインしてください'}
         <button type="button" onclick={() => ui.gotoSetting('twitchOauth')}>Twitch ログイン設定を開く</button>
+      </p>
+    {/if}
+  {:else if youtube}
+    <p>視聴者は YouTube のライブチャットから投票できます。</p>
+    {#if youtubeOauth && !youtubeOauth.connected}
+      <p>
+        設定から YouTube の配信チャンネルの Google アカウントに接続してください。
+        <button type="button" onclick={() => ui.gotoSetting('youtubeOauth')}>YouTube ログイン設定を開く</button>
       </p>
     {/if}
   {:else}
