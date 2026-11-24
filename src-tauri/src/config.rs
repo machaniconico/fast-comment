@@ -38,16 +38,24 @@ pub struct ChannelOverrides {
     pub tts_enabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tts_voice: Option<ChannelTtsVoice>,
+    /// 効果音。`false` だけを保存する(`true` は上書き無しと同じ)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sound_enabled: Option<bool>,
 }
 
 impl ChannelOverrides {
     pub fn is_empty(&self) -> bool {
-        self.tts_enabled.is_none() && self.tts_voice.as_ref().is_none_or(ChannelTtsVoice::is_empty)
+        self.tts_enabled.is_none()
+            && self.sound_enabled.is_none()
+            && self.tts_voice.as_ref().is_none_or(ChannelTtsVoice::is_empty)
     }
 
     pub fn normalize(&mut self) {
         if self.tts_enabled == Some(true) {
             self.tts_enabled = None;
+        }
+        if self.sound_enabled == Some(true) {
+            self.sound_enabled = None;
         }
         if let Some(voice) = &mut self.tts_voice {
             voice.web_speech_voice = voice
@@ -1314,6 +1322,9 @@ pub struct AppConfig {
     pub x_post: XPostConfig,
     #[serde(default)]
     pub twitcasting: TwitcastingConfig,
+    /// 種別ごとの効果音。読み込みは寛容(壊れた項目は既定値)。
+    #[serde(default)]
+    pub sound_effects: crate::sound_effects::SoundEffectsConfig,
 }
 
 impl Default for AppConfig {
@@ -1337,6 +1348,7 @@ impl Default for AppConfig {
             credentials: CredentialsConfig::default(),
             x_post: XPostConfig::default(),
             twitcasting: TwitcastingConfig::default(),
+            sound_effects: Default::default(),
         }
     }
 }
@@ -1469,6 +1481,7 @@ impl AppConfig {
         self.tts.options.normalize();
         self.x_post.normalize();
         self.twitcasting.normalize();
+        self.sound_effects.normalize();
         for channel in &mut self.channels {
             channel.overrides.normalize();
         }
@@ -2035,6 +2048,7 @@ mod tests {
             twitcasting_overrides: Default::default(),
             x_post: XPostConfig::default(),
             twitcasting: TwitcastingConfig::default(),
+            sound_effects: Default::default(),
         };
 
         let text = serde_json::to_string(&cfg).expect("serialize AppConfig");
@@ -2801,6 +2815,7 @@ mod tests {
                     web_speech_voice: Some("  ".into()),
                     ..Default::default()
                 }),
+                sound_enabled: Some(true),
             },
         );
         replace_channel_in(&mut cfg, "twitch:old", new).unwrap();
@@ -3131,5 +3146,33 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.to_string(), CONFIG_SAVE_BLOCKED_ERROR);
+    }
+
+    #[test]
+    fn sound_enabled_override_stores_only_false() {
+        let mut o = ChannelOverrides { sound_enabled: Some(true), ..Default::default() };
+        o.normalize();
+        assert!(o.is_empty());
+        let mut off = ChannelOverrides { sound_enabled: Some(false), ..Default::default() };
+        off.normalize();
+        assert!(!off.is_empty());
+        assert_eq!(serde_json::to_string(&off).unwrap(), r#"{"soundEnabled":false}"#);
+        assert_eq!(serde_json::to_string(&ChannelOverrides::default()).unwrap(), "{}");
+        let old: ChannelOverrides = serde_json::from_str(r#"{"ttsEnabled":false}"#).unwrap();
+        assert_eq!(old.sound_enabled, None);
+    }
+
+    #[test]
+    fn removing_a_custom_sound_resets_only_rules_that_used_it() {
+        let id = "0b1c2d3e-4f50-4a6b-8c7d-9e0f1a2b3c4d";
+        let other = "1b1c2d3e-4f50-4a6b-8c7d-9e0f1a2b3c4d";
+        let mut cfg = crate::sound_effects::SoundEffectsConfig::default();
+        cfg.super_chat.sound = format!("custom:{id}");
+        cfg.gift.sound = format!("custom:{other}");
+        assert!(cfg.reset_removed_custom(id));
+        let d = crate::sound_effects::SoundEffectsConfig::default();
+        assert_eq!(cfg.super_chat.sound, d.super_chat.sound);
+        assert_eq!(cfg.gift.sound, format!("custom:{other}"));
+        assert!(!cfg.reset_removed_custom(id));
     }
 }

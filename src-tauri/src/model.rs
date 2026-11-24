@@ -293,6 +293,9 @@ pub struct ChatMessage {
     /// 内部制御用: inject_test_comment が注入したテストコメント。シリアライズしない。
     #[serde(skip)]
     pub injected_test: bool,
+    /// 効果音の指定(`builtin:<名前>` / `custom:<id>`)。パイプラインが判定して入れ、UI は鳴らすだけ。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sound: Option<String>,
     #[serde(skip)]
     pub route: MessageRoute,
 }

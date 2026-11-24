@@ -1,10 +1,28 @@
 <script lang="ts">
-  import { onDestroy, untrack } from 'svelte';
+  import { onDestroy, onMount, untrack } from 'svelte';
   import { store } from '../stores.svelte';
+  import { readCustomSound } from '../ipc';
+  import { createSoundPlayer } from '../soundEffects';
 
   let prev = $state(0);
   let initialized = $state(false);
   let flashing = $state(false);
+
+  let lastBeep = 0;
+  const sounds = createSoundPlayer({
+    createContext: () => new AudioContext() as never,
+    createAudio: () => new Audio(),
+    loadCustom: readCustomSound,
+    createObjectUrl: (blob) => URL.createObjectURL(blob),
+    revokeObjectUrl: (url) => URL.revokeObjectURL(url),
+  });
+
+  onMount(() => {
+    store.soundHandler = (sound, volume) => void sounds.play(sound, volume);
+    return () => {
+      store.soundHandler = null;
+    };
+  });
 
   let audioCtx: AudioContext | null = null;
   let flashTimeout: ReturnType<typeof setTimeout> | null = null;
@@ -63,6 +81,7 @@
 
     if (!wasInitialized) {
       untrack(() => {
+        lastBeep = store.beepCount;
         prev = current;
         initialized = true;
       });
@@ -72,9 +91,12 @@
       });
 
       if (store.notifySound) {
-        void playBeep();
+        // 同じメッセージに効果音が付いた時は効果音を優先し、ビープは鳴らさない(フラッシュは出す)。
+        const beeps = untrack(() => store.beepCount);
+        if (beeps > lastBeep) void playBeep();
         triggerFlash();
       }
+      lastBeep = untrack(() => store.beepCount);
     } else if (current !== last) {
       // highlightCount is monotonic, but keep local state synced if stores are replaced in tests.
       untrack(() => {
@@ -84,6 +106,7 @@
   });
 
   onDestroy(() => {
+    sounds.dispose();
     if (flashTimeout !== null) {
       clearTimeout(flashTimeout);
       flashTimeout = null;

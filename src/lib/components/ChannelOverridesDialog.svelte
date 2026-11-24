@@ -33,7 +33,7 @@
   let speakersFailed = $state(false);
   let savedVoice = $state('');
   let baseForm = toFormState(undefined, 'none');
-  let form: OverridesForm = $state({ ttsDisabled: false, voice: '' });
+  let form: OverridesForm = $state({ ttsDisabled: false, soundDisabled: false, voice: '' });
   let speakers: TtsEngineSpeaker[] = $state([]);
   let webVoices: string[] = $state([]);
   let error = $state('');
@@ -171,6 +171,14 @@
       <p class="ov-error">話者一覧を取得できませんでした</p>
     {/if}
 
+    <label class="ov-row">
+      <span>効果音</span>
+      <span class="ov-check">
+        <input type="checkbox" aria-label="この枠は効果音を鳴らさない" disabled={missing} bind:checked={form.soundDisabled} />
+        この枠は効果音を鳴らさない
+      </span>
+    </label>
+
     {#if error}<p class="ov-error" role="alert">{error}</p>{/if}
 
     <div class="ov-actions">
@@ -181,6 +189,13 @@
 </div>
 
 <style>
+  .ov-check {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .ov-row .ov-check input { flex: none; max-width: none; padding: 0; }
+
   .ov-backdrop {
     position: fixed;
     inset: 0;

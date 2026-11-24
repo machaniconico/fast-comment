@@ -1025,6 +1025,7 @@ fn chunked_to_chat(
                 skip_tts: false,
                 injected_test: false,
                 route: Default::default(),
+                sound: None,
             })
         }
         ndgr::nicolive_message::Data::Gift(g) => {
@@ -1076,6 +1077,7 @@ fn chunked_to_chat(
                 skip_tts: false,
                 injected_test: false,
                 route: Default::default(),
+                sound: None,
             })
         }
     }

@@ -11,29 +11,29 @@ import {
 } from './channelOverrides.ts';
 
 test('toFormState_maps_absent_overrides_to_follow_global', () => {
-  assert.deepEqual(toFormState(undefined, 'voicevox'), { ttsDisabled: false, voice: '' });
-  assert.deepEqual(toFormState({}, 'webSpeech'), { ttsDisabled: false, voice: '' });
+  assert.deepEqual(toFormState(undefined, 'voicevox'), { ttsDisabled: false, soundDisabled: false, voice: '' });
+  assert.deepEqual(toFormState({}, 'webSpeech'), { ttsDisabled: false, soundDisabled: false, voice: '' });
   assert.deepEqual(toFormState({ ttsEnabled: false, ttsVoice: { voicevoxSpeaker: 3 } }, 'voicevox'), {
-    ttsDisabled: true,
+    ttsDisabled: true, soundDisabled: false,
     voice: '3',
   });
   assert.equal(toFormState({ ttsVoice: { voicevoxSpeaker: 3 } }, 'bouyomi').voice, '');
 });
 
 test('fromFormState_omits_empty_voice_and_true_flag', () => {
-  assert.deepEqual(fromFormState({ ttsDisabled: false, voice: '' }, 'voicevox'), {});
-  assert.deepEqual(fromFormState({ ttsDisabled: true, voice: '' }, 'voicevox'), { ttsEnabled: false });
-  assert.deepEqual(fromFormState({ ttsDisabled: false, voice: '2' }, 'voicevox'), {
+  assert.deepEqual(fromFormState({ ttsDisabled: false, soundDisabled: false, voice: '' }, 'voicevox'), {});
+  assert.deepEqual(fromFormState({ ttsDisabled: true, soundDisabled: false, voice: '' }, 'voicevox'), { ttsEnabled: false });
+  assert.deepEqual(fromFormState({ ttsDisabled: false, soundDisabled: false, voice: '2' }, 'voicevox'), {
     ttsVoice: { voicevoxSpeaker: 2 },
   });
   // 他 backend の声は残し、今の backend の声だけ「全体に従う」で消える
   assert.deepEqual(
-    fromFormState({ ttsDisabled: false, voice: '' }, 'voicevox', {
+    fromFormState({ ttsDisabled: false, soundDisabled: false, voice: '' }, 'voicevox', {
       ttsVoice: { voicevoxSpeaker: 2, bouyomiVoice: 4 },
     }),
     { ttsVoice: { bouyomiVoice: 4 } },
   );
-  assert.deepEqual(fromFormState({ ttsDisabled: false, voice: 'abc' }, 'bouyomi'), {});
+  assert.deepEqual(fromFormState({ ttsDisabled: false, soundDisabled: false, voice: 'abc' }, 'bouyomi'), {});
 });
 
 test('voiceOptions_for_current_backend_has_follow_global_first', () => {
@@ -74,11 +74,11 @@ test('applyChannelsSaved_replaces_local_channels_from_response', () => {
 
 test('bouyomi_voice_zero_is_distinct_from_follow_global', () => {
   assert.equal(toFormState({ ttsVoice: { bouyomiVoice: 0 } }, 'bouyomi').voice, '0');
-  assert.deepEqual(fromFormState({ ttsDisabled: false, voice: '0' }, 'bouyomi'), { ttsVoice: { bouyomiVoice: 0 } });
-  assert.deepEqual(fromFormState({ ttsDisabled: false, voice: '10001' }, 'bouyomi'), {
+  assert.deepEqual(fromFormState({ ttsDisabled: false, soundDisabled: false, voice: '0' }, 'bouyomi'), { ttsVoice: { bouyomiVoice: 0 } });
+  assert.deepEqual(fromFormState({ ttsDisabled: false, soundDisabled: false, voice: '10001' }, 'bouyomi'), {
     ttsVoice: { bouyomiVoice: 10001 },
   });
-  assert.deepEqual(fromFormState({ ttsDisabled: false, voice: '' }, 'bouyomi'), {});
+  assert.deepEqual(fromFormState({ ttsDisabled: false, soundDisabled: false, voice: '' }, 'bouyomi'), {});
 });
 
 test('replacedChannelKeys_lists_every_old_row_of_same_platform_for_x_and_niconico', () => {
@@ -97,23 +97,23 @@ test('replacedChannelKeys_lists_every_old_row_of_same_platform_for_x_and_niconic
 
 test('fromFormState_treats_cleared_bouyomi_number_input_as_follow_global', () => {
   // <input type="number" bind:value> は消すと null になる。0(棒読みちゃん既定)として保存しない。
-  assert.deepEqual(fromFormState({ ttsDisabled: false, voice: null }, 'bouyomi'), {});
-  assert.deepEqual(fromFormState({ ttsDisabled: false, voice: undefined }, 'bouyomi'), {});
+  assert.deepEqual(fromFormState({ ttsDisabled: false, soundDisabled: false, voice: null }, 'bouyomi'), {});
+  assert.deepEqual(fromFormState({ ttsDisabled: false, soundDisabled: false, voice: undefined }, 'bouyomi'), {});
   assert.deepEqual(
-    fromFormState({ ttsDisabled: false, voice: null }, 'bouyomi', { ttsVoice: { bouyomiVoice: 3, voicevoxSpeaker: 2 } }),
+    fromFormState({ ttsDisabled: false, soundDisabled: false, voice: null }, 'bouyomi', { ttsVoice: { bouyomiVoice: 3, voicevoxSpeaker: 2 } }),
     { ttsVoice: { voicevoxSpeaker: 2 } },
   );
   // 明示の 0 は保存する
-  assert.deepEqual(fromFormState({ ttsDisabled: false, voice: 0 }, 'bouyomi'), { ttsVoice: { bouyomiVoice: 0 } });
+  assert.deepEqual(fromFormState({ ttsDisabled: false, soundDisabled: false, voice: 0 }, 'bouyomi'), { ttsVoice: { bouyomiVoice: 0 } });
 });
 
 test('reapplyPendingForm_keeps_user_input_after_stale_reload', () => {
-  const previousBase = { ttsDisabled: false, voice: '1' };
-  const pending = { ttsDisabled: true, voice: '7' };
-  const nextBase = { ttsDisabled: false, voice: '2' };
-  assert.deepEqual(reapplyPendingForm(previousBase, pending, nextBase, false), { ttsDisabled: true, voice: '7' });
+  const previousBase = { ttsDisabled: false, soundDisabled: false, voice: '1' };
+  const pending = { ttsDisabled: true, soundDisabled: false, voice: '7' };
+  const nextBase = { ttsDisabled: false, soundDisabled: false, voice: '2' };
+  assert.deepEqual(reapplyPendingForm(previousBase, pending, nextBase, false), { ttsDisabled: true, soundDisabled: false, voice: '7' });
   // backend が変わったら声だけ新しい基準に戻す
-  assert.deepEqual(reapplyPendingForm(previousBase, pending, nextBase, true), { ttsDisabled: true, voice: '2' });
+  assert.deepEqual(reapplyPendingForm(previousBase, pending, nextBase, true), { ttsDisabled: true, soundDisabled: false, voice: '2' });
 });
 
 test('reapplyPendingForm_keeps_the_latest_voice_when_only_tts_was_edited', () => {
@@ -129,11 +129,33 @@ test('reapplyPendingForm_keeps_the_latest_voice_when_only_tts_was_edited', () =>
 });
 
 test('reapplyPendingForm_preserves_latest_tts_flag_and_handles_number_input_values', () => {
-  const previousBase = { ttsDisabled: false, voice: '0' };
-  const nextBase = { ttsDisabled: true, voice: '2' };
+  const previousBase = { ttsDisabled: false, soundDisabled: false, voice: '0' };
+  const nextBase = { ttsDisabled: true, soundDisabled: false, voice: '2' };
   assert.deepEqual(reapplyPendingForm(previousBase, { ...previousBase, voice: 0 }, nextBase, false), nextBase);
   assert.deepEqual(reapplyPendingForm(previousBase, { ...previousBase, voice: null }, nextBase, false), {
-    ttsDisabled: true,
+    ttsDisabled: true, soundDisabled: false,
     voice: null,
   });
+});
+
+test('sound_disabled_roundtrips_and_only_false_is_sent', () => {
+  assert.equal(toFormState({ soundEnabled: false }, 'none').soundDisabled, true);
+  assert.equal(toFormState({ soundEnabled: true }, 'none').soundDisabled, false);
+  assert.equal(toFormState(undefined, 'none').soundDisabled, false);
+  assert.deepEqual(fromFormState({ ttsDisabled: false, soundDisabled: true, voice: '' }, 'none'), { soundEnabled: false });
+  assert.deepEqual(fromFormState({ ttsDisabled: false, soundDisabled: false, voice: '' }, 'none'), {});
+});
+
+test('chipBadge_marks_sound_off_alone_and_with_tts_off', () => {
+  const base = { platform: 'twitch', identifier: 'a', enabled: true, ownStream: false } as const;
+  assert.equal(chipBadge({ ...base, overrides: { soundEnabled: false } }), '効果音なし');
+  assert.equal(chipBadge({ ...base, overrides: { ttsEnabled: false, soundEnabled: false } }), '読まない・効果音なし');
+  assert.equal(chipBadge({ ...base, overrides: { soundEnabled: true } }), null);
+});
+
+test('reapply_keeps_a_pending_sound_choice_over_a_new_base', () => {
+  const prev = { ttsDisabled: false, soundDisabled: false, voice: '' };
+  const next = { ttsDisabled: false, soundDisabled: true, voice: '' };
+  assert.equal(reapplyPendingForm(prev, { ...prev, soundDisabled: true }, { ...prev }, false).soundDisabled, true);
+  assert.equal(reapplyPendingForm(prev, { ...prev }, next, false).soundDisabled, true);
 });

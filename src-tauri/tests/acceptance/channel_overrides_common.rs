@@ -29,12 +29,13 @@ pub fn cfg_with(channels: Vec<ChannelConfig>) -> AppConfig {
 }
 
 pub fn off() -> ChannelOverrides {
-    ChannelOverrides { tts_enabled: Some(false), tts_voice: None }
+    ChannelOverrides { tts_enabled: Some(false), tts_voice: None, sound_enabled: None }
 }
 
 pub fn voice_ov(voicevox: Option<u32>, bouyomi: Option<i16>, web: Option<&str>) -> ChannelOverrides {
     ChannelOverrides {
         tts_enabled: None,
+        sound_enabled: None,
         tts_voice: Some(ChannelTtsVoice {
             voicevox_speaker: voicevox,
             bouyomi_voice: bouyomi,

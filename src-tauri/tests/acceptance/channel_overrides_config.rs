@@ -130,7 +130,7 @@ fn non_object_overrides_value_fails_load_with_path() {
 
 #[test]
 fn normalize_turns_tts_enabled_true_into_none() {
-    let mut ov = ChannelOverrides { tts_enabled: Some(true), tts_voice: None };
+    let mut ov = ChannelOverrides { tts_enabled: Some(true), tts_voice: None, sound_enabled: None };
     ov.normalize();
     assert_eq!(ov.tts_enabled, None);
     assert!(ov.is_empty());
@@ -157,7 +157,7 @@ fn normalize_trims_web_speech_voice_and_drops_empty() {
 #[test]
 fn normalize_collapses_all_none_voice_to_none() {
     for mut ov in [
-        ChannelOverrides { tts_enabled: None, tts_voice: Some(ChannelTtsVoice::default()) },
+        ChannelOverrides { tts_enabled: None, tts_voice: Some(ChannelTtsVoice::default()), sound_enabled: None },
         voice_ov(None, None, Some("   ")),
     ] {
         ov.normalize();
@@ -205,6 +205,7 @@ fn set_channel_overrides_in_replaces_only_target_row() {
     // 対象行は丸ごと置き換わる(古い ttsEnabled=false は引き継がれない)。未正規化の入力は正規化されて入る。
     let new = ChannelOverrides {
         tts_enabled: Some(true),
+        sound_enabled: None,
         tts_voice: Some(ChannelTtsVoice { web_speech_voice: Some(" Kyoko ".into()), ..Default::default() }),
     };
     set_channel_overrides_in(&mut cfg, "youtube:vid", new).expect("既存キーは置き換えられる");

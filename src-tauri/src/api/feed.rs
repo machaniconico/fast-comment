@@ -151,6 +151,7 @@ impl ApiFeed {
                 skip_tts: false,
                 injected_test: false,
                 route: Default::default(),
+                sound: None,
             },
         });
         if state.history.len() == state.capacity {

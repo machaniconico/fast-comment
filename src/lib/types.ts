@@ -116,6 +116,8 @@ export interface ChatMessage {
   amount?: Amount;
   timestampMs: number;
   raw?: unknown;
+  /** 効果音の指定(`builtin:<name>` / `custom:<id>`)。Rust が判定済みで、UI は鳴らすだけ。 */
+  sound?: string;
 }
 
 /** Anonymous YouTube reaction counts received in one backend polling update. */

@@ -31,6 +31,7 @@
   } from '../theme.svelte';
   import { buildCsv, setNotify, store } from '../stores.svelte';
   import ConfigPortability from './ConfigPortability.svelte';
+  import SoundEffectsSettings from './SoundEffectsSettings.svelte';
   import DanmakuSettings from './DanmakuSettings.svelte';
   import ModerationPortability from './ModerationPortability.svelte';
   import ModerationTester from './ModerationTester.svelte';
@@ -466,6 +467,7 @@
           hydrateConfig(saved);
           baseRevision = revision;
           setNotify(saved.ui.notifySound, saved.ui.notifyVolume);
+          store.setSoundVolume(saved.soundEffects?.volume ?? 0.6);
           onConfigSaved?.(saved, revision);
         }
         // 基準と同じ revision を読めたなら、フォームは保存済みの設定と揃っている。
@@ -1350,6 +1352,7 @@
       // client_id の変更で Twitch 側も未接続になり得るので、こちらも取り直す。
       await refreshTwitchOauth();
       setNotify(config.ui.notifySound, config.ui.notifyVolume);
+      store.setSoundVolume(config.soundEffects?.volume ?? 0.6);
       if (result) onConfigSaved?.(result.config, result.revision);
       saveMsg = saveWarned ? `保存しました(警告: ${warnings.join(' / ')})` : '保存しました';
     } catch (e) {
@@ -3141,6 +3144,15 @@
       />
       <span class="hint-inline">{Math.round(config.ui.notifyVolume * 100)}%</span>
     </div>
+    <SoundEffectsSettings
+      bind:value={config.soundEffects}
+      onVolume={(volume) => store.setSoundVolume(volume)}
+      onRemovedCommit={(commit, late) =>
+        applyCommit(commit.revision, () => {
+          if (config) config.soundEffects = commit.soundEffects;
+          store.setSoundVolume(commit.soundEffects.volume);
+        }, late)}
+    />
   </section>
 
   <!-- ── App update ── -->

@@ -184,5 +184,6 @@ pub fn msg(id: &str) -> ChatMessage {
         skip_tts: false,
         injected_test: false,
         route: Default::default(),
+        sound: None,
     }
 }
