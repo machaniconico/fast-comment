@@ -35,10 +35,9 @@ fn votes(poll: &Poll) -> Vec<u32> {
     poll.snapshot().options.iter().map(|o| o.votes).collect()
 }
 
-/// 現在の投票の poll_id(u64)は境界に定義が無いので、`apply_external` が true を返す値を探して特定する。
-/// 探索中に流す票は全て 0・開いたままなので、状態は変えない。
-fn find_poll_id(poll: &Poll) -> Option<u64> {
-    (0..10_000u64).find(|id| poll.apply_external(*id, &[0, 0, 0], false))
+/// 現在の投票の id(スナップショットの `id`、UUID の文字列)。
+fn find_poll_id(poll: &Poll) -> Option<String> {
+    Some(poll.snapshot().id).filter(|id| !id.is_empty())
 }
 
 #[test]
@@ -56,7 +55,7 @@ fn apply_external_overwrites_votes_and_closes() {
     begin(&poll, PollSource::Twitch);
     let id = find_poll_id(&poll).expect("Twitch の投票の poll_id が見つからない");
 
-    assert!(poll.apply_external(id, &[5, 3, 2], false));
+    assert!(poll.apply_external(&id, &[5, 3, 2], false));
     let s = poll.snapshot();
     assert_eq!(votes(&poll), vec![5, 3, 2]);
     assert_eq!(s.total_voters, 10);
@@ -65,7 +64,7 @@ fn apply_external_overwrites_votes_and_closes() {
     assert_eq!(s.options.iter().map(|o| o.leading).collect::<Vec<_>>(), vec![true, false, false]);
 
     // 上書き(足し込みではない)+ closed で閉じる
-    assert!(poll.apply_external(id, &[1, 1, 2], true));
+    assert!(poll.apply_external(&id, &[1, 1, 2], true));
     let s = poll.snapshot();
     assert_eq!(votes(&poll), vec![1, 1, 2]);
     assert_eq!(s.total_voters, 4);
@@ -80,10 +79,10 @@ fn apply_external_ignores_stale_or_chat_polls() {
     let poll = new_poll();
     begin(&poll, PollSource::Twitch);
     let id = find_poll_id(&poll).expect("Twitch の投票の poll_id が見つからない");
-    assert!(poll.apply_external(id, &[4, 0, 0], false));
+    assert!(poll.apply_external(&id, &[4, 0, 0], false));
     let before = poll.snapshot();
-    for stale in [id + 1, u64::MAX] {
-        assert!(!poll.apply_external(stale, &[9, 9, 9], true), "poll_id={stale}");
+    for stale in [format!("{id}x"), String::new(), "00000000-0000-0000-0000-000000000000".to_owned()] {
+        assert!(!poll.apply_external(&stale, &[9, 9, 9], true), "poll_id={stale}");
         assert_eq!(poll.snapshot(), before, "古い poll_id で状態が変わった");
     }
 
@@ -91,9 +90,8 @@ fn apply_external_ignores_stale_or_chat_polls() {
     let chat = new_poll();
     begin(&chat, PollSource::Chat);
     let before = chat.snapshot();
-    for id in 0..200u64 {
-        assert!(!chat.apply_external(id, &[9, 9, 9], true), "poll_id={id}");
-    }
+    let chat_id = chat.snapshot().id;
+    assert!(!chat.apply_external(&chat_id, &[9, 9, 9], true), "Chat の投票に適用された");
     assert_eq!(chat.snapshot(), before, "Chat の投票の状態が変わった");
 }
 
