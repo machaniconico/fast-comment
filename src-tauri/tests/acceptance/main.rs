@@ -53,5 +53,12 @@ mod achievements_wiring;
 // PR4(実績): Webhook と SSE への配信(.omc/plans/achievements-acceptance.md §3.7)
 mod achievements_relay;
 
+// PR2(アンケート): Twitch 公式 Polls(.omc/plans/poll-pr2-twitch.md)
+mod poll_twitch_common;
+mod poll_twitch_scopes;
+mod poll_twitch_helix;
+mod poll_twitch_validate;
+mod poll_twitch_poll;
+
 #[test]
 fn acceptance_harness_runs() {}

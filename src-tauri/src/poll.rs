@@ -48,6 +48,8 @@ impl Default for PollDisplaySettings {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct PollPreferences {
+    #[serde(default, skip_serializing_if = "PollSource::is_chat")]
+    pub source: PollSource,
     pub question: String,
     pub options: Vec<String>,
     #[serde(flatten)]
@@ -57,6 +59,7 @@ pub struct PollPreferences {
 impl Default for PollPreferences {
     fn default() -> Self {
         Self {
+            source: PollSource::Chat,
             question: String::new(),
             options: vec![String::new(); 2],
             settings: PollDisplaySettings::default(),
@@ -77,13 +80,32 @@ impl PollPreferences {
         if preferences.question.is_empty() && preferences.options == Self::default().options {
             return Ok(preferences);
         }
-        if preferences.validate_text().is_err() {
+        let valid = match preferences.source {
+            PollSource::Chat => preferences.validate_chat_text().is_ok(),
+            PollSource::Twitch => {
+                let valid = crate::sources::twitch_polls::validate_twitch_text(
+                    &preferences.question,
+                    &preferences.options,
+                )
+                .is_ok();
+                preferences.trim_twitch_text();
+                valid
+            }
+        };
+        if !valid {
             return Ok(Self::default());
         }
         Ok(preferences)
     }
 
-    fn validate_text(&mut self) -> Result<RegexSet, PollError> {
+    fn trim_twitch_text(&mut self) {
+        self.question = self.question.trim().to_owned();
+        for option in &mut self.options {
+            *option = option.trim().to_owned();
+        }
+    }
+
+    fn validate_chat_text(&mut self) -> Result<RegexSet, PollError> {
         self.question = self.question.trim().to_owned();
         if !(1..=100).contains(&self.question.chars().count()) {
             return Err(PollError::Invalid("質問は1〜100文字で入力してください"));
@@ -98,28 +120,33 @@ impl PollPreferences {
                 return Err(PollError::Invalid("各選択肢は1〜40文字で入力してください"));
             }
         }
-        let labels = RegexSetBuilder::new(
-            self.options
-                .iter()
-                .map(|label| format!(r"\A{}\z", regex::escape(label))),
-        )
-        .case_insensitive(true)
-        .build()
-        .map_err(|_| PollError::Invalid("選択肢を読み取れませんでした"))?;
-        if self
-            .options
-            .iter()
-            .any(|label| labels.matches(label).iter().count() > 1)
-        {
-            return Err(PollError::Invalid("同じ選択肢は指定できません"));
-        }
-        Ok(labels)
+        unique_option_labels(&self.options).map_err(PollError::Invalid)
     }
+}
+
+pub(crate) fn unique_option_labels(options: &[String]) -> Result<RegexSet, &'static str> {
+    let labels = RegexSetBuilder::new(
+        options
+            .iter()
+            .map(|label| format!(r"\A{}\z", regex::escape(trim_vote(label)))),
+    )
+    .case_insensitive(true)
+    .build()
+    .map_err(|_| "選択肢を読み取れませんでした")?;
+    if options
+        .iter()
+        .any(|label| labels.matches(trim_vote(label)).iter().count() > 1)
+    {
+        return Err("同じ選択肢は指定できません");
+    }
+    Ok(labels)
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct PollStart {
+pub struct PollStart {
+    #[serde(default)]
+    pub source: PollSource,
     pub question: String,
     pub options: Vec<String>,
     pub duration_secs: Option<u32>,
@@ -129,14 +156,22 @@ pub(crate) struct PollStart {
 }
 
 impl PollStart {
-    pub(crate) fn validate(self) -> Result<ValidatedStart, PollError> {
-        if self
+    pub fn validate(self) -> Result<ValidatedStart, PollError> {
+        if self.source == PollSource::Twitch {
+            crate::sources::twitch_polls::validate_twitch(
+                &self.question,
+                &self.options,
+                self.duration_secs,
+            )
+            .map_err(PollError::Invalid)?;
+        } else if self
             .duration_secs
             .is_some_and(|secs| !(10..=3600).contains(&secs))
         {
             return Err(PollError::Invalid("投票時間は10〜3600秒で指定してください"));
         }
         let mut preferences = PollPreferences {
+            source: self.source,
             question: self.question,
             options: self.options,
             settings: PollDisplaySettings {
@@ -145,7 +180,13 @@ impl PollStart {
                 show_counts: self.show_counts,
             },
         };
-        let labels = preferences.validate_text()?;
+        let labels = match self.source {
+            PollSource::Chat => preferences.validate_chat_text()?,
+            PollSource::Twitch => {
+                preferences.trim_twitch_text();
+                RegexSet::empty()
+            }
+        };
         Ok(ValidatedStart {
             preferences,
             labels,
@@ -154,22 +195,29 @@ impl PollStart {
     }
 }
 
-pub(crate) struct ValidatedStart {
-    preferences: PollPreferences,
+pub struct ValidatedStart {
+    pub(crate) preferences: PollPreferences,
     labels: RegexSet,
-    duration_secs: Option<u32>,
+    pub(crate) duration_secs: Option<u32>,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
-enum PollSource {
+pub enum PollSource {
     #[default]
     Chat,
+    Twitch,
+}
+
+impl PollSource {
+    fn is_chat(&self) -> bool {
+        *self == Self::Chat
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
-pub(crate) enum PollStatus {
+pub enum PollStatus {
     #[default]
     Idle,
     Open,
@@ -178,7 +226,7 @@ pub(crate) enum PollStatus {
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct PollOption {
+pub struct PollOption {
     pub label: String,
     pub votes: u32,
     pub percent: f64,
@@ -187,9 +235,9 @@ pub(crate) struct PollOption {
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct PollSnapshot {
+pub struct PollSnapshot {
     pub id: String,
-    source: PollSource,
+    pub source: PollSource,
     pub status: PollStatus,
     pub question: String,
     pub options: Vec<PollOption>,
@@ -202,7 +250,7 @@ pub(crate) struct PollSnapshot {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum PollError {
+pub enum PollError {
     #[error("{0}")]
     Invalid(&'static str),
     #[error("受付中のアンケートがあります")]
@@ -211,7 +259,7 @@ pub(crate) enum PollError {
     Save,
 }
 
-pub(crate) enum PreferenceChange<'a> {
+pub enum PreferenceChange<'a> {
     Started(&'a PollPreferences),
     Display(PollDisplaySettings),
 }
@@ -239,7 +287,7 @@ impl Default for CurrentPoll {
     }
 }
 
-pub(crate) struct Poll {
+pub struct Poll {
     // 永続化を操作間で直列化する。コメント処理と時計はこのロックを取らない。
     controls: Mutex<()>,
     current: Mutex<CurrentPoll>,
@@ -250,7 +298,7 @@ pub(crate) struct Poll {
 }
 
 impl Poll {
-    pub(crate) fn new(
+    pub fn new(
         save_preferences: impl Fn(PreferenceChange<'_>) -> Result<(), PollError> + Send + Sync + 'static,
         emit_snapshot: impl Fn(&PollSnapshot) + Send + Sync + 'static,
     ) -> Self {
@@ -268,26 +316,37 @@ impl Poll {
         self.tx.clone()
     }
 
-    pub(crate) fn snapshot(&self) -> PollSnapshot {
+    pub fn snapshot(&self) -> PollSnapshot {
         self.tx.borrow().clone()
     }
 
-    pub(crate) fn start(&self, start: ValidatedStart) -> Result<PollSnapshot, PollError> {
+    pub fn start(&self, start: ValidatedStart) -> Result<PollSnapshot, PollError> {
         let _controls = self.controls.lock().unwrap();
-        {
-            let mut current = self.current.lock().unwrap();
-            if current
-                .deadline
-                .is_some_and(|deadline| deadline <= Instant::now())
-            {
-                self.close(&mut current);
-            }
-            if current.snapshot.status == PollStatus::Open {
-                return Err(PollError::AlreadyOpen);
-            }
-        }
-        (self.save_preferences)(PreferenceChange::Started(&start.preferences))?;
+        self.check_can_start()?;
+        self.save_start_preferences(&start)?;
+        Ok(self.open(start))
+    }
 
+    pub(crate) fn check_can_start(&self) -> Result<(), PollError> {
+        let mut current = self.current.lock().unwrap();
+        if current
+            .deadline
+            .is_some_and(|deadline| deadline <= Instant::now())
+        {
+            self.close(&mut current);
+        }
+        if current.snapshot.status == PollStatus::Open {
+            return Err(PollError::AlreadyOpen);
+        }
+        Ok(())
+    }
+
+    // 呼び出し側で開始・終了・リセットと直列化する。
+    pub(crate) fn save_start_preferences(&self, start: &ValidatedStart) -> Result<(), PollError> {
+        (self.save_preferences)(PreferenceChange::Started(&start.preferences))
+    }
+
+    pub(crate) fn open(&self, start: ValidatedStart) -> PollSnapshot {
         let mut current = self.current.lock().unwrap();
         let started_at_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -295,6 +354,7 @@ impl Poll {
             .as_millis() as u64;
         let now = Instant::now();
         let PollPreferences {
+            source,
             question,
             options,
             settings,
@@ -302,7 +362,7 @@ impl Poll {
         *current = CurrentPoll {
             snapshot: PollSnapshot {
                 id: Uuid::new_v4().to_string(),
-                source: PollSource::Chat,
+                source,
                 status: PollStatus::Open,
                 question,
                 options: options
@@ -322,14 +382,54 @@ impl Poll {
                 settings,
             },
             labels: start.labels,
-            deadline: start
-                .duration_secs
-                .map(|secs| now + Duration::from_secs(secs.into())),
+            deadline: match source {
+                PollSource::Chat => start
+                    .duration_secs
+                    .map(|secs| now + Duration::from_secs(secs.into())),
+                PollSource::Twitch => None,
+            },
             ..CurrentPoll::default()
         };
         self.publish(&mut current);
         self.wake.notify_one();
-        Ok(current.snapshot.clone())
+        current.snapshot.clone()
+    }
+
+    pub fn apply_external(&self, poll_id: &str, votes: &[u32], closed: bool) -> bool {
+        let mut current = self.current.lock().unwrap();
+        if current.snapshot.id != poll_id || current.snapshot.source != PollSource::Twitch {
+            return false;
+        }
+        for (index, option) in current.snapshot.options.iter_mut().enumerate() {
+            option.votes = votes.get(index).copied().unwrap_or_default();
+        }
+        current.snapshot.total_voters = current
+            .snapshot
+            .options
+            .iter()
+            .fold(0u32, |total, option| total.saturating_add(option.votes));
+        if closed {
+            self.close(&mut current);
+        } else {
+            self.publish(&mut current);
+        }
+        true
+    }
+
+    /// Twitch 側の開始・終了予定時刻に合わせる。変わった時だけ配信する。
+    pub(crate) fn set_remote_timing(&self, poll_id: &str, started_at_ms: u64, ends_at_ms: u64) {
+        let mut current = self.current.lock().unwrap();
+        let snapshot = &mut current.snapshot;
+        if snapshot.id != poll_id
+            || snapshot.source != PollSource::Twitch
+            || snapshot.status != PollStatus::Open
+            || (snapshot.started_at_ms, snapshot.ends_at_ms) == (started_at_ms, Some(ends_at_ms))
+        {
+            return;
+        }
+        snapshot.started_at_ms = started_at_ms;
+        snapshot.ends_at_ms = Some(ends_at_ms);
+        self.publish(&mut current);
     }
 
     pub(crate) fn stop(&self) -> PollSnapshot {
@@ -375,13 +475,14 @@ impl Poll {
         Ok(current.snapshot.clone())
     }
 
-    pub(crate) fn record(&self, msg: &ChatMessage, verdict: &Verdict) -> bool {
+    pub fn record(&self, msg: &ChatMessage, verdict: &Verdict) -> bool {
         if !eligible(msg, verdict) {
             return false;
         }
         let mut current = self.current.lock().unwrap();
         let now = Instant::now();
-        if current.snapshot.status != PollStatus::Open
+        if current.snapshot.source != PollSource::Chat
+            || current.snapshot.status != PollStatus::Open
             || current.deadline.is_some_and(|deadline| deadline <= now)
         {
             return false;

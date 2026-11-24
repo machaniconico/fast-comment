@@ -11,7 +11,7 @@ use reqwest::StatusCode;
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
-use super::twitch_auth::{is_current_generation, scopes_satisfied, TwitchAccess, TwitchAuth};
+use super::twitch_auth::{is_current_generation, TwitchAccess, TwitchAuth, REQUIRED_SCOPES};
 use crate::moderation_error::{ModerationError, ModerationErrorCode};
 
 const SCOPE_MISSING_MESSAGE: &str =
@@ -52,6 +52,11 @@ async fn cached_user_id(generation: u64, login: &str) -> Option<String> {
         .map(|entry| entry.id.clone())
 }
 
+#[cfg(test)]
+pub(crate) async fn cache_poll_test_user(login: &str, id: &str) {
+    cache_user_id(0, login, id).await;
+}
+
 async fn cache_user_id(generation: u64, login: &str, id: &str) {
     user_ids().lock().await.insert(
         login.to_string(),
@@ -62,10 +67,31 @@ async fn cache_user_id(generation: u64, login: &str, id: &str) {
     );
 }
 
-enum HelixError {
+pub(crate) enum HelixError {
     Api { status: StatusCode, body: String },
     Network(String),
     Moderation(ModerationError),
+}
+
+impl HelixError {
+    fn unauthorized(&self) -> bool {
+        matches!(
+            self,
+            Self::Api {
+                status: StatusCode::UNAUTHORIZED,
+                ..
+            }
+        )
+    }
+}
+
+impl From<ModerationError> for HelixError {
+    fn from(mut error: ModerationError) -> Self {
+        if error.code == ModerationErrorCode::ScopeMissing {
+            error.message = SCOPE_MISSING_MESSAGE.to_owned();
+        }
+        Self::Moderation(error)
+    }
 }
 
 impl TwitchAuth {
@@ -98,13 +124,19 @@ impl TwitchAuth {
         let channel_ref = channel.as_str();
         let message_id_ref = message_id.as_str();
         let result = self
-            .with_token_retry(client_id, client_secret, move |access| {
-                let this = this;
-                async move {
-                    this.delete_message_once(generation, channel_ref, message_id_ref, access)
-                        .await
-                }
-            })
+            .with_token_retry(
+                client_id,
+                client_secret,
+                &REQUIRED_SCOPES,
+                HelixError::unauthorized,
+                move |access| {
+                    let this = this;
+                    async move {
+                        this.delete_message_once(generation, channel_ref, message_id_ref, access)
+                            .await
+                    }
+                },
+            )
             .await;
         result.map_err(|error| map_helix_error(error, ModerationAction::DeleteMessage))
     }
@@ -149,20 +181,26 @@ impl TwitchAuth {
         let author_ref = author_id.as_str();
         let reason_ref = reason.as_deref();
         let result = self
-            .with_token_retry(client_id, client_secret, move |access| {
-                let this = this;
-                async move {
-                    this.ban_user_once(
-                        generation,
-                        channel_ref,
-                        author_ref,
-                        duration_secs,
-                        reason_ref,
-                        access,
-                    )
-                    .await
-                }
-            })
+            .with_token_retry(
+                client_id,
+                client_secret,
+                &REQUIRED_SCOPES,
+                HelixError::unauthorized,
+                move |access| {
+                    let this = this;
+                    async move {
+                        this.ban_user_once(
+                            generation,
+                            channel_ref,
+                            author_ref,
+                            duration_secs,
+                            reason_ref,
+                            access,
+                        )
+                        .await
+                    }
+                },
+            )
             .await;
         result.map_err(|error| map_helix_error(error, ModerationAction::Ban))
     }
@@ -195,54 +233,21 @@ impl TwitchAuth {
         let channel_ref = channel.as_str();
         let author_ref = author_id.as_str();
         let result = self
-            .with_token_retry(client_id, client_secret, move |access| {
-                let this = this;
-                async move {
-                    this.unban_user_once(generation, channel_ref, author_ref, access)
-                        .await
-                }
-            })
+            .with_token_retry(
+                client_id,
+                client_secret,
+                &REQUIRED_SCOPES,
+                HelixError::unauthorized,
+                move |access| {
+                    let this = this;
+                    async move {
+                        this.unban_user_once(generation, channel_ref, author_ref, access)
+                            .await
+                    }
+                },
+            )
             .await;
         result.map_err(|error| map_helix_error(error, ModerationAction::Unban))
-    }
-
-    async fn with_token_retry<F, Fut, T>(
-        &self,
-        client_id: &str,
-        client_secret: &str,
-        mut action: F,
-    ) -> Result<T, HelixError>
-    where
-        F: FnMut(TwitchAccess) -> Fut,
-        Fut: std::future::Future<Output = Result<T, HelixError>>,
-    {
-        for attempt in 0..2 {
-            let mut access = match self.access(client_id, client_secret).await {
-                Ok(access) => access,
-                Err(error) => return Err(HelixError::Moderation(error)),
-            };
-            self.maybe_validate(client_id.trim(), &mut access).await;
-            if !scopes_satisfied(&access.scopes) {
-                return Err(HelixError::Moderation(ModerationError::new(
-                    ModerationErrorCode::ScopeMissing,
-                    SCOPE_MISSING_MESSAGE,
-                )));
-            }
-
-            match action(access).await {
-                Ok(value) => return Ok(value),
-                Err(HelixError::Api { status, .. })
-                    if attempt == 0 && status == StatusCode::UNAUTHORIZED =>
-                {
-                    self.invalidate_access_token().await;
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        Err(HelixError::Moderation(ModerationError::new(
-            ModerationErrorCode::NotLoggedIn,
-            "Twitchの認証が切れています。設定からTwitchへ再接続してください",
-        )))
     }
 
     async fn delete_message_once(
@@ -330,7 +335,7 @@ impl TwitchAuth {
     }
 
     /// login を Helix の user id へ解決する。世代が変わっていたらキャッシュを使わない。
-    async fn resolve_user_id(
+    pub(crate) async fn resolve_user_id(
         &self,
         generation: u64,
         login: &str,
@@ -357,7 +362,12 @@ impl TwitchAuth {
             .bearer_auth(&access.token)
             .send()
             .await
-            .map_err(|e| HelixError::Network(format!("Twitchユーザー情報の取得に失敗しました: {e}")))?;
+            .map_err(|e| {
+                HelixError::Network(format!(
+                    "Twitchユーザー情報の取得に失敗しました: {}",
+                    e.without_url()
+                ))
+            })?;
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         if !status.is_success() {

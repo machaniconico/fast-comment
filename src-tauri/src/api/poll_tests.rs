@@ -1,5 +1,5 @@
 use super::*;
-use crate::poll::Poll;
+use crate::{poll::Poll, poll_control::PollControl, sources::twitch_auth::TwitchAuth};
 use axum::{
     body::{to_bytes, Body},
     http::Request,
@@ -13,8 +13,15 @@ async fn poll_api_serves_the_shared_snapshot_and_validates_start() {
     let gate = crate::api::ApiGate::closed();
     gate.open("test-token");
     let poll = Arc::new(Poll::default());
+    let (_, config) = tokio::sync::watch::channel(Default::default());
+    let control = Arc::new(PollControl::new(
+        poll.clone(),
+        Arc::new(TwitchAuth::new().unwrap()),
+        config,
+        Default::default(),
+    ));
     let app = crate::api::router(
-        ApiDeps::new(gate, Default::default()).with_poll(poll.clone()),
+        ApiDeps::new(gate, Default::default()).with_poll(control),
         1234,
     );
     let send = |method, suffix, body: Option<Value>| {
@@ -35,10 +42,13 @@ async fn poll_api_serves_the_shared_snapshot_and_validates_start() {
     });
     let mut duplicate = start.clone();
     duplicate["options"] = json!(["A", " a "]);
+    let mut twitch = start.clone();
+    twitch["source"] = json!("twitch");
     for (method, suffix, body, expected) in [
         ("GET", "", None, StatusCode::OK),
         ("POST", "/start", Some(json!({})), StatusCode::BAD_REQUEST),
         ("POST", "/start", Some(duplicate), StatusCode::BAD_REQUEST),
+        ("POST", "/start", Some(twitch), StatusCode::BAD_REQUEST),
         ("POST", "/start", Some(start.clone()), StatusCode::OK),
         ("POST", "/start", Some(start.clone()), StatusCode::CONFLICT),
         ("GET", "", None, StatusCode::OK),

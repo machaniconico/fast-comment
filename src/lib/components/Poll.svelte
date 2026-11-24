@@ -2,11 +2,13 @@
   import { onMount } from 'svelte';
   import { listen } from '@tauri-apps/api/event';
   import {
-    copyTextToClipboard, getConfig, getObsPollUrl, getPollState, isTauri,
+    copyTextToClipboard, getConfig, getObsPollUrl, getPollState, getTwitchOauthStatus, isTauri,
     resetPoll, setPollDisplay, startPoll, stopPoll,
   } from '../ipc';
+  import type { TwitchOauthStatus } from '../ipc';
+  import { ui } from '../ui.svelte';
   import { isWinner, pollRows, roundPercent, sector, timeLeft } from '../pollView';
-  import type { PollDisplay, PollPreferences, PollSnapshot } from '../pollView';
+  import type { PollDisplay, PollPreferences, PollSnapshot, PollSource } from '../pollView';
 
   const displays: { value: PollDisplay; label: string }[] = [
     { value: 'bar-h', label: '横棒' }, { value: 'bar-v', label: '縦棒' },
@@ -14,6 +16,8 @@
     { value: 'number', label: '数字のみ' },
   ];
 
+  let source = $state<PollSource>('chat');
+  let oauth = $state<TwitchOauthStatus | null>(null);
   let snapshot = $state<PollSnapshot | null>(null);
   let question = $state('');
   let options = $state<string[]>(Array.from({ length: 10 }, () => ''));
@@ -30,6 +34,7 @@
   let error = $state('');
   let now = $state(Date.now());
 
+  const twitch = $derived(source === 'twitch');
   const open = $derived(snapshot?.status === 'open');
   const rows = $derived(pollRows(snapshot?.options ?? []));
   const settings = $derived({ display, showPercent, showCounts });
@@ -42,7 +47,25 @@
     return () => clearInterval(timer);
   });
 
+  $effect(() => {
+    if (!ready || !twitch) return;
+    let disposed = false;
+    oauth = null;
+    void getTwitchOauthStatus().then((status) => {
+      if (!disposed) oauth = status;
+    }).catch(() => {
+      // 開始時にも認証状態を確認し、Rust のエラーを表示する。
+    });
+    return () => { disposed = true; };
+  });
+
+  function selectSource(value: string) {
+    source = value === 'twitch' ? 'twitch' : 'chat';
+    if (source === 'twitch') optionCount = Math.min(optionCount, 5);
+  }
+
   function loadPreferences(saved: PollPreferences) {
+    source = saved.source ?? 'chat';
     question = saved.question;
     optionCount = saved.options.length;
     options = Array.from({ length: 10 }, (_, index) => saved.options[index] ?? '');
@@ -76,7 +99,13 @@
       const [initial, config, url] = await Promise.all([getPollState(), getConfig(), getObsPollUrl()]);
       if (disposed) return;
       if (before === updates) snapshot = initial;
-      if (!preferencesFromEvent && config?.poll) loadPreferences(config.poll);
+      if (!preferencesFromEvent) {
+        if (snapshot && snapshot.status !== 'idle') {
+          loadPreferences({ ...snapshot, options: snapshot.options.map(({ label }) => label) });
+        } else if (config?.poll) {
+          loadPreferences(config.poll);
+        }
+      }
       obsUrl = url;
       ready = isTauri();
     }
@@ -106,9 +135,10 @@
     event.preventDefault();
     if (!ready || busy || open) return;
     void act(() => startPoll({
+      source,
       question,
       options: options.slice(0, optionCount),
-      durationSecs: timed ? (duration ?? 0) : undefined,
+      durationSecs: twitch ? duration : timed ? (duration ?? 0) : undefined,
       ...settings,
     }));
   }
@@ -123,10 +153,19 @@
   <h2>アンケート</h2>
   <form onsubmit={start} novalidate>
     <fieldset disabled={!ready || busy || open}>
+      <label>方式
+        <select value={source} onchange={(event) => selectSource(event.currentTarget.value)}>
+          <option value="chat">コメント</option>
+          <option value="twitch">Twitch</option>
+        </select>
+      </label>
+      {#if twitch}
+        <p>質問は60文字まで、選択肢は2〜5件で各25文字までです。</p>
+      {/if}
       <label>質問 <textarea rows="1" bind:value={question}></textarea></label>
       <label>選択肢の数
         <select bind:value={optionCount}>
-          {#each options.slice(1) as _, index (index)}
+          {#each options.slice(1, twitch ? 5 : 10) as _, index (index)}
             <option value={index + 2}>{index + 2}</option>
           {/each}
         </select>
@@ -135,14 +174,20 @@
         <label>選択肢 {index + 1} <textarea rows="1" bind:value={options[index]}></textarea></label>
       {/each}
       <div class="controls">
-        <label>終了方法
-          <select bind:value={timed}>
-            <option value={false}>手動</option>
-            <option value={true}>時間指定</option>
-          </select>
-        </label>
-        {#if timed}
-          <label>秒数 <input type="number" bind:value={duration} /></label>
+        {#if twitch}
+          <label>秒数（必須、15〜1800秒）
+            <input type="number" min="15" max="1800" required bind:value={duration} />
+          </label>
+        {:else}
+          <label>終了方法
+            <select bind:value={timed}>
+              <option value={false}>手動</option>
+              <option value={true}>時間指定</option>
+            </select>
+          </label>
+          {#if timed}
+            <label>秒数 <input type="number" bind:value={duration} /></label>
+          {/if}
         {/if}
       </div>
     </fieldset>
@@ -167,7 +212,17 @@
     </div>
   </form>
 
-  <p>投票するには、1〜{open ? rows.length : 'N'} の番号か選択肢の言葉そのものをコメントしてください。</p>
+  {#if twitch}
+    <p>視聴者は Twitch の投票画面から投票できます。</p>
+    {#if oauth && !oauth.pollsScopeOk}
+      <p>
+        {oauth.connected ? 'Twitch で再ログインしてください' : 'Twitch にログインしてください'}
+        <button type="button" onclick={() => ui.gotoSetting('twitchOauth')}>Twitch ログイン設定を開く</button>
+      </p>
+    {/if}
+  {:else}
+    <p>投票するには、1〜{open ? rows.length : 'N'} の番号か選択肢の言葉そのものをコメントしてください。</p>
+  {/if}
   {#if error}<p role="alert">{error}</p>{/if}
 
   {#if snapshot && snapshot.status !== 'idle'}

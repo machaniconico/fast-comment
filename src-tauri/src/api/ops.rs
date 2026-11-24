@@ -2,6 +2,7 @@
 use super::{error, ApiDeps};
 use crate::{
     poll::{PollError, PollStart},
+    poll_control::PollControlError,
     stats::TimerSnapshot,
     tts::TtsQueueStatePayload,
 };
@@ -314,16 +315,24 @@ pub async fn poll_mutate(State(deps): State<ApiDeps>, request: Request) -> Respo
     if let Err(response) = deps.rate_limit.take() {
         return response;
     }
-    let snapshot = match (path.as_str(), start) {
-        ("/api/v1/poll/start", Some(start)) => match poll.start(start) {
-            Ok(snapshot) => snapshot,
-            Err(error) => return poll_error(error),
-        },
-        ("/api/v1/poll/stop", _) => poll.stop(),
-        ("/api/v1/poll/reset", _) => poll.reset(),
-        _ => return error::not_found().await,
-    };
-    Json(snapshot).into_response()
+    // HTTP クライアントが切断しても Twitch 側の操作と結果の反映は完了させる。
+    let operation = tokio::spawn(async move {
+        match (path.as_str(), start) {
+            ("/api/v1/poll/start", Some(start)) => Some(poll.start(start).await),
+            ("/api/v1/poll/stop", _) => Some(poll.stop().await),
+            ("/api/v1/poll/reset", _) => Some(poll.reset().await),
+            _ => None,
+        }
+    });
+    match operation.await {
+        Ok(Some(Ok(snapshot))) => Json(snapshot).into_response(),
+        Ok(Some(Err(PollControlError::Local(error)))) => poll_error(error),
+        Ok(Some(Err(PollControlError::Remote(error)))) => {
+            error::response(StatusCode::BAD_GATEWAY, "twitch_poll_error", &error.to_string())
+        }
+        Ok(None) => error::not_found().await,
+        Err(_) => internal(),
+    }
 }
 
 fn poll_error(error: PollError) -> Response {
