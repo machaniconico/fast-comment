@@ -1,6 +1,9 @@
 //! IPC とローカル API で共有するアンケート操作。
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use reqwest::StatusCode;
 use tokio::sync::{watch, Mutex};
@@ -22,6 +25,14 @@ use crate::{
 mod tests;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
+/// 作成応答を失った後の照合 GET の待ち時間。Network と 5xx の時だけ次を試す。
+const MATCH_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+];
+/// 操作回数制限の解除時刻が分からない時の待ち時間。Twitch の制限は 1 分単位で回復する。
+const UNKNOWN_RATE_LIMIT_RETRY_SECS: u64 = 60;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum PollControlError {
@@ -42,7 +53,17 @@ impl From<ModerationError> for PollControlError {
                 PollError::Invalid("「自分の配信」のTwitchチャンネルが見つかりません").into()
             }
             ModerationErrorCode::Network => PollsError::Network.into(),
-            _ => PollsError::Authentication.into(),
+            ModerationErrorCode::RateLimited => PollsError::RateLimited {
+                retry_after_secs: UNKNOWN_RATE_LIMIT_RETRY_SECS,
+            }
+            .into(),
+            ModerationErrorCode::Unavailable => PollsError::Api(503).into(),
+            ModerationErrorCode::Conflict => PollsError::Api(409).into(),
+            ModerationErrorCode::NotModerator | ModerationErrorCode::ProtectedTarget => {
+                PollsError::Api(403).into()
+            }
+            // 資格情報ストアの読み書きや認証更新の応答解析の失敗。
+            ModerationErrorCode::Other => PollsError::Authentication.into(),
         }
     }
 }
@@ -147,7 +168,7 @@ impl PollControl {
 
         let login = &login;
         let start_ref = &start;
-        let target = self
+        let (target, timing) = self
             .with_access(&credentials, None, |access, helix| async move {
                 let generation = self.auth.generation();
                 let broadcaster_id = self
@@ -162,38 +183,71 @@ impl PollControl {
                 }
                 let title = &start_ref.preferences.question;
                 let choices = &start_ref.preferences.options;
-                let remote_id = match helix
-                    .create(
-                        &access.token,
-                        &broadcaster_id,
-                        title,
-                        choices,
-                        start_ref.duration_secs.expect("Twitchの投票時間は検証済み"),
-                    )
+                let duration_secs = start_ref.duration_secs.expect("Twitchの投票時間は検証済み");
+                let sent_at_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                let (remote_id, timing) = match helix
+                    .create(&access.token, &broadcaster_id, title, choices, duration_secs)
                     .await
                 {
-                    Ok(id) => id,
+                    Ok(id) => (id, None),
                     Err(PollsError::Network) => {
                         // 作成済みの可能性があるので POST は繰り返さず、最新の投票を照合する。
-                        helix
-                            .find_matching_latest(&access.token, &broadcaster_id, title, choices)
-                            .await
-                            .ok()
-                            .flatten()
-                            .ok_or(PollsError::CreateUnconfirmed)?
+                        let mut matched = None;
+                        for delay in MATCH_RETRY_DELAYS {
+                            let waited = self
+                                .app_cancel
+                                .run_until_cancelled(tokio::time::sleep(delay))
+                                .await;
+                            if waited.is_none() {
+                                break;
+                            }
+                            let found = self
+                                .app_cancel
+                                .run_until_cancelled(helix.find_matching_latest(
+                                    &access.token,
+                                    &broadcaster_id,
+                                    title,
+                                    choices,
+                                    duration_secs,
+                                    sent_at_ms,
+                                ))
+                                .await;
+                            match found {
+                                Some(Err(PollsError::Network)) => {}
+                                Some(Err(PollsError::Api(status))) if status >= 500 => {}
+                                Some(Ok(found)) => {
+                                    matched = found;
+                                    break;
+                                }
+                                _ => break,
+                            }
+                        }
+                        let matched = matched.ok_or(PollsError::CreateUnconfirmed)?;
+                        (matched.id, Some(matched.timing))
                     }
                     Err(error) => return Err(error.into()),
                 };
-                Ok(RemoteTarget {
-                    remote_id,
-                    broadcaster_id,
-                })
+                Ok((
+                    RemoteTarget {
+                        remote_id,
+                        broadcaster_id,
+                    },
+                    timing,
+                ))
             })
             .await?;
 
         // 設定保存に失敗しても、作成済みの投票は追跡できるようにする。
         let saved = self.poll.save_start_preferences(&start);
-        let snapshot = self.poll.open(start);
+        let mut snapshot = self.poll.open(start);
+        if let Some(timing) = timing {
+            self.poll
+                .set_remote_timing(&snapshot.id, timing.started_at_ms, timing.ends_at_ms);
+            snapshot = self.poll.snapshot();
+        }
         let cancel = self.app_cancel.child_token();
         *active = Some(ActivePoll {
             local_id: snapshot.id.clone(),
@@ -251,8 +305,12 @@ impl PollControl {
     }
 
     async fn reset_remote(&self, target: &RemoteTarget) -> Result<(), PollControlError> {
-        if self.get(target).await?.status != RemoteStatus::Active {
-            return Ok(());
+        match self.get(target).await {
+            Ok(remote) if remote.status != RemoteStatus::Active => return Ok(()),
+            Ok(_) => {}
+            // 見つからない投票は終了済みとみなす。
+            Err(PollControlError::Remote(PollsError::Api(404))) => return Ok(()),
+            Err(error) => return Err(error),
         }
         match self.end(target).await {
             Err(PollControlError::Remote(PollsError::BadRequest(_) | PollsError::Api(404))) => {
@@ -306,6 +364,10 @@ impl PollControl {
             match result {
                 Ok(remote) => {
                     last_error = None;
+                    if let Some(timing) = remote.timing {
+                        self.poll
+                            .set_remote_timing(&local_id, timing.started_at_ms, timing.ends_at_ms);
+                    }
                     let closed = remote.status != RemoteStatus::Active;
                     if !self.poll.apply_external(&local_id, &remote.votes, closed) || closed {
                         *active = None;

@@ -43,12 +43,33 @@ fn request() -> PollStart {
 }
 
 fn remote_poll(status: &str) -> serde_json::Value {
+    remote_poll_started(status, chrono::Utc::now())
+}
+
+fn remote_poll_started(
+    status: &str,
+    started_at: chrono::DateTime<chrono::Utc>,
+) -> serde_json::Value {
     json!({
         "id": "remote-42",
         "title": "今日の色は？",
         "status": status,
-        "choices": [{"title": "赤", "votes": 3}, {"title": "青", "votes": 2}]
+        "choices": [{"title": "赤", "votes": 3}, {"title": "青", "votes": 2}],
+        "duration": 60,
+        "started_at": started_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
     })
+}
+
+fn interrupted_body() -> Response {
+    let chunks = futures_util::stream::unfold(false, |sent| async move {
+        if sent {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            Some((Err(io::Error::other("body interrupted")), true))
+        } else {
+            Some((Ok(bytes::Bytes::from_static(b"{\"data\":[")), true))
+        }
+    });
+    Body::from_stream(chunks).into_response()
 }
 
 fn response(status: StatusCode, message: &str) -> Response {
@@ -185,16 +206,30 @@ async fn reset_only_terminates_active_polls_and_accepts_patch_races() {
 
 #[tokio::test]
 async fn create_recovers_only_the_latest_matching_active_poll_after_body_disconnect() {
-    let matching = remote_poll("ACTIVE");
+    let started_at = chrono::Utc::now() - chrono::Duration::seconds(5);
+    let matching = remote_poll_started("ACTIVE", started_at);
     let mut other_title = matching.clone();
     other_title["title"] = json!("別の質問");
     let mut other_choices = matching.clone();
     other_choices["choices"].as_array_mut().unwrap().reverse();
-    for (latest, recovered) in [
-        (matching.clone(), true),
-        (other_title, false),
-        (other_choices, false),
-        (remote_poll("COMPLETED"), false),
+    // 配信者が Twitch 側で先に始めていた同じ題・選択肢の投票は採用しない。
+    let mut other_duration = matching.clone();
+    other_duration["duration"] = json!(300);
+    let mut no_duration = matching.clone();
+    no_duration.as_object_mut().unwrap().remove("duration");
+    let started_before_post =
+        remote_poll_started("ACTIVE", chrono::Utc::now() - chrono::Duration::seconds(11));
+    let mut no_started_at = matching.clone();
+    no_started_at.as_object_mut().unwrap().remove("started_at");
+    for (case, latest, recovered) in [
+        ("matching", matching.clone(), true),
+        ("title", other_title, false),
+        ("choices", other_choices, false),
+        ("completed", remote_poll("COMPLETED"), false),
+        ("duration", other_duration, false),
+        ("no-duration", no_duration, false),
+        ("started-before-post", started_before_post, false),
+        ("no-started-at", no_started_at, false),
     ] {
         let methods = Arc::new(StdMutex::new(Vec::new()));
         let captured = methods.clone();
@@ -208,15 +243,7 @@ async fn create_recovers_only_the_latest_matching_active_poll_after_body_disconn
                     .unwrap()
                     .push((req.method().clone(), req.uri().query().map(str::to_owned)));
                 if req.method() == "POST" {
-                    let chunks = futures_util::stream::unfold(false, |sent| async move {
-                        if sent {
-                            tokio::time::sleep(Duration::from_millis(30)).await;
-                            Some((Err(io::Error::other("body interrupted")), true))
-                        } else {
-                            Some((Ok(bytes::Bytes::from_static(b"{\"data\":[")), true))
-                        }
-                    });
-                    Body::from_stream(chunks).into_response()
+                    interrupted_body()
                 } else {
                     Json(data).into_response()
                 }
@@ -226,7 +253,16 @@ async fn create_recovers_only_the_latest_matching_active_poll_after_body_disconn
         let fixture = Fixture::new(base, BROADCASTER).await;
         let result = fixture.control.start(request().validate().unwrap()).await;
         if recovered {
-            assert_eq!(result.unwrap().status, PollStatus::Open);
+            let snapshot = result.unwrap();
+            assert_eq!(snapshot.status, PollStatus::Open);
+            // 残り時間は Twitch の started_at + duration から数える。
+            let started_ms = started_at.timestamp_millis() as u64;
+            assert_eq!(snapshot.started_at_ms, started_ms);
+            assert_eq!(snapshot.ends_at_ms, Some(started_ms + 60_000));
+            assert_eq!(
+                fixture.control.snapshot().ends_at_ms,
+                Some(started_ms + 60_000)
+            );
             assert_eq!(
                 fixture
                     .control
@@ -241,19 +277,150 @@ async fn create_recovers_only_the_latest_matching_active_poll_after_body_disconn
             );
             assert_eq!(fixture.saved.lock().unwrap().len(), 1);
         } else {
-            assert!(result.unwrap_err().to_string().contains("作成を確認"));
-            assert_eq!(fixture.control.snapshot().status, PollStatus::Idle);
-            assert!(fixture.saved.lock().unwrap().is_empty());
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("作成を確認"), "{case}: {error}");
+            assert!(error.contains("Twitchで確認"), "{case}: {error}");
+            assert_eq!(
+                fixture.control.snapshot().status,
+                PollStatus::Idle,
+                "{case}"
+            );
+            assert!(fixture.saved.lock().unwrap().is_empty(), "{case}");
         }
         assert_eq!(
             *methods.lock().unwrap(),
             [
                 (reqwest::Method::POST, None),
                 (reqwest::Method::GET, Some("broadcaster_id=42".into())),
-            ]
+            ],
+            "{case}"
         );
         server.abort();
     }
+}
+
+#[tokio::test]
+async fn create_match_get_retries_only_network_and_5xx_with_backoff() {
+    // 各要素は照合 GET の応答。"ok" で一致する投票を返す。
+    for (case, replies, recovered) in [
+        ("network-then-5xx", vec!["network", "502", "ok"], true),
+        ("all-5xx", vec!["503", "503", "503", "ok"], false),
+        ("bad-request", vec!["400", "ok"], false),
+    ] {
+        let gets = Arc::new(StdMutex::new(Vec::new()));
+        let captured = gets.clone();
+        let started = tokio::time::Instant::now();
+        let (base, server) = mock(move |req| {
+            let captured = captured.clone();
+            let replies = replies.clone();
+            async move {
+                if req.method() == "POST" {
+                    return interrupted_body();
+                }
+                let index = {
+                    let mut gets = captured.lock().unwrap();
+                    gets.push(started.elapsed());
+                    gets.len() - 1
+                };
+                match replies[index] {
+                    "network" => interrupted_body(),
+                    "ok" => Json(json!({"data": [remote_poll("ACTIVE")]})).into_response(),
+                    code => response(
+                        StatusCode::from_u16(code.parse().unwrap()).unwrap(),
+                        "unavailable",
+                    ),
+                }
+            }
+        })
+        .await;
+        let fixture = Fixture::new(base, BROADCASTER).await;
+        let result = fixture.control.start(request().validate().unwrap()).await;
+        let gets = gets.lock().unwrap().clone();
+        if recovered {
+            assert_eq!(result.unwrap().status, PollStatus::Open, "{case}");
+        } else {
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("Twitchで確認"), "{case}: {error}");
+            assert_eq!(
+                fixture.control.snapshot().status,
+                PollStatus::Idle,
+                "{case}"
+            );
+        }
+        let expected = if case == "bad-request" { 1 } else { 3 };
+        assert_eq!(gets.len(), expected, "{case}: {gets:?}");
+        // 1 秒・2 秒・4 秒の間隔を空けて試す。
+        let mut waited = Duration::ZERO;
+        for (attempt, delay) in [1, 2, 4].into_iter().take(expected).enumerate() {
+            waited += Duration::from_secs(delay);
+            assert!(gets[attempt] >= waited, "{case}: {gets:?}");
+            assert!(
+                gets[attempt] < waited + Duration::from_millis(900),
+                "{case}: {gets:?}"
+            );
+        }
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn create_match_retry_stops_immediately_on_cancel() {
+    let gets = Arc::new(AtomicUsize::new(0));
+    let first_get = Arc::new(Notify::new());
+    let (base, server) = mock({
+        let (gets, first_get) = (gets.clone(), first_get.clone());
+        move |req| {
+            let (gets, first_get) = (gets.clone(), first_get.clone());
+            async move {
+                if req.method() == "POST" {
+                    return interrupted_body();
+                }
+                gets.fetch_add(1, SeqCst);
+                first_get.notify_one();
+                response(StatusCode::SERVICE_UNAVAILABLE, "unavailable")
+            }
+        }
+    })
+    .await;
+    let fixture = Fixture::new(base, BROADCASTER).await;
+    let control = fixture.control.clone();
+    let start = tokio::spawn(async move { control.start(request().validate().unwrap()).await });
+    tokio::time::timeout(Duration::from_secs(3), first_get.notified())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    fixture.control.app_cancel.cancel();
+    let result = tokio::time::timeout(Duration::from_millis(500), start)
+        .await
+        .expect("キャンセル後も照合の再試行を待った")
+        .unwrap();
+    assert!(matches!(
+        result,
+        Err(PollControlError::Remote(PollsError::CreateUnconfirmed))
+    ));
+    assert_eq!(gets.load(SeqCst), 1);
+    assert_eq!(fixture.control.snapshot().status, PollStatus::Idle);
+    server.abort();
+}
+
+#[tokio::test]
+async fn polling_syncs_remaining_time_to_twitch() {
+    let started_at = chrono::Utc::now() - chrono::Duration::seconds(20);
+    let (base, server) = mock(move |_| async move {
+        Json(json!({"data": [remote_poll_started("COMPLETED", started_at)]})).into_response()
+    })
+    .await;
+    let fixture = Fixture::new(base, BROADCASTER).await;
+    let (id, cancel) = fixture.track().await;
+    tokio::time::timeout(POLL_INTERVAL * 2, fixture.control.clone().run(id, cancel))
+        .await
+        .unwrap();
+    let snapshot = fixture.control.snapshot();
+    let started_ms = started_at.timestamp_millis() as u64;
+    assert_eq!(snapshot.status, PollStatus::Closed);
+    assert_eq!(snapshot.started_at_ms, started_ms);
+    assert_eq!(snapshot.ends_at_ms, Some(started_ms + 60_000));
+    server.abort();
 }
 
 #[tokio::test]
@@ -286,8 +453,14 @@ async fn stop_and_reset_update_local_state_on_remote_failure() {
         assert!(fixture.control.active.lock().await.is_none());
 
         fixture.track().await;
-        let error = fixture.control.reset().await.unwrap_err();
-        assert!(error.to_string().contains(message), "{failure}: {error}");
+        let result = fixture.control.reset().await;
+        if failure == "missing" {
+            // 最初の GET が 404 なら終了済みとみなす。
+            assert_eq!(result.unwrap().status, PollStatus::Idle);
+        } else {
+            let error = result.unwrap_err();
+            assert!(error.to_string().contains(message), "{failure}: {error}");
+        }
         assert_eq!(
             fixture.control.snapshot().status,
             PollStatus::Idle,
@@ -393,6 +566,31 @@ async fn slow_poll_response_does_not_block_reset_or_update_new_poll() {
     assert_eq!(snapshot.id, new_id);
     assert_eq!(snapshot.total_voters, 13);
     server.abort();
+}
+
+#[test]
+fn moderation_errors_map_to_matching_poll_errors() {
+    for (code, expected) in [
+        (ModerationErrorCode::RateLimited, "RateLimited"),
+        (ModerationErrorCode::Unavailable, "Api"),
+        (ModerationErrorCode::Network, "Network"),
+        (ModerationErrorCode::Conflict, "Api"),
+        (ModerationErrorCode::ScopeMissing, "ScopeMissing"),
+    ] {
+        let error = PollControlError::from(ModerationError::new(code, "details"));
+        let PollControlError::Remote(error) = error else {
+            panic!("{code:?}: {error:?}");
+        };
+        assert_eq!(error.class(), expected, "{code:?}");
+    }
+    let error = PollControlError::from(ModerationError::new(
+        ModerationErrorCode::Unavailable,
+        "details",
+    ));
+    assert!(matches!(
+        error,
+        PollControlError::Remote(PollsError::Api(503))
+    ));
 }
 
 #[test]

@@ -416,6 +416,22 @@ impl Poll {
         true
     }
 
+    /// Twitch 側の開始・終了予定時刻に合わせる。変わった時だけ配信する。
+    pub(crate) fn set_remote_timing(&self, poll_id: &str, started_at_ms: u64, ends_at_ms: u64) {
+        let mut current = self.current.lock().unwrap();
+        let snapshot = &mut current.snapshot;
+        if snapshot.id != poll_id
+            || snapshot.source != PollSource::Twitch
+            || snapshot.status != PollStatus::Open
+            || (snapshot.started_at_ms, snapshot.ends_at_ms) == (started_at_ms, Some(ends_at_ms))
+        {
+            return;
+        }
+        snapshot.started_at_ms = started_at_ms;
+        snapshot.ends_at_ms = Some(ends_at_ms);
+        self.publish(&mut current);
+    }
+
     pub(crate) fn stop(&self) -> PollSnapshot {
         let _controls = self.controls.lock().unwrap();
         let mut current = self.current.lock().unwrap();

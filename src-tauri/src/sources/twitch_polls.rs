@@ -31,7 +31,7 @@ pub enum PollsError {
     Network,
     #[error("Twitchの認証情報を確認できませんでした")]
     Authentication,
-    #[error("通信が途切れ、Twitchでアンケートの作成を確認できませんでした")]
+    #[error("通信が途切れ、Twitchでアンケートの作成を確認できませんでした。Twitch側に投票が作られた可能性があるので、Twitchで確認・終了してください")]
     CreateUnconfirmed,
 }
 
@@ -65,6 +65,21 @@ pub enum RemoteStatus {
 pub struct RemotePoll {
     pub status: RemoteStatus,
     pub votes: Vec<u32>,
+    /// Twitch 上の開始時刻と終了予定時刻(UNIX ミリ秒)。欠けたら None。
+    pub timing: Option<RemoteTiming>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RemoteTiming {
+    pub started_at_ms: u64,
+    pub ends_at_ms: u64,
+}
+
+/// 作成応答を失った後の照合で採用した投票。
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct MatchedPoll {
+    pub id: String,
+    pub timing: RemoteTiming,
 }
 
 impl HelixPolls {
@@ -118,29 +133,42 @@ impl HelixPolls {
             .ok_or(PollsError::Api(200))
     }
 
+    /// `sent_at_ms` は POST を送る直前の壁時計(UTC、UNIX ミリ秒)。
     pub(crate) async fn find_matching_latest(
         &self,
         token: &str,
         broadcaster_id: &str,
         title: &str,
         choices: &[String],
-    ) -> Result<Option<String>, PollsError> {
+        duration_secs: u32,
+        sent_at_ms: u64,
+    ) -> Result<Option<MatchedPoll>, PollsError> {
         let request = self
             .request(Method::GET, token)
             .query(&[("broadcaster_id", broadcaster_id)]);
         let response = self.send(request, token).await?;
-        let latest = first_poll(response).await?;
-        let matching = latest.as_ref().filter(|poll| {
-            poll["status"].as_str() == Some("ACTIVE")
-                && poll["title"].as_str() == Some(title)
-                && poll["choices"].as_array().is_some_and(|remote_choices| {
-                    remote_choices
-                        .iter()
-                        .map(|choice| choice["title"].as_str())
-                        .eq(choices.iter().map(|choice| Some(choice.as_str())))
-                })
-        });
-        Ok(matching.and_then(poll_id).map(str::to_owned))
+        let Some(latest) = first_poll(response).await? else {
+            return Ok(None);
+        };
+        // 配信者が Twitch 側で先に始めた同じ内容の投票を拾わないよう、時間と開始時刻も照合する。
+        let matching = latest["status"].as_str() == Some("ACTIVE")
+            && latest["title"].as_str() == Some(title)
+            && latest["choices"].as_array().is_some_and(|remote_choices| {
+                remote_choices
+                    .iter()
+                    .map(|choice| choice["title"].as_str())
+                    .eq(choices.iter().map(|choice| Some(choice.as_str())))
+            })
+            && latest["duration"].as_u64() == Some(u64::from(duration_secs));
+        let timing = remote_timing(&latest)
+            .filter(|timing| timing.started_at_ms > sent_at_ms.saturating_sub(10_000));
+        Ok(match (matching, poll_id(&latest), timing) {
+            (true, Some(id), Some(timing)) => Some(MatchedPoll {
+                id: id.to_owned(),
+                timing,
+            }),
+            _ => None,
+        })
     }
 
     pub async fn end(
@@ -195,7 +223,11 @@ impl HelixPolls {
                     .ok_or(PollsError::Api(200))
             })
             .collect::<Result<_, _>>()?;
-        Ok(RemotePoll { status, votes })
+        Ok(RemotePoll {
+            status,
+            votes,
+            timing: remote_timing(&poll),
+        })
     }
 
     fn request(&self, method: Method, token: &str) -> RequestBuilder {
@@ -268,6 +300,18 @@ fn poll_id(poll: &Value) -> Option<&str> {
     poll.get("id")
         .and_then(Value::as_str)
         .filter(|id| !id.is_empty())
+}
+
+fn remote_timing(poll: &Value) -> Option<RemoteTiming> {
+    let started_at_ms = chrono::DateTime::parse_from_rfc3339(poll.get("started_at")?.as_str()?)
+        .ok()?
+        .timestamp_millis();
+    let started_at_ms = u64::try_from(started_at_ms).ok()?;
+    let duration_ms = poll.get("duration")?.as_u64()?.checked_mul(1000)?;
+    Some(RemoteTiming {
+        started_at_ms,
+        ends_at_ms: started_at_ms.checked_add(duration_ms)?,
+    })
 }
 
 async fn first_poll(response: reqwest::Response) -> Result<Option<Value>, PollsError> {
