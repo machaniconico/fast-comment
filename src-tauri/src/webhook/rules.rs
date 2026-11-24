@@ -9,6 +9,23 @@ thread_local! { pub(crate) static COMPILES: std::cell::Cell<usize> = const { std
 pub fn decide(def: &WebhookDef, msg: &ChatMessage) -> Option<Matched> {
     CompiledRules::new(def).decide(def, msg)
 }
+/// キーワードを `regex::escape` した大文字小文字無視の正規表現へ。空白のみは対象外(None)。
+/// Webhook とキーワードエフェクトで共用する。
+pub(crate) fn keyword_regex(keyword: &str) -> Option<regex::Regex> {
+    if keyword.trim().is_empty() {
+        return None;
+    }
+    #[cfg(test)]
+    COMPILES.with(|n| n.set(n.get() + 1));
+    regex::RegexBuilder::new(&regex::escape(keyword))
+        .case_insensitive(true)
+        .build()
+        .ok()
+}
+/// テキスト部分(エモート名・著者名は対象外)のどれかがキーワードに一致するか。
+pub(crate) fn text_matches(re: &regex::Regex, msg: &ChatMessage) -> bool {
+    msg.text_fragments().any(|t| re.is_match(t))
+}
 pub(crate) struct CompiledRules {
     keywords: Vec<(String, regex::Regex)>,
 }
@@ -17,16 +34,7 @@ impl CompiledRules {
         let keywords = def
             .keywords
             .iter()
-            .filter(|k| !k.trim().is_empty())
-            .filter_map(|k| {
-                #[cfg(test)]
-                COMPILES.with(|n| n.set(n.get() + 1));
-                regex::RegexBuilder::new(&regex::escape(k))
-                    .case_insensitive(true)
-                    .build()
-                    .ok()
-                    .map(|re| (k.clone(), re))
-            })
+            .filter_map(|k| keyword_regex(k).map(|re| (k.clone(), re)))
             .collect();
         Self { keywords }
     }
@@ -58,7 +66,7 @@ impl CompiledRules {
         }
         if def.triggers.keyword {
             for (keyword, re) in &self.keywords {
-                if msg.text_fragments().any(|t| re.is_match(t)) {
+                if text_matches(re, msg) {
                     return Some(Matched {
                         trigger: Trigger::Keyword,
                         keyword: Some(keyword.clone()),

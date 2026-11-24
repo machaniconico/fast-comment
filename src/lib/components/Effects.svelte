@@ -1,8 +1,7 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte';
-  import { onYoutubeReactions, type EffectsConfig } from '../ipc';
-  import type { UiChatMessage, YoutubeReaction } from '../types';
-  import { store } from '../stores.svelte';
+  import { onKeywordEffects, onYoutubeReactions, type EffectsConfig, type KeywordEffect } from '../ipc';
+  import type { YoutubeReaction } from '../types';
 
   interface Props {
     config: EffectsConfig;
@@ -23,21 +22,18 @@
 
   const MAX_PARTICLES = 200;
   const MAX_REACTION_TEXT_LENGTH = 32;
-  const MAX_SEEN_IDS = 2000;
   const FALLBACK_REMOVE_MS = 4500;
 
   let { config }: Props = $props();
   let particles: Particle[] = $state([]);
   let nextParticleId = 1;
-  let initialized = false;
-  let lastReceivedCount = 0;
-  const processedIds = new Set<string>();
   const removeTimers = new Map<number, ReturnType<typeof setTimeout>>();
   let reducedMotion = false;
 
   onMount(() => {
     let disposed = false;
     let unlistenReactions = () => {};
+    let unlistenKeywordEffects = () => {};
     const motionQuery = window.matchMedia('(prefers-reduced-motion: reduce)');
     const syncMotionPreference = () => {
       reducedMotion = motionQuery.matches;
@@ -57,81 +53,41 @@
         if (!disposed) console.warn('YouTubeリアクション購読に失敗しました', error);
       });
 
+    // 判定は Rust(キーワード・クールダウン・除外条件)。ここは受け取った物を描くだけ。
+    void onKeywordEffects((effects) => {
+      if (!disposed && !reducedMotion && config.enabled) spawnKeywordEffects(effects);
+    })
+      .then((unlisten) => {
+        if (disposed) unlisten();
+        else unlistenKeywordEffects = unlisten;
+      })
+      .catch((error) => {
+        if (!disposed) console.warn('キーワードエフェクト購読に失敗しました', error);
+      });
+
     return () => {
       disposed = true;
       unlistenReactions();
+      unlistenKeywordEffects();
       motionQuery.removeEventListener('change', syncMotionPreference);
     };
-  });
-
-  $effect(() => {
-    const receivedCount = store.receivedCount;
-    const messages = store.allMessages;
-    const enabled = config.enabled;
-    const rules = normalizeRules(config.rules);
-
-    if (!initialized) {
-      markMessagesProcessed(messages);
-      lastReceivedCount = receivedCount;
-      initialized = true;
-      return;
-    }
-
-    if (!enabled || rules.length === 0 || receivedCount === lastReceivedCount) {
-      lastReceivedCount = receivedCount;
-      return;
-    }
-
-    for (const message of messages) {
-      if (processedIds.has(message.id)) continue;
-      processedIds.add(message.id);
-      const text = messageText(message).toLowerCase();
-      for (const rule of rules) {
-        if (text.includes(rule.keyword)) {
-          spawnParticles(rule.emoji, rule.count);
-        }
-      }
-    }
-    pruneProcessedIds(messages);
-    lastReceivedCount = receivedCount;
   });
 
   onDestroy(() => {
     clearParticles();
   });
 
-  function normalizeRules(rules: EffectsConfig['rules']) {
-    return (rules ?? [])
-      .map((rule) => ({
-        keyword: rule.keyword.trim().toLowerCase(),
-        emoji: rule.emoji,
-        count: boundedCount(rule.count)
-      }))
-      .filter((rule) => rule.keyword !== '' && rule.emoji !== '' && rule.count > 0);
+  function spawnKeywordEffects(effects: KeywordEffect[]) {
+    for (const effect of effects) {
+      if (typeof effect.emoji !== 'string' || effect.emoji === '') continue;
+      spawnParticles(effect.emoji, boundedCount(effect.count));
+    }
   }
 
   function boundedCount(value: unknown): number {
     const n = typeof value === 'number' ? value : Number(value);
     if (!Number.isFinite(n) || n <= 0) return 0;
     return Math.min(MAX_PARTICLES, Math.trunc(n));
-  }
-
-  function messageText(message: UiChatMessage): string {
-    return message.fragments.map((fragment) => fragment.type === 'text' ? fragment.text : '').join('');
-  }
-
-  function markMessagesProcessed(messages: UiChatMessage[]) {
-    for (const message of messages) processedIds.add(message.id);
-    pruneProcessedIds(messages);
-  }
-
-  function pruneProcessedIds(messages: UiChatMessage[]) {
-    if (processedIds.size <= MAX_SEEN_IDS) return;
-    const keep = new Set(messages.slice(-MAX_SEEN_IDS).map((message) => message.id));
-    for (const id of processedIds) {
-      if (!keep.has(id)) processedIds.delete(id);
-      if (processedIds.size <= MAX_SEEN_IDS) break;
-    }
   }
 
   function spawnReactionBatch(reactions: YoutubeReaction[]) {
