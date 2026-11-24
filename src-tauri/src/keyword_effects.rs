@@ -47,14 +47,19 @@ impl KeywordEffects {
             .collect()
     }
 
-    /// 規則が変わった時だけ作り直す。クールダウンはキーワードが同じ規則に引き継ぎ、
-    /// キーワードを変えた規則・新しい規則だけをリセットする。
+    /// 規則が変わった時だけ作り直す。クールダウンはキーワード(trim + 小文字)が同じ規則に引き継ぎ、
+    /// キーワードを変えた規則・新しい規則だけをリセットする。同じキーワードの規則が複数ある時は、その中で
+    /// 最後に発火した時刻をどれにも引き継ぐ(並べ替え・削除で出現順がずれても、クールダウン中に再発火しない)。
     fn sync(&mut self, rules: &[EffectRule]) {
         if self.raw == rules {
             return;
         }
-        let old: std::collections::HashMap<(String, usize), Option<Instant>> =
-            Self::keys(&self.rules).into_iter().zip(self.last_fired.drain(..)).collect();
+        let mut old: std::collections::HashMap<String, Instant> = std::collections::HashMap::new();
+        for ((k, _), last) in Self::keys(&self.rules).into_iter().zip(self.last_fired.drain(..)) {
+            if let Some(last) = last {
+                old.entry(k).and_modify(|t| *t = (*t).max(last)).or_insert(last);
+            }
+        }
         self.raw = rules.to_vec();
         self.rules = self.raw.clone();
         for rule in &mut self.rules {
@@ -74,7 +79,7 @@ impl KeywordEffects {
             .collect();
         self.last_fired = Self::keys(&self.rules)
             .iter()
-            .map(|k| old.get(k).copied().flatten())
+            .map(|(k, _)| old.get(k).copied())
             .collect();
     }
 
@@ -372,6 +377,20 @@ mod tests {
         let c2 = cfg(vec![slow, fast, other]);
         let out = fx.evaluate(&c2, &text("party"), t0 + Duration::from_secs(1));
         assert_eq!(ids(&out), vec![1]);
+    }
+
+    #[test]
+    fn deleting_an_earlier_rule_with_the_same_keyword_keeps_the_cooldown() {
+        let mut fx = KeywordEffects::default();
+        let mut off = rule("Party");
+        off.enabled = false;
+        let mut slow = rule(" party ");
+        slow.cooldown_ms = 60_000;
+        let t0 = Instant::now();
+        assert_eq!(ids(&fx.evaluate(&cfg(vec![off, slow.clone()]), &text("party"), t0)), vec![1]);
+        // 先の同じキーワードの規則を消すと出現順がずれるが、クールダウン中は再発火しない。
+        let out = fx.evaluate(&cfg(vec![slow]), &text("party"), t0 + Duration::from_secs(1));
+        assert!(out.is_empty(), "{out:?}");
     }
 
     #[test]

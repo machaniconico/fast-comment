@@ -424,13 +424,13 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
 
 コメント本文に規則のキーワードが含まれたら、アプリ内と OBS(内蔵 `effects`)へ演出を出す。判定・クールダウン・除外は Rust だけが行い、UI(`Effects.svelte`)と `effects` テンプレは受け取った物を描くだけ。
 
-- **規則(`config.json` の `effects.rules[]`、`EffectRule`)**: `keyword` / `emoji`(表示物。絵文字以外の短い文字でもよい。画像は内蔵テンプレートの対象外。カスタムテンプレートなら zip 内の画像を使える)/ `count` / `target` / `animation` / `durationMs` / `cooldownMs`。旧 config(`keyword`・`emoji`・`count` だけ)は足りない値を既定で補って読み込み、`target="app"` として従来どおり動く。
+- **規則(`config.json` の `effects.rules[]`、`EffectRule`)**: `keyword` / `emoji`(表示物。絵文字以外の短い文字でもよい。画像は内蔵テンプレートの対象外。カスタムテンプレートなら zip 内の画像を使える)/ `enabled`(既定 true。false の規則は発火しない。「テスト」は発火する)/ `count` / `target` / `animation` / `durationMs` / `cooldownMs`。旧 config(`keyword`・`emoji`・`count` だけ)は足りない値を既定で補って読み込み、`target="app"` として従来どおり動く。キーワードは読み込み時に trim する。旧 config の `count: 0`(旧 UI での無効化)は `enabled=false`・`count=1` として読む。新しい版で保存した config を旧版に戻して読むと `enabled` は無視される(更新は新しい版へだけ進む前提で、戻した時の互換は保証しない)。
   - `target`: `app` | `obs` | `both`、既定 `app`(未知の値も `app`)。
   - `count`: 1〜50(既定 12)。`durationMs`: 500〜15000(既定 3000、OBS のみ)。`cooldownMs`: 0〜60000(既定 2000)。範囲外は `normalize_all`(ロード・保存時)と発火時に丸める。`emoji` は 16 文字まで。
   - `animation`(OBS のみ。未知の値は `float`): `rain`(降る)・`burst`(弾ける)・`float`(浮かぶ)・`bounce`(跳ねる)・`spin`(回る)・`big`(中央に大きく)。CSS アニメだけで描く。
   - 表示物かキーワードが空(空白のみ含む)の規則は無効。
 - **判定**: `moderator` の Hide 除外の後(パイプライン)。対象外は System・`injected_test`・履歴/バックフィル(`route.uncounted`、効果音と同じ基準)・`effects.enabled=false`。キーワードは `regex::escape` + 大文字小文字無視の部分一致で、`text_fragments` ごとに照合(エモート名・著者名は対象外、断片をまたぐ一致はしない。Webhook と共用の `webhook::rules::keyword_regex` / `text_matches`)。1 コメントが複数の規則に当たれば規則ごとに 1 回、同じ規則は 1 コメントで最大 1 回。
-- **クールダウン**: 規則ごと、`Instant`(単調時計)で管理。発火した時刻から `cooldownMs` 未満の一致は捨てる(溜めない・窓も延ばさない)。`target` に関係なく共通。規則を編集するとリセットされる。「テスト」はクールダウンを無視する。
+- **クールダウン**: 規則ごと、`Instant`(単調時計)で管理。発火した時刻から `cooldownMs` 未満の一致は捨てる(溜めない・窓も延ばさない)。`target` に関係なく共通。規則を編集しても、キーワード(trim + 小文字)が同じ規則はクールダウンを引き継ぐ(同じキーワードの規則が複数ある時は、その中で最後に発火した時刻をどれにも引き継ぐ)。キーワードを変えた規則・新しい規則だけがリセットされる。「テスト」はクールダウンを無視する。
 - **配信**: 発火は Bus の `EffectTriggered { ruleId(規則の index), emoji, count, animation, durationMs }` になる(`target` は配信先の振り分け専用でシリアライズしない)。chat の発行の後に流す。
   - OBS: `/ws?effectEvents=1`(`1` / `true` のみ opt-in。判定は `modEvents` と同じ)のクライアントにだけ、`target` が `obs` / `both` の物を chat 配列の後に `{"effects":[EffectTriggered…]}` として 16ms tick 単位で送る(1 tick 1 フレーム、chat のバッチは分割しない、channel フィルタなし、原因の chat の後になるよう 1 tick 保留)。内蔵 `effects` がこれだけを使う。
   - アプリ: `target` が `app` / `both` の物を 16ms バッチで `emit("keyword-effects", [...])`。UI は判定をせず描画のみ(見た目は従来どおり、`prefers-reduced-motion` では省略)。
