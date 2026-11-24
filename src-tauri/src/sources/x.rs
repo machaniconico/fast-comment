@@ -154,6 +154,7 @@ impl ShowFetch {
     async fn activate_guest(&self, client: &reqwest::Client) -> anyhow::Result<String> {
         let v: Value = client
             .post(&self.activate_url)
+            .header(reqwest::header::CONTENT_LENGTH, "0")
             .timeout(HTTP_TIMEOUT)
             .header("authorization", format!("Bearer {}", self.bearer))
             .header("origin", "https://x.com")
@@ -1734,6 +1735,12 @@ mod tests {
                     let path = req.split_whitespace().nth(1).unwrap_or("").to_string();
                     if path.starts_with("/activate") {
                         activate_calls.fetch_add(1, Ordering::SeqCst);
+                        if !req.lines().any(|line| line.eq_ignore_ascii_case("content-length: 0")) {
+                            let _ = stream
+                                .write_all(b"HTTP/1.1 411 Length Required\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                                .await;
+                            return;
+                        }
                         let body = r#"{"guest_token":"g1"}"#;
                         let resp = format!(
                             "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",

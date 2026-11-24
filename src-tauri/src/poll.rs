@@ -449,8 +449,18 @@ impl Poll {
 
     pub(crate) fn stop(&self) -> PollSnapshot {
         let _controls = self.controls.lock().unwrap();
+        self.stop_matching(None)
+    }
+
+    pub(crate) fn stop_if_current(&self, poll_id: &str) -> PollSnapshot {
+        self.stop_matching(Some(poll_id))
+    }
+
+    fn stop_matching(&self, expected_id: Option<&str>) -> PollSnapshot {
         let mut current = self.current.lock().unwrap();
-        if current.snapshot.status == PollStatus::Open {
+        if current.snapshot.status == PollStatus::Open
+            && expected_id.is_none_or(|id| current.snapshot.id == id)
+        {
             self.close(&mut current);
             self.wake.notify_one();
         }

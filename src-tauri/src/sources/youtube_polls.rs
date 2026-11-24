@@ -2,7 +2,7 @@
 
 use std::{sync::LazyLock, time::Duration};
 
-use reqwest::{RequestBuilder, StatusCode, Url};
+use reqwest::{header::CONTENT_LENGTH, RequestBuilder, StatusCode, Url};
 use serde_json::{json, Value};
 
 use super::youtube_send::google_api_reason;
@@ -42,7 +42,7 @@ pub enum YtPollStatus {
 pub enum YtPollsError {
     #[error("YouTube側ですでに投票が受付中です")]
     AlreadyActive,
-    #[error("YouTubeのアンケート操作に必要な権限がありません")]
+    #[error("{}", forbidden_message(.0))]
     Forbidden(String),
     #[error("YouTube APIの利用上限に達しました。日次上限は翌日の割り当てまで回復しません")]
     QuotaExceeded,
@@ -56,6 +56,14 @@ pub enum YtPollsError {
     Api(u16),
     #[error("YouTubeのアンケートとの通信に失敗しました")]
     Network,
+}
+
+fn forbidden_message(reason: &str) -> &'static str {
+    match reason {
+        "liveChatEnded" => "YouTube配信のチャットが終了しています",
+        "liveChatDisabled" => "YouTube配信のチャットが無効になっています",
+        _ => "YouTubeのアンケート操作に必要な権限がありません",
+    }
 }
 
 impl YtPollsError {
@@ -139,6 +147,7 @@ impl YoutubePolls {
         let request = self
             .http
             .post(format!("{}/transition", self.messages_url))
+            .header(CONTENT_LENGTH, "0")
             .query(&[("id", message_id), ("status", "closed")]);
         Ok(parse_state(
             &self
@@ -155,7 +164,7 @@ impl YoutubePolls {
         let request = self
             .http
             .get(&self.messages_url)
-            .query(&[("liveChatId", live_chat_id)]);
+            .query(&[("liveChatId", live_chat_id), ("maxResults", "200")]);
         let value = self.send(request, token, &[live_chat_id]).await?;
         Ok(value.get("activePollItem").and_then(parse_state))
     }
@@ -280,7 +289,10 @@ fn parse_state(item: &Value) -> Option<YtPollState> {
             .then(|| {
                 options
                     .iter()
-                    .map(|option| option["tally"].as_str()?.parse().ok())
+                    .map(|option| {
+                        let tally = &option["tally"];
+                        tally.as_u64().or_else(|| tally.as_str()?.parse().ok())
+                    })
                     .collect()
             })
             .flatten(),

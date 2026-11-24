@@ -22,7 +22,7 @@ use crate::{
 };
 
 const POLL_INTERVAL: Duration = Duration::from_secs(10);
-// 作成応答を失った時の照合 GET は、通信失敗と 5xx の時だけ再試行する。
+// 作成応答を失った時の照合 GET は、各待機時間の後に 1 回まで送る。
 const MATCH_RETRY_SECS: [u64; 3] = [1, 2, 4];
 
 #[derive(Clone, Debug, thiserror::Error)]
@@ -52,6 +52,14 @@ impl YoutubeControlError {
 
     fn transient(&self) -> bool {
         matches!(self, Self::Api(error) if error.transient())
+    }
+
+    fn should_end_remote(&self) -> bool {
+        matches!(
+            self,
+            Self::MissingTallies
+                | Self::Api(YtPollsError::Forbidden(_) | YtPollsError::Api(400..=499))
+        )
     }
 }
 
@@ -167,16 +175,20 @@ impl YoutubePollControl {
         let question = &start.preferences.question;
         let options = &start.preferences.options;
         let sent_at_ms = chrono::Utc::now().timestamp_millis();
-        let remote_id = match self
+        let (remote_id, published_at_ms) = match self
             .api
             .create(&token, &live_chat_id, question, options)
             .await
         {
-            Ok(YtPollCreated { id, .. }) => id,
+            Ok(YtPollCreated {
+                id,
+                published_at_ms,
+            }) => (id, published_at_ms),
             Err(YtPollsError::Network) => {
-                self.reconcile(&client_id, &live_chat_id, question, options, sent_at_ms)
-                    .await?
-                    .id
+                let found = self
+                    .reconcile(&token, &live_chat_id, question, options, sent_at_ms)
+                    .await?;
+                (found.id, found.published_at_ms)
             }
             Err(error) => return Err(YoutubeControlError::from(error).into()),
         };
@@ -188,10 +200,20 @@ impl YoutubePollControl {
 
         // 保存に失敗しても、YouTube に作成できた投票は追跡する。
         let saved = self.poll.save_start_preferences(&start);
-        let deadline = start
-            .duration_secs
-            .map(|secs| Instant::now() + Duration::from_secs(secs.into()));
-        let snapshot = self.poll.open(start);
+        let duration_secs = start.duration_secs;
+        let opened_at = Instant::now();
+        let mut snapshot = self.poll.open(start);
+        let deadline = duration_secs.map(|secs| {
+            let local_start = snapshot.started_at_ms;
+            let started_at_ms = published_at_ms
+                .and_then(|at| u64::try_from(at).ok())
+                .map_or(local_start, |at| at.min(local_start));
+            let ends_at_ms = started_at_ms + u64::from(secs) * 1000;
+            self.poll
+                .set_remote_timing(&snapshot.id, started_at_ms, ends_at_ms);
+            snapshot = self.poll.snapshot();
+            opened_at + Duration::from_millis(ends_at_ms.saturating_sub(local_start))
+        });
         let cancel = self.app_cancel.child_token();
         *self.active.lock().await = Some(ActivePoll {
             local_id: snapshot.id.clone(),
@@ -218,7 +240,7 @@ impl YoutubePollControl {
 
     async fn reconcile(
         &self,
-        client_id: &str,
+        token: &str,
         live_chat_id: &str,
         question: &str,
         options: &[String],
@@ -229,7 +251,7 @@ impl YoutubePollControl {
                 .app_cancel
                 .run_until_cancelled(async {
                     time::sleep(Duration::from_secs(seconds)).await;
-                    self.get(client_id, live_chat_id).await
+                    self.api.active(token, live_chat_id).await
                 })
                 .await;
             match found {
@@ -247,6 +269,7 @@ impl YoutubePollControl {
                 {
                     return Ok(found);
                 }
+                Some(Ok(None) | Err(YtPollsError::Unauthorized)) => {}
                 Some(Err(error)) if error.transient() => {}
                 _ => break,
             }
@@ -302,15 +325,22 @@ impl YoutubePollControl {
         let snapshot = if reset {
             self.poll.reset()
         } else if still_current {
-            if let Ok(Some(state)) = &result {
-                match snapshot_votes(state, self.poll.snapshot().options.len()) {
-                    Some(votes) => {
-                        self.poll.apply_external(&local_id, &votes, true);
+            let snapshot = self.poll.snapshot();
+            match &result {
+                Ok(Some(state)) if snapshot.id == local_id => {
+                    match snapshot_votes(state, snapshot.options.len()) {
+                        Some(votes) => {
+                            self.poll.apply_external(&local_id, &votes, true);
+                            self.poll.snapshot()
+                        }
+                        None => {
+                            result = Err(YoutubeControlError::MissingTallies);
+                            self.poll.stop_if_current(&local_id)
+                        }
                     }
-                    None => result = Err(YoutubeControlError::MissingTallies),
                 }
+                _ => self.poll.stop_if_current(&local_id),
             }
-            self.poll.stop()
         } else {
             self.poll.snapshot()
         };
@@ -327,20 +357,42 @@ impl YoutubePollControl {
         deadline: Option<Instant>,
         cancel: CancellationToken,
     ) {
-        let mut ticks = time::interval_at(Instant::now() + POLL_INTERVAL, POLL_INTERVAL);
-        ticks.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+        let next_get = Mutex::new(Instant::now() + POLL_INTERVAL);
         let mut last_error = None;
         loop {
-            if cancel.run_until_cancelled(ticks.tick()).await.is_none()
-                || deadline.is_some_and(|at| Instant::now() >= at)
+            let scheduled = *next_get.lock().await;
+            if deadline.is_some_and(|at| scheduled >= at)
+                || cancel
+                    .run_until_cancelled(time::sleep_until(scheduled))
+                    .await
+                    .is_none()
             {
                 return;
             }
-            // 認証更新と保存は途中で打ち切らず、キャンセル後は集計結果の反映を止める。
-            let result = self.get(&target.client_id, &target.live_chat_id).await;
+            // 401 の再試行も、直前の GET を送信してから 10 秒空ける。
+            // 認証更新と保存は途中で打ち切らず、キャンセル後は送信と反映を止める。
+            let (next_get, cancel) = (&next_get, &cancel);
+            let (api, live_chat_id) = (&self.api, &target.live_chat_id);
+            let result = with_access(&self.auth, &target.client_id, |token| async move {
+                let mut scheduled = next_get.lock().await;
+                let wake_at = deadline.map_or(*scheduled, |at| at.min(*scheduled));
+                if cancel
+                    .run_until_cancelled(time::sleep_until(wake_at))
+                    .await
+                    .is_none()
+                    || deadline.is_some_and(|at| Instant::now() >= at)
+                {
+                    return Ok(None);
+                }
+                *scheduled = Instant::now() + POLL_INTERVAL;
+                drop(scheduled);
+                api.active(&token, live_chat_id).await
+            })
+            .await;
 
             let mut active = self.active.lock().await;
             if cancel.is_cancelled()
+                || deadline.is_some_and(|at| Instant::now() >= at)
                 || !active
                     .as_ref()
                     .is_some_and(|poll| poll.local_id == local_id && poll.transition.is_none())
@@ -364,7 +416,7 @@ impl YoutubePollControl {
                     }
                 }
                 Ok(_) => {
-                    self.poll.stop();
+                    self.poll.stop_if_current(&local_id);
                     *active = None;
                     return;
                 }
@@ -376,9 +428,18 @@ impl YoutubePollControl {
                 last_error = Some(class);
             }
             if !error.transient() {
-                self.poll.stop();
+                self.poll.stop_if_current(&local_id);
                 *active = None;
-                if !matches!(error, YoutubeControlError::Api(YtPollsError::NotFound)) {
+                drop(active);
+                if error.should_end_remote() {
+                    if let Ok(token) = self.auth.access_token(&target.client_id).await {
+                        let _ = self
+                            .api
+                            .end_for_chat(&token, &target.remote_id, &target.live_chat_id)
+                            .await;
+                    }
+                    (self.notify)(&format!("{error}。YouTube 側で投票を終了してください"));
+                } else if !matches!(error, YoutubeControlError::Api(YtPollsError::NotFound)) {
                     (self.notify)(&error.to_string());
                 }
                 return;
@@ -405,17 +466,6 @@ impl YoutubePollControl {
                 (self.notify)(&error.to_string());
             }
         }
-    }
-
-    async fn get(
-        &self,
-        client_id: &str,
-        live_chat_id: &str,
-    ) -> Result<Option<YtPollState>, YoutubeControlError> {
-        with_access(&self.auth, client_id, |token| async move {
-            self.api.active(&token, live_chat_id).await
-        })
-        .await
     }
 }
 

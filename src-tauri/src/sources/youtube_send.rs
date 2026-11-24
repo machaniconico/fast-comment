@@ -387,7 +387,7 @@ impl YoutubeAuth {
         Err(SendError::Unauthorized)
     }
 
-    pub(super) async fn access_token(&self, client_id: &str) -> Result<String, String> {
+    pub(crate) async fn access_token(&self, client_id: &str) -> Result<String, String> {
         // refreshを同時実行しないため、更新完了まで同じmutexを保持する。
         let mut cache = self.access_token.lock().await;
         if let Some(cached) = cache.as_ref() {

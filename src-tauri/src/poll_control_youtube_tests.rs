@@ -76,6 +76,10 @@ struct Mock {
     calls: StdMutex<Vec<&'static str>>,
     hold_get: Notify,
     get_entered: Notify,
+    transition_entered: Notify,
+    get_times: StdMutex<Vec<Instant>>,
+    get_queries: StdMutex<Vec<String>>,
+    transition_lengths: StdMutex<Vec<Option<String>>>,
 }
 
 impl Mock {
@@ -115,6 +119,11 @@ impl Mock {
                 .pop_front()
                 .unwrap_or_else(|| Json(item(ID, "active")).into_response()),
             "active" => {
+                self.get_times.lock().unwrap().push(Instant::now());
+                self.get_queries
+                    .lock()
+                    .unwrap()
+                    .push(request.uri().query().unwrap_or_default().to_owned());
                 let reply = self.active.lock().unwrap().pop_front();
                 if let Some(reply) = reply {
                     return reply;
@@ -123,12 +132,24 @@ impl Mock {
                 self.hold_get.notified().await;
                 Json(json!({"activePollItem": item(ID, "active")})).into_response()
             }
-            "transition" => self
-                .transition
-                .lock()
-                .unwrap()
-                .pop_front()
-                .unwrap_or_else(|| Json(item(ID, "closed")).into_response()),
+            "transition" => {
+                self.transition_lengths.lock().unwrap().push(
+                    request
+                        .headers()
+                        .get("content-length")
+                        .map(|value| value.to_str().unwrap().to_owned()),
+                );
+                assert!(axum::body::to_bytes(request.into_body(), 1)
+                    .await
+                    .unwrap()
+                    .is_empty());
+                self.transition_entered.notify_one();
+                self.transition
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or_else(|| Json(item(ID, "closed")).into_response())
+            }
             _ => unreachable!(),
         }
     }
@@ -231,9 +252,13 @@ impl Fixture {
     }
 
     async fn closed(&self) -> PollSnapshot {
+        self.closed_within(Duration::from_secs(15)).await
+    }
+
+    async fn closed_within(&self, timeout: Duration) -> PollSnapshot {
         let mut state = self.poll.sender().subscribe();
         let closed = time::timeout(
-            Duration::from_secs(15),
+            timeout,
             state.wait_for(|state| state.status == PollStatus::Closed),
         )
         .await
@@ -421,13 +446,8 @@ async fn quota_stops_polling_and_notifies_without_sensitive_details() {
 }
 
 #[tokio::test]
-async fn poller_refreshes_once_and_closes_with_notice_if_tallies_are_missing() {
+async fn poller_closes_with_notice_if_tallies_are_missing() {
     let mut fixture = Fixture::new().await;
-    fixture.mock.active.lock().unwrap().push_back(reply(
-        StatusCode::UNAUTHORIZED,
-        "authError",
-        "expired",
-    ));
     let mut without_tally = item(ID, "active");
     without_tally["snippet"]["pollDetails"]["metadata"]["options"][0] = json!({"optionText": "A"});
     fixture.mock.push_active(without_tally);
@@ -437,10 +457,11 @@ async fn poller_refreshes_once_and_closes_with_notice_if_tallies_are_missing() {
         .unwrap()
         .unwrap();
     assert!(notice.contains("所有者"));
+    assert!(notice.contains("YouTube 側で投票を終了してください"));
     assert_eq!(fixture.closed().await.total_voters, 6);
     assert_eq!(
         fixture.mock.calls(),
-        ["token", "broadcasts", "create", "active", "token", "active"]
+        ["token", "broadcasts", "create", "active", "transition"]
     );
 }
 
@@ -535,4 +556,299 @@ async fn bad_request_uses_reason_when_api_message_echoes_sensitive_data() {
         assert!(!format!("{error:?}").contains(secret));
     }
     assert_eq!(fixture.control.snapshot().status, PollStatus::Idle);
+}
+
+#[tokio::test]
+async fn transition_sends_zero_content_length() {
+    let fixture = Fixture::new().await;
+    fixture.start().await.unwrap();
+    assert_eq!(
+        fixture.control.stop().await.unwrap().status,
+        PollStatus::Closed
+    );
+    assert_eq!(
+        *fixture.mock.transition_lengths.lock().unwrap(),
+        [Some("0".into())]
+    );
+}
+
+#[tokio::test]
+async fn active_uses_minimum_page_size() {
+    let fixture = Fixture::new().await;
+    fixture.mock.push_active(item(ID, "active"));
+    fixture
+        .control
+        .youtube
+        .api
+        .active(TOKEN, CHAT)
+        .await
+        .unwrap();
+    let queries = fixture.mock.get_queries.lock().unwrap();
+    assert!(url::form_urlencoded::parse(queries[0].as_bytes())
+        .any(|(key, value)| key == "maxResults" && value == "200"));
+}
+
+#[tokio::test]
+async fn accepts_unsigned_integer_tallies_and_rejects_invalid_values() {
+    let fixture = Fixture::new().await;
+    for (tally, expected) in [
+        (json!(12), Some(vec![12, 3])),
+        (json!(0), Some(vec![0, 3])),
+        (json!(-1), None),
+        (json!(1.5), None),
+        (json!("1.5"), None),
+        (json!("-1"), None),
+        (json!("no votes"), None),
+    ] {
+        let mut sample = item(ID, "active");
+        sample["snippet"]["pollDetails"]["metadata"]["options"][0]["tally"] = tally.clone();
+        fixture.mock.push_active(sample);
+        let state = fixture
+            .control
+            .youtube
+            .api
+            .active(TOKEN, CHAT)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.tallies, expected, "tally={tally}");
+    }
+}
+
+#[tokio::test]
+async fn delayed_publish_uses_youtube_start_time_for_remaining_duration() {
+    let fixture = Fixture::new().await;
+    let published = chrono::Utc::now() - chrono::Duration::seconds(9);
+    let mut created = item(ID, "active");
+    created["snippet"]["publishedAt"] = json!(published.to_rfc3339());
+    fixture
+        .mock
+        .create
+        .lock()
+        .unwrap()
+        .push_back(Json(created).into_response());
+    let mut start = request();
+    start.duration_secs = Some(10);
+
+    let opened = fixture
+        .control
+        .start(start.validate().unwrap())
+        .await
+        .unwrap();
+    let started_at_ms = published.timestamp_millis() as u64;
+    assert_eq!(opened.started_at_ms, started_at_ms);
+    assert_eq!(opened.ends_at_ms, Some(started_at_ms + 10_000));
+    assert_eq!(fixture.poll.snapshot(), opened);
+    assert_eq!(
+        time::timeout(Duration::from_secs(3), fixture.closed())
+            .await
+            .unwrap()
+            .total_voters,
+        10
+    );
+}
+
+#[tokio::test]
+async fn reconciliation_retries_empty_responses_within_three_gets() {
+    for found in [true, false] {
+        let fixture = Fixture::new().await;
+        fixture.mock.create.lock().unwrap().push_back(interrupted());
+        fixture
+            .mock
+            .active
+            .lock()
+            .unwrap()
+            .extend((0..if found { 2 } else { 3 }).map(|_| Json(json!({})).into_response()));
+        if found {
+            fixture.mock.push_active(item(ID, "active"));
+        }
+        let result = fixture.start().await;
+        if found {
+            assert_eq!(result.unwrap().status, PollStatus::Open);
+        } else {
+            assert!(matches!(
+                result,
+                Err(PollControlError::Youtube(
+                    YoutubeControlError::CreateUnconfirmed
+                ))
+            ));
+            assert_eq!(fixture.control.snapshot().status, PollStatus::Idle);
+        }
+        assert_eq!(
+            fixture.mock.calls(),
+            [
+                "token",
+                "broadcasts",
+                "create",
+                "active",
+                "active",
+                "active"
+            ]
+        );
+    }
+}
+
+#[tokio::test]
+async fn reconciliation_counts_unauthorized_without_resending_get() {
+    let fixture = Fixture::new().await;
+    fixture.mock.create.lock().unwrap().push_back(interrupted());
+    fixture
+        .mock
+        .active
+        .lock()
+        .unwrap()
+        .extend((0..3).map(|_| reply(StatusCode::UNAUTHORIZED, "authError", "expired")));
+    assert!(matches!(
+        fixture.start().await,
+        Err(PollControlError::Youtube(
+            YoutubeControlError::CreateUnconfirmed
+        ))
+    ));
+    assert_eq!(
+        fixture.mock.calls(),
+        [
+            "token",
+            "broadcasts",
+            "create",
+            "active",
+            "active",
+            "active"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn polling_spaces_gets_even_when_refreshing_an_unauthorized_token() {
+    let fixture = Fixture::new().await;
+    fixture.mock.active.lock().unwrap().extend([
+        reply(StatusCode::UNAUTHORIZED, "authError", "expired"),
+        reply(StatusCode::BAD_GATEWAY, "backendError", "retry"),
+    ]);
+    fixture.mock.push_active(item(ID, "closed"));
+    fixture.seed_votes().await;
+    assert_eq!(
+        fixture
+            .closed_within(Duration::from_secs(35))
+            .await
+            .total_voters,
+        10
+    );
+    assert_eq!(
+        fixture.mock.calls(),
+        [
+            "token",
+            "broadcasts",
+            "create",
+            "active",
+            "token",
+            "active",
+            "active"
+        ]
+    );
+    let times = fixture.mock.get_times.lock().unwrap();
+    for pair in times.windows(2) {
+        // HTTP の到着時刻は送信時刻と僅かにずれる。
+        assert!(
+            pair[1] - pair[0] >= Duration::from_millis(9_950),
+            "{times:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn polling_terminal_errors_attempt_exactly_one_transition_and_keep_votes_on_failure() {
+    for (status, reason, expected) in [
+        (StatusCode::FORBIDDEN, "forbidden", "権限がありません"),
+        (StatusCode::GONE, "gone", "HTTP 410"),
+    ] {
+        let mut fixture = Fixture::new().await;
+        fixture
+            .mock
+            .active
+            .lock()
+            .unwrap()
+            .push_back(reply(status, reason, "failed"));
+        fixture.mock.transition.lock().unwrap().push_back(reply(
+            StatusCode::UNAUTHORIZED,
+            "authError",
+            "expired",
+        ));
+        fixture.seed_votes().await;
+        let notice = time::timeout(Duration::from_secs(15), fixture.notices.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(notice.contains(expected), "{notice}");
+        assert!(
+            notice.contains("YouTube 側で投票を終了してください"),
+            "{notice}"
+        );
+        assert_eq!(fixture.closed().await.total_voters, 6);
+        fixture.control.stop().await.unwrap();
+        assert_eq!(
+            fixture.mock.calls(),
+            ["token", "broadcasts", "create", "active", "transition"]
+        );
+    }
+}
+
+#[tokio::test]
+async fn ended_live_chat_has_its_own_error_message() {
+    let fixture = Fixture::new().await;
+    fixture.mock.active.lock().unwrap().push_back(reply(
+        StatusCode::FORBIDDEN,
+        "liveChatEnded",
+        "chat has ended",
+    ));
+    let error = fixture
+        .control
+        .youtube
+        .api
+        .active(TOKEN, CHAT)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("配信のチャットが終了しています"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn auto_finish_cannot_stop_a_new_chat_poll() {
+    let fixture = Fixture::new().await;
+    let old = fixture.seed_votes().await;
+    let held = Arc::new(Notify::new());
+    let released = held.clone();
+    fixture.mock.transition.lock().unwrap().push_back(
+        Body::from_stream(futures_util::stream::once(async move {
+            released.notified().await;
+            Ok::<_, io::Error>(item(ID, "closed").to_string())
+        }))
+        .into_response(),
+    );
+    let youtube = fixture.control.youtube.clone();
+    let old_id = old.id.clone();
+    let expire = tokio::spawn(youtube.expire(old_id, Instant::now(), fixture.cancel.child_token()));
+    time::timeout(
+        Duration::from_secs(5),
+        fixture.mock.transition_entered.notified(),
+    )
+    .await
+    .unwrap();
+
+    assert!(fixture.poll.apply_external(&old.id, &[7, 3], true));
+    let mut chat = request();
+    chat.source = PollSource::Chat;
+    let new = fixture
+        .control
+        .start(chat.validate().unwrap())
+        .await
+        .unwrap();
+    held.notify_one();
+    time::timeout(Duration::from_secs(5), expire)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fixture.control.snapshot(), new);
+    assert_eq!(new.status, PollStatus::Open);
 }
