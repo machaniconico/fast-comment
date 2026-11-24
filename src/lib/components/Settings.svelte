@@ -6,7 +6,7 @@
     ConfigCommit, OAuthClientSaved
   } from '../ipc';
   import {
-    isTauri, getConfigSnapshot, setConfig, configChangedError, getObsUrl, getObsGoalsUrl, getObsTimerUrl, exportCommentsCsv, injectTestComment, testKeywordEffect,
+    isTauri, getConfigSnapshot, setConfig, configChangedError, getObsUrl, getObsGoalsUrl, getObsTimerUrl, getObsPollUrl, exportCommentsCsv, injectTestComment, testKeywordEffect,
     setTtsPaused, clearTtsQueue, skipCurrentTts, testTts, probeTtsEngine, getYoutubeOauthStatus,
     connectYoutubeOauth, disconnectYoutubeOauth, getTwitchOauthStatus, beginTwitchLogin,
     awaitTwitchLogin, cancelTwitchLogin, disconnectTwitchOauth, getGoalSkinInfo, openUrl,
@@ -109,6 +109,8 @@
   let obsBaseUrl: string = $state('');
   let obsGoalsBaseUrl: string = $state('');
   let obsTimerBaseUrl: string = $state('');
+  let obsPollUrl = $state('');
+  let copiedPollObs = $state(false);
   let copiedObs: boolean = $state(false);
   let copiedGiftObs: boolean = $state(false);
   let copiedDanmakuObs: boolean = $state(false);
@@ -543,6 +545,7 @@
     obsBaseUrl = url ?? 'http://127.0.0.1:11180/?template=default';
     obsGoalsBaseUrl = await getObsGoalsUrl();
     obsTimerBaseUrl = await getObsTimerUrl();
+    obsPollUrl = await getObsPollUrl();
     await refreshGoalSkins();
 
     refreshSpeechVoices();
@@ -2711,6 +2714,13 @@
       <input type="text" value={giftObsUrl} readonly class="obs-input" />
       <button class="copy-btn" class:copied={copiedGiftObs} onclick={onCopyGiftObs}>
         {copiedGiftObs ? 'コピー済' : 'コピー'}
+      </button>
+    </div>
+    <div class="obs-label">アンケート オーバーレイURL（推奨 800 × 600）</div>
+    <div class="obs-row">
+      <input type="text" value={obsPollUrl} readonly class="obs-input" aria-label="アンケート オーバーレイURL" />
+      <button class="copy-btn" class:copied={copiedPollObs} onclick={() => copyText(obsPollUrl, () => { copiedPollObs = true; })}>
+        {copiedPollObs ? 'コピー済' : 'コピー'}
       </button>
     </div>
     <div id="settings-obs-template-editor" class="template-editor-wrap">

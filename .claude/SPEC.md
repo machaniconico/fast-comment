@@ -319,6 +319,7 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
 - **コメント投稿** (`CommentComposer.svelte`, `sources/twitch_send.rs`, `sources/youtube_send.rs`): 自分でコメントを送信。Twitch は IRC、YouTube は公式Data API `liveChatMessages.insert` で送信する。YouTube認証はシステムブラウザ + loopback redirect + Authorization Code/PKCE、scopeは`youtube.force-ssl`。refresh tokenはOS資格情報ストア、access tokenは期限付きメモリキャッシュに保持し、受信ホットパスへ処理を追加しない。配信中の`liveChatId`は`liveBroadcasts.list`で解決して60秒キャッシュする。
 - **参加型配信の管理** (`Participation.svelte`, `Raffle.svelte`): キーワード(既定「参加」)での参加登録、先着/ランダム抽選、専用タブ。既定 OFF。
 - **投げ銭パネル** (`DonationPanel.svelte`): SuperChat/Bits/メンバーを通常コメントと分けて表示(アプリ内タブ / OBS `?only=gift`)。既定 OFF。
+- **アンケート** (`Poll.svelte`): 「ツール ▾」からコメント投票を開始・終了し、5 種類のグラフで結果を表示。OBS に同じ結果を配信する(§19)。
 - **配信振り返りダッシュボード** (`Dashboard.svelte`, `Sparkline.svelte`): コメント数・視聴者推移などの集計表示。
 - **タイマー/ゴール/エフェクト/マイルストーン** (`Timer.svelte`, `GoalsBar.svelte`, `Effects.svelte`, `Milestone.svelte`): 配信演出系。OBS テンプレ `timer`/`goals` と連動。
   - Goals はコメント、視聴者、高評価、リアクションを表示できる。リアクションは YouTube 絵文字リアクション累計で、YouTube のみ有効(`reactionsAvailable=false` で自動非表示)。
@@ -331,7 +332,7 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
 
 - 各テンプレは index.html + style.css + app.js の独立した静的サイト。`/ws` に接続し、届いた batch を描画する。ユーザーが CSS を差し替えて見た目をカスタムできる。
 - OBS には「ブラウザソース」で `http://127.0.0.1:11180/?template=<name>&ws=ws://127.0.0.1:11180/ws&channel=...` を指定。`template` 未指定時は `default`。OBS ポート変更時は `ws` も同じポートを指す。
-- 出荷済みテンプレ(10種):
+- 出荷済みテンプレ(12種):
 
   | テンプレ | 用途 |
   |---|---|
@@ -343,6 +344,7 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
   | `goals` | 目標(ゴール)バー |
   | `donation` | 投げ銭(SuperChat/Bits)サマリー |
   | `timer` | カウントダウン/アップタイマー |
+  | `poll` | アンケートの集計・結果(透過背景、`/poll` WS、推奨 800×600。§19) |
   | `danmaku` | ニコ生風に画面を横切る弾幕(後述 §8.1) |
   | `trophy` | 実績解除を等級別のアイコン・色で1件ずつ表示(チャット非表示、`?duration=<秒>` 既定5秒) |
   | `effects` | キーワードエフェクト(透過背景に絵文字等を CSS アニメで描く。推奨 1920x1080。§9.2) |
@@ -586,6 +588,7 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
 - `POST /test-comments`: platform 必須(twitch / youtube / x / niconico)、kind は normal(既定) / superChat / membership / bits / gift、count は 1〜20(既定 1)、name は 64 文字以下、text は 500 文字以下、amount は有限の 0〜1,000,000,000。負のゼロは 0 に正規化する。未知キー・不正な型・範囲外は丸めず 400 invalid_request。name / text 省略は空文字として扱い、生成時に空白を trim して空なら「テストユーザー」/「テストコメントです」。amount は superChat / bits のみ適用。成功は 202 `{injected,ids}`。ID はプロセスごとに一度生成する UUID と連番の `injected-test:<UUID>-<連番>`、injected_test フラグを持ち、Webhook の対象外。source_tx → 既存パイプラインを通す。
 - `GET /tts` は `{paused,depth,items:[{id,preview}]}`。`POST /tts/pause`・`resume`・`skip`・`clear` は既存コマンドの共通処理を使い、操作後のキュー状態を返す。pause / resume は冪等。UI の停止表示・発話停止・棒読みちゃんの停止/再開命令も既存どおり。
 - `GET /timer` は既存の TimerSnapshot。`POST /timer/start` は本文なし、または `{durationSec:1〜359999}`。省略時は設定の既定秒数。`POST /timer/pause`・`resume`・`reset` は本文なし。遷移は既存コマンドと共通の純関数で処理し、操作が返すスナップショットを応答する。UI / OBS の watch 通知も共用。
+- `GET /api/v1/poll` は PollSnapshot。`POST /api/v1/poll/start` は §19 の開始パラメータを JSON で受け、`POST /api/v1/poll/stop`・`POST /api/v1/poll/reset` は本文なし。各操作は IPC と同じ状態・入力検証を使い、成功時は操作後の PollSnapshot を返す。入力不正は 400 `invalid_request`、二重開始は 409 `poll_already_open`。
 - 操作本文は JSON オブジェクトのみ、最大 16 KiB(413 payload_too_large)。本文ありで JSON 以外なら 415 unsupported_media_type。本文なし操作に JSON 本文が来た場合も 400。変更系 POST 全体で容量 20・毎秒 10 補充のトークンバケット(tokio::time)を共有し、OBS ポート変更でも枠を維持する。認証・入力検証後に消費。超過時は 429 rate_limited と Retry-After: 1、操作を実行しない。GET は制限しない。依存未提供は 503 unavailable、操作内部エラーは詳細を伏せた 500 internal。
 - config / webhooks / token / chat/send / moderation/ban / tts/speak のルートは提供しない。Webhook は §16。
 
@@ -629,3 +632,13 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
 - **枠ごとの上書き**: `ChannelOverrides.soundEnabled`。`tts_enabled` と同じく `false` だけを保存する(`true` は正規化で消える)。枠ごとの設定ダイアログにチェックボックス「この枠は効果音を鳴らさない」。
 - **試し鳴らし**: 設定画面の各行のボタンは UI だけで鳴らす(判定・間引きの経路は通さない)。
 - **対象外 (v1)**: チャンネルポイントの引き換えと接続断の音は将来の候補。
+
+
+## 19. アンケート (PR1)
+
+- アプリ全体で同時に 1 件のコメント投票を扱う。`PollSnapshot` は `id`・`source:"chat"`・`status`(`idle`/`open`/`closed`)・`question`・`options`(`label`・`votes`・`percent`・`leading`)・`totalVoters`・`startedAtMs`・任意の `endsAtMs`・`display`・`showPercent`・`showCounts` を持つ。票が 0 の時の割合は 0。割合・最多の判定は Rust で計算する。
+- `poll_start` は trim 後の質問 1〜100 文字、選択肢 2〜10 件(各 1〜40 文字、大小文字を無視して一意)と表示設定を受け付ける。`durationSecs` は 10〜3600 秒。省略時は手動終了。期限は Rust の単調時計で管理する。`poll_stop` は結果を保持したまま閉じ、`poll_reset` は待機状態に戻す。`poll_set_display` は表示形式(`bar-h`/`bar-v`/`pie`/`donut`/`number`)と割合・票数の表示を変更する。
+- 受付中はモデレーション後のコメントを判定する。System・非表示・履歴やバックフィル(`route.uncounted`)・空の著者 ID を除外し、`injected_test` のテスト注入は数える。`plain_text()` の前後の空白と見えない文字(Twitch のクライアントが連投のために付ける U+E0000、BOM、ゼロ幅文字)を落とし、番号 1〜N(全角数字可)を優先し、該当しなければラベルと大小文字を無視して全文一致で照合する。投票者のキーはプラットフォームと著者 ID の組。最新の選択肢で上書きし、同じ選択肢の連投は集計を変えない。最大 100,000 人。上限到達後も既存の投票者は変更できる。
+- 状態はメモリ内の `watch` に公開する。`poll_state` で現在値を取得でき、票による `poll-updated` と OBS 更新は最大 100ms に 1 回。操作や自動終了は即時反映する。`config.json` の `poll` に最後に使った質問・選択肢・表示設定を保存する。欠落・破損時は既定値を使う。票・結果は再起動で消える。アンケートの通知・ログ・エラーに投票者の名前や ID を含めない。
+- ローカル API は §15。OBS は設定の OBS 節またはアンケート画面から URL をコピーする。`/poll` WS は接続時と更新時に最新のスナップショットを送る。透過テンプレートは質問・残り時間・総投票者数・グラフを表示する。待機中は非表示、終了後は「結果」として最多の選択肢をすべて強調する。
+- PR2 は Twitch 公式 Polls、PR3 は YouTube 公式投票を同じ PollSnapshot とグラフへ接続する。

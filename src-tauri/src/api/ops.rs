@@ -1,6 +1,10 @@
 //! アプリ操作の HTTP 境界。内部エラーの内容は公開しない。
 use super::{error, ApiDeps};
-use crate::{stats::TimerSnapshot, tts::TtsQueueStatePayload};
+use crate::{
+    poll::{PollError, PollStart},
+    stats::TimerSnapshot,
+    tts::TtsQueueStatePayload,
+};
 use axum::{
     extract::{Request, State},
     http::{header, StatusCode},
@@ -273,11 +277,116 @@ pub async fn mutate(State(deps): State<ApiDeps>, request: Request) -> Response {
     Json(ops.tts_state()).into_response()
 }
 
+pub async fn poll(State(deps): State<ApiDeps>) -> Response {
+    match deps.poll {
+        Some(poll) => Json(poll.snapshot()).into_response(),
+        None => unavailable(),
+    }
+}
+
+pub async fn poll_mutate(State(deps): State<ApiDeps>, request: Request) -> Response {
+    let path = request.uri().path().to_owned();
+    let body = match body(request).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let start = if path == "/api/v1/poll/start" {
+        let Some(body) = body else {
+            return invalid("body");
+        };
+        let Ok(request) = serde_json::from_value::<PollStart>(body) else {
+            return invalid("body");
+        };
+        match request.validate() {
+            Ok(start) => Some(start),
+            Err(error) => return poll_error(error),
+        }
+    } else {
+        if body.is_some() {
+            return invalid("body");
+        }
+        None
+    };
+
+    let Some(poll) = deps.poll else {
+        return unavailable();
+    };
+    if let Err(response) = deps.rate_limit.take() {
+        return response;
+    }
+    let snapshot = match (path.as_str(), start) {
+        ("/api/v1/poll/start", Some(start)) => match poll.start(start) {
+            Ok(snapshot) => snapshot,
+            Err(error) => return poll_error(error),
+        },
+        ("/api/v1/poll/stop", _) => poll.stop(),
+        ("/api/v1/poll/reset", _) => poll.reset(),
+        _ => return error::not_found().await,
+    };
+    Json(snapshot).into_response()
+}
+
+fn poll_error(error: PollError) -> Response {
+    match error {
+        PollError::Invalid(message) => {
+            error::response(StatusCode::BAD_REQUEST, "invalid_request", message)
+        }
+        PollError::AlreadyOpen => error::response(
+            StatusCode::CONFLICT,
+            "poll_already_open",
+            &error.to_string(),
+        ),
+        PollError::Save => internal(),
+    }
+}
+
+#[cfg(test)]
+#[path = "poll_tests.rs"]
+mod poll_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::{body::Body, http::Request};
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn poll_routes_use_authenticated_operations() {
+        let gate = crate::api::ApiGate::closed();
+        gate.open("test-token");
+        let app = crate::api::router(ApiDeps::new(gate, Default::default()), 1234);
+        for (method, path, body) in [
+            ("GET", "", ""),
+            (
+                "POST",
+                "/start",
+                r#"{"question":"Q","options":["a","b"],"display":"bar-h","showPercent":true,"showCounts":true}"#,
+            ),
+            ("POST", "/stop", ""),
+            ("POST", "/reset", ""),
+        ] {
+            for (token, expected) in [
+                ("wrong", StatusCode::UNAUTHORIZED),
+                ("test-token", StatusCode::SERVICE_UNAVAILABLE),
+            ] {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method(method)
+                            .uri(format!("/api/v1/poll{path}"))
+                            .header(header::HOST, "127.0.0.1:1234")
+                            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(body))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), expected, "{method} /poll{path}");
+            }
+        }
+    }
 
     #[tokio::test]
     async fn body_read_failure_is_not_reported_as_a_size_limit() {

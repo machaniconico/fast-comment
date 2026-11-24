@@ -21,6 +21,7 @@ pub struct ApiDeps {
     pub(crate) shutdown: CancellationToken,
     pub(crate) feed: ApiFeed,
     pub(crate) ops: Option<Arc<dyn AppOps>>,
+    poll: Option<Arc<crate::poll::Poll>>,
     pub(crate) rate_limit: Arc<ops::RateLimit>,
 }
 impl ApiDeps {
@@ -36,11 +37,16 @@ impl ApiDeps {
             shutdown,
             feed: ApiFeed::new(1000),
             ops: None,
+            poll: None,
             rate_limit: Arc::new(ops::RateLimit::new()),
         }
     }
     pub fn with_ops(mut self, ops: Arc<dyn AppOps>) -> Self {
         self.ops = Some(ops);
+        self
+    }
+    pub(crate) fn with_poll(mut self, poll: Arc<crate::poll::Poll>) -> Self {
+        self.poll = Some(poll);
         self
     }
     pub(crate) fn with_rate_limit(mut self, limit: Arc<RateLimit>) -> Self {
@@ -114,6 +120,10 @@ pub fn router(deps: ApiDeps, port: u16) -> axum::Router {
             "/api/v1/timer/reset",
             post(ops::mutate).fallback(error::method_not_allowed),
         )
+        .route("/api/v1/poll", get(ops::poll).fallback(error::method_not_allowed))
+        .route("/api/v1/poll/start", post(ops::poll_mutate).fallback(error::method_not_allowed))
+        .route("/api/v1/poll/stop", post(ops::poll_mutate).fallback(error::method_not_allowed))
+        .route("/api/v1/poll/reset", post(ops::poll_mutate).fallback(error::method_not_allowed))
         .route("/api", any(error::not_found))
         .route("/api/", any(error::not_found))
         .route("/api/*path", any(error::not_found))

@@ -1,3 +1,4 @@
+import type { PollDisplaySettings, PollPreferences, PollSnapshot, PollStart } from './pollView';
 /**
  * IPC layer between Tauri backend and Svelte UI.
  *
@@ -425,6 +426,7 @@ export interface AppConfig {
     showPlatform: boolean;
   };
   goals: GoalsConfig;
+  poll: PollPreferences;
   timer: TimerConfig;
   effects: EffectsConfig;
   welcome: WelcomeConfig;
@@ -884,6 +886,30 @@ export async function getObsUrl(): Promise<string | null> {
 
 export async function getObsGoalsUrl(): Promise<string> {
   return (await invoke<string>('get_obs_goals_url')) ?? 'http://127.0.0.1:11180/?template=goals&ws=ws://127.0.0.1:11180/stats';
+}
+
+export async function getObsPollUrl(): Promise<string> {
+  return (await invoke<string>('get_obs_poll_url')) ?? 'http://127.0.0.1:11180/?template=poll&ws=ws://127.0.0.1:11180/poll';
+}
+
+export function getPollState(): Promise<PollSnapshot | null> {
+  return invoke<PollSnapshot>('poll_state');
+}
+
+export function startPoll(request: PollStart): Promise<PollSnapshot | null> {
+  return invoke<PollSnapshot>('poll_start', { ...request });
+}
+
+export function stopPoll(): Promise<PollSnapshot | null> {
+  return invoke<PollSnapshot>('poll_stop');
+}
+
+export function resetPoll(): Promise<PollSnapshot | null> {
+  return invoke<PollSnapshot>('poll_reset');
+}
+
+export function setPollDisplay(settings: PollDisplaySettings): Promise<PollSnapshot | null> {
+  return invoke<PollSnapshot>('poll_set_display', { ...settings });
 }
 
 export async function getObsTimerUrl(): Promise<string> {

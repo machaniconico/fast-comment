@@ -23,7 +23,7 @@ use axum::{
     routing::get,
     Router,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::time::interval;
@@ -34,6 +34,7 @@ use tower_http::services::ServeDir;
 use crate::achievements::engine::AchievementUnlocked;
 use crate::keyword_effects::EffectTriggered;
 use crate::model::{ChatMessage, ModerationEvent, YoutubeReaction};
+use crate::poll::PollSnapshot;
 use crate::stats::{StatsSnapshot, TimerSnapshot};
 use crate::templates::{TemplateRef, TemplateStore};
 
@@ -303,6 +304,7 @@ pub struct Bus {
     effect_tx: broadcast::Sender<EffectTriggered>,
     stats_tx: watch::Sender<StatsSnapshot>,
     timer_tx: watch::Sender<TimerSnapshot>,
+    poll_tx: watch::Sender<PollSnapshot>,
     obs_port: u16,
 }
 
@@ -325,8 +327,14 @@ impl Bus {
             effect_tx,
             stats_tx,
             timer_tx,
+            poll_tx: watch::channel(PollSnapshot::default()).0,
             obs_port,
         }
+    }
+
+    pub(crate) fn with_poll(mut self, poll_tx: watch::Sender<PollSnapshot>) -> Self {
+        self.poll_tx = poll_tx;
+        self
     }
 
     /// 削除・BAN イベントの購読者を得る。
@@ -569,6 +577,7 @@ impl Bus {
             effect_tx: Arc::new(self.effect_tx.clone()),
             stats_tx: Arc::new(self.stats_tx.clone()),
             timer_tx: Arc::new(self.timer_tx.clone()),
+            poll_tx: Arc::new(self.poll_tx.clone()),
             templates: Arc::new(templates),
         }
     }
@@ -593,6 +602,7 @@ fn obs_router(state: ObsState, goals_skin_dir: &Path) -> Router {
         .route("/ws", get(ws_handler))
         .route("/stats", get(stats_ws_handler))
         .route("/timer", get(timer_ws_handler))
+        .route("/poll", get(poll_ws_handler))
         .route("/", get(template_index_handler))
         .nest_service("/skin", skin_dir)
         .fallback_service(serve_dir)
@@ -609,6 +619,7 @@ struct ObsState {
     effect_tx: Arc<broadcast::Sender<EffectTriggered>>,
     stats_tx: Arc<watch::Sender<StatsSnapshot>>,
     timer_tx: Arc<watch::Sender<TimerSnapshot>>,
+    poll_tx: Arc<watch::Sender<PollSnapshot>>,
     templates: Arc<TemplateStore>,
 }
 
@@ -826,7 +837,15 @@ async fn timer_ws_handler(
     State(state): State<ObsState>,
 ) -> impl IntoResponse {
     let rx = state.timer_tx.subscribe();
-    ws.on_upgrade(move |socket| handle_timer_ws_client(socket, rx))
+    ws.on_upgrade(move |socket| handle_snapshot_ws_client(socket, rx))
+}
+
+async fn poll_ws_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<ObsState>,
+) -> impl IntoResponse {
+    let rx = state.poll_tx.subscribe();
+    ws.on_upgrade(move |socket| handle_snapshot_ws_client(socket, rx))
 }
 
 /// 1 WS クライアントの送信ループ。
@@ -1041,15 +1060,13 @@ async fn send_stats_snapshot(
     }
 }
 
-/// `/timer` WS クライアントの送信ループ。
-///
-/// 接続直後に現在値を1回送り、以後 watch の変更ごとに JSON オブジェクトを push する。
-async fn handle_timer_ws_client(
+/// 接続直後と watch 更新時にスナップショットを送る(`/timer` / `/poll`)。
+async fn handle_snapshot_ws_client<T: Clone + Serialize + Send + Sync + 'static>(
     mut socket: WebSocket,
-    mut rx: watch::Receiver<TimerSnapshot>,
+    mut rx: watch::Receiver<T>,
 ) {
-    let initial = rx.borrow().clone();
-    if send_timer_snapshot(&mut socket, &initial).await.is_err() {
+    let initial = rx.borrow_and_update().clone();
+    if send_snapshot(&mut socket, &initial).await.is_err() {
         return;
     }
 
@@ -1060,7 +1077,7 @@ async fn handle_timer_ws_client(
                     break;
                 }
                 let snapshot = rx.borrow_and_update().clone();
-                if send_timer_snapshot(&mut socket, &snapshot).await.is_err() {
+                if send_snapshot(&mut socket, &snapshot).await.is_err() {
                     break;
                 }
             }
@@ -1075,14 +1092,14 @@ async fn handle_timer_ws_client(
     }
 }
 
-async fn send_timer_snapshot(
+async fn send_snapshot(
     socket: &mut WebSocket,
-    snapshot: &TimerSnapshot,
+    snapshot: &impl Serialize,
 ) -> Result<(), axum::Error> {
     match serde_json::to_string(snapshot) {
         Ok(json) => socket.send(WsMessage::Text(json.into())).await,
         Err(e) => {
-            tracing::warn!("timer WS 向け JSON 化失敗: {e}");
+            tracing::warn!("スナップショットの JSON 化失敗: {e}");
             Ok(())
         }
     }
@@ -1421,7 +1438,10 @@ mod tests {
     async fn serve(builtin: &Path, custom: &Path) -> String {
         let (stats_tx, _) = watch::channel(StatsSnapshot::default());
         let (timer_tx, _) = watch::channel(TimerSnapshot::default());
-        let bus = Bus::new(0, stats_tx, timer_tx);
+        serve_bus(Bus::new(0, stats_tx, timer_tx), builtin, custom).await
+    }
+
+    async fn serve_bus(bus: Bus, builtin: &Path, custom: &Path) -> String {
         let state = bus.obs_state(TemplateStore::new(builtin.into(), custom.into()));
         let app = obs_router(state, &builtin.join("no-skin"));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1430,6 +1450,37 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn poll_ws_sends_snapshot_and_updates() {
+        use futures_util::StreamExt;
+        let (root, builtin, custom) = obs_roots();
+        std::fs::create_dir_all(builtin.join("poll")).unwrap();
+        std::fs::write(builtin.join("poll/app.js"), "/* test asset */").unwrap();
+        let (stats_tx, _) = watch::channel(StatsSnapshot::default());
+        let (timer_tx, _) = watch::channel(TimerSnapshot::default());
+        let poll = crate::poll::Poll::default();
+        let bus = Bus::new(0, stats_tx, timer_tx).with_poll(poll.sender());
+        let base = serve_bus(bus, &builtin, &custom).await;
+        let url = base.replacen("http:", "ws:", 1) + "/poll";
+        let (mut socket, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(2), socket.next())
+            .await.unwrap().unwrap().unwrap();
+        let snapshot: serde_json::Value = serde_json::from_str(first.to_text().unwrap()).unwrap();
+        assert_eq!(snapshot["status"], "idle");
+        let start: crate::poll::PollStart = serde_json::from_value(serde_json::json!({
+            "question": "質問", "options": ["A", "B"],
+            "display": "pie", "showPercent": true, "showCounts": false
+        })).unwrap();
+        let opened = poll.start(start.validate().unwrap()).unwrap();
+        let update = tokio::time::timeout(Duration::from_secs(2), socket.next())
+            .await.unwrap().unwrap().unwrap();
+        let snapshot: serde_json::Value = serde_json::from_str(update.to_text().unwrap()).unwrap();
+        assert_eq!(snapshot, serde_json::to_value(opened).unwrap());
+        let asset = reqwest::get(format!("{base}/poll/app.js")).await.unwrap();
+        assert_eq!(asset.status(), reqwest::StatusCode::OK);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     async fn get_text(url: String) -> (u16, String) {

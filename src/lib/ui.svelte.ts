@@ -138,6 +138,7 @@ class UiStore {
   activeTab: Tab = $state('comments');
   viewMode: ViewMode = $state('unified');
   showDashboard: boolean = $state(false);
+  showPoll: boolean = $state(false);
   showRaffle: boolean = $state(false);
   showTimer: boolean = $state(false);
   toolSettingsView: ToolSettingsView | null = $state(null);
@@ -183,6 +184,7 @@ class UiStore {
     this.showDashboard = false;
     this.showRaffle = false;
     this.showTimer = false;
+    this.showPoll = false;
     this.toolSettingsView = null;
   }
 
@@ -199,6 +201,7 @@ class UiStore {
     if (this.showDashboard) {
       this.showRaffle = false;
       this.showTimer = false;
+      this.showPoll = false;
       this.toolSettingsView = null;
     }
   }
@@ -208,6 +211,7 @@ class UiStore {
     if (this.showDashboard) {
       this.showRaffle = false;
       this.showTimer = false;
+      this.showPoll = false;
       this.toolSettingsView = null;
     }
   }
@@ -217,6 +221,7 @@ class UiStore {
     if (this.showRaffle) {
       this.showDashboard = false;
       this.showTimer = false;
+      this.showPoll = false;
       this.toolSettingsView = null;
     }
   }
@@ -224,6 +229,7 @@ class UiStore {
   setShowTimer(show: boolean): void {
     this.showTimer = show;
     if (this.showTimer) {
+      this.showPoll = false;
       this.showDashboard = false;
       this.showRaffle = false;
       this.toolSettingsView = null;
@@ -233,8 +239,19 @@ class UiStore {
   toggleTimer(): void {
     this.showTimer = !this.showTimer;
     if (this.showTimer) {
+      this.showPoll = false;
       this.showDashboard = false;
       this.showRaffle = false;
+      this.toolSettingsView = null;
+    }
+  }
+
+  togglePoll(): void {
+    this.showPoll = !this.showPoll;
+    if (this.showPoll) {
+      this.showDashboard = false;
+      this.showRaffle = false;
+      this.showTimer = false;
       this.toolSettingsView = null;
     }
   }
@@ -248,6 +265,7 @@ class UiStore {
     this.showDashboard = false;
     this.showRaffle = false;
     this.showTimer = false;
+    this.showPoll = false;
   }
 
   openPalette(): void {
@@ -330,6 +348,7 @@ class UiStore {
     this.showDashboard = false;
     this.showRaffle = false;
     this.showTimer = false;
+    this.showPoll = false;
     this.toolSettingsView = null;
     this.settingsAnchor = anchor;
   }
