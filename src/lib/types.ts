@@ -79,11 +79,18 @@ export interface ListenerRecord {
   memo: string | null;
   commentCount: number;
   giftCount: number;
+  donation: Record<string, number>;
   firstSeenMs: number;
   lastSeenMs: number;
   nameHistory: NameHistory[];
   ttsMuted: boolean;
   ttsVoice?: TtsVoiceOverride | null;
+}
+
+export interface ListenerDonation {
+  totals: { currency: string; milli: number }[];
+  jpyEstimateMilli: number | null;
+  unconvertible: string[];
 }
 
 /** Payload of the 'listener-updated' event: the record, or a deletion marker. */

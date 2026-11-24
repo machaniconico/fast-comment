@@ -218,6 +218,59 @@ async fn get_listener(
 }
 
 #[tauri::command]
+async fn listener_donation(
+    state: State<'_, AppState>,
+    platform: String,
+    author_id: String,
+) -> Result<serde_json::Value, String> {
+    let donation = state.listeners.donation(&platform, &author_id);
+    let defs = state.achievement_defs.current();
+    let summary = listeners::donation_summary(&donation, &defs.rates, &defs.symbol_overrides);
+    let totals: Vec<_> = summary
+        .totals
+        .into_iter()
+        .map(|(currency, milli)| serde_json::json!({ "currency": currency, "milli": milli }))
+        .collect();
+    Ok(serde_json::json!({
+        "totals": totals,
+        "jpyEstimateMilli": summary.jpy_estimate_milli,
+        "unconvertible": summary.unconvertible,
+    }))
+}
+
+#[tauri::command]
+async fn reset_listener_donation(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    platform: String,
+    author_id: String,
+) -> Result<bool, String> {
+    let reset = state.listeners.reset_donation(&platform, &author_id);
+    if reset {
+        emit_listener_donation_changed(&app);
+    }
+    Ok(reset)
+}
+
+#[tauri::command]
+async fn reset_all_listener_donations(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<usize, String> {
+    let count = state.listeners.reset_all_donations();
+    if count > 0 {
+        emit_listener_donation_changed(&app);
+    }
+    Ok(count)
+}
+
+fn emit_listener_donation_changed(app: &AppHandle) {
+    if app.emit("listener-donation-changed", ()).is_err() {
+        tracing::warn!("listener-donation-changed emit 失敗");
+    }
+}
+
+#[tauri::command]
 async fn update_listener(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -4154,6 +4207,9 @@ pub fn run() {
             get_local_api_token,
             regenerate_local_api_token,
             get_listener,
+            listener_donation,
+            reset_listener_donation,
+            reset_all_listener_donations,
             update_listener,
             set_listener_voice,
             list_listeners,

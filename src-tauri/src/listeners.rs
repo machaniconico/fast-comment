@@ -1,8 +1,9 @@
 //! Persistent listener records. Message processing only changes memory; flush snapshots on a worker.
+use crate::achievements::currency::{normalize_currency, trim_currency, AmountTotals, RateTable};
 use crate::model::{ChatMessage, ListenerInfo, MessageKind, Platform};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     fs,
     io::Write,
     path::{Path, PathBuf},
@@ -57,6 +58,7 @@ pub struct ListenerRecord {
     pub memo: Option<String>,
     pub comment_count: u64,
     pub gift_count: u64,
+    pub donation: BTreeMap<String, i64>,
     pub first_seen_ms: u64,
     pub last_seen_ms: u64,
     pub name_history: Vec<NameHistory>,
@@ -76,12 +78,46 @@ impl ListenerRecord {
             memo: None,
             comment_count: 0,
             gift_count: 0,
+            donation: BTreeMap::new(),
             first_seen_ms: 0,
             last_seen_ms: 0,
             name_history: Vec::new(),
             tts_muted: false,
             tts_voice: None,
         }
+    }
+}
+
+pub struct DonationSummary {
+    pub totals: Vec<(String, i64)>,
+    pub jpy_estimate_milli: Option<i64>,
+    pub unconvertible: Vec<String>,
+}
+
+pub fn donation_summary(
+    donation: &BTreeMap<String, i64>,
+    rates: &RateTable,
+    overrides: &BTreeMap<String, String>,
+) -> DonationSummary {
+    let unconvertible: Vec<_> = donation
+        .keys()
+        .filter(|currency| {
+            let code = normalize_currency(currency, overrides);
+            !rates.get(&code).is_some_and(|rate| rate.is_finite())
+        })
+        .cloned()
+        .collect();
+    let jpy_estimate_milli = (unconvertible.len() < donation.len())
+        .then(|| AmountTotals(donation.clone()).jpy_milli(rates, overrides));
+    let mut totals: Vec<_> = donation
+        .iter()
+        .map(|(code, &milli)| (code.clone(), milli))
+        .collect();
+    totals.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    DonationSummary {
+        totals,
+        jpy_estimate_milli,
+        unconvertible,
     }
 }
 
@@ -202,6 +238,23 @@ impl ListenerStore {
         } else {
             &msg.author.id
         };
+        let donation = msg
+            .amount
+            .as_ref()
+            .filter(|amount| {
+                matches!(
+                    msg.kind,
+                    MessageKind::SuperChat | MessageKind::Bits | MessageKind::Gift
+                ) && amount.value.is_finite()
+                    && amount.value > 0.0
+                    && !trim_currency(&amount.currency).eq_ignore_ascii_case("SUBGIFT")
+            })
+            .map(|amount| {
+                (
+                    normalize_currency(&amount.currency, &BTreeMap::new()),
+                    (amount.value * 1000.0).round() as i64,
+                )
+            });
         let mut records = self.records.lock().unwrap();
         if records.closed {
             return;
@@ -234,6 +287,10 @@ impl ListenerStore {
             )
         {
             record.gift_count = record.gift_count.saturating_add(1);
+        }
+        if let Some((currency, milli)) = donation {
+            let total = record.donation.entry(currency).or_default();
+            *total = total.saturating_add(milli);
         }
         msg.author.nickname = record.nickname.clone();
         msg.listener = Some(ListenerInfo {
@@ -337,6 +394,45 @@ impl ListenerStore {
             records.changed();
         }
         deleted
+    }
+
+    pub(crate) fn donation(&self, platform: &str, author_id: &str) -> BTreeMap<String, i64> {
+        self.records
+            .lock()
+            .unwrap()
+            .entries
+            .get(&key(platform, author_id))
+            .map(|record| record.donation.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn reset_donation(&self, platform: &str, author_id: &str) -> bool {
+        let mut records = self.records.lock().unwrap();
+        let Some(record) = records.entries.get_mut(&key(platform, author_id)) else {
+            return false;
+        };
+        if !record.donation.is_empty() {
+            record.donation.clear();
+            records.changed();
+        }
+        true
+    }
+
+    pub fn reset_all_donations(&self) -> usize {
+        let mut records = self.records.lock().unwrap();
+        let mut count = 0;
+        for record in records
+            .entries
+            .values_mut()
+            .filter(|record| !record.donation.is_empty())
+        {
+            record.donation.clear();
+            count += 1;
+        }
+        if count > 0 {
+            records.changed();
+        }
+        count
     }
 
     pub fn flush(&self) -> anyhow::Result<()> {

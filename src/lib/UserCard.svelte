@@ -1,18 +1,25 @@
 <script lang="ts">
-  import { untrack } from 'svelte';
-  import { appendModerationValue, deleteListener, getListener, listenerAchievements, setListenerVoice, updateListener } from './ipc';
+  import { onMount, untrack } from 'svelte';
+  import {
+    appendModerationValue, deleteListener, getListener, getListenerDonation, listenerAchievements,
+    resetListenerDonation, setListenerVoice, startListenerDonationChangedListener, updateListener,
+  } from './ipc';
   import { store } from './stores.svelte';
   import { ui } from './ui.svelte';
   import { moderation } from './moderation.svelte';
   import { moderationAvailability, TIMEOUT_PRESETS, formatTimeoutLabel } from './moderationActions';
   import { trophyViews, type TrophyView } from './achievementsUi';
-  import { isListenerDeleted, safeAvatarUrl, type ListenerRecord, type ListenerUpdate } from './types';
+  import { isListenerDeleted, safeAvatarUrl, type ListenerDonation, type ListenerRecord, type ListenerUpdate } from './types';
 
   type LoadState = 'loading' | 'loaded' | 'error';
 
   let record: ListenerRecord | null = $state(null);
   let loadState = $state<LoadState>('loading');
   let trophies = $state<TrophyView[]>([]);
+  let donation = $state<ListenerDonation | null>(null);
+  let donationError = $state(false);
+  let donationRequest = 0;
+  const DONATION_DISPLAY_LIMIT = 6;
   let nickname = $state('');
   let label = $state('');
   let memo = $state('');
@@ -190,6 +197,9 @@
     seenSeq = untrack(() => store.lastListenerUpdate?.seq ?? 0);
     pending = null;
     trophies = [];
+    donation = null;
+    donationError = false;
+    void refreshDonation();
     listenerAchievements(t.platform, t.authorId).then(
       (list) => { if (gen === generation) trophies = trophyViews(list); },
       () => {},
@@ -210,6 +220,36 @@
       },
     );
   }
+
+  async function refreshDonation() {
+    const t = ui.userCard;
+    if (!t) return;
+    const gen = generation;
+    const request = ++donationRequest;
+    try {
+      const summary = await getListenerDonation(t.platform, t.authorId);
+      if (gen !== generation || request !== donationRequest) return;
+      donation = summary;
+      donationError = false;
+    } catch {
+      if (gen !== generation || request !== donationRequest) return;
+      donation = null;
+      donationError = true;
+    }
+  }
+
+  onMount(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    startListenerDonationChangedListener(() => { void refreshDonation(); }).then((stop) => {
+      if (disposed) stop();
+      else unlisten = stop;
+    }, () => {});
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  });
 
   // Load the record whenever a different user is opened.
   $effect(() => {
@@ -242,6 +282,7 @@
       seenSeq = ev.seq;
       const u = ev.update;
       if (u.platform !== t.platform || u.authorId !== t.authorId) return;
+      if (isListenerDeleted(u)) void refreshDonation();
       if (loadState === 'loaded') applyKeepingDrafts(isListenerDeleted(u) ? null : u);
       else if (loadState === 'loading') pending = u;
     });
@@ -294,6 +335,25 @@
     saving = false;
   }
 
+  async function resetDonation() {
+    const t = target;
+    if (!t || !ready || !donation?.totals.length) return;
+    if (!window.confirm('このリスナーの累計ギフト金額をリセットしますか？')) return;
+    const gen = generation;
+    saving = true;
+    status = '';
+    try {
+      const reset = await resetListenerDonation(t.platform, t.authorId);
+      if (gen !== generation) return;
+      status = reset ? '累計ギフト金額をリセットしました' : 'リスナーの記録がありません';
+      await refreshDonation();
+    } catch {
+      if (gen === generation) status = '累計ギフト金額をリセットできませんでした';
+    } finally {
+      if (gen === generation) saving = false;
+    }
+  }
+
   async function addNg() {
     const t = target;
     if (!t) return;
@@ -309,6 +369,17 @@
   function fmtDate(ms: number | undefined): string {
     if (!ms) return '-';
     return new Date(ms).toLocaleString();
+  }
+
+  const donationNumber = new Intl.NumberFormat('ja-JP', { maximumFractionDigits: 3 });
+  const currencyNumber = new Intl.NumberFormat('ja-JP', { minimumFractionDigits: 2, maximumFractionDigits: 3 });
+
+  function fmtDonation(currency: string, milli: number): string {
+    const value = milli / 1000;
+    if (currency === 'JPY') return `¥${donationNumber.format(value)}`;
+    if (currency === 'BITS') return `Bits ${donationNumber.format(value)}`;
+    if (currency === 'PT') return `pt ${donationNumber.format(value)}`;
+    return `${currency || '通貨不明'} ${currencyNumber.format(value)}`;
   }
 
   function fmtTime(ms: number): string {
@@ -480,6 +551,30 @@
         <dl class="uc-stats">
           <dt>累計コメント</dt><dd>{record?.commentCount ?? 0}</dd>
           <dt>累計ギフト</dt><dd>{record?.giftCount ?? 0}</dd>
+          <dt>累計ギフト金額</dt>
+          <dd class="uc-donation">
+            {#if donation?.totals.length}
+              <div>
+                {#each donation.totals.slice(0, DONATION_DISPLAY_LIMIT) as { currency, milli } (currency)}
+                  <span class="uc-donation-amount">{fmtDonation(currency, milli)}</span>
+                {/each}
+                {#if donation.totals.length > DONATION_DISPLAY_LIMIT}
+                  <span class="uc-donation-amount">ほか {donation.totals.length - DONATION_DISPLAY_LIMIT} 通貨</span>
+                {/if}
+              </div>
+              <div class="uc-dim">
+                円の目安 {donation.jpyEstimateMilli === null ? '—' : fmtDonation('JPY', donation.jpyEstimateMilli)}
+                {#if donation.unconvertible.length}
+                  （換算できない通貨 {donation.unconvertible.map((currency) => currency || '通貨不明').join('、')}）
+                {/if}
+              </div>
+            {:else}
+              <span class="uc-dim">{donationError ? '金額を取得できませんでした' : donation ? 'なし' : '—'}</span>
+            {/if}
+            <button type="button" class="uc-btn danger" onclick={resetDonation} disabled={!ready || !donation?.totals.length}>
+              金額をリセット
+            </button>
+          </dd>
           <dt>初回来訪</dt><dd>{fmtDate(record?.firstSeenMs)}</dd>
           <dt>最終来訪</dt><dd>{fmtDate(record?.lastSeenMs)}</dd>
         </dl>
@@ -659,6 +754,18 @@
   }
   .uc-stats dd {
     margin: 0;
+  }
+  .uc-donation {
+    display: grid;
+    gap: 4px;
+    justify-items: start;
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+  .uc-donation-amount {
+    display: inline-block;
+    margin-inline-end: 8px;
+    max-width: 100%;
   }
   h3 {
     margin: 8px 0 0;

@@ -10,7 +10,7 @@
     setTtsPaused, clearTtsQueue, skipCurrentTts, testTts, probeTtsEngine, getYoutubeOauthStatus,
     connectYoutubeOauth, disconnectYoutubeOauth, getTwitchOauthStatus, beginTwitchLogin,
     awaitTwitchLogin, cancelTwitchLogin, disconnectTwitchOauth, getGoalSkinInfo, openUrl,
-    getCommentLogDir, openCommentLogDir, listListeners, deleteListener
+    getCommentLogDir, openCommentLogDir, listListeners, deleteListener, resetAllListenerDonations
   } from '../ipc';
   import {
     urlForEngineChange, buildVoicevoxParams, buildAutoSpeed, buildQueueLimits, kindTemplate, allTemplate,
@@ -341,6 +341,8 @@
   let listenerRows: ListenerRecord[] = $state([]);
   let listenerLoading: boolean = $state(false);
   let listenerMsg: string = $state('');
+  let listenerResetting = $state(false);
+  let listenerResetMsg = $state('');
   let listenerSeq = 0;
   let ttsPaused: boolean = $state(false);
   let ttsControlBusy: boolean = $state(false);
@@ -1091,6 +1093,24 @@
       listenerRows = listenerRows.filter((x) => !(x.platform === r.platform && x.authorId === r.authorId));
     } catch (e) {
       listenerMsg = `削除に失敗: ${String(e)}`;
+    }
+  }
+
+  async function resetListenerAmounts() {
+    if (listenerResetting || !window.confirm('全リスナーの累計ギフト金額をリセットしますか？')) return;
+    listenerResetting = true;
+    listenerResetMsg = '';
+    try {
+      const count = await resetAllListenerDonations();
+      listenerResetMsg = count === null
+        ? '累計ギフト金額をリセットできませんでした'
+        : count === 0
+          ? 'リセットする累計ギフト金額はありません'
+          : `${count} 人分の累計ギフト金額をリセットしました`;
+    } catch {
+      listenerResetMsg = '累計ギフト金額をリセットできませんでした';
+    } finally {
+      listenerResetting = false;
     }
   }
 
@@ -2572,7 +2592,11 @@
         onkeydown={(e) => { if (e.key === 'Enter') void searchListeners(); }}
       />
       <button type="button" class="copy-btn" onclick={searchListeners} disabled={listenerLoading}>検索</button>
+      <button type="button" class="copy-btn" onclick={resetListenerAmounts} disabled={listenerResetting}>
+        全員の金額をリセット
+      </button>
     </div>
+    {#if listenerResetMsg}<p class="hint" role="status">{listenerResetMsg}</p>{/if}
     {#if listenerMsg}<p class="hint">{listenerMsg}</p>{/if}
     {#if listenerRows.length > 0}
       <div class="listener-table-wrap">
