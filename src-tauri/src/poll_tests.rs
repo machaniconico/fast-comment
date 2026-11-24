@@ -184,6 +184,53 @@ fn stops_accepting_new_voters_at_the_limit() {
     assert_eq!(snapshot.options[1].votes, 1);
 }
 
+#[test]
+fn ignores_invisible_suffixes_that_chat_clients_add_to_repeated_messages() {
+    let labels = request().validate().unwrap().labels;
+    for text in ["1\u{E0000}", "1 \u{E0000}", "\u{FEFF}2", "2\u{200B}", "Beta\u{E0000}"] {
+        assert!(vote_index(text, &labels).is_some(), "{text:?}");
+    }
+    assert_eq!(vote_index("1\u{E0000}", &labels), Some(0));
+    assert_eq!(vote_index("Beta\u{E0000}", &labels), Some(1));
+}
+
+#[test]
+fn a_number_wins_over_a_label_with_the_same_text() {
+    let numeric = PollStart {
+        options: vec!["2".into(), "x".into()],
+        ..request()
+    }
+    .validate()
+    .unwrap();
+    // 「2」は 1 番目のラベル「2」ではなく、番号 2(= 2 番目の「x」)として数える。
+    assert_eq!(vote_index("2", &numeric.labels), Some(1));
+    assert_eq!(vote_index("x", &numeric.labels), Some(1));
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_old_deadline_does_not_close_a_poll_restarted_after_reset() {
+    let poll = Arc::new(Poll::default());
+    let mut rx = poll.sender().subscribe();
+    let cancel = CancellationToken::new();
+    let worker = tokio::spawn(poll.clone().run(cancel.clone()));
+    start(
+        &poll,
+        PollStart {
+            duration_secs: Some(10),
+            ..request()
+        },
+    )
+    .unwrap();
+    poll.reset();
+    start(&poll, request()).unwrap();
+    rx.borrow_and_update();
+    tokio::time::advance(Duration::from_secs(11)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(poll.sender().borrow().status, PollStatus::Open);
+    cancel.cancel();
+    worker.await.unwrap();
+}
+
 #[tokio::test(start_paused = true)]
 async fn batches_votes_and_closes_once_at_the_monotonic_deadline() {
     let poll = Arc::new(Poll::default());

@@ -474,8 +474,16 @@ fn eligible(msg: &ChatMessage, verdict: &Verdict) -> bool {
         && !msg.author.id.is_empty()
 }
 
+/// 投票の本文の前後を落とす。空白に加え、Twitch のクライアント(7TV・Chatterino など)が同じ文の連投を通すために
+/// 末尾へ付ける U+E0000、BOM、ゼロ幅文字も落とす(付いたままだと 2 回目の「1」が数えられない)。
+fn trim_vote(text: &str) -> &str {
+    text.trim_matches(|c: char| {
+        c.is_whitespace() || matches!(c, '\u{E0000}' | '\u{FEFF}' | '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{2060}')
+    })
+}
+
 fn vote_index(text: &str, labels: &RegexSet) -> Option<usize> {
-    let text = text.trim();
+    let text = trim_vote(text);
     let mut chars = text.chars();
     let number = match (chars.next(), chars.next(), chars.next()) {
         (Some(c @ '1'..='9'), None, None) => Some(c as usize - '1' as usize),
