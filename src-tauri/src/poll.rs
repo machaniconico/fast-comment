@@ -120,23 +120,26 @@ impl PollPreferences {
                 return Err(PollError::Invalid("各選択肢は1〜40文字で入力してください"));
             }
         }
-        let labels = RegexSetBuilder::new(
-            self.options
-                .iter()
-                .map(|label| format!(r"\A{}\z", regex::escape(label))),
-        )
-        .case_insensitive(true)
-        .build()
-        .map_err(|_| PollError::Invalid("選択肢を読み取れませんでした"))?;
-        if self
-            .options
-            .iter()
-            .any(|label| labels.matches(label).iter().count() > 1)
-        {
-            return Err(PollError::Invalid("同じ選択肢は指定できません"));
-        }
-        Ok(labels)
+        unique_option_labels(&self.options).map_err(PollError::Invalid)
     }
+}
+
+pub(crate) fn unique_option_labels(options: &[String]) -> Result<RegexSet, &'static str> {
+    let labels = RegexSetBuilder::new(
+        options
+            .iter()
+            .map(|label| format!(r"\A{}\z", regex::escape(trim_vote(label)))),
+    )
+    .case_insensitive(true)
+    .build()
+    .map_err(|_| "選択肢を読み取れませんでした")?;
+    if options
+        .iter()
+        .any(|label| labels.matches(trim_vote(label)).iter().count() > 1)
+    {
+        return Err("同じ選択肢は指定できません");
+    }
+    Ok(labels)
 }
 
 #[derive(Deserialize)]
@@ -319,7 +322,8 @@ impl Poll {
 
     pub fn start(&self, start: ValidatedStart) -> Result<PollSnapshot, PollError> {
         let _controls = self.controls.lock().unwrap();
-        self.prepare_start(&start)?;
+        self.check_can_start()?;
+        self.save_start_preferences(&start)?;
         Ok(self.open(start))
     }
 
@@ -338,8 +342,7 @@ impl Poll {
     }
 
     // 呼び出し側で開始・終了・リセットと直列化する。
-    pub(crate) fn prepare_start(&self, start: &ValidatedStart) -> Result<(), PollError> {
-        self.check_can_start()?;
+    pub(crate) fn save_start_preferences(&self, start: &ValidatedStart) -> Result<(), PollError> {
         (self.save_preferences)(PreferenceChange::Started(&start.preferences))
     }
 

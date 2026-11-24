@@ -312,6 +312,8 @@ pub struct TwitchAuth {
     login_gate: std::sync::Mutex<LoginGate>,
     /// refresh で回転した後、keyring へ保存できていない認証。access_token の lock 内で扱う。
     unsaved: std::sync::Mutex<UnsavedRefresh>,
+    #[cfg(test)]
+    poll_test_token: Option<StoredTwitchToken>,
 }
 
 impl TwitchAuth {
@@ -335,7 +337,36 @@ impl TwitchAuth {
             epoch: std::sync::Mutex::new(AuthEpoch::default()),
             login_gate: std::sync::Mutex::new(LoginGate::default()),
             unsaved: std::sync::Mutex::new(UnsavedRefresh::default()),
+            #[cfg(test)]
+            poll_test_token: None,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_poll_test(access: TwitchAccess) -> Self {
+        let mut auth = Self::new().unwrap();
+        let client_id = access.client_id.clone();
+        auth.poll_test_token = Some(StoredTwitchToken {
+            client_id: client_id.clone(),
+            refresh_token: String::new(),
+            login: access.login.clone(),
+            user_id: access.user_id.clone(),
+            scopes: access.scopes.clone(),
+        });
+        let now = Instant::now();
+        auth.validated = Mutex::new(Some((client_id.clone(), now)));
+        auth.access_token = Mutex::new(Some(CachedAccessToken {
+            client_id,
+            access,
+            generation: 0,
+            valid_until: now + Duration::from_secs(60),
+        }));
+        auth
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sign_out_for_poll_test(&self) {
+        self.epoch().sign_out();
     }
 
     fn epoch(&self) -> std::sync::MutexGuard<'_, AuthEpoch> {
@@ -424,6 +455,11 @@ impl TwitchAuth {
                 scopes_ok: false,
                 polls_scope_ok: false,
             });
+        }
+
+        #[cfg(test)]
+        if let Some(stored) = &self.poll_test_token {
+            return Ok(status_from_stored(stored));
         }
 
         match secret_store::load::<StoredTwitchToken>(KEYRING_USER).await? {

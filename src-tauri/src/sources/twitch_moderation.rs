@@ -52,6 +52,11 @@ async fn cached_user_id(generation: u64, login: &str) -> Option<String> {
         .map(|entry| entry.id.clone())
 }
 
+#[cfg(test)]
+pub(crate) async fn cache_poll_test_user(login: &str, id: &str) {
+    cache_user_id(0, login, id).await;
+}
+
 async fn cache_user_id(generation: u64, login: &str, id: &str) {
     user_ids().lock().await.insert(
         login.to_string(),

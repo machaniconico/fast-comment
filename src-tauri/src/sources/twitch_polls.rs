@@ -23,12 +23,32 @@ pub enum PollsError {
     Unauthorized,
     #[error("Twitchの操作回数制限に達しました。{retry_after_secs}秒後に再試行してください")]
     RateLimited { retry_after_secs: u64 },
-    #[error("Twitchがアンケートの操作を受け付けませんでした")]
+    #[error("Twitchがアンケートの操作を受け付けませんでした。{0}")]
     BadRequest(String),
     #[error("Twitchのアンケート操作に失敗しました (HTTP {0})")]
     Api(u16),
     #[error("Twitchのアンケートに接続できませんでした")]
     Network,
+    #[error("Twitchの認証情報を確認できませんでした")]
+    Authentication,
+    #[error("通信が途切れ、Twitchでアンケートの作成を確認できませんでした")]
+    CreateUnconfirmed,
+}
+
+impl PollsError {
+    pub(crate) fn class(&self) -> &'static str {
+        match self {
+            Self::NotEligible => "NotEligible",
+            Self::ScopeMissing => "ScopeMissing",
+            Self::Unauthorized => "Unauthorized",
+            Self::RateLimited { .. } => "RateLimited",
+            Self::BadRequest(_) => "BadRequest",
+            Self::Api(_) => "Api",
+            Self::Network => "Network",
+            Self::Authentication => "Authentication",
+            Self::CreateUnconfirmed => "CreateUnconfirmed",
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -83,13 +103,44 @@ impl HelixPolls {
             "choices": choices,
             "duration": duration_secs,
         }));
-        let response = self.send(request, token).await?;
-        let poll = first_poll(response).await?;
-        poll.get("id")
-            .and_then(Value::as_str)
-            .filter(|id| !id.is_empty())
+        let response = self
+            .send(request, token)
+            .await
+            .map_err(|error| match error {
+                PollsError::Api(403) => PollsError::NotEligible,
+                other => other,
+            })?;
+        first_poll(response)
+            .await?
+            .as_ref()
+            .and_then(poll_id)
             .map(str::to_owned)
             .ok_or(PollsError::Api(200))
+    }
+
+    pub(crate) async fn find_matching_latest(
+        &self,
+        token: &str,
+        broadcaster_id: &str,
+        title: &str,
+        choices: &[String],
+    ) -> Result<Option<String>, PollsError> {
+        let request = self
+            .request(Method::GET, token)
+            .query(&[("broadcaster_id", broadcaster_id)]);
+        let response = self.send(request, token).await?;
+        let latest = first_poll(response).await?;
+        let matching = latest.as_ref().filter(|poll| {
+            poll["status"].as_str() == Some("ACTIVE")
+                && poll["title"].as_str() == Some(title)
+                && poll["choices"].as_array().is_some_and(|remote_choices| {
+                    remote_choices
+                        .iter()
+                        .map(|choice| choice["title"].as_str())
+                        .eq(choices.iter().map(|choice| Some(choice.as_str())))
+                })
+        });
+        Ok(matching.and_then(poll_id).map(str::to_owned))
     }
 
     pub async fn end(
@@ -119,7 +170,7 @@ impl HelixPolls {
             .request(Method::GET, token)
             .query(&[("broadcaster_id", broadcaster_id), ("id", poll_id)]);
         let response = self.send(request, token).await?;
-        let poll = first_poll(response).await?;
+        let poll = first_poll(response).await?.ok_or(PollsError::Api(200))?;
         if poll.get("id").and_then(Value::as_str) != Some(poll_id) {
             return Err(PollsError::Api(200));
         }
@@ -186,7 +237,7 @@ impl HelixPolls {
                     return Err(if message.to_ascii_lowercase().contains("scope") {
                         PollsError::ScopeMissing
                     } else {
-                        PollsError::NotEligible
+                        PollsError::Api(status.as_u16())
                     });
                 }
                 // API の診断用にメッセージを保持するが、資格情報や URL を含む本文は捨てる。
@@ -213,18 +264,19 @@ impl HelixPolls {
     }
 }
 
-async fn first_poll(response: reqwest::Response) -> Result<Value, PollsError> {
+fn poll_id(poll: &Value) -> Option<&str> {
+    poll.get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+}
+
+async fn first_poll(response: reqwest::Response) -> Result<Option<Value>, PollsError> {
     let status = response.status().as_u16();
-    let mut body = response.json::<Value>().await.map_err(|error| {
-        if error.is_decode() {
-            PollsError::Api(status)
-        } else {
-            PollsError::Network
-        }
-    })?;
-    body.pointer_mut("/data/0")
-        .map(Value::take)
-        .ok_or(PollsError::Api(status))
+    // JSON の構文エラーと、応答本文の途中で起きた通信エラーを区別する。
+    let bytes = response.bytes().await.map_err(|_| PollsError::Network)?;
+    let mut body: Value = serde_json::from_slice(&bytes).map_err(|_| PollsError::Api(status))?;
+    let data = body["data"].as_array_mut().ok_or(PollsError::Api(status))?;
+    Ok(data.first_mut().map(Value::take))
 }
 
 pub fn validate_twitch(
@@ -252,5 +304,5 @@ pub(crate) fn validate_twitch_text(question: &str, options: &[String]) -> Result
     {
         return Err("Twitchの各選択肢は1〜25文字で入力してください");
     }
-    Ok(())
+    crate::poll::unique_option_labels(options).map(|_| ())
 }

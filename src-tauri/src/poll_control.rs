@@ -17,6 +17,10 @@ use crate::{
     },
 };
 
+#[cfg(test)]
+#[path = "poll_control_tests.rs"]
+mod tests;
+
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
 
 #[derive(Debug, thiserror::Error)]
@@ -38,7 +42,7 @@ impl From<ModerationError> for PollControlError {
                 PollError::Invalid("「自分の配信」のTwitchチャンネルが見つかりません").into()
             }
             ModerationErrorCode::Network => PollsError::Network.into(),
-            _ => PollsError::Unauthorized.into(),
+            _ => PollsError::Authentication.into(),
         }
     }
 }
@@ -57,11 +61,15 @@ impl From<HelixError> for PollControlError {
     }
 }
 
-struct ActivePoll {
-    local_id: String,
+#[derive(Clone)]
+struct RemoteTarget {
     remote_id: String,
     broadcaster_id: String,
-    terminated: bool,
+}
+
+struct ActivePoll {
+    local_id: String,
+    target: RemoteTarget,
     _cancel: DropGuard,
 }
 
@@ -70,7 +78,9 @@ pub(crate) struct PollControl {
     auth: Arc<TwitchAuth>,
     config: watch::Receiver<AppConfig>,
     app_cancel: CancellationToken,
-    // 集計・操作を直列化する。待ち時間にはロックを保持しない。
+    #[cfg(test)]
+    helix_base: String,
+    // 操作と集計結果の反映を直列化する。ポーラーの HTTP 待ちには保持しない。
     active: Mutex<Option<ActivePoll>>,
 }
 
@@ -86,6 +96,8 @@ impl PollControl {
             auth,
             config,
             app_cancel,
+            #[cfg(test)]
+            helix_base: HELIX_BASE.to_owned(),
             active: Mutex::new(None),
         }
     }
@@ -107,7 +119,7 @@ impl PollControl {
         let login = {
             let config = self.config.borrow();
             let mut own = config.channels.iter().filter(|channel| {
-                channel.platform == ChannelPlatform::Twitch && channel.own_stream
+                channel.enabled && channel.platform == ChannelPlatform::Twitch && channel.own_stream
             });
             let channel = own.next().ok_or(PollError::Invalid(
                 "Twitchチャンネルを「自分の配信」に設定してください",
@@ -135,7 +147,7 @@ impl PollControl {
 
         let login = &login;
         let start_ref = &start;
-        let (remote_id, broadcaster_id) = self
+        let target = self
             .with_access(&credentials, None, |access, helix| async move {
                 let generation = self.auth.generation();
                 let broadcaster_id = self
@@ -148,71 +160,106 @@ impl PollControl {
                     )
                     .into());
                 }
-                // 保存できない場合は Twitch 上にも投票を作らない。
-                self.poll.prepare_start(start_ref)?;
-                let remote_id = helix
+                let title = &start_ref.preferences.question;
+                let choices = &start_ref.preferences.options;
+                let remote_id = match helix
                     .create(
                         &access.token,
                         &broadcaster_id,
-                        &start_ref.preferences.question,
-                        &start_ref.preferences.options,
+                        title,
+                        choices,
                         start_ref.duration_secs.expect("Twitchの投票時間は検証済み"),
                     )
-                    .await?;
-                Ok((remote_id, broadcaster_id))
+                    .await
+                {
+                    Ok(id) => id,
+                    Err(PollsError::Network) => {
+                        // 作成済みの可能性があるので POST は繰り返さず、最新の投票を照合する。
+                        helix
+                            .find_matching_latest(&access.token, &broadcaster_id, title, choices)
+                            .await
+                            .ok()
+                            .flatten()
+                            .ok_or(PollsError::CreateUnconfirmed)?
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                Ok(RemoteTarget {
+                    remote_id,
+                    broadcaster_id,
+                })
             })
             .await?;
 
+        // 設定保存に失敗しても、作成済みの投票は追跡できるようにする。
+        let saved = self.poll.save_start_preferences(&start);
         let snapshot = self.poll.open(start);
         let cancel = self.app_cancel.child_token();
         *active = Some(ActivePoll {
             local_id: snapshot.id.clone(),
-            remote_id,
-            broadcaster_id,
-            terminated: false,
+            target,
             _cancel: cancel.clone().drop_guard(),
         });
         tauri::async_runtime::spawn(self.clone().run(snapshot.id.clone(), cancel));
+        saved?;
         Ok(snapshot)
     }
 
     pub(crate) async fn stop(&self) -> Result<PollSnapshot, PollControlError> {
         let mut active = self.active.lock().await;
-        let Some(poll) = active.as_mut() else {
+        let Some(poll) = active.as_ref() else {
             return Ok(self.poll.stop());
         };
-        let votes = if poll.terminated {
-            self.get(poll).await?.votes
-        } else {
-            match self.end(poll, false).await {
-                Ok(()) => {
-                    poll.terminated = true;
-                    self.get(poll).await?.votes
-                }
-                Err(error @ PollControlError::Remote(PollsError::BadRequest(_))) => {
-                    // PATCH の直前に時間切れや Twitch 側の操作で終了した場合は最終値を使う。
-                    match self.get(poll).await {
-                        Ok(remote) if remote.status != RemoteStatus::Active => remote.votes,
-                        _ => return Err(error),
-                    }
-                }
-                Err(error) => return Err(error),
+        let result = self.stop_remote(&poll.target).await;
+        match &result {
+            Ok(votes) => {
+                self.poll.apply_external(&poll.local_id, votes, true);
             }
-        };
-        self.poll.apply_external(&poll.local_id, &votes, true);
+            Err(_) => {
+                self.poll.stop();
+            }
+        }
         *active = None;
+        result?;
         Ok(self.snapshot())
+    }
+
+    async fn stop_remote(&self, target: &RemoteTarget) -> Result<Vec<u32>, PollControlError> {
+        match self.end(target).await {
+            Ok(()) => Ok(self.get(target).await?.votes),
+            Err(error @ PollControlError::Remote(PollsError::BadRequest(_))) => {
+                // PATCH の直前に終了した場合は最終値を使う。
+                match self.get(target).await {
+                    Ok(remote) if remote.status != RemoteStatus::Active => Ok(remote.votes),
+                    _ => Err(error),
+                }
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub(crate) async fn reset(&self) -> Result<PollSnapshot, PollControlError> {
         let mut active = self.active.lock().await;
-        if let Some(poll) = active.as_ref() {
-            if !poll.terminated && self.get(poll).await?.status == RemoteStatus::Active {
-                self.end(poll, true).await?;
-            }
-        }
+        let result = match active.as_ref() {
+            Some(poll) => self.reset_remote(&poll.target).await,
+            None => Ok(()),
+        };
         *active = None;
-        Ok(self.poll.reset())
+        let snapshot = self.poll.reset();
+        result?;
+        Ok(snapshot)
+    }
+
+    async fn reset_remote(&self, target: &RemoteTarget) -> Result<(), PollControlError> {
+        if self.get(target).await?.status != RemoteStatus::Active {
+            return Ok(());
+        }
+        match self.end(target).await {
+            Err(PollControlError::Remote(PollsError::BadRequest(_) | PollsError::Api(404))) => {
+                Ok(())
+            }
+            result => result,
+        }
     }
 
     pub(crate) async fn set_display(
@@ -227,42 +274,73 @@ impl PollControl {
         let mut ticks =
             tokio::time::interval_at(tokio::time::Instant::now() + POLL_INTERVAL, POLL_INTERVAL);
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last_error = None;
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => return,
                 _ = ticks.tick() => {}
             }
+            let target = {
+                let Some(active) = cancel.run_until_cancelled(self.active.lock()).await else {
+                    return;
+                };
+                let Some(poll) = active.as_ref().filter(|poll| poll.local_id == local_id) else {
+                    return;
+                };
+                poll.target.clone()
+            };
+
+            // refresh token の回転・保存は途中で打ち切らず、終了時には結果の反映だけ止める。
+            let result = self.get(&target).await;
             let Some(mut active) = cancel.run_until_cancelled(self.active.lock()).await else {
                 return;
             };
-            let Some(poll) = active.as_ref().filter(|poll| poll.local_id == local_id) else {
-                return;
-            };
-            // refresh token の回転・保存は途中で打ち切らず、終了時には結果の反映だけ止める。
-            let result = self.get(poll).await;
-            if cancel.is_cancelled() {
+            if cancel.is_cancelled()
+                || !active
+                    .as_ref()
+                    .is_some_and(|poll| poll.local_id == local_id)
+            {
                 return;
             }
+
             match result {
                 Ok(remote) => {
-                    let closed = poll.terminated || remote.status != RemoteStatus::Active;
+                    last_error = None;
+                    let closed = remote.status != RemoteStatus::Active;
                     if !self.poll.apply_external(&local_id, &remote.votes, closed) || closed {
                         *active = None;
                         return;
                     }
                 }
-                Err(PollControlError::Remote(PollsError::RateLimited { retry_after_secs })) => {
-                    if let Some(retry_at) = tokio::time::Instant::now()
-                        .checked_add(Duration::from_secs(retry_after_secs))
-                    {
-                        ticks.reset_at(retry_at);
-                    } else {
-                        drop(active);
-                        cancel.cancelled().await;
-                        return;
+                Err(error) => {
+                    let class = match &error {
+                        PollControlError::Local(_) => "Local",
+                        PollControlError::Remote(error) => error.class(),
+                    };
+                    if last_error != Some(class) {
+                        tracing::warn!(error_class = class, "Twitchアンケートの集計に失敗しました");
+                        last_error = Some(class);
+                    }
+                    match error {
+                        PollControlError::Remote(PollsError::Api(404)) => {
+                            self.poll.stop();
+                            *active = None;
+                            return;
+                        }
+                        PollControlError::Remote(PollsError::RateLimited { retry_after_secs }) => {
+                            if let Some(retry_at) = tokio::time::Instant::now()
+                                .checked_add(Duration::from_secs(retry_after_secs))
+                            {
+                                ticks.reset_at(retry_at);
+                            } else {
+                                drop(active);
+                                cancel.cancelled().await;
+                                return;
+                            }
+                        }
+                        _ => {}
                     }
                 }
-                Err(_) => {}
             }
         }
     }
@@ -286,6 +364,10 @@ impl PollControl {
         Fut: std::future::Future<Output = Result<T, PollControlError>>,
     {
         let (client_id, client_secret) = credentials;
+        #[cfg(not(test))]
+        let helix_base = HELIX_BASE;
+        #[cfg(test)]
+        let helix_base = &self.helix_base;
         self.auth
             .with_token_retry(
                 client_id,
@@ -295,7 +377,7 @@ impl PollControl {
                 |access| {
                     let allowed = broadcaster_id.is_none_or(|id| id == access.user_id);
                     let helix = HelixPolls::with_client(
-                        HELIX_BASE,
+                        helix_base,
                         &access.client_id,
                         self.auth.http.clone(),
                     );
@@ -314,30 +396,30 @@ impl PollControl {
             .await
     }
 
-    async fn get(&self, poll: &ActivePoll) -> Result<RemotePoll, PollControlError> {
+    async fn get(&self, target: &RemoteTarget) -> Result<RemotePoll, PollControlError> {
         self.with_access(
             &self.credentials(),
-            Some(&poll.broadcaster_id),
+            Some(&target.broadcaster_id),
             |access, helix| async move {
                 Ok(helix
-                    .get(&access.token, &poll.broadcaster_id, &poll.remote_id)
+                    .get(&access.token, &target.broadcaster_id, &target.remote_id)
                     .await?)
             },
         )
         .await
     }
 
-    async fn end(&self, poll: &ActivePoll, archive: bool) -> Result<(), PollControlError> {
+    async fn end(&self, target: &RemoteTarget) -> Result<(), PollControlError> {
         self.with_access(
             &self.credentials(),
-            Some(&poll.broadcaster_id),
+            Some(&target.broadcaster_id),
             |access, helix| async move {
                 Ok(helix
                     .end(
                         &access.token,
-                        &poll.broadcaster_id,
-                        &poll.remote_id,
-                        archive,
+                        &target.broadcaster_id,
+                        &target.remote_id,
+                        false,
                     )
                     .await?)
             },
