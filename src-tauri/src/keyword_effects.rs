@@ -33,29 +33,49 @@ pub struct KeywordEffects {
 }
 
 impl KeywordEffects {
-    /// 規則が変わった時だけ作り直す(クールダウンもその時にリセットされる)。
+    /// 照合・クールダウン引き継ぎ用のキー。同じキーワードが複数ある時は出現順で区別する。
+    fn keys(rules: &[EffectRule]) -> Vec<(String, usize)> {
+        let mut seen = std::collections::HashMap::<String, usize>::new();
+        rules
+            .iter()
+            .map(|r| {
+                let k = r.keyword.trim().to_lowercase();
+                let n = seen.entry(k.clone()).or_insert(0);
+                *n += 1;
+                (k, *n)
+            })
+            .collect()
+    }
+
+    /// 規則が変わった時だけ作り直す。クールダウンはキーワードが同じ規則に引き継ぎ、
+    /// キーワードを変えた規則・新しい規則だけをリセットする。
     fn sync(&mut self, rules: &[EffectRule]) {
         if self.raw == rules {
             return;
         }
+        let old: std::collections::HashMap<(String, usize), Option<Instant>> =
+            Self::keys(&self.rules).into_iter().zip(self.last_fired.drain(..)).collect();
         self.raw = rules.to_vec();
         self.rules = self.raw.clone();
         for rule in &mut self.rules {
             rule.normalize();
         }
-        // 表示物が空の規則は無効として扱う(キーワードが空白のみなら regex が None)。
+        // 無効・表示物が空の規則は発火しない(キーワードが空白のみなら regex が None)。
         self.compiled = self
             .rules
             .iter()
             .map(|r| {
-                if r.emoji.trim().is_empty() {
+                if !r.enabled || r.emoji.trim().is_empty() {
                     None
                 } else {
                     keyword_regex(&r.keyword)
                 }
             })
             .collect();
-        self.last_fired = vec![None; self.rules.len()];
+        self.last_fired = Self::keys(&self.rules)
+            .iter()
+            .map(|k| old.get(k).copied().flatten())
+            .collect();
     }
 
     /// 1 コメントを判定する。クールダウン中の規則は捨てる(溜めない)。
@@ -299,6 +319,59 @@ mod tests {
         assert!(fx.evaluate(&cfg(vec![r.clone()]), &text("party"), t0).is_empty());
         r.keyword = "party!".into();
         assert_eq!(fx.evaluate(&cfg(vec![r]), &text("party!"), t0).len(), 1);
+    }
+
+    #[test]
+    fn disabled_rules_never_fire_but_the_test_button_still_works() {
+        let mut fx = KeywordEffects::default();
+        let mut off = rule("party");
+        off.enabled = false;
+        let c = cfg(vec![off.clone(), rule("party")]);
+        assert_eq!(ids(&fx.evaluate(&c, &text("party"), Instant::now())), vec![1]);
+        assert!(test_trigger(0, &off).is_some());
+    }
+
+    #[test]
+    fn editing_another_rule_keeps_cooldowns_of_unchanged_keywords() {
+        let mut fx = KeywordEffects::default();
+        let mut a = rule("alpha");
+        a.cooldown_ms = 5000;
+        let mut b = rule("beta");
+        b.cooldown_ms = 5000;
+        let t0 = Instant::now();
+        let both = text("alpha beta");
+        assert_eq!(ids(&fx.evaluate(&cfg(vec![a.clone(), b.clone()]), &both, t0)), vec![0, 1]);
+        // b だけ編集(キーワード変更): a の cooldown は保たれ、b はリセットされる。
+        let mut b2 = b.clone();
+        b2.keyword = "beta2".into();
+        let t1 = t0 + Duration::from_secs(1);
+        let out = fx.evaluate(&cfg(vec![a.clone(), b2.clone()]), &text("alpha beta2"), t1);
+        assert_eq!(ids(&out), vec![1]);
+        // 並べ替え・先頭への新規追加でも、キーワードが同じ規則は cooldown を引き継ぐ。
+        let fresh = rule("gamma");
+        let c3 = cfg(vec![fresh, a.clone(), b2.clone()]);
+        let out = fx.evaluate(&c3, &text("gamma alpha beta2"), t1);
+        assert_eq!(ids(&out), vec![0]);
+        // 大文字小文字・前後空白だけの違いは同じキーワード扱い。
+        let mut a_case = a.clone();
+        a_case.keyword = "ALPHA".into();
+        assert!(fx.evaluate(&cfg(vec![a_case]), &text("alpha"), t1).is_empty());
+    }
+
+    #[test]
+    fn duplicate_keywords_keep_their_own_cooldowns() {
+        let mut fx = KeywordEffects::default();
+        let mut slow = rule("party");
+        slow.cooldown_ms = 5000;
+        let fast = rule("party");
+        let t0 = Instant::now();
+        let c = cfg(vec![slow.clone(), fast.clone()]);
+        assert_eq!(ids(&fx.evaluate(&c, &text("party"), t0)), vec![0, 1]);
+        let mut other = rule("zzz");
+        other.cooldown_ms = 0;
+        let c2 = cfg(vec![slow, fast, other]);
+        let out = fx.evaluate(&c2, &text("party"), t0 + Duration::from_secs(1));
+        assert_eq!(ids(&out), vec![1]);
     }
 
     #[test]

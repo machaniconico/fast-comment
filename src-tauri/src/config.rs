@@ -579,8 +579,11 @@ const EFFECT_MAX_EMOJI_CHARS: usize = 16;
 
 /// コメント本文に反応してエフェクトを表示するルール(アプリ内・OBS)。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", from = "EffectRuleRaw")]
 pub struct EffectRule {
+    /// 規則ごとの有効/無効。既定 true。
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     /// 大文字小文字を区別せずに本文(テキスト部分のみ)へ部分一致するキーワード。
     #[serde(default)]
     pub keyword: String,
@@ -604,9 +607,48 @@ pub struct EffectRule {
     pub cooldown_ms: u32,
 }
 
+/// 読み込み用。旧 config(`enabled` 無し)の `count=0` は「無効」を意味していたので、
+/// 無効の規則として count=1 で読む。キーワードは旧アプリと同じく trim する。
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EffectRuleRaw {
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    keyword: String,
+    #[serde(default)]
+    emoji: String,
+    #[serde(default = "default_effect_count")]
+    count: u32,
+    #[serde(default)]
+    target: EffectTarget,
+    #[serde(default = "default_effect_animation")]
+    animation: String,
+    #[serde(default = "default_effect_duration_ms")]
+    duration_ms: u32,
+    #[serde(default = "default_effect_cooldown_ms")]
+    cooldown_ms: u32,
+}
+
+impl From<EffectRuleRaw> for EffectRule {
+    fn from(raw: EffectRuleRaw) -> Self {
+        EffectRule {
+            enabled: raw.enabled.unwrap_or(raw.count != 0),
+            keyword: raw.keyword.trim().to_string(),
+            emoji: raw.emoji,
+            count: raw.count.max(EFFECT_MIN_COUNT),
+            target: raw.target,
+            animation: raw.animation,
+            duration_ms: raw.duration_ms,
+            cooldown_ms: raw.cooldown_ms,
+        }
+    }
+}
+
 impl Default for EffectRule {
     fn default() -> Self {
         EffectRule {
+            enabled: true,
             keyword: String::new(),
             emoji: String::new(),
             count: default_effect_count(),
@@ -621,6 +663,10 @@ impl Default for EffectRule {
 impl EffectRule {
     /// 範囲外値の丸め。
     pub fn normalize(&mut self) {
+        let trimmed = self.keyword.trim();
+        if trimmed.len() != self.keyword.len() {
+            self.keyword = trimmed.to_string();
+        }
         self.count = self.count.clamp(EFFECT_MIN_COUNT, EFFECT_MAX_COUNT);
         self.duration_ms = self
             .duration_ms
@@ -2776,6 +2822,41 @@ mod tests {
         .expect("legacy config");
         assert_eq!(cfg.effects.rules[0].target, EffectTarget::App);
         assert_eq!(cfg.effects.rules[0].count, 12);
+    }
+
+    #[test]
+    fn legacy_count_zero_rule_loads_disabled_with_count_one() {
+        let legacy: EffectsConfig = serde_json::from_str(
+            r#"{"enabled":true,"rules":[
+                {"keyword":"off","emoji":"x","count":0},
+                {"keyword":"on","emoji":"y","count":3},
+                {"keyword":"new","emoji":"z"}]}"#,
+        )
+        .unwrap();
+        assert!(!legacy.rules[0].enabled);
+        assert_eq!(legacy.rules[0].count, 1);
+        assert!(legacy.rules[1].enabled);
+        assert!(legacy.rules[2].enabled);
+        // enabled を明示した規則はそのまま。保存し直しても無効のまま。
+        let text = serde_json::to_string(&legacy).unwrap();
+        let again: EffectsConfig = serde_json::from_str(&text).unwrap();
+        assert_eq!(again, legacy);
+        let explicit: EffectRule =
+            serde_json::from_str(r#"{"keyword":"a","emoji":"b","count":0,"enabled":true}"#).unwrap();
+        assert!(explicit.enabled);
+        assert_eq!(explicit.count, 1);
+    }
+
+    #[test]
+    fn effect_keywords_are_trimmed_on_load_and_normalize() {
+        let legacy: EffectsConfig = serde_json::from_str(
+            r#"{"enabled":true,"rules":[{"keyword":" 拍手 ","emoji":"x"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.rules[0].keyword, "拍手");
+        let mut rule = EffectRule { keyword: "\t拍手\u{3000}".into(), ..Default::default() };
+        rule.normalize();
+        assert_eq!(rule.keyword, "拍手");
     }
 
     #[test]

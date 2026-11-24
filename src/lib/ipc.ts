@@ -529,6 +529,8 @@ export interface TimerConfig {
 export type EffectTarget = 'app' | 'obs' | 'both';
 
 export interface EffectRule {
+  /** 規則ごとの有効/無効(無効でも「テスト」は押せる)。 */
+  enabled: boolean;
   keyword: string;
   emoji: string;
   count: number;

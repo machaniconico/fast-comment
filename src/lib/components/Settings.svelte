@@ -914,6 +914,7 @@
   // 範囲の丸めは Rust(保存時)が正。ここは編集中の表示を壊さないための入力補正だけ。
   function normalizeEffectRules(rules: Partial<EffectRule>[] | undefined): EffectRule[] {
     return (rules ?? []).map((rule) => ({
+      enabled: rule.enabled !== false,
       keyword: typeof rule.keyword === 'string' ? rule.keyword : '',
       emoji: typeof rule.emoji === 'string' ? rule.emoji : '',
       count: clampInt(rule.count, 12, 1, 50),
@@ -973,7 +974,7 @@
     normalizeEffectsConfig();
     config.effects.rules = [
       ...config.effects.rules,
-      { keyword: '', emoji: '🎉', count: 12, target: 'app', animation: 'float', durationMs: 3000, cooldownMs: 2000 }
+      { enabled: true, keyword: '', emoji: '🎉', count: 12, target: 'app', animation: 'float', durationMs: 3000, cooldownMs: 2000 }
     ];
   }
 
@@ -2945,6 +2946,8 @@
           <button type="button" class="copy-btn dict-delete" onclick={() => removeEffectRule(index)}>削除</button>
         </div>
         <div class="effect-row effect-row-sub">
+          <label for={`effect-enabled-${index}`} class="dict-label">有効</label>
+          <input id={`effect-enabled-${index}`} type="checkbox" bind:checked={rule.enabled} class="chk" />
           <label for={`effect-target-${index}`} class="dict-label">表示先</label>
           <select id={`effect-target-${index}`} bind:value={rule.target} class="platform-select">
             {#each EFFECT_TARGETS as t (t.value)}
@@ -3589,7 +3592,7 @@
   }
 
   .effect-row-sub {
-    grid-template-columns: auto minmax(90px, 1fr) auto minmax(90px, 1fr) auto 90px auto 90px auto;
+    grid-template-columns: auto auto auto minmax(90px, 1fr) auto minmax(90px, 1fr) auto 90px auto 90px auto;
   }
 
   .dict-label {
