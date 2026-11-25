@@ -45,6 +45,8 @@
     getConfigSnapshot,
     setGoalsShowInApp,
     getTtsQueueState,
+    getStartupLaunchSettings,
+    onStartupLaunchFailure,
     onTtsNotice,
     takeStartupConfigNotice,
     onTtsQueueState,
@@ -60,6 +62,9 @@
 
   let unlisten: (() => void) | null = null;
   let unlistenPollError: (() => void) | null = null;
+  let unlistenStartupLaunchFailure: (() => void) | null = null;
+  let startupLaunchFailures = $state(0);
+  let startupLaunchNeedsApproval = $state<boolean | null>(null);
   let unlistenTtsNotice: (() => void) | null = null;
   let unlistenTtsQueueState: (() => void) | null = null;
   let config: AppConfig | null = $state(null);
@@ -204,6 +209,7 @@
           else unlistenPollError = unlisten;
         })
         .catch(() => console.warn('[poll] error notification subscription failed'));
+      void watchStartupLaunchStatus();
     }
     {
       const fn = await initStore();
@@ -253,6 +259,7 @@
     unlisten?.();
     unlistenTtsNotice?.();
     unlistenPollError?.();
+    unlistenStartupLaunchFailure?.();
     unlistenTtsQueueState?.();
     unlistenDanmakuState?.();
     if (searchDebounce) clearTimeout(searchDebounce);
@@ -489,6 +496,35 @@
     if (configStale && !configLoading && !configRetryWait) void loadConfig();
   });
 
+  async function watchStartupLaunchStatus() {
+    try {
+      const unlisten = await onStartupLaunchFailure((count) => {
+        startupLaunchFailures = Math.max(startupLaunchFailures, count);
+      });
+      if (destroyed) {
+        unlisten();
+        return;
+      }
+      unlistenStartupLaunchFailure = unlisten;
+    } catch {
+      console.warn('[startup-launch] notification setup failed');
+    }
+    try {
+      const settings = await getStartupLaunchSettings();
+      if (!destroyed && settings) {
+        startupLaunchFailures = Math.max(startupLaunchFailures, settings.failures);
+        // 設定画面から先に状態が届いた場合は、起動時の応答で上書きしない。
+        startupLaunchNeedsApproval ??= settings.needsApproval;
+      }
+    } catch {
+      console.warn('[startup-launch] status load failed');
+    }
+  }
+
+  function onStartupLaunchApprovalChanged(needsApproval: boolean) {
+    startupLaunchNeedsApproval = needsApproval;
+  }
+
   function showTtsNotice(notice: TtsNotice) {
     ttsNotice = notice;
     if (ttsNoticeTimer) clearTimeout(ttsNoticeTimer);
@@ -603,6 +639,18 @@
         title="閉じる"
         aria-label="TTS通知を閉じる"
       >×</button>
+    </div>
+  {/if}
+
+  {#if startupLaunchNeedsApproval}
+    <div class="tts-notice-banner tts-notice-banner--error" role="alert">
+      <span class="tts-notice-banner__text">起動時に開く設定が変更されています。設定画面で確認してください。</span>
+    </div>
+  {/if}
+
+  {#if startupLaunchFailures > 0}
+    <div class="tts-notice-banner tts-notice-banner--error" role="status">
+      <span class="tts-notice-banner__text">起動時に開く項目のうち {startupLaunchFailures} 件を開けませんでした。</span>
     </div>
   {/if}
 
@@ -936,7 +984,7 @@
     {:else if ui.activeTab === 'participation'}
       <Participation />
     {:else}
-      <Settings onConfigSaved={onSettingsSaved} />
+      <Settings onConfigSaved={onSettingsSaved} {onStartupLaunchApprovalChanged} />
     {/if}
   </div>
 

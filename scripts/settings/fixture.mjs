@@ -77,6 +77,9 @@ const mock = window.mock = {
   callbacks: new Map(),
   listenerDonation: { totals: [], jpyEstimateMilli: null, unconvertible: [] },
   donationReads: 0,
+  startupLaunch: { items: [], needsApproval: location.search === '?startup-launch-app', readError: null, failures: 0 },
+  startupLaunchWrites: [],
+  startupLaunchSaveError: null,
   configSync,
   appearance: () => theme.getSnapshot(),
   pushComment: comment => store.pushBatch([comment]),
@@ -102,6 +105,12 @@ if (location.search === '?browser') {
     async invoke(command, args) {
       switch (command) {
         case 'plugin:window|get_all_windows': return ['main'];
+        case 'get_startup_launch_settings': return structuredClone(mock.startupLaunch);
+        case 'save_startup_launch_settings':
+          mock.startupLaunchWrites.push(structuredClone(args));
+          if (mock.startupLaunchSaveError) throw mock.startupLaunchSaveError;
+          mock.startupLaunch = { ...mock.startupLaunch, items: structuredClone(args.items), needsApproval: false };
+          return null;
         case 'listener_donation':
           mock.donationReads++;
           return structuredClone(mock.listenerDonation);
@@ -235,5 +244,5 @@ if (location.search === '?browser') {
       }
     },
   };
-  mount(location.search === '?app' ? App : Settings, { target: document.body });
+  mount(['?app', '?startup-launch-app'].includes(location.search) ? App : Settings, { target: document.body });
 }

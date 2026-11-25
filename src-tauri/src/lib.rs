@@ -35,6 +35,7 @@ mod sounds;
 mod template_import;
 pub mod sources;
 pub mod stats;
+pub mod startup_launch;
 mod templates;
 pub mod tts;
 mod tts_dictionary;
@@ -3251,6 +3252,61 @@ fn require_main_integrations_window(label: &str) -> Result<(), integrations::Int
         Err(integrations::IntegrationError::ForbiddenWindow)
     }
 }
+
+struct StartupLaunchState {
+    config_dir: Option<PathBuf>,
+    // Hold the gate through the startup read so concurrent saves take effect next launch.
+    gate: Arc<tokio::sync::Mutex<()>>,
+    failures: Arc<AtomicU64>,
+}
+
+fn require_main_startup_launch_window(label: &str) -> Result<(), String> {
+    if label == "main" {
+        Ok(())
+    } else {
+        Err("起動時に開く設定はメインウィンドウからのみ操作できます".into())
+    }
+}
+
+#[tauri::command]
+async fn get_startup_launch_settings(
+    window: tauri::WebviewWindow,
+    state: State<'_, StartupLaunchState>,
+) -> Result<startup_launch::LaunchSettings, String> {
+    require_main_startup_launch_window(window.label())?;
+    let dir = state.config_dir.clone().ok_or("設定フォルダーを取得できませんでした")?;
+    let guard = state.gate.clone().lock_owned().await;
+    let failures = state.failures.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = guard;
+        let mut settings = startup_launch::settings(&dir);
+        settings.failures = failures.load(Ordering::Relaxed);
+        settings
+    })
+    .await
+    .map_err(|_| "起動時に開く設定を読み込めませんでした".into())
+}
+
+#[tauri::command]
+async fn save_startup_launch_settings(
+    window: tauri::WebviewWindow,
+    state: State<'_, StartupLaunchState>,
+    items: serde_json::Value,
+    confirmed: serde_json::Value,
+) -> Result<(), String> {
+    require_main_startup_launch_window(window.label())?;
+    let items = startup_launch::items_from_ipc(items, confirmed)?;
+    let dir = state.config_dir.clone().ok_or("設定フォルダーを取得できませんでした")?;
+    let guard = state.gate.clone().lock_owned().await;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = guard;
+        startup_launch::save_approved(&dir, &startup_launch::KeyringApprovalStore, items, true)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|_| "起動時に開く設定を保存できませんでした".to_string())?
+}
+
 #[tauri::command]
 fn get_local_api_status(
     window: tauri::WebviewWindow,
@@ -4214,6 +4270,33 @@ pub fn run() {
                 ));
             }
 
+            let launch_dir = app_config_dir.filter(|dir| dir.is_absolute());
+            let gate = Arc::new(tokio::sync::Mutex::new(()));
+            let failures = Arc::new(AtomicU64::new(0));
+            // Acquire before publishing the state to IPC.
+            let guard = gate.clone().try_lock_owned().expect("new startup launch gate");
+            handle.manage(StartupLaunchState {
+                config_dir: launch_dir.clone(),
+                gate,
+                failures: failures.clone(),
+            });
+            if let Some(dir) = launch_dir {
+                let launch_app = handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    let decision = tauri::async_runtime::spawn_blocking(move || {
+                        let _guard = guard;
+                        startup_launch::load_for_startup(&dir, &startup_launch::KeyringApprovalStore)
+                    })
+                    .await;
+                    if let Ok(startup_launch::StartupDecision::Run(items)) = decision {
+                        startup_launch::run(items, || {
+                            let count = failures.fetch_add(1, Ordering::Relaxed) + 1;
+                            let _ = launch_app.emit_to("main", "startup-launch-failure", count);
+                        }).await;
+                    }
+                });
+            }
+
             // Bus の UI forwarder と OBS サーバを起動。
             bus.spawn_ui_forwarder(handle.clone(), app_cancel.clone());
             spawn_reaction_ui_forwarder(reaction_rx, handle.clone(), app_cancel.clone());
@@ -4294,6 +4377,8 @@ pub fn run() {
             set_local_api_enabled,
             get_local_api_token,
             regenerate_local_api_token,
+            get_startup_launch_settings,
+            save_startup_launch_settings,
             get_listener,
             listener_donation,
             reset_listener_donation,
