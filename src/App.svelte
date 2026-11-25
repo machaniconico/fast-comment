@@ -53,7 +53,7 @@
     isDanmakuOverlayOpen,
     setAlwaysOnTop,
   } from './lib/ipc';
-  import type { AppConfig, TtsNotice } from './lib/ipc';
+  import type { AppConfig, RestoreFailureNotice, TtsNotice } from './lib/ipc';
   import { appUpdate } from './lib/appUpdate.svelte';
   import { configReloadMessage, configSync } from './lib/configSync.svelte';
   import { progressLabel, progressPercent } from './lib/appUpdate';
@@ -62,7 +62,7 @@
   let unlistenTtsNotice: (() => void) | null = null;
   let unlistenTtsQueueState: (() => void) | null = null;
   let config: AppConfig | null = $state(null);
-  let restoreFailed = $state(false);
+  let restoreFailure = $state<RestoreFailureNotice | null>(null);
   let ttsNotice = $state<TtsNotice | null>(null);
   let ttsNoticeTimer: ReturnType<typeof setTimeout> | null = null;
   let toolsOpen = $state(false);
@@ -197,8 +197,8 @@
     void appUpdate.checkSilently();
     void loadConfig();
     void moderation.refreshAuth();
-    void takeStartupRestoreFailure().then((failed) => {
-      if (!destroyed && failed) restoreFailed = true;
+    void takeStartupRestoreFailure().then((notice) => {
+      if (!destroyed) restoreFailure = notice;
     }).catch(() => console.warn('[backup] startup notice load failed'));
     {
       const fn = await initStore();
@@ -584,11 +584,18 @@
     </div>
   {/if}
 
-  {#if restoreFailed}
+  {#if restoreFailure}
     <div class="tts-notice-banner tts-notice-banner--error" role="status">
-      <span class="tts-notice-banner__text">復元に失敗しました</span>
-      <button class="tts-notice-dismiss" onclick={() => { restoreFailed = false; }}
-        aria-label="復元の通知を閉じる">×</button>
+      <span class="tts-notice-banner__text">
+        復元に失敗しました。
+        {#if restoreFailure === 'savesBlocked'}
+          復元の取り消しが完了していません。該当するデータの保存を停止しています。
+        {/if}
+      </span>
+      {#if restoreFailure === 'failed'}
+        <button class="tts-notice-dismiss" onclick={() => { restoreFailure = null; }}
+          aria-label="復元の通知を閉じる">×</button>
+      {/if}
     </div>
   {/if}
 

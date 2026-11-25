@@ -25,6 +25,18 @@ pub trait StoreIo: Send + Sync {
     fn create_backup(&self, src: &Path, dst: &Path) -> io::Result<()>;
 }
 
+struct ReadOnlyIo;
+
+impl StoreIo for ReadOnlyIo {
+    fn write_atomic(&self, _path: &Path, _bytes: &[u8]) -> io::Result<()> {
+        Err(io::ErrorKind::PermissionDenied.into())
+    }
+
+    fn create_backup(&self, _src: &Path, _dst: &Path) -> io::Result<()> {
+        Err(io::ErrorKind::PermissionDenied.into())
+    }
+}
+
 pub struct FsIo;
 
 impl StoreIo for FsIo {
@@ -134,6 +146,7 @@ pub struct DefsStore {
     path: PathBuf,
     io: Arc<dyn StoreIo>,
     save_refused: bool,
+    progress_read_only: bool,
     state: Mutex<DefsState>,
 }
 
@@ -143,6 +156,30 @@ impl DefsStore {
     }
 
     pub fn load_with(dir: &Path, now_ms: u64, io: Arc<dyn StoreIo>) -> Self {
+        Self::load_inner(dir, now_ms, io, false, false)
+    }
+
+    pub(crate) fn load_for_startup(
+        dir: &Path,
+        now_ms: u64,
+        defs_read_only: bool,
+        progress_read_only: bool,
+    ) -> Self {
+        let io: Arc<dyn StoreIo> = if defs_read_only { Arc::new(ReadOnlyIo) } else { Arc::new(FsIo) };
+        Self::load_inner(dir, now_ms, io, defs_read_only, progress_read_only)
+    }
+
+    pub(crate) fn progress_io(&self) -> Arc<dyn StoreIo> {
+        if self.progress_read_only { Arc::new(ReadOnlyIo) } else { Arc::new(FsIo) }
+    }
+
+    fn load_inner(
+        dir: &Path,
+        now_ms: u64,
+        io: Arc<dyn StoreIo>,
+        defs_read_only: bool,
+        progress_read_only: bool,
+    ) -> Self {
         let path = dir.join(DEFS_FILE);
         let _transaction = DEFS_TRANSACTION.lock().unwrap_or_else(|e| e.into_inner());
         let (loaded, saved_bytes, save_refused) =
@@ -155,7 +192,8 @@ impl DefsStore {
         Self {
             path,
             io,
-            save_refused,
+            save_refused: defs_read_only || save_refused,
+            progress_read_only,
             state: Mutex::new(DefsState {
                 current: loaded.unwrap_or_default(),
                 saved_bytes,
@@ -345,6 +383,14 @@ fn decode_versioned<T: DeserializeOwned>(bytes: &[u8], validate: impl FnOnce(&T)
     serde_json::from_value(value).ok().filter(|data| validate(data))
 }
 
+pub(crate) fn validate_backup_defs(bytes: &[u8]) -> bool {
+    decode_versioned(bytes, |defs: &AchievementDefs| validate_all(&defs.achievements).is_ok()).is_some()
+}
+
+pub(crate) fn validate_backup_progress(bytes: &[u8]) -> bool {
+    decode_versioned(bytes, |_: &Progress| true).is_some()
+}
+
 fn preserve_broken(path: &Path, now_ms: u64, io: &dyn StoreIo) -> Result<(), CommitError> {
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     for n in 0u64..=u64::MAX {
@@ -441,11 +487,7 @@ impl ProgressFile {
 /// 進捗ファイルを読み取り専用で読む(退避も書き込みもしない)。無い・壊れている・版違いは None。
 pub(super) fn read_progress(dir: &Path) -> Option<Progress> {
     let bytes = read_optional(&dir.join(PROGRESS_FILE)).ok()??;
-    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    if value.get("version").and_then(serde_json::Value::as_u64) != Some(u64::from(STORE_VERSION)) {
-        return None;
-    }
-    serde_json::from_value(value).ok()
+    decode_versioned(&bytes, |_: &Progress| true)
 }
 
 /// Remove a viewer's achievements when there is no active engine.

@@ -1,7 +1,8 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import {
-    createBackupNow, isTauri, listBackups, openBackupDir, restoreBackup,
+    createBackupNow, getLastAutoBackupFailure, isTauri, listBackups,
+    onAutoBackupFailed, openBackupDir, restoreBackup,
     type BackupEntry, type BackupSettings,
   } from '../ipc';
 
@@ -9,6 +10,8 @@
   let entries = $state<BackupEntry[] | null>(null);
   let busy = $state(false);
   let status = $state('');
+  let listError = $state('');
+  let lastFailure = $state<string | null>(null);
   const available = isTauri();
   const date = new Intl.DateTimeFormat('ja-JP', { dateStyle: 'medium', timeStyle: 'medium' });
 
@@ -19,11 +22,38 @@
   const size = new Intl.NumberFormat('ja-JP', { maximumFractionDigits: 1 });
 
   async function refresh() {
-    entries = await listBackups();
+    try {
+      entries = await listBackups();
+      listError = '';
+    } catch (error) {
+      entries = null;
+      listError = typeof error === 'string' ? error : 'バックアップの一覧を取得できませんでした。';
+    }
   }
 
   onMount(() => {
-    void refresh().catch(() => { status = 'バックアップの一覧を取得できませんでした。'; });
+    void refresh();
+    let active = true;
+    let unlisten: (() => void) | undefined;
+    void (async () => {
+      try {
+        unlisten = await onAutoBackupFailed((reason) => {
+          if (active) lastFailure = reason;
+        });
+        if (!active) {
+          unlisten();
+          return;
+        }
+        const reason = await getLastAutoBackupFailure();
+        if (active && lastFailure === null) lastFailure = reason;
+      } catch {
+        // 一覧と作成の操作は引き続き利用できる。
+      }
+    })();
+    return () => {
+      active = false;
+      unlisten?.();
+    };
   });
 
   async function create() {
@@ -44,7 +74,10 @@
     if (!window.confirm(
       `${formatDate(entry.createdAtMs)} のバックアップを復元しますか？\n\n` +
       '現在の状態を先にバックアップしてからアプリを再起動します。\n' +
-      '資格情報、ローカル API、Webhook の設定は復元の対象外です。',
+      '事前バックアップの後、再起動までの変更は失われる可能性があります。\n' +
+      '資格情報、ローカル API、Webhook の設定は復元の対象外です。\n' +
+      'X 自動告知の台帳は戻らないため、現在の状態を引き継ぎます。\n' +
+      '実行ファイルの指定や接続先の上書きは今の設定のままです。',
     )) return;
     busy = true;
     status = '復元を準備しています…';
@@ -81,7 +114,10 @@
     <button type="button" onclick={openFolder} disabled={!available || busy}>フォルダを開く</button>
   </div>
   {#if status}<p role="status">{status}</p>{/if}
-  {#if entries?.length}
+  {#if lastFailure}<p role="status">自動バックアップに失敗しました。{lastFailure}</p>{/if}
+  {#if listError}
+    <p role="status">{listError}</p>
+  {:else if entries?.length}
     <ul aria-label="バックアップ一覧">
       {#each entries as entry (entry.fileName)}
         <li class="row">

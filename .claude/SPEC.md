@@ -483,9 +483,15 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
 
 - `config.json` の `backup { enabled, keep }` で制御する。既定は有効・10 世代。世代数は Rust 側で 1〜50 に丸める。最新が 20 時間以上前か初回なら起動時に作成し、稼働中は 24 時間ごとに作成する。前回と全データの SHA-256 が同じ場合は省略する。設定画面から手動作成、一覧、フォルダを開く操作ができる。
 - 保存先は `<app_config_dir>/backups/auto/fc-backup-<UTC ミリ秒>.zip`。世代の順序は名前の時刻で判定し、この名前の通常ファイルだけを整理する。zip は一時ファイルを同期してから rename で公開する。
-- 対象は `config.json`、`listeners.json`、`achievements.json`、`achievement-progress.json`、`sounds.json` と、`sounds/`、`templates/`、`skin/` のユーザーファイル。対象パスは `manifest.json`（schema `fast-comment-backup`、version 1）に記録する。設定の `credentials` は空にし、OS の資格情報ストアは除外する。対象データに資格情報の値が別途含まれていれば作成を中止する。URL や署名の秘密を保持する `integrations.json`、古い状態へ戻すと二重投稿につながる X 自動告知の台帳、ログ、エクスポート、バックアップ自体、一時ファイルや破損データの退避も除外する。
-- 復元はメイン画面の設定から行う。zip を検証し、対象の相対パスだけを受け付ける。最大 2,000 エントリ、展開後合計 200 MiB、1 エントリ 50 MiB。リンクは拒否する。現在の状態をバックアップした後、`backups/restore-pending/` に展開して `READY` を書き、再起動する。起動時に設定やストアの読み込み前に再検証し、既存の対象を `<名前>.pre-restore-<ms>` に退避してから置き換える。退避は最新 3 世代を残す。失敗時は元に戻し、`restore-failed-<ms>/` に作業データを残して画面に一度だけ通知する。
-- 既知の限界は 2 点。資格情報・ローカル API・Webhook は現在の値を引き継ぐ。X 自動告知の台帳も現在の状態を引き継ぐ。
+- 対象は `config.json`、`listeners.json`、`achievements.json`、`achievement-progress.json`、`sounds.json` と、`sounds/`、`templates/`、`skin/` のユーザーファイル。対象パスは `manifest.json`（schema `fast-comment-backup`、version 1）に記録する。zip では `credentials`、`xOverrides.bearerToken`、`youtubeOverrides.apiKey` を空にする。設定にある8文字以上の鍵・トークン・Cookie がファイル名または内容に残っていれば作成を中止する。OS の資格情報、`integrations.json`、X 自動告知の台帳、ログ、エクスポート、バックアップ自体、トップレベルの一時ファイルや退避ファイルは対象外。カスタムテンプレートとスキンの中にある同名のファイルは対象に含める。
+- 復元はメイン画面の設定から行う。zip の相対パスと各ストアの JSON 形式を検証してから `backups/restore-pending/` に展開する。最大 2,000 エントリ、展開後合計 200 MiB、1 エントリ 50 MiB。リンクは拒否する。事前バックアップを作成して世代を整理する間は復元元 zip も保持する。`READY` を書いて再起動し、ストアの読み込み前に再検証する。既存の対象を `<名前>.pre-restore-<ms>` に退避して置き換え、zip に無い対象は退避した状態にする。
+- ロールバックは失敗した対象ごとに最大3回試す。回復できなければ `APPLYING` を保持し、該当ストアの保存を止めて起動中は失敗を表示する。次回起動時に再試行する。回復後は `restore-failed-<ms>/` に作業データを残し、一度だけ通知する。起動時に作業用の一時ファイルを掃除し、失敗記録と退避はそれぞれ最新3世代を残す。バックアップ欄では自動作成の最後の失敗理由と一覧取得エラーを表示する。
+- 既知の限界。事前バックアップの後、再起動までの変更は失われる。以下は現在の値・状態を引き継ぐ。
+  - `credentials` 全体と OS の資格情報。
+  - `xOverrides.bearerToken` と `youtubeOverrides.apiKey`。
+  - `xOverrides.endpoints` 全体（`guestActivateUrl`、`broadcastShowUrl`、`liveChatUrl`、`userQueryUrl`、`userByScreenNameUrl`、`avatarContentUrl`）。
+  - 棒読みちゃん自動起動の `tts.options.bouyomiPath` と `tts.options.bouyomiLaunchElevated`。
+  - ローカル API と Webhook の設定、X 自動告知の台帳。
 
 ## 11. フェーズ計画
 

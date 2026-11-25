@@ -119,3 +119,15 @@
 - 事前バックアップの中身が最新のバックアップと同じなら、新たに作らない(最新のものが今の状態の写しになっているので)。
 - READY の無い restore-pending は適用しない(途中で落ちた展開の残骸とみなし、消す)。
 - 新旧の順序と created_at_ms は、ファイル名の数値で決める。
+
+## 修正1 の裁定(2026-11-25、レビュー後。ルート)
+- 秘密の検査: 本当の秘密(twitchOauth・twitchClientSecret・youtubeApiKey・xAuthToken・xCsrfToken、xOverrides.bearerToken、youtubeOverrides.apiKey など鍵・トークン・cookie)だけを対象にし、8 文字未満の値は検査しない。ユーザー名・クライアント ID は対象外。
+- バックアップに入れる config.json では、credentials に加えて、鍵・トークンを持つ override の値(xOverrides.bearerToken、youtubeOverrides.apiKey 等。実装担当が config.rs を走査して列挙する)も空にする。
+- 復元時に「今の値を引き継ぐ」欄: credentials、上の鍵・トークン欄、資格情報と一緒に送られる宛先(xOverrides の URL 類など、cookie やトークンを送る先)、外部プログラムを起動する設定(棒読みちゃんの実行ファイルなど。config から Command / spawn される値をすべて)。zip の値は使わない。SPEC の既知の限界に列挙する。
+- prune は復元元の zip を消さない(stage_restore では、復元元を restore-pending に写してから事前バックアップと prune を行う)。
+- zip に無い許可対象(listeners.json、templates/ など)は「バックアップの時点で無かった」とみなし、今のものを .pre-restore に退避してから外す。
+- 検証は、実際のストアの読み込みと同じ型で行う(Config、listeners の HashMap<String, ListenerRecord>、実績の定義と進捗、sounds.json)。読めなければ Invalid。stage と apply の両方で行う。
+- ロールバックが失敗した時(Windows のロックなど): 短い間隔で 3 回試す。それでも失敗した対象があれば、APPLYING の印を残して次回の起動で再び戻しを試みる。今回の起動では、該当するストアを保存禁止(listeners の既存の保存禁止モードと同じ扱い)にして起動し、UI に失敗を出し続ける。
+- 起動時の掃除: restore-applied-*.tmp、auto/*.tmp を消す。restore-failed-* と *.pre-restore-* は最新の 3 件だけ残す。
+- 上限を超えて自動作成できない時は、UI(バックアップ欄)に最後の失敗の理由を出す。一覧で権限エラーが出た時は空と見せず、エラーを出す。
+- 確認ダイアログに次の文言を足す:「事前バックアップの後、再起動までの変更は失われる」「X 自動告知の台帳は戻らない」「実行ファイルの指定や接続先の上書きは今の設定のまま」。

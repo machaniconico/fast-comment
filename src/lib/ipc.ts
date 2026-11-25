@@ -431,6 +431,15 @@ export function listBackups(): Promise<BackupEntry[] | null> {
   return invoke<BackupEntry[]>('list_backups');
 }
 
+export function getLastAutoBackupFailure(): Promise<string | null> {
+  return invoke<string>('get_last_auto_backup_failure');
+}
+
+export async function onAutoBackupFailed(cb: (reason: string) => void): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  return listen<string>('auto-backup-failed', (event) => cb(event.payload));
+}
+
 export function createBackupNow(): Promise<boolean | null> {
   return invoke<boolean>('create_backup_now');
 }
@@ -443,8 +452,10 @@ export function openBackupDir(): Promise<void | null> {
   return invoke<void>('open_backup_dir');
 }
 
-export function takeStartupRestoreFailure(): Promise<boolean | null> {
-  return invoke<boolean>('take_startup_restore_failure');
+export type RestoreFailureNotice = 'failed' | 'savesBlocked';
+
+export function takeStartupRestoreFailure(): Promise<RestoreFailureNotice | null> {
+  return invoke<RestoreFailureNotice>('take_startup_restore_failure');
 }
 
 export interface AppConfig {

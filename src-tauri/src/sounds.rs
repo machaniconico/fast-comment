@@ -36,6 +36,10 @@ struct Index {
     sounds: Vec<SoundEntry>,
 }
 
+pub(crate) fn validate_backup_index(bytes: &[u8]) -> bool {
+    serde_json::from_slice::<Index>(bytes).is_ok()
+}
+
 /// 再生用に UI へ返す中身。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SoundData {

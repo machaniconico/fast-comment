@@ -384,6 +384,8 @@ impl ConfigLoadOutcome {
 /// 退避できなかった設定ディレクトリ。元の config.json を既定値で上書きしないよう保存を止める。
 static SAVE_BLOCKED_DIRS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
 
+static RESTORE_BLOCKED_DIRS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
 pub const CONFIG_SAVE_BLOCKED_ERROR: &str =
     "設定ファイルを読めず退避もできなかったため、上書きしないよう保存を止めています。config.json を確認してアプリを再起動してください";
 
@@ -1600,6 +1602,14 @@ impl AppConfig {
         }
     }
 
+    pub(crate) fn load_read_only(dir: &Path) -> Self {
+        RESTORE_BLOCKED_DIRS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(dir.to_path_buf());
+        Self::load(dir).unwrap_or_default()
+    }
+
     /// IPC の入力値はエラー文に含めない。
     pub(crate) fn from_config_update(value: serde_json::Value) -> Result<Self, String> {
         serde_path_to_error::deserialize(value).map_err(|e| {
@@ -1637,6 +1647,9 @@ impl AppConfig {
     /// クレート内では `commit_config` だけが呼ぶ(revision を進めない保存を作らない。lib.rs の
     /// `every_config_write_goes_through_commit_config` で検査)。受け入れテストが使うので公開している。
     pub fn save(&self, dir: &Path) -> anyhow::Result<()> {
+        if RESTORE_BLOCKED_DIRS.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|d| d == dir) {
+            return Err(crate::backup::RestoreSaveBlocked.into());
+        }
         if save_blocked(dir) {
             return Err(anyhow::Error::new(ConfigSaveBlocked));
         }
@@ -1713,6 +1726,9 @@ impl std::fmt::Display for ChannelOverridesCommitError {
             Self::Stale => f.write_str(CONFIG_CHANGED_ERROR),
             Self::NotFound => std::fmt::Display::fmt(&ChannelEditError::NotFound, f),
             Self::Save(e) if e.is::<ConfigSaveBlocked>() => f.write_str(CONFIG_SAVE_BLOCKED_ERROR),
+            Self::Save(e) if e.is::<crate::backup::RestoreSaveBlocked>() => {
+                f.write_str(crate::backup::RESTORE_SAVE_BLOCKED)
+            }
             Self::Save(_) => f.write_str("枠の設定を保存できませんでした"),
         }
     }
