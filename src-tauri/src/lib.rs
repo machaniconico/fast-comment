@@ -931,9 +931,20 @@ struct ConfigSnapshot {
     revision: u64,
 }
 
+const CONFIG_PORTABILITY_MAIN_ONLY: &str =
+    "設定の書き出しと読み込みはメインウィンドウからのみ行えます";
+const X_POST_DISABLED_BY_IMPORT: &str =
+    "X の自動告知は取り込み後に無効にしました。設定画面で確認してから有効にしてください";
+
 /// 設定の書き出し用の写し。資格情報は Rust 側で消してから渡す(SPEC §8.1)。
 #[tauri::command]
-fn export_config(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+fn export_config(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    if window.label() != "main" {
+        return Err(CONFIG_PORTABILITY_MAIN_ONLY.into());
+    }
     let config = state.config.lock().unwrap();
     backup::export_config(&config).map_err(Into::into)
 }
@@ -1866,35 +1877,43 @@ async fn update_config(
     save_config_update(app, state, new_config, base_revision, false).await
 }
 
-/// 書き出した設定(SPEC §8.1)を読み込む。資格情報と URL の欄は今の値のままにする。
+/// 書き出した設定(SPEC §8.1)を読み込む。資格情報と X の接続先は今の値のままにし、
+/// X の自動告知は無効にする。
 #[tauri::command]
 async fn import_config(
+    window: tauri::WebviewWindow,
     app: AppHandle,
     state: State<'_, AppState>,
     new_config: serde_json::Value,
 ) -> Result<UpdateConfigOutcome, String> {
+    if window.label() != "main" {
+        return Err(CONFIG_PORTABILITY_MAIN_ONLY.into());
+    }
     save_config_update(app, state, new_config, None, true).await
 }
 
 async fn save_config_update(
     app: AppHandle,
     state: State<'_, AppState>,
-    mut new_config: serde_json::Value,
+    new_config: serde_json::Value,
     base_revision: Option<u64>,
     imported: bool,
 ) -> Result<UpdateConfigOutcome, String> {
     let write = state.config_write.lock().await;
-    if imported {
-        backup::keep_current_redacted(&mut new_config, &state.config.lock().unwrap())?;
-    }
     let mut new_config = parse_config_update(
         state.config_revision.load(Ordering::SeqCst),
         base_revision,
         new_config,
     )?;
     validate_x_post_template(&new_config.x_post.template)?;
+    let mut x_post_disabled = false;
     let protected_oauth = {
         let current = state.config.lock().unwrap();
+        if imported {
+            x_post_disabled = new_config.x_post.enabled || current.x_post.enabled;
+            // 以降の検証(API モードの接続確認など)が、保存する資格情報を見るようにする。
+            new_config = backup::merge_import(&new_config, &current)?;
+        }
         tts_dictionary::validate_edit(
             &current.tts.options.dictionary,
             &new_config.tts.options.dictionary,
@@ -1917,6 +1936,11 @@ async fn save_config_update(
         tts_purged,
     ) = {
         let mut current = state.config.lock().unwrap();
+        if imported {
+            // 検証の間に別経路(OAuth の接続など)が保存した値を、古い写しで戻さない。
+            // 今の値は、保存と同じロックの中で読む。
+            new_config = backup::merge_import(&new_config, &current)?;
+        }
         let changes = (
             current.youtube_overrides != new_config.youtube_overrides
                 || current.credentials.youtube_api_key.trim()
@@ -1969,6 +1993,9 @@ async fn save_config_update(
     let mut warnings = Vec::new();
     if let Some(w) = configure_chatlog_nonfatal(&state.chatlog, new_config.log.clone()).await {
         warnings.push(w);
+    }
+    if x_post_disabled {
+        warnings.push(X_POST_DISABLED_BY_IMPORT.into());
     }
 
     if youtube_source_config_changed {

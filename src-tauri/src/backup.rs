@@ -34,28 +34,36 @@ const OVERRIDE_SECRETS: &[&[&str]] = &[
 ];
 /// 資格情報の欄。zip では空にし、設定の書き出し(SPEC §8.1)では欄ごと消す。
 const CREDENTIALS: &[&str] = &["credentials"];
-/// 秘密ではないが、復元時に今の値を引き継ぐ欄(外部プログラムの起動、OAuth の redirect URI)。
+/// 外部プログラムの起動の欄。秘密ではないが、復元時に今の値を引き継ぐ。
 const LOCAL_CONFIG_FIELDS: &[&[&str]] = &[
     &["tts", "options", "bouyomiPath"],
     &["tts", "options", "bouyomiLaunchElevated"],
-    // redirect URI のポートは、今の Client ID に登録した値と揃える。
+];
+/// OAuth の redirect URI のポート。今の Client ID に登録した値と揃えるため、
+/// 復元でも設定の読み込みでも今の値を引き継ぐ。
+const CALLBACK_PORTS: &[&[&str]] = &[
     &["xPost", "callbackPort"],
     &["twitcasting", "callbackPort"],
 ];
+/// X の接続先。ログイン cookie の送り先なので、設定の読み込みでも今の値を引き継ぐ。
+const X_ENDPOINTS: &[&str] = &["xOverrides", "endpoints"];
 /// URL の欄。zip ではユーザー情報(user:pass@)を消し、復元時は今の値を引き継ぐ。
 const URL_FIELDS: &[&[&str]] = &[
     &["tts", "options", "voicevoxUrl"],
-    &["xOverrides", "endpoints"],
+    X_ENDPOINTS,
     &["niconicoOverrides", "endpoints"],
     &["twitcastingOverrides", "endpoints"],
 ];
 const EXPORT_SECRET_ERROR: &str = "資格情報と同じ値が他の欄にあるため、設定を書き出せません";
+const EXPORT_CHECK_ERROR: &str = "資格情報の検査に失敗したため、設定を書き出せません";
+const IMPORT_ERROR: &str = "設定を取り込めません";
 
-/// zip と設定の書き出しが値を伏せる欄。復元と設定の読み込みは、ここを今の値のままにする。
-fn redacted_fields() -> impl Iterator<Item = &'static [&'static str]> {
+/// 復元でも設定の読み込みでも、ファイルの値を使わず今の値を引き継ぐ欄。
+fn kept_fields() -> impl Iterator<Item = &'static [&'static str]> {
     std::iter::once(CREDENTIALS)
         .chain(OVERRIDE_SECRETS.iter().copied())
-        .chain(URL_FIELDS.iter().copied())
+        .chain(CALLBACK_PORTS.iter().copied())
+        .chain(std::iter::once(X_ENDPOINTS))
 }
 const SCHEMA: &str = "fast-comment-backup";
 const MANIFEST: &str = "manifest.json";
@@ -568,7 +576,8 @@ fn empty_credentials() -> Value {
 }
 
 fn collect_secret(value: Option<&Value>, secrets: &mut BTreeSet<String>) {
-    let Some(value) = value.and_then(Value::as_str) else {
+    // 設定は前後の空白を除いて使う。写しが空白なしで残っていても見つける。
+    let Some(value) = value.and_then(Value::as_str).map(str::trim) else {
         return;
     };
     // Twitch accepts the OAuth token with or without the "oauth:" prefix.
@@ -703,34 +712,34 @@ pub(crate) fn export_config(config: &AppConfig) -> std::result::Result<Value, &'
     let text = exported.to_string();
     match contains_secret(secrets, std::iter::once(text.as_bytes())) {
         Ok(false) => Ok(exported),
-        _ => Err(EXPORT_SECRET_ERROR),
+        Ok(true) => Err(EXPORT_SECRET_ERROR),
+        Err(_) => Err(EXPORT_CHECK_ERROR),
     }
 }
 
-/// 設定の読み込み(SPEC §8.1)。書き出しが伏せる欄はファイルの値を使わず、今の値に差し替える
-/// (旧版の書き出しに残る資格情報も適用しない)。エラー文は固定の欄名だけで組み立てる。
-pub(crate) fn keep_current_redacted(
-    imported: &mut Value,
+/// 設定の読み込み(SPEC §8.1)。`incoming` はファイルから型変換した設定、戻り値は保存する設定。
+/// - 資格情報、上書き用の鍵、OAuth の待受ポート、X の接続先は今の値にする
+///   (旧版の書き出しに残る資格情報も適用しない)
+/// - それ以外の URL の欄はファイルの値を使い、ユーザー情報を消す
+/// - X の自動告知は無効にする(今の資格情報と他人のファイルの組み合わせで投稿させない)
+pub(crate) fn merge_import(
+    incoming: &AppConfig,
     current: &AppConfig,
-) -> std::result::Result<(), String> {
-    let invalid = |field: &str| format!("設定の形式が不正です (項目 {field})");
-    let imported = imported.as_object_mut().ok_or_else(|| invalid("."))?;
-    let Ok(Value::Object(current)) = serde_json::to_value(current) else {
-        return Err(invalid("."));
+) -> std::result::Result<AppConfig, &'static str> {
+    // 型変換した後の値は必ず名前で辿れる(配列で書かれたファイルでも差し替えを外さない)。
+    let (Ok(Value::Object(mut merged)), Ok(Value::Object(current))) =
+        (serde_json::to_value(incoming), serde_json::to_value(current))
+    else {
+        return Err(IMPORT_ERROR);
     };
-    for path in redacted_fields() {
-        // serde の struct は配列からも読める。名前で辿れない親は差し替えられないので拒否する。
-        let mut object = &*imported;
-        for (depth, parent) in path[..path.len() - 1].iter().enumerate() {
-            match object.get(*parent) {
-                None => break,
-                Some(Value::Object(child)) => object = child,
-                Some(_) => return Err(invalid(&path[..=depth].join("."))),
-            }
-        }
-        set_config_field(imported, path, config_field(&current, path).cloned());
+    redact_overrides(&mut merged);
+    for path in kept_fields() {
+        set_config_field(&mut merged, path, config_field(&current, path).cloned());
     }
-    Ok(())
+    let mut merged: AppConfig =
+        serde_json::from_value(Value::Object(merged)).map_err(|_| IMPORT_ERROR)?;
+    merged.x_post.enabled = false;
+    Ok(merged)
 }
 
 fn snapshot(config_dir: &Path, now_ms: u64) -> Result<Contents> {
@@ -1085,13 +1094,13 @@ fn prepare_config(config_dir: &Path, snapshot: Option<&[u8]>) -> Result<Option<V
         let defaults =
             serde_json::to_value(AppConfig::default()).expect("default config serializes");
         let defaults = defaults.as_object().expect("config object");
-        for path in LOCAL_CONFIG_FIELDS.iter().copied().chain(redacted_fields()) {
+        for path in LOCAL_CONFIG_FIELDS.iter().chain(URL_FIELDS).copied().chain(kept_fields()) {
             if config_field(&current, path) == config_field(defaults, path) {
                 set_config_field(&mut current, path, None);
             }
         }
     }
-    for path in LOCAL_CONFIG_FIELDS.iter().copied().chain(redacted_fields()) {
+    for path in LOCAL_CONFIG_FIELDS.iter().chain(URL_FIELDS).copied().chain(kept_fields()) {
         set_config_field(&mut restored, path, config_field(&current, path).cloned());
     }
     if snapshot.is_none() && restored.is_empty() {
@@ -2134,16 +2143,25 @@ mod tests {
         config
     }
 
-    /// `imported` を読み込んだ時に期待する設定。伏せる欄だけ `current` の値になる。
-    fn with_redacted_fields_of(mut imported: AppConfig, current: &AppConfig) -> AppConfig {
-        imported.credentials = current.credentials.clone();
-        imported.x_overrides.bearer_token = current.x_overrides.bearer_token.clone();
-        imported.youtube_overrides.api_key = current.youtube_overrides.api_key.clone();
-        imported.tts.options.voicevox_url = current.tts.options.voicevox_url.clone();
-        imported.x_overrides.endpoints = current.x_overrides.endpoints.clone();
-        imported.niconico_overrides.endpoints = current.niconico_overrides.endpoints.clone();
-        imported.twitcasting_overrides.endpoints = current.twitcasting_overrides.endpoints.clone();
-        imported
+    /// `file` を読み込んだ時に期待する設定(SPEC §8.1 の規則を型の上で書いたもの)。
+    fn expected_import(mut file: AppConfig, current: &AppConfig) -> AppConfig {
+        file.credentials = current.credentials.clone();
+        file.x_overrides.bearer_token = current.x_overrides.bearer_token.clone();
+        file.youtube_overrides.api_key = current.youtube_overrides.api_key.clone();
+        file.x_overrides.endpoints = current.x_overrides.endpoints.clone();
+        file.x_post.callback_port = current.x_post.callback_port;
+        file.twitcasting.callback_port = current.twitcasting.callback_port;
+        file.x_post.enabled = false;
+        let urls = [&mut file.tts.options.voicevox_url]
+            .into_iter()
+            .chain(file.niconico_overrides.endpoints.values_mut())
+            .chain(file.twitcasting_overrides.endpoints.values_mut());
+        for url in urls {
+            if let Some(stripped) = strip_user_info(url) {
+                *url = stripped;
+            }
+        }
+        file
     }
 
     #[test]
@@ -2176,41 +2194,109 @@ mod tests {
         // 資格情報と同じ値が他の欄にあれば、書き出さない。
         config.tts.options.name_format = config.credentials.x_auth_token.clone();
         assert_eq!(export_config(&config), Err(EXPORT_SECRET_ERROR));
+        // 資格情報の前後に空白があっても、空白なしの写しを見つける。
+        config.credentials.x_auth_token = format!(" {}\n", config.tts.options.name_format);
+        assert_eq!(export_config(&config), Err(EXPORT_SECRET_ERROR));
     }
 
     #[test]
-    fn settings_import_keeps_current_redacted_fields() {
+    fn settings_import_keeps_current_secrets_and_x_endpoints() {
         let current = synthetic_config("cur");
         let mut other = synthetic_config("new");
         other.obs.port = 11190;
-        let expected = with_redacted_fields_of(other.clone(), &current);
-        for mut imported in [
+        other.x_post.callback_port = 47999;
+        other.twitcasting.callback_port = 39999;
+        let expected = expected_import(other.clone(), &current);
+        for file in [
             // 今の版の書き出し(資格情報の欄が無い)。
             export_config(&other).unwrap(),
             // 旧版の書き出し(資格情報、鍵、URL のユーザー情報を含む)。
             serde_json::to_value(&other).unwrap(),
         ] {
-            keep_current_redacted(&mut imported, &current).unwrap();
-            assert!(!imported.to_string().contains("syn-new-"));
-            let merged = AppConfig::from_config_update(imported).unwrap();
-            assert_eq!(merged.obs.port, 11190);
+            let merged =
+                merge_import(&AppConfig::from_config_update(file).unwrap(), &current).unwrap();
             assert_eq!(merged, expected);
+            // 資格情報、鍵、待受ポート、X の接続先は今の値のまま。
+            assert_eq!(merged.credentials, current.credentials);
+            assert_eq!(merged.x_overrides, current.x_overrides);
+            assert_eq!(merged.youtube_overrides.api_key, current.youtube_overrides.api_key);
+            assert_eq!(merged.x_post.callback_port, current.x_post.callback_port);
+            assert_eq!(merged.twitcasting.callback_port, current.twitcasting.callback_port);
+            // それ以外の URL はファイルの接続先を使い、ユーザー情報は持ち込まない。
+            assert_eq!(merged.tts.options.voicevox_url, "https://voicevox.example.invalid/path");
+            assert_eq!(
+                merged.niconico_overrides.endpoints["watchPageBaseUrl"],
+                "https://nico.example.invalid/path"
+            );
+            assert_eq!(
+                merged.twitcasting_overrides.endpoints["eventPubSubUrl"],
+                "https://tc.example.invalid/path"
+            );
+            assert_eq!(merged.obs.port, 11190);
+            let text = serde_json::to_string(&merged).unwrap();
+            assert!(!text.contains("syn-new-"), "{text}");
+            // 保存の直前にもう一度通しても変わらない。
+            assert_eq!(merge_import(&merged, &current).unwrap(), merged);
         }
 
-        // 欄が無い・空のファイルでも、今の値を空で上書きしない。
-        for mut imported in [
+        // 欄が無い・空のファイルでも、今の資格情報を空で上書きしない。
+        for file in [
             serde_json::json!({}),
             serde_json::json!({
                 "credentials": {"xAuthToken": "", "xCsrfToken": ""},
                 "xOverrides": {},
-                "tts": {"options": {"voicevoxUrl": ""}},
             }),
-            // 丸ごと差し替える欄は、配列で書かれていても今の値になる。
-            serde_json::json!({"credentials": ["syn-new-positional-oauth"]}),
+            // 配列で書かれた欄も、型変換の後で今の値に差し替わる。
+            serde_json::json!({
+                "credentials": ["oauth:syn-new-positional-oauth"],
+                "xOverrides": ["syn-new-positional-bearer", {"liveChatUrl": "https://new.example.invalid/c"}],
+            }),
         ] {
-            keep_current_redacted(&mut imported, &current).unwrap();
-            let merged = AppConfig::from_config_update(imported).unwrap();
-            assert_eq!(merged, with_redacted_fields_of(AppConfig::default(), &current));
+            let merged =
+                merge_import(&AppConfig::from_config_update(file).unwrap(), &current).unwrap();
+            assert_eq!(merged, expected_import(AppConfig::default(), &current));
+            assert_eq!(merged.credentials, current.credentials);
+            assert_eq!(merged.x_overrides, current.x_overrides);
+        }
+    }
+
+    #[test]
+    fn settings_import_drops_file_secrets_when_current_has_none() {
+        let current = AppConfig::default();
+        let file = synthetic_config("new");
+        let merged = merge_import(&file, &current).unwrap();
+        // 今の設定に無い鍵と X の接続先は、ファイルにあっても取り込まない。
+        assert_eq!(merged.credentials, CredentialsConfig::default());
+        assert_eq!(merged.x_overrides.bearer_token, None);
+        assert!(merged.x_overrides.endpoints.is_empty());
+        assert_eq!(merged.youtube_overrides.api_key, None);
+        // X 以外の接続先はファイルの値(ユーザー情報なし)。
+        assert_eq!(merged.tts.options.voicevox_url, "https://voicevox.example.invalid/path");
+        assert_eq!(merged.niconico_overrides.endpoints.len(), 1);
+        assert_eq!(merged.twitcasting_overrides.endpoints.len(), 1);
+        assert!(!serde_json::to_string(&merged).unwrap().contains("syn-new-"));
+        assert_eq!(merged, expected_import(file, &current));
+    }
+
+    #[test]
+    fn settings_import_never_enables_x_autopost() {
+        // 接続済みの環境(今の資格情報)に、API モードの自動告知を有効にした他の配信者のファイル。
+        let mut current = synthetic_config("cur");
+        let file = serde_json::json!({
+            "channels": [{"platform": "twitch", "identifier": "other_streamer", "ownStream": true}],
+            "xPost": {"enabled": true, "mode": "api", "intentOpen": "auto", "callbackPort": 47999},
+        });
+        let file = AppConfig::from_config_update(file).unwrap();
+        assert!(file.x_post.enabled && file.channels[0].own_stream);
+        for current_enabled in [false, true] {
+            current.x_post.enabled = current_enabled;
+            let merged = merge_import(&file, &current).unwrap();
+            assert!(!merged.x_post.enabled);
+            // 無効にするのは告知だけ。他はファイルの値を読む。
+            assert_eq!(merged.x_post.mode, "api");
+            assert!(merged.channels[0].own_stream);
+            assert_eq!(merged.credentials, current.credentials);
+            assert_eq!(merged.x_post.callback_port, current.x_post.callback_port);
         }
     }
 
@@ -2218,12 +2304,12 @@ mod tests {
     fn settings_import_reads_an_older_export() {
         let current = synthetic_config("cur");
         // 旧版の形: 新しい節(backup・soundEffects・twitcasting 等)が無く、資格情報が入っている。
-        let mut imported = serde_json::json!({
+        let file = serde_json::json!({
             "channels": [{"platform": "twitch", "identifier": "old_channel"}],
             "obs": {"port": 11190},
             "tts": {"options": {
                 "bouyomiPort": 50002,
-                "voicevoxUrl": "http://syn-old-user:syn-old-pass@127.0.0.1:50021",
+                "voicevoxUrl": "http://syn-old-user:syn-old-pass@127.0.0.1:10101",
             }},
             "xOverrides": {
                 "bearerToken": "syn-old-bearer-token",
@@ -2239,39 +2325,18 @@ mod tests {
                 "xCsrfToken": "syn-old-x-csrf-token",
             },
         });
-        keep_current_redacted(&mut imported, &current).unwrap();
-        let merged = AppConfig::from_config_update(imported).unwrap();
+        let file = AppConfig::from_config_update(file).unwrap();
+        let merged = merge_import(&file, &current).unwrap();
         assert!(!serde_json::to_string(&merged).unwrap().contains("syn-old-"));
         // 資格情報ではない設定はファイルの値になる。
         assert_eq!(merged.channels.len(), 1);
         assert_eq!(merged.channels[0].identifier, "old_channel");
         assert_eq!(merged.obs.port, 11190);
         assert_eq!(merged.tts.options.bouyomi_port, 50002);
+        assert_eq!(merged.tts.options.voicevox_url, "http://127.0.0.1:10101/");
         assert_eq!(merged.x_overrides.live_poll_secs, Some(45));
         assert_eq!(merged.youtube_overrides.client_version.as_deref(), Some("2.1"));
-        // 伏せる欄は今の値のまま。
-        assert_eq!(with_redacted_fields_of(merged.clone(), &current), merged);
-    }
-
-    #[test]
-    fn settings_import_rejects_fields_it_cannot_address_by_name() {
-        let current = synthetic_config("cur");
-        for (imported, field) in [
-            (serde_json::json!([]), "."),
-            (serde_json::json!("syn-new-root"), "."),
-            (serde_json::json!({"xOverrides": ["syn-new-bearer-token"]}), "xOverrides"),
-            (serde_json::json!({"youtubeOverrides": ["syn-new-innertube-key"]}), "youtubeOverrides"),
-            (serde_json::json!({"tts": ["voicevox"]}), "tts"),
-            (serde_json::json!({"tts": {"options": ["127.0.0.1"]}}), "tts.options"),
-            (serde_json::json!({"niconicoOverrides": null}), "niconicoOverrides"),
-            (serde_json::json!({"twitcastingOverrides": [{}]}), "twitcastingOverrides"),
-        ] {
-            let mut imported = imported;
-            assert_eq!(
-                keep_current_redacted(&mut imported, &current),
-                Err(format!("設定の形式が不正です (項目 {field})")),
-            );
-        }
+        assert_eq!(merged, expected_import(file, &current));
     }
 
     #[cfg(unix)]

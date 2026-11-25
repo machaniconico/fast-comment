@@ -849,7 +849,7 @@ export async function exportConfig(): Promise<ExportedConfig | null> {
   return invoke<ExportedConfig>('export_config');
 }
 
-/** 書き出した設定を読み込む。資格情報と URL の欄は Rust 側で今の値のままにする。 */
+/** 書き出した設定を読み込む。資格情報と X の接続先は Rust 側で今の値のままにし、X の自動告知は無効にする。 */
 export async function importConfig(config: ExportedConfig): Promise<UpdateConfigOutcome | null> {
   return invoke<UpdateConfigOutcome>('import_config', { newConfig: config });
 }

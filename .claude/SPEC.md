@@ -337,12 +337,15 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
   - キーワードエフェクトは §9.2。アプリ内エフェクト有効時は、YouTube匿名リアクションの絵文字別増分を専用16msバッチIPCで受け、右端寄りに浮上・フェード表示する。初回pollはrolling windowの再送分なので、再接続時の重複を避けるため統計・演出とも更新しない。描画数は画面幅別の上限を設け、`prefers-reduced-motion` では演出を省略する。コメント/TTS/OBSには混ぜない。
 - **マルチカラム表示** (`MultiColumnView.svelte`): チャンネル/種別ごとの複数列ビュー。
 - **設定/モデレーションのポータビリティ** (`ConfigPortability.svelte`, `ModerationPortability.svelte`): 設定・NG/ハイライトのエクスポート/インポート。
-  - 設定の書き出しは `export_config`、読み込みは `import_config` で行い、どちらも Rust 側(`backup.rs` の `export_config` / `keep_current_redacted`)で資格情報を扱う。UI は受け取った JSON に外観設定を添えて表示・保存するだけで、`get_config` の値を書き出さない。
-  - 書き出す JSON には `credentials` の欄を入れない(鍵・トークン・Cookie に加え、Client ID と Twitch のユーザー名も含む欄全体)。`xOverrides.bearerToken` と `youtubeOverrides.apiKey` も入れない。URL の欄(`tts.options.voicevoxUrl`、`xOverrides.endpoints`、`niconicoOverrides.endpoints`、`twitcastingOverrides.endpoints`)はユーザー情報(`user:pass@`)を消す(解析できず `@` を含む値は空にする)。伏せる欄の一覧と URL の処理は自動バックアップ(§10.1)と同じ定数・関数を使う。
-  - 伏せた後の JSON に、設定にある 8 文字以上の鍵・トークン・Cookie が残っていれば(他の欄に同じ値を貼っていた場合)、固定文言で書き出しを中止する。
-  - 読み込みでは、上の欄(`credentials` 全体、2 つの鍵、URL の 4 欄)にファイルの値を使わず、今の値をそのまま残す。欄が無い・空のファイルでも今の値を空にしない。URL の欄を今の値のままにするのは、今の Cookie をファイルが指す接続先へ送らないため。
+  - 設定の書き出しは `export_config`、読み込みは `import_config` で行い、どちらも Rust 側(`backup.rs` の `export_config` / `merge_import`)で資格情報を扱う。UI は受け取った JSON に外観設定を添えて表示・保存するだけで、`get_config` の値を書き出さない。両 IPC はメインウィンドウ以外からの呼び出しを固定文言で拒否する。
+  - ファイルは `{ schema: "fast-comment/settings-v2", version: 2, exportedAt, config, appearance }`。読み込みは旧形式(`schema: "fast-comment/settings"`、または schema なし)も受け付ける。schema を変えたのは、v0.8.0 までの版が `credentials` の無いファイルを読み込んで今の資格情報を空にしないため(旧版は schema が違うファイルを拒否する)。
+  - 書き出す JSON には `credentials` の欄を入れない(鍵・トークン・Cookie に加え、Client ID と Twitch のユーザー名も含む欄全体)。`xOverrides.bearerToken` と `youtubeOverrides.apiKey` も入れない。URL の欄(`tts.options.voicevoxUrl`、`xOverrides.endpoints`、`niconicoOverrides.endpoints`、`twitcastingOverrides.endpoints`)はユーザー情報(`user:pass@`)を消す(解析できず `@` を含む値は空にする)。欄の一覧と URL の処理は自動バックアップ(§10.1)と同じ定数・関数を使う。
+  - 伏せた後の JSON に、設定にある 8 文字以上の鍵・トークン・Cookie(前後の空白は除いて比べる)が残っていれば(他の欄に同じ値を貼っていた場合)、固定文言で書き出しを中止する。検査そのものに失敗した時は別の固定文言で中止する。
+  - 読み込みで今の値をそのまま残す欄: `credentials` 全体、`xOverrides.bearerToken`、`youtubeOverrides.apiKey`、`xOverrides.endpoints`(ログイン cookie の送り先なので、ファイルが指す接続先へ今の cookie を送らない)、`xPost.callbackPort` と `twitcasting.callbackPort`(今の Client ID に登録した redirect URI と揃える)。ファイルに欄が無い・空でも今の値を空にせず、今の値が無い欄はファイルに値があっても取り込まない。
+  - 読み込みでファイルの値を使う URL の欄: `tts.options.voicevoxUrl`、`niconicoOverrides.endpoints`、`twitcastingOverrides.endpoints`。ユーザー情報は消して取り込む(旧版のファイルに残るユーザー情報を持ち込まない)。
+  - 読み込みは `xPost.enabled` を必ず false にする(ファイルが true でも、今が true でも)。今の資格情報と他人のファイルの `xPost`・`ownStream` の組み合わせで、確認なしに投稿させないため。ファイルか今の設定のどちらかで有効だった時は、固定文言「X の自動告知は取り込み後に無効にしました。設定画面で確認してから有効にしてください」を `warnings` で返し、UI が表示する。
   - 旧版(v0.8.0 まで)が書き出したファイルは資格情報を含むが、読み込めるままにし、資格情報だけを適用しない(共有・改変されたファイルと本人の控えを区別できないため)。別の PC へ移す時は、ログイン情報を入力し直す。
-  - `import_config` は、上の欄の親(`xOverrides`、`youtubeOverrides`、`tts`、`tts.options`、`niconicoOverrides`、`twitcastingOverrides`)やルートがオブジェクトでないファイルを、型エラーと同じ固定文言(欄名だけ)で拒否する。serde は配列からも struct を読めるので、名前で差し替えられない形を通さない。それ以外の検証と保存は `update_config` と同じ。
+  - 差し替えは型変換した後の設定に対して行う(配列で書かれた欄でも外れない)。検証の前に一度、保存と同じ設定ロックの中でもう一度行い、検証の間に別経路(OAuth の接続など)が保存した値を古い写しで戻さない。それ以外の検証と保存は `update_config` と同じ。
 - **読み上げ辞書のポータビリティ** (`TtsDictionaryPortability.svelte`): 辞書の書き出しと、ファイル・貼り付け・URL からの取り込み (§6.1)。
 - **ウィンドウ最前面ピン**: メインウィンドウを最前面固定するトグル(`core:window:allow-set-always-on-top`)。
 

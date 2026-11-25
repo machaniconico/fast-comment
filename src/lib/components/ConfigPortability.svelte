@@ -3,13 +3,16 @@
   import { configReloadMessage, configSync } from '../configSync.svelte';
   import { theme, type AppearanceSnapshot } from '../theme.svelte';
 
-  const SCHEMA = 'fast-comment/settings';
+  // v0.8.0 までの版は schema が違うファイルを拒否する。資格情報の欄が無い書き出しを
+  // 旧版が読み込んで今の資格情報を空にしないよう、書き出しの schema を変えた。
+  const SCHEMA = 'fast-comment/settings-v2';
+  const LEGACY_SCHEMA = 'fast-comment/settings';
   // import_config の型エラーは Rust が固定フィールド名だけで組み立てる。
   const configTypeError = /^設定の形式が不正です \(項目 (?:\.|[a-zA-Z][a-zA-Z0-9]*(?:\.[a-zA-Z][a-zA-Z0-9]*)*)\)$/;
 
   interface SettingsBundle {
     schema: typeof SCHEMA;
-    version: 1;
+    version: 2;
     exportedAt: string;
     config: ExportedConfig;
     appearance: AppearanceSnapshot;
@@ -64,7 +67,7 @@
   function buildBundle(config: ExportedConfig): SettingsBundle {
     return {
       schema: SCHEMA,
-      version: 1,
+      version: 2,
       exportedAt: new Date().toISOString(),
       config,
       appearance: theme.getSnapshot(),
@@ -137,7 +140,7 @@
       throw new Error('設定JSONのルートがオブジェクトではありません。');
     }
 
-    if ('schema' in parsed && parsed.schema !== SCHEMA) {
+    if ('schema' in parsed && parsed.schema !== SCHEMA && parsed.schema !== LEGACY_SCHEMA) {
       throw new Error('fast-comment の設定バックアップではないため読み込めません。');
     }
 
@@ -255,7 +258,7 @@
 
   <div class="portability-block">
     <h4>エクスポート</h4>
-    <p class="portability-note">ログイン情報(トークン・Cookie・API キー・Client ID)は書き出しません。URL のユーザー名とパスワードも消します。</p>
+    <p class="portability-note">ログイン情報(トークン・Cookie・API キー・Client ID)は書き出しません。URL のユーザー名とパスワードも消します。v0.8.0 までの版では読み込めません。</p>
     <div class="field-row portability-actions">
       <button type="button" class="export-btn" onclick={onExport} disabled={exporting}>
         {exporting ? 'エクスポート中...' : '設定JSONをエクスポート'}
@@ -278,7 +281,7 @@
 
   <div class="portability-block">
     <h4>インポート</h4>
-    <p class="portability-note">ログイン情報と接続先 URL の欄は、ファイルの値を使わず今の設定のままにします。</p>
+    <p class="portability-note">ログイン情報と X の接続先は、ファイルの値を使わず今の設定のままにします。X の自動告知は無効にします。</p>
     <div class="field-row portability-actions">
       <label class="file-button" for="settings-import-file">JSONファイルを選択</label>
       <input
