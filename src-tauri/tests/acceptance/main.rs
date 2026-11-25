@@ -62,5 +62,11 @@ mod poll_twitch_helix;
 mod poll_twitch_validate;
 mod poll_twitch_poll;
 
+// PR3(アンケート): YouTube 公式投票(.omc/plans/poll-pr3-youtube.md)
+mod poll_youtube_common;
+mod poll_youtube_http;
+mod poll_youtube_validate;
+mod poll_youtube_poll;
+
 #[test]
 fn acceptance_harness_runs() {}

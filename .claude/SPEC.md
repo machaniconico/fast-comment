@@ -327,7 +327,7 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
   - **端フェード**: 右端の出現(0→6%)と左端の消失(94→100%)を opacity アニメ(`danmaku-fade`)で柔らかく。移動アニメ(`danmaku-fly`)の linear タイミングは不変で、撤去は `animationName==='danmaku-fly'` 側のみ(2アニメでの二重/早期撤去を防ぐ)。全体不透明度(`?opacity=`/`--opacity`)と要素フェードは乗算合成。
   - **連投まとめ(×N)**: 同一本文(名前前置前の素の本文 `core` をキー)の連投を `COALESCE_WINDOW_MS`(1500ms)内なら1つの弾幕に集約し `×N` カウント表示(『草』『w』『888』のスパム抑制)。流れるコメント(非gift/非system)のみ対象。集約は既存要素のテキスト書き換えのみで `lanePrev`(追突防止状態)は触らない。撤去/間引き時に集約マップから掃除(OBSは `size<32` ガード)。デスクトップは設定トグル、OBS は `?coalesce=0` で無効化(既定 ON)。
   - **投げ銭固定強調弾幕**: SuperChat/Bits/メンバーは流さず画面上部に `PIN_SEC`(8秒)固定表示してフェード撤去(ニコ生 `ue` コマンド風・見逃し防止)。同時 `PIN_MAX`(6件)・最古から間引き・最新を上。半透明角丸ボックス+種別色。デスクトップは設定トグル(タイマは `onDestroy` で `clearTimeout` しリーク防止)、OBS は `?pin=0` で無効化(既定 ON、OFF時は従来通り流す)。
-- **コメント投稿** (`CommentComposer.svelte`, `sources/twitch_send.rs`, `sources/youtube_send.rs`): 自分でコメントを送信。Twitch は IRC、YouTube は公式Data API `liveChatMessages.insert` で送信する。YouTube認証はシステムブラウザ + loopback redirect + Authorization Code/PKCE、scopeは`youtube.force-ssl`。refresh tokenはOS資格情報ストア、access tokenは期限付きメモリキャッシュに保持し、受信ホットパスへ処理を追加しない。配信中の`liveChatId`は`liveBroadcasts.list`で解決して60秒キャッシュする。
+- **コメント投稿** (`CommentComposer.svelte`, `sources/twitch_send.rs`, `sources/youtube_send.rs`): 自分でコメントを送信。Twitch は IRC、YouTube は公式Data API `liveChatMessages.insert` で送信する。YouTube認証はシステムブラウザ + loopback redirect + Authorization Code/PKCE、scopeは`youtube.force-ssl`。refresh tokenはOS資格情報ストア、access tokenは期限付きメモリキャッシュに保持し、受信ホットパスへ処理を追加しない。コメント投稿と YouTube 公式投票 (§19.2) に使う配信中の`liveChatId`は`liveBroadcasts.list`で解決して60秒キャッシュする。
 - **参加型配信の管理** (`Participation.svelte`, `Raffle.svelte`): キーワード(既定「参加」)での参加登録、先着/ランダム抽選、専用タブ。既定 OFF。
 - **投げ銭パネル** (`DonationPanel.svelte`): SuperChat/Bits/メンバーを通常コメントと分けて表示(アプリ内タブ / OBS `?only=gift`)。既定 OFF。
 - **アンケート** (`Poll.svelte`): 「ツール ▾」からコメント投票を開始・終了し、5 種類のグラフで結果を表示。OBS に同じ結果を配信する(§19)。
@@ -649,9 +649,9 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
 - **対象外 (v1)**: チャンネルポイントの引き換えと接続断の音は将来の候補。
 
 
-## 19. アンケート (コメント投票 / Twitch 公式 Polls)
+## 19. アンケート (コメント投票 / Twitch 公式 Polls / YouTube 公式投票)
 
-- アプリ全体で同時に 1 件の投票を扱う。`PollSnapshot` は `id`・`source`(`"chat"` / `"twitch"`)・`status`(`idle`/`open`/`closed`)・`question`・`options`(`label`・`votes`・`percent`・`leading`)・`totalVoters`・`startedAtMs`・任意の `endsAtMs`・`display`・`showPercent`・`showCounts` を持つ。票が 0 の時の割合は 0。割合・最多の判定は Rust で計算する。
+- アプリ全体で同時に 1 件の投票を扱う。`PollSnapshot` は `id`・`source`(`"chat"` / `"twitch"` / `"youtube"`)・`status`(`idle`/`open`/`closed`)・`question`・`options`(`label`・`votes`・`percent`・`leading`)・`totalVoters`・`startedAtMs`・任意の `endsAtMs`・`display`・`showPercent`・`showCounts` を持つ。票が 0 の時の割合は 0。割合・最多の判定は Rust で計算する。
 - **コメント方式 (`source: "chat"`、省略時の既定値)** の `poll_start` は trim 後の質問 1〜100 文字、選択肢 2〜10 件(各 1〜40 文字、大小文字を無視して一意)と表示設定を受け付ける。`durationSecs` は 10〜3600 秒。省略時は手動終了。期限は Rust の単調時計で管理する。`poll_stop` は結果を保持したまま閉じ、`poll_reset` は待機状態に戻す。`poll_set_display` は表示形式(`bar-h`/`bar-v`/`pie`/`donut`/`number`)と割合・票数の表示を変更する。
 - コメント方式の受付中はモデレーション後のコメントを判定する。System・非表示・履歴やバックフィル(`route.uncounted`)・空の著者 ID を除外し、`injected_test` のテスト注入は数える。`plain_text()` の前後の空白と見えない文字(Twitch のクライアントが連投のために付ける U+E0000、BOM、ゼロ幅文字)を落とし、番号 1〜N(全角数字可)を優先し、該当しなければラベルと大小文字を無視して全文一致で照合する。投票者のキーはプラットフォームと著者 ID の組。最新の選択肢で上書きし、同じ選択肢の連投は集計を変えない。最大 100,000 人。上限到達後も既存の投票者は変更できる。
 - 状態はメモリ内の `watch` に公開する。`poll_state` で現在値を取得でき、票による `poll-updated` と OBS 更新は最大 100ms に 1 回。操作や自動終了は即時反映する。`config.json` の `poll` に最後に使った方式・質問・選択肢・表示設定を保存する。欠落・破損時は既定値を使う。票・結果は再起動で消える。アンケートの通知・ログ・エラーに投票者の名前や ID を含めない。
@@ -666,4 +666,11 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
 - 手動終了は `TERMINATED` を要求して最終結果を取得する。リセットは Twitch 側が受付中の時だけ `TERMINATED` を要求する。最初の GET の 404 と、この PATCH の 400・404 は終了済みとして扱う。結果は Twitch 上に残る。遠隔操作が失敗しても、手動終了は直前の票で閉じ、リセットは待機状態に戻し、失敗の文言を返す。
 - IPC とローカル API は同じ操作を使い、画面と OBS は同じスナップショットを表示する。アフィリエイト・パートナーの案内は作成時の権限エラーに限り、終了時の 403 には汎用の文言を返す。400 の文言には安全な Helix のメッセージを添える。認証の取得・更新で起きた失敗は、操作回数制限を `RateLimited`(解除時刻が分からないので 60 秒)、通信失敗を `Network`、提供停止を HTTP 503、競合を 409、権限不足を 403 として返し、資格情報の読み書きや応答解析の失敗だけを認証情報の確認失敗とする。エラーやログに資格情報やリクエスト URL を含めない。
 
-PR3 は YouTube 公式投票を同じスナップショットとグラフへ接続する。
+### 19.2 YouTube 方式 (`source: "youtube"`)
+
+- アンケート画面で「YouTube 公式投票」を選ぶと、視聴者は YouTube のライブチャットで投票できる。質問は前後の空白を除いて 1〜100 文字、選択肢は 2〜4 件で各 1〜40 文字。Unicode スカラー値で数え、重複判定はコメント方式と共通。期間は任意で、指定する場合は 10〜3600 秒。
+- 開始には「自分の配信」に設定した有効な YouTube チャンネルが 1 件必要。既存の Google ログイン (`youtube.force-ssl`) で `liveBroadcasts.list` を使い、そのアカウントの配信中のライブが 1 件のときに `liveChatId` を解決する。認証していない場合はアンケート画面から YouTube のログイン設定を開ける。
+- `liveChatMessages.insert` で `pollEvent` を 1 回だけ作成する (20 units)。通信で応答を失った場合は、1・2・4 秒待って `liveChatMessages.list` を最大 3 回試す。まだ投票が表示されていない場合、通信失敗、5xx、401 はそれぞれ 1 試行の失敗として数え、次の待機時間を経てから GET を送り直す。401 の後は次の GET の前にアクセストークンを更新する (401 を受けたトークンがキャッシュ中の時だけ捨てる。GET は合計 3 回まで、作成 POST は送り直さない)。受付中の `activePollItem` の質問・選択肢が trim 後に内容と順序まで一致し、公開時刻が POST 直前の UTC 時刻の 10 秒前より後なら採用する。確認できなければローカルの投票を開始せず、YouTube で作成された可能性を知らせる。作成を確認してから設定を保存し、保存失敗時も投票の追跡を続ける。作成応答または採用した照合の投票に票数があれば、ローカルの投票を開いた直後に反映する (初回の集計 GET より前に YouTube 側で終了しても 0 票にならないため)。
+- 集計の `liveChatMessages.list` は投票の受付中だけ呼ぶ (1 回 5 units、1 時間で最大 1,800 units)。照合・集計の list は API の最小取得件数 `maxResults=200` を指定する。集計 GET は前回の送信から 10 秒以上空け、401 の認証更新後の 1 回の再試行にも同じ間隔を適用する。通信失敗、5xx、429 は票を保持したまま次の周期を待つ。応答 (照合で採用した GET を含む) の `pollingIntervalMillis` が 10 秒より長ければ、次の GET はその間隔 (上限 60 秒) を空ける。同じ投票 ID の票数を反映し、tally は符号なし整数の JSON 数値と文字列を受け付ける。欠落や変換できない値が一つでもあれば票数を取得できなかったと扱う。404、別の ID、`activePollItem` の欠落では直前の票で閉じる。
+- 票数欠落、403 (割り当て超過を除く)、その他の `Api(4xx)` で集計を打ち切るときは、直前の票でローカルを閉じ、元の投票 ID に transition を 1 回だけ試みる。transition が成功して投票が閉じたと確認できれば、理由と「YouTube 側でも終了しました」を表示し、失敗または未確認なら理由と YouTube 側で終了する案内を表示する。`liveChatEnded` は配信のチャットが終了したと表示する。割り当て超過では集計を止めて直前の票で閉じ、日次上限は翌日の割り当てまで回復しないと表示する。集計の HTTP 待ちには投票のロックを保持せず、反映前に投票 ID と停止トークンを確認する。失敗の WARN は分類名だけを記録し、同じ分類が連続する場合は初回だけ記録する。
+- 期間を指定した場合は、作成の応答 (照合で採用した場合は採用した時点) を受けた時点の単調時計から指定秒数後を締め切りとする。公開時刻 (`publishedAt`) や壁時計の差は使わない (PC の時計がずれていても早く閉じないため。代わりに投票は通信の往復分だけ長くなりうる)。この起点は設定の保存より前に取り、保存が遅くても締め切りは延びない。画面と OBS の残り時間は、同じ起点に対応するローカルの壁時計の時刻とその指定秒数後を開始・終了予定として表示する。手動停止とローカル期限では `liveChatMessages.transition` で閉じ (20 units)、応答の票数を最終値にする。受付中の投票をリセットするときも transition で閉じる。transition は空の本文と `Content-Length: 0` で送る。期限の処理は対象の投票 ID に限定する。遠隔操作に失敗しても、停止時は直前の票で閉じ、リセット時は待機状態に戻し、失敗を知らせる。IPC・ローカル API・OBS は共通の投票状態を使う。トークン、リクエスト URL のクエリ、`liveChatId` はログ・エラー・通知に出さない。

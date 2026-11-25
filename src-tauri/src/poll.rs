@@ -88,7 +88,16 @@ impl PollPreferences {
                     &preferences.options,
                 )
                 .is_ok();
-                preferences.trim_twitch_text();
+                preferences.trim_remote_text();
+                valid
+            }
+            PollSource::Youtube => {
+                let valid = crate::sources::youtube_polls::validate_youtube(
+                    &preferences.question,
+                    &preferences.options,
+                )
+                .is_ok();
+                preferences.trim_remote_text();
                 valid
             }
         };
@@ -98,7 +107,7 @@ impl PollPreferences {
         Ok(preferences)
     }
 
-    fn trim_twitch_text(&mut self) {
+    fn trim_remote_text(&mut self) {
         self.question = self.question.trim().to_owned();
         for option in &mut self.options {
             *option = option.trim().to_owned();
@@ -170,6 +179,10 @@ impl PollStart {
         {
             return Err(PollError::Invalid("投票時間は10〜3600秒で指定してください"));
         }
+        if self.source == PollSource::Youtube {
+            crate::sources::youtube_polls::validate_youtube(&self.question, &self.options)
+                .map_err(PollError::Invalid)?;
+        }
         let mut preferences = PollPreferences {
             source: self.source,
             question: self.question,
@@ -182,8 +195,8 @@ impl PollStart {
         };
         let labels = match self.source {
             PollSource::Chat => preferences.validate_chat_text()?,
-            PollSource::Twitch => {
-                preferences.trim_twitch_text();
+            PollSource::Twitch | PollSource::Youtube => {
+                preferences.trim_remote_text();
                 RegexSet::empty()
             }
         };
@@ -207,6 +220,7 @@ pub enum PollSource {
     #[default]
     Chat,
     Twitch,
+    Youtube,
 }
 
 impl PollSource {
@@ -386,7 +400,7 @@ impl Poll {
                 PollSource::Chat => start
                     .duration_secs
                     .map(|secs| now + Duration::from_secs(secs.into())),
-                PollSource::Twitch => None,
+                PollSource::Twitch | PollSource::Youtube => None,
             },
             ..CurrentPoll::default()
         };
@@ -397,7 +411,7 @@ impl Poll {
 
     pub fn apply_external(&self, poll_id: &str, votes: &[u32], closed: bool) -> bool {
         let mut current = self.current.lock().unwrap();
-        if current.snapshot.id != poll_id || current.snapshot.source != PollSource::Twitch {
+        if current.snapshot.id != poll_id || current.snapshot.source == PollSource::Chat {
             return false;
         }
         for (index, option) in current.snapshot.options.iter_mut().enumerate() {
@@ -416,26 +430,37 @@ impl Poll {
         true
     }
 
-    /// Twitch 側の開始・終了予定時刻に合わせる。変わった時だけ配信する。
-    pub(crate) fn set_remote_timing(&self, poll_id: &str, started_at_ms: u64, ends_at_ms: u64) {
+    /// 配信サービス側の開始・終了予定時刻に合わせる。変わった時だけ配信する。
+    pub fn set_remote_timing(&self, poll_id: &str, started_at_ms: u64, ends_at_ms: u64) -> bool {
         let mut current = self.current.lock().unwrap();
         let snapshot = &mut current.snapshot;
         if snapshot.id != poll_id
-            || snapshot.source != PollSource::Twitch
+            || snapshot.source == PollSource::Chat
             || snapshot.status != PollStatus::Open
             || (snapshot.started_at_ms, snapshot.ends_at_ms) == (started_at_ms, Some(ends_at_ms))
         {
-            return;
+            return false;
         }
         snapshot.started_at_ms = started_at_ms;
         snapshot.ends_at_ms = Some(ends_at_ms);
         self.publish(&mut current);
+        true
     }
 
     pub(crate) fn stop(&self) -> PollSnapshot {
         let _controls = self.controls.lock().unwrap();
+        self.stop_matching(None)
+    }
+
+    pub(crate) fn stop_if_current(&self, poll_id: &str) -> PollSnapshot {
+        self.stop_matching(Some(poll_id))
+    }
+
+    fn stop_matching(&self, expected_id: Option<&str>) -> PollSnapshot {
         let mut current = self.current.lock().unwrap();
-        if current.snapshot.status == PollStatus::Open {
+        if current.snapshot.status == PollStatus::Open
+            && expected_id.is_none_or(|id| current.snapshot.id == id)
+        {
             self.close(&mut current);
             self.wake.notify_one();
         }

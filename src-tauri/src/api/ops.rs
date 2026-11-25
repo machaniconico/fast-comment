@@ -315,7 +315,7 @@ pub async fn poll_mutate(State(deps): State<ApiDeps>, request: Request) -> Respo
     if let Err(response) = deps.rate_limit.take() {
         return response;
     }
-    // HTTP クライアントが切断しても Twitch 側の操作と結果の反映は完了させる。
+    // HTTP クライアントが切断しても配信サービス側の操作と結果の反映は完了させる。
     let operation = tokio::spawn(async move {
         match (path.as_str(), start) {
             ("/api/v1/poll/start", Some(start)) => Some(poll.start(start).await),
@@ -329,6 +329,9 @@ pub async fn poll_mutate(State(deps): State<ApiDeps>, request: Request) -> Respo
         Ok(Some(Err(PollControlError::Local(error)))) => poll_error(error),
         Ok(Some(Err(PollControlError::Remote(error)))) => {
             error::response(StatusCode::BAD_GATEWAY, "twitch_poll_error", &error.to_string())
+        }
+        Ok(Some(Err(PollControlError::Youtube(error)))) => {
+            error::response(StatusCode::BAD_GATEWAY, "youtube_poll_error", &error.to_string())
         }
         Ok(None) => error::not_found().await,
         Err(_) => internal(),
