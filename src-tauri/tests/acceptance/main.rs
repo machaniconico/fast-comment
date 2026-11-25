@@ -52,6 +52,8 @@ mod achievements_engine;
 mod achievements_wiring;
 // PR4(実績): Webhook と SSE への配信(.omc/plans/achievements-acceptance.md §3.7)
 mod achievements_relay;
+// ユーザー別ギフト金額(.omc/plans/listener-donation.md)
+mod listener_donation;
 
 // PR2(アンケート): Twitch 公式 Polls(.omc/plans/poll-pr2-twitch.md)
 mod poll_twitch_common;

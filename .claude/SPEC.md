@@ -299,6 +299,7 @@ trait TtsBackend { async fn speak(&self, text: String) -> Result<()>; fn availab
   - **投げ銭サマリー**: SuperChat/Bits を通貨別に合計金額・件数、メンバーシップ件数をヘッダーに集計表示。store側でセッション累積(バッファ退避後も保持、一覧クリアでリセット)。bits は通貨キー `bits` に正規化。
   - **ピン留め**: 重要コメントを上部固定ストリップに表示。ピンは ChatMessage 実体を別保持しバッファ退避後も残る。最大5件FIFO。各行にピン/解除ボタン。
   - **キーワード通知**: ハイライト一致コメント到着で効果音(Web Audio)+控えめな画面フラッシュ。ON/OFF・音量は `config.ui.notifySound`/`notifyVolume` に永続化。store の単調 `highlightCount` を `Notifier.svelte` が監視(初回非発火)。
+- **リスナー詳細**(`UserCard.svelte`): 開いた時に `listener_donation(platform, authorId)` で読み込み、「累計ギフト」の隣に累計金額を表示する。表示中のリスナーに金額付きの SuperChat / Bits / Gift が届いたら、コメントバッチにつき 1 回再取得する。換算前のミリ単位の額が大きい順、同額は通貨コード順で、最大 6 通貨と「ほか N 通貨」を表示する。円の目安は Rust が `achievements.json` の現在の `rates` と保存済みの通貨キーで計算し、画面では整数円に四捨五入する。正の有限なレートが無い通貨は換算できない通貨として併記する。換算できる通貨が無ければ円の目安は「—」。カードの「金額をリセット」と設定の「リスナー管理」にある「全員の金額をリセット」は確認後に専用 IPC を呼ぶ。金額だけを消去し、全員分の操作では消去した人数を表示する。
 - **設定画面**: チャンネル追加(Twitch名 / YouTube videoId or URL)、テンプレ選択、TTS設定、NG/ハイライト編集、OBSサーバURLコピー、通知(効果音ON/OFF+音量)。各セクションはコマンドパレットからアンカースクロールで到達可能(`id="settings-*"`)。**連携設定**(`IntegrationsSettings.svelte`): 「ローカル API」(`settings-local-api`、§15)と「Webhook」(`settings-webhooks`、§16)は通常の「保存」とは独立で、操作ごとに専用コマンドで即時保存する。URL・トークン・署名シークレットは console・エラー表示に出さず、一覧は Rust が返す `urlPreview` だけを表示する。純関数は `integrations.ts`(キーワード欄の行分割・状態ラベル)。
 - **テンプレ編集** (`TemplateEditor.svelte`, 実装済み): 設定画面からテンプレ選択 + 編集(`index.html` / `style.css` / `app.js`)。内蔵テンプレは閲覧のみ(書き込みは Err)で、複製してカスタム(`custom:<name>`)にしてから編集する。名前空間・複製・削除の仕様は §9.1。ライブプレビュー強化は将来。
 - IPC: `listen("chat", ...)` でバッチ受信。型は `src/lib/types.ts`(Rust model のミラー)。受信は ipc.ts の rAF バッチ flush(最小化/オクルージョンで rAF が止まっても 250ms タイムアウトで必ず flush)。
@@ -442,6 +443,7 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
 ## 10. 設定永続化 (`config.rs`)
 
 - 保存先: Tauri の app config dir に `config.json`。
+- リスナー記録は同じディレクトリの `listeners.json` に保存する。各記録の `donation` は通貨コードからミリ単位の整数へのマップで、欄が無い旧データは空として読む。値が非整数、i64 の範囲外、または負の項目は読み込み時に捨て、有効な項目とほかのリスナー記録を保持する。実績の有効・無効にかかわらず、SuperChat / Bits / Gift の有限かつ正の金額を 1,000 倍して四捨五入し、通貨別に飽和加算する。件数の `SUBGIFT` と `route.uncounted` が付いた履歴などの再送は除外する。通貨キーは集計時点の保存済み `symbolOverrides` を優先し、該当する上書きが無ければ既定の正規化を使う。円の換算値は表示時だけ計算する。リセットは既存の flush で保存し、ストアの終了処理後は受け付けない。リスナー削除時は金額も消える。
 - ローカル API と Webhook は別の `integrations.json`(version 1、localApi.enabled 既定 false、webhooks 既定空)に保存。`AppConfig` / `update_config` / エクスポートには載せない。破損・非対応 version は `.corrupt-<時刻ms>` に退避。読み込みエラー(退避失敗を含む)時は保存禁止とし、変更系は FileWrite で拒否する。再起動後に正常に読み込めるまで元ファイルを保護する。同じディレクトリに create_new の一時ファイルを作成し、write → sync_all → rename で保存。
 - API トークンは OS 資格情報ストア(service `fast-comment`、key `local-api-token`)に `{token, createdAtMs}` として保存。無効化しても削除しない。
 - 内容: channels[], obs{port}, tts{backend, options}, moderation{ngWords[], ngUsers[], highlights[]}, ui{maxBuffer, notifySound, notifyVolume}, youtubeOverrides{apiKey?, clientVersion?, paths?}, credentials{youtubeApiKey?, ...}。
@@ -492,6 +494,8 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
 - **P6(後)**: OAuth実モデレーション(実BAN/削除)、さらなる追加Source、テンプレ編集のライブプレビュー強化
 
 ## 12. 既知の制約・注意
+
+- リスナーのギフト金額は全期間の累計。`route.uncounted` の付かない経路で同じコメントが再配信されると、重複して数えることがある。通貨記号の上書き変更は変更後に届くギフトに適用し、集計済みの金額は記録時の通貨キーに残る。ツイキャスのギフトと X には金額データがないため集計対象外。
 
 - WSLでは Tauri ビルド不可(Linuxバイナリになる)。ビルドはWindows側。
 - Webhook のキューと重複排除はメモリのみ。終了時に未送信を捨てる。送信済みコメントの削除は通知を取り消さない。キーワードは全角/半角・ひらがな/カタカナを正規化しない。Discord の素の URL の自動リンク化は防げない。設定 UI は §8。

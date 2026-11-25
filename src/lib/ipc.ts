@@ -8,7 +8,11 @@ import type { PollDisplaySettings, PollPreferences, PollSnapshot, PollStart } fr
  * - Safe to import in a plain browser (Tauri absent): all calls are no-ops.
  */
 
-import type { AchievementCommitReply, AchievementDef, AchievementSubjectKind, AchievementList, AchievementSchema, AchievementUnlocked, ListenerTrophy, ChatMessage, ListenerRecord, ListenerUpdate, ModerationEvent, TtsVoiceOverride, TwitcastingMode, YoutubeReaction } from './types';
+import type {
+  AchievementCommitReply, AchievementDef, AchievementSubjectKind, AchievementList, AchievementSchema, AchievementUnlocked,
+  ListenerTrophy, ChatMessage, ListenerDonation, ListenerRecord, ListenerUpdate, ModerationEvent, TtsVoiceOverride,
+  TwitcastingMode, YoutubeReaction,
+} from './types';
 import { Channel, invoke as tauriInvoke } from '@tauri-apps/api/core';
 import { emit, listen } from '@tauri-apps/api/event';
 import { getCurrentWindow, primaryMonitor } from '@tauri-apps/api/window';
@@ -783,6 +787,23 @@ export async function setTtsPaused(paused: boolean): Promise<void> {
 
 export async function getListener(platform: string, authorId: string): Promise<ListenerRecord | null> {
   return invoke<ListenerRecord | null>('get_listener', { platform, authorId });
+}
+
+export async function getListenerDonation(platform: string, authorId: string): Promise<ListenerDonation | null> {
+  return invoke<ListenerDonation>('listener_donation', { platform, authorId });
+}
+
+export async function resetListenerDonation(platform: string, authorId: string): Promise<boolean> {
+  return (await invoke<boolean>('reset_listener_donation', { platform, authorId })) ?? false;
+}
+
+export async function resetAllListenerDonations(): Promise<number | null> {
+  return invoke<number>('reset_all_listener_donations');
+}
+
+export async function startListenerDonationChangedListener(handler: () => void): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  return listen('listener-donation-changed', handler);
 }
 
 export async function updateListener(

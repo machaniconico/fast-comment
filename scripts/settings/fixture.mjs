@@ -75,9 +75,12 @@ const mock = window.mock = {
   login: {},
   cancels: [],
   callbacks: new Map(),
+  listenerDonation: { totals: [], jpyEstimateMilli: null, unconvertible: [] },
+  donationReads: 0,
   configSync,
   appearance: () => theme.getSnapshot(),
   pushComment: comment => store.pushBatch([comment]),
+  pushComments: comments => store.pushBatch(comments),
 };
 
 window.confirm = () => true;
@@ -99,6 +102,9 @@ if (location.search === '?browser') {
     async invoke(command, args) {
       switch (command) {
         case 'plugin:window|get_all_windows': return ['main'];
+        case 'listener_donation':
+          mock.donationReads++;
+          return structuredClone(mock.listenerDonation);
         case 'get_config': {
           mock.reads++;
           if (mock.readsToFail > 0) {

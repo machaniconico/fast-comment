@@ -127,6 +127,7 @@ function loadDisplayFilter(): DisplayFilter {
 }
 
 class CommentStore {
+  private readonly batchListeners = new Set<(messages: readonly ChatMessage[]) => void>();
   // Private backing state — entries carry a precomputed search string.
   private _buf: BufEntry[] = $state([]);
   // msg-only projection of _buf, rebuilt only on push/eviction/clear so the
@@ -365,6 +366,11 @@ class CommentStore {
     if (this._pinned.some(matcher.hits)) this._pinned = this._pinned.filter((m) => !matcher.hits(m));
   }
 
+  subscribeBatches(listener: (messages: readonly ChatMessage[]) => void): () => void {
+    this.batchListeners.add(listener);
+    return () => { this.batchListeners.delete(listener); };
+  }
+
   /** Push a batch into the ring buffer, evicting oldest on overflow. */
   pushBatch(messages: ChatMessage[]): void {
     // Accumulate the session donation tally (clone-on-write so the reactive
@@ -464,6 +470,7 @@ class CommentStore {
       this._buf = combined;
     }
     this._msgs = this._buf.map((e) => e.msg);
+    for (const listener of this.batchListeners) listener(messages);
   }
 
   /** Drop hiddenIds that no longer reference any buffered message. */
