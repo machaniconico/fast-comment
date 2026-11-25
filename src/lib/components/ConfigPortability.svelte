@@ -281,7 +281,7 @@
 
   <div class="portability-block">
     <h4>インポート</h4>
-    <p class="portability-note">ログイン情報と X の接続先は、ファイルの値を使わず今の設定のままにします。X の自動告知は無効にします。</p>
+    <p class="portability-note">ログイン情報、X の接続先、棒読みちゃんの起動パスは、ファイルの値を使わず今の設定のままにします。X の自動告知は無効にします。</p>
     <div class="field-row portability-actions">
       <label class="file-button" for="settings-import-file">JSONファイルを選択</label>
       <input

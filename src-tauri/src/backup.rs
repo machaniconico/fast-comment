@@ -34,7 +34,8 @@ const OVERRIDE_SECRETS: &[&[&str]] = &[
 ];
 /// 資格情報の欄。zip では空にし、設定の書き出し(SPEC §8.1)では欄ごと消す。
 const CREDENTIALS: &[&str] = &["credentials"];
-/// 外部プログラムの起動の欄。秘密ではないが、復元時に今の値を引き継ぐ。
+/// 外部プログラムの起動の欄。ファイルを読んだだけで任意の exe を(昇格して)起動させないよう、
+/// 復元でも設定の読み込みでも今の値を引き継ぐ。
 const LOCAL_CONFIG_FIELDS: &[&[&str]] = &[
     &["tts", "options", "bouyomiPath"],
     &["tts", "options", "bouyomiLaunchElevated"],
@@ -62,6 +63,7 @@ const IMPORT_ERROR: &str = "設定を取り込めません";
 fn kept_fields() -> impl Iterator<Item = &'static [&'static str]> {
     std::iter::once(CREDENTIALS)
         .chain(OVERRIDE_SECRETS.iter().copied())
+        .chain(LOCAL_CONFIG_FIELDS.iter().copied())
         .chain(CALLBACK_PORTS.iter().copied())
         .chain(std::iter::once(X_ENDPOINTS))
 }
@@ -718,7 +720,7 @@ pub(crate) fn export_config(config: &AppConfig) -> std::result::Result<Value, &'
 }
 
 /// 設定の読み込み(SPEC §8.1)。`incoming` はファイルから型変換した設定、戻り値は保存する設定。
-/// - 資格情報、上書き用の鍵、OAuth の待受ポート、X の接続先は今の値にする
+/// - 資格情報、上書き用の鍵、外部プログラムの起動、OAuth の待受ポート、X の接続先は今の値にする
 ///   (旧版の書き出しに残る資格情報も適用しない)
 /// - それ以外の URL の欄はファイルの値を使い、ユーザー情報を消す
 /// - X の自動告知は無効にする(今の資格情報と他人のファイルの組み合わせで投稿させない)
@@ -1094,13 +1096,13 @@ fn prepare_config(config_dir: &Path, snapshot: Option<&[u8]>) -> Result<Option<V
         let defaults =
             serde_json::to_value(AppConfig::default()).expect("default config serializes");
         let defaults = defaults.as_object().expect("config object");
-        for path in LOCAL_CONFIG_FIELDS.iter().chain(URL_FIELDS).copied().chain(kept_fields()) {
+        for path in URL_FIELDS.iter().copied().chain(kept_fields()) {
             if config_field(&current, path) == config_field(defaults, path) {
                 set_config_field(&mut current, path, None);
             }
         }
     }
-    for path in LOCAL_CONFIG_FIELDS.iter().chain(URL_FIELDS).copied().chain(kept_fields()) {
+    for path in URL_FIELDS.iter().copied().chain(kept_fields()) {
         set_config_field(&mut restored, path, config_field(&current, path).cloned());
     }
     if snapshot.is_none() && restored.is_empty() {
@@ -2151,6 +2153,8 @@ mod tests {
         file.x_overrides.endpoints = current.x_overrides.endpoints.clone();
         file.x_post.callback_port = current.x_post.callback_port;
         file.twitcasting.callback_port = current.twitcasting.callback_port;
+        file.tts.options.bouyomi_path = current.tts.options.bouyomi_path.clone();
+        file.tts.options.bouyomi_launch_elevated = current.tts.options.bouyomi_launch_elevated;
         file.x_post.enabled = false;
         let urls = [&mut file.tts.options.voicevox_url]
             .into_iter()
@@ -2297,6 +2301,33 @@ mod tests {
             assert!(merged.channels[0].own_stream);
             assert_eq!(merged.credentials, current.credentials);
             assert_eq!(merged.x_post.callback_port, current.x_post.callback_port);
+        }
+    }
+
+    #[test]
+    fn settings_import_keeps_current_bouyomi_launch() {
+        // 棒読みちゃんを使う設定に、別の exe を昇格して起動させるファイル。
+        let file = serde_json::json!({
+            "tts": {"backend": "bouyomi", "options": {
+                "bouyomiPath": "C:\\syn-new\\other.exe",
+                "bouyomiLaunchElevated": true,
+                "bouyomiPort": 50002,
+            }},
+        });
+        let file = AppConfig::from_config_update(file).unwrap();
+        assert!(file.tts.options.bouyomi_launch_elevated);
+        assert_eq!(file.tts.backend, crate::config::TtsBackendKind::Bouyomi);
+        let mut current = AppConfig::default();
+        for (path, elevated) in [("", false), ("C:\\syn-cur\\BouyomiChan.exe", false)] {
+            current.tts.options.bouyomi_path = path.into();
+            current.tts.options.bouyomi_launch_elevated = elevated;
+            let merged = merge_import(&file, &current).unwrap();
+            assert_eq!(merged.tts.options.bouyomi_path, path);
+            assert_eq!(merged.tts.options.bouyomi_launch_elevated, elevated);
+            // 起動に関わらない読み上げ設定はファイルの値を読む。
+            assert_eq!(merged.tts.backend, crate::config::TtsBackendKind::Bouyomi);
+            assert_eq!(merged.tts.options.bouyomi_port, 50002);
+            assert_eq!(merged, expected_import(file.clone(), &current));
         }
     }
 

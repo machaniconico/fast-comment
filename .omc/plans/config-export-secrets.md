@@ -36,7 +36,15 @@
 7. 今の設定に `bearerToken`・`endpoints` が無く、ファイルにある場合
    - テスト: `settings_import_drops_file_secrets_when_current_has_none`(鍵と X の接続先は取り込まない。X 以外の接続先はファイルの値)。
 
-### 裁定に無く、手を付けていないこと
+## 追加の裁定(57fbfde の後)
 
-- `tts.options.bouyomiPath` と `bouyomiLaunchElevated` は、読み込みではファイルの値が入る(復元は今の値のまま)。バックエンドが棒読みちゃんのファイルを読み込むと、保存時にそのパスを起動する。
-- X 以外の URL は、接続先が今と同じでも今のユーザー情報を引き継がない(ファイルの値からユーザー情報を消して入れる)。
+### 棒読みちゃんの起動パス
+
+- 経路: `tts.options.bouyomiPath` と `bouyomiLaunchElevated` にファイルの値が入り、バックエンドが棒読みちゃんなら、未起動の時に保存の直後にそのパスを起動していた(昇格つきもあり得た)。
+- 裁定: 復元と同じく、読み込みでも今の値を残す。一覧は復元と共有する。
+- 実装: `LOCAL_CONFIG_FIELDS` を `kept_fields()` に入れた。復元(`prepare_config`)と読み込み(`merge_import`)が同じ `kept_fields()` を通るので、一覧は 1 か所。
+- テスト: `settings_import_keeps_current_bouyomi_launch`(ファイルに別のパスと `bouyomiLaunchElevated: true`。今のパスが空・設定済みの両方)。
+
+### X 以外の URL のユーザー情報
+
+- 裁定: 今のまま。接続先が今と同じでも今のユーザー情報は引き継がず、ファイルの値からユーザー情報を消して入れる。
