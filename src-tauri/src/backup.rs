@@ -315,7 +315,7 @@ fn excluded(part: &str) -> bool {
             .any(|fragment| part.contains(fragment))
         || matches!(
             part.as_str(),
-            "integrations.json" | "x-autopost-ledger.json" | "logs" | "exports" | "backups"
+            "integrations.json" | "x-autopost-ledger.json" | "launch.json" | "launch.lock" | "logs" | "exports" | "backups"
         )
 }
 

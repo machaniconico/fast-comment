@@ -506,6 +506,7 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
   - URL の欄 `tts.options.voicevoxUrl`、`niconicoOverrides.endpoints`、`twitcastingOverrides.endpoints`(zip ではユーザー情報を消しているため)。
   - ローカル API と Webhook の設定、X 自動告知の台帳。
 - 既知の限界。配信中のバックアップでは、リスナー台帳と実績の進捗を順に保存して写すので、その間にコメントが入ると同じリスナーの件数が 1 件ほどずれることがある。
+- 起動時に開く設定(`launch.json`・`launch.lock`)は対象外(§20)。承認の HMAC は資格情報ストアにあり、写しても照合できないため。
 
 ## 11. フェーズ計画
 
