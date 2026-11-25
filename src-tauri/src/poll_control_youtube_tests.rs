@@ -20,6 +20,7 @@ const CLIENT_ID: &str = "test-oauth-client";
 const TOKEN: &str = "test-access-token";
 const CHAT: &str = "test-live-chat";
 const ID: &str = "message-1";
+const STALE_TOKEN: &str = "test-stale-token";
 
 fn request() -> PollStart {
     PollStart {
@@ -80,6 +81,10 @@ struct Mock {
     get_times: StdMutex<Vec<Instant>>,
     get_queries: StdMutex<Vec<String>>,
     transition_lengths: StdMutex<Vec<Option<String>>>,
+    // token の応答で順に払い出す値。空なら TOKEN。
+    issued: StdMutex<VecDeque<&'static str>>,
+    // 失効済みとして扱い、GET /liveChat/messages で 401 を返す token。
+    stale: StdMutex<Option<&'static str>>,
 }
 
 impl Mock {
@@ -94,14 +99,20 @@ impl Mock {
         };
         self.calls.lock().unwrap().push(route);
         if route != "token" {
-            assert_eq!(
-                request.headers()["authorization"],
-                format!("Bearer {TOKEN}")
-            );
+            let header = request.headers()["authorization"].to_str().unwrap();
+            let stale = *self.stale.lock().unwrap();
+            if stale.is_some_and(|stale| header == format!("Bearer {stale}")) {
+                if route == "active" {
+                    return reply(StatusCode::UNAUTHORIZED, "authError", "expired");
+                }
+            } else {
+                assert_eq!(header, format!("Bearer {TOKEN}"));
+            }
         }
         match route {
             "token" => {
-                Json(json!({"access_token": TOKEN, "token_type": "Bearer", "expires_in": 3600}))
+                let token = self.issued.lock().unwrap().pop_front().unwrap_or(TOKEN);
+                Json(json!({"access_token": token, "token_type": "Bearer", "expires_in": 3600}))
                     .into_response()
             }
             "broadcasts" => self
@@ -457,7 +468,8 @@ async fn poller_closes_with_notice_if_tallies_are_missing() {
         .unwrap()
         .unwrap();
     assert!(notice.contains("所有者"));
-    assert!(notice.contains("YouTube 側で投票を終了してください"));
+    // transition で閉じられたので、手動終了の案内は出さない。
+    assert!(notice.contains("YouTube 側でも終了しました"), "{notice}");
     assert_eq!(fixture.closed().await.total_voters, 6);
     assert_eq!(
         fixture.mock.calls(),
@@ -618,15 +630,21 @@ async fn accepts_unsigned_integer_tallies_and_rejects_invalid_values() {
 #[tokio::test]
 async fn delayed_publish_uses_youtube_start_time_for_remaining_duration() {
     let fixture = Fixture::new().await;
-    let published = chrono::Utc::now() - chrono::Duration::seconds(9);
+    // 作成の応答が 2 秒遅れる。YouTube 側では POST の受信時に投票が始まっている。
+    let published = chrono::Utc::now();
     let mut created = item(ID, "active");
     created["snippet"]["publishedAt"] = json!(published.to_rfc3339());
+    let body = serde_json::to_vec(&created).unwrap();
+    let chunks = futures_util::stream::once(async move {
+        time::sleep(Duration::from_secs(2)).await;
+        Ok::<_, io::Error>(bytes::Bytes::from(body))
+    });
     fixture
         .mock
         .create
         .lock()
         .unwrap()
-        .push_back(Json(created).into_response());
+        .push_back(Body::from_stream(chunks).into_response());
     let mut start = request();
     start.duration_secs = Some(10);
 
@@ -635,17 +653,62 @@ async fn delayed_publish_uses_youtube_start_time_for_remaining_duration() {
         .start(start.validate().unwrap())
         .await
         .unwrap();
-    let started_at_ms = published.timestamp_millis() as u64;
-    assert_eq!(opened.started_at_ms, started_at_ms);
-    assert_eq!(opened.ends_at_ms, Some(started_at_ms + 10_000));
+    let opened_at = Instant::now();
+    let published_ms = published.timestamp_millis() as u64;
+    assert!(
+        opened.started_at_ms.abs_diff(published_ms) <= 300,
+        "{} {published_ms}",
+        opened.started_at_ms
+    );
+    assert_eq!(opened.ends_at_ms, Some(opened.started_at_ms + 10_000));
     assert_eq!(fixture.poll.snapshot(), opened);
     assert_eq!(
-        time::timeout(Duration::from_secs(3), fixture.closed())
+        time::timeout(Duration::from_secs(10), fixture.closed())
             .await
             .unwrap()
             .total_voters,
         10
     );
+    assert!(opened_at.elapsed() < Duration::from_millis(8_500));
+}
+
+#[tokio::test]
+async fn clock_ahead_of_youtube_does_not_shorten_the_poll() {
+    for interrupted_create in [false, true] {
+        let fixture = Fixture::new().await;
+        // PC の時計が YouTube より進んでいる。照合は公開時刻が POST 直前の 10 秒前より
+        // 後の時だけ採用するので、照合の経路では 9 秒にする。
+        let ahead = if interrupted_create { 9 } else { 60 };
+        let mut created = item(ID, "active");
+        created["snippet"]["publishedAt"] =
+            json!((chrono::Utc::now() - chrono::Duration::seconds(ahead)).to_rfc3339());
+        if interrupted_create {
+            fixture.mock.create.lock().unwrap().push_back(interrupted());
+            fixture.mock.push_active(created);
+        } else {
+            fixture
+                .mock
+                .create
+                .lock()
+                .unwrap()
+                .push_back(Json(created).into_response());
+        }
+        let mut start = request();
+        start.duration_secs = Some(10);
+        let opened = fixture
+            .control
+            .start(start.validate().unwrap())
+            .await
+            .unwrap();
+        let now_ms = chrono::Utc::now().timestamp_millis() as u64;
+        let ends_at_ms = opened.ends_at_ms.unwrap();
+        assert_eq!(ends_at_ms, opened.started_at_ms + 10_000);
+        // 照合の待機(1 秒)を含めても、差し引くのは POST からの経過時間まで。
+        assert!(ends_at_ms >= now_ms + 8_500, "{ends_at_ms} {now_ms}");
+        time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(fixture.poll.snapshot().status, PollStatus::Open);
+        assert!(!fixture.mock.calls().contains(&"transition"));
+    }
 }
 
 #[tokio::test]
@@ -711,9 +774,25 @@ async fn reconciliation_counts_unauthorized_without_resending_get() {
             "broadcasts",
             "create",
             "active",
+            "token",
             "active",
+            "token",
             "active"
         ]
+    );
+}
+
+#[tokio::test]
+async fn reconciliation_refreshes_token_after_unauthorized() {
+    let fixture = Fixture::new().await;
+    fixture.mock.issued.lock().unwrap().push_back(STALE_TOKEN);
+    *fixture.mock.stale.lock().unwrap() = Some(STALE_TOKEN);
+    fixture.mock.create.lock().unwrap().push_back(interrupted());
+    fixture.mock.push_active(item(ID, "active"));
+    assert_eq!(fixture.start().await.unwrap().status, PollStatus::Open);
+    assert_eq!(
+        fixture.mock.calls(),
+        ["token", "broadcasts", "create", "active", "token", "active"]
     );
 }
 
@@ -851,4 +930,83 @@ async fn auto_finish_cannot_stop_a_new_chat_poll() {
         .unwrap();
     assert_eq!(fixture.control.snapshot(), new);
     assert_eq!(new.status, PollStatus::Open);
+}
+
+#[tokio::test]
+async fn terminal_error_reports_when_youtube_also_closed_the_poll() {
+    let mut fixture = Fixture::new().await;
+    fixture.mock.active.lock().unwrap().push_back(reply(
+        StatusCode::FORBIDDEN,
+        "forbidden",
+        "failed",
+    ));
+    fixture.seed_votes().await;
+    let notice = time::timeout(Duration::from_secs(15), fixture.notices.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(notice.contains("YouTube 側でも終了しました"), "{notice}");
+    assert!(!notice.contains("終了してください"), "{notice}");
+    assert_eq!(fixture.closed().await.total_voters, 6);
+    assert_eq!(
+        fixture.mock.calls(),
+        ["token", "broadcasts", "create", "active", "transition"]
+    );
+}
+
+#[tokio::test]
+async fn rate_limited_poll_keeps_votes_and_waits_for_next_cycle() {
+    let mut fixture = Fixture::new().await;
+    fixture.mock.active.lock().unwrap().push_back(reply(
+        StatusCode::TOO_MANY_REQUESTS,
+        "rateLimitExceeded",
+        "slow down",
+    ));
+    fixture.mock.push_active(item(ID, "closed"));
+    let started = fixture.seed_votes().await;
+    time::sleep(Duration::from_secs(12)).await;
+    let snapshot = fixture.poll.snapshot();
+    assert_eq!(
+        (snapshot.status, snapshot.total_voters),
+        (PollStatus::Open, 6)
+    );
+    assert_eq!(snapshot.id, started.id);
+    assert_eq!(
+        fixture
+            .closed_within(Duration::from_secs(15))
+            .await
+            .total_voters,
+        10
+    );
+    assert!(fixture.notices.try_recv().is_err());
+    assert_eq!(
+        fixture.mock.calls(),
+        ["token", "broadcasts", "create", "active", "active"]
+    );
+}
+
+#[tokio::test]
+async fn polling_honors_longer_interval_from_youtube() {
+    let fixture = Fixture::new().await;
+    fixture.mock.active.lock().unwrap().push_back(
+        Json(json!({"activePollItem": item(ID, "active"), "pollingIntervalMillis": 13_000}))
+            .into_response(),
+    );
+    fixture.mock.push_active(item(ID, "closed"));
+    fixture.seed_votes().await;
+    fixture.closed_within(Duration::from_secs(30)).await;
+    let times = fixture.mock.get_times.lock().unwrap();
+    assert_eq!(times.len(), 2);
+    assert!(
+        times[1] - times[0] >= Duration::from_millis(12_950),
+        "{times:?}"
+    );
+}
+
+#[test]
+fn polling_interval_from_youtube_is_capped() {
+    assert_eq!(next_poll_delay(None), POLL_INTERVAL);
+    assert_eq!(next_poll_delay(Some(3_000)), POLL_INTERVAL);
+    assert_eq!(next_poll_delay(Some(13_000)), Duration::from_secs(13));
+    assert_eq!(next_poll_delay(Some(600_000)), Duration::from_secs(60));
 }

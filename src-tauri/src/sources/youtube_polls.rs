@@ -29,6 +29,8 @@ pub struct YtPollState {
     pub options: Vec<String>,
     pub tallies: Option<Vec<u64>>,
     pub published_at_ms: Option<i64>,
+    /// list 応答の `pollingIntervalMillis`。list 以外の応答では None。
+    pub polling_interval_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -166,7 +168,17 @@ impl YoutubePolls {
             .get(&self.messages_url)
             .query(&[("liveChatId", live_chat_id), ("maxResults", "200")]);
         let value = self.send(request, token, &[live_chat_id]).await?;
-        Ok(value.get("activePollItem").and_then(parse_state))
+        let interval = &value["pollingIntervalMillis"];
+        let polling_interval_ms = interval
+            .as_u64()
+            .or_else(|| interval.as_str()?.parse().ok());
+        Ok(value
+            .get("activePollItem")
+            .and_then(parse_state)
+            .map(|state| YtPollState {
+                polling_interval_ms,
+                ..state
+            }))
     }
 
     async fn send(
@@ -297,6 +309,7 @@ fn parse_state(item: &Value) -> Option<YtPollState> {
             })
             .flatten(),
         published_at_ms: published_at_ms(item),
+        polling_interval_ms: None,
     })
 }
 
