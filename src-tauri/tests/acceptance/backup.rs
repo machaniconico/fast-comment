@@ -30,6 +30,15 @@ fn read(dir: &Path, rel: &str) -> String {
     fs::read_to_string(dir.join(rel)).unwrap()
 }
 
+// 実際のストアの読み込みと同じ型で読める最小の固定データ。名前・値は中身の差を見分けるためのもの。
+const LISTENERS_OLD: &str = r#"{"twitch:old":{"name":"listeners-old"}}"#;
+const LISTENERS_CURRENT: &str = r#"{"twitch:old":{"name":"listeners-current"}}"#;
+const LISTENERS_CHANGED: &str = r#"{"twitch:old":{"name":"listeners-changed"}}"#;
+const ACHIEVEMENTS_OLD: &str = r#"{"version":1,"revision":1,"enabled":false,"rates":{"JPY":1.0},"ratesUpdatedAtMs":null,"symbolOverrides":{"JPY":"achievements-old"},"achievements":[]}"#;
+const ACHIEVEMENTS_CURRENT: &str = r#"{"version":1,"revision":2,"enabled":false,"rates":{"JPY":1.0},"ratesUpdatedAtMs":null,"symbolOverrides":{"JPY":"achievements-current"},"achievements":[]}"#;
+const PROGRESS_OLD: &str = r#"{"version":1,"enabledAtMs":0,"sessions":{},"seenStreams":[],"streamer":{},"viewers":{},"unlocks":{"progress-old":1}}"#;
+const SOUNDS_OLD: &str = r#"{"version":1,"sounds":[{"id":"sounds-old","name":"ding","ext":"wav","size":9}]}"#;
+
 fn config_json(keep: u32, creds: [&str; 4]) -> String {
     json!({
         "backup": { "enabled": true, "keep": keep },
@@ -46,10 +55,10 @@ fn config_json(keep: u32, creds: [&str; 4]) -> String {
 /// 実物と同じファイル名でダミーを並べた config_dir(除外対象も含む)。
 fn populated(dir: &Path) {
     write(dir, "config.json", &config_json(10, [X_AUTH, X_CSRF, TWITCH, YT_KEY]));
-    write(dir, "listeners.json", r#"{"v":"listeners-old"}"#);
-    write(dir, "achievements.json", r#"{"v":"achievements-old"}"#);
-    write(dir, "achievement-progress.json", r#"{"v":"progress-old"}"#);
-    write(dir, "sounds.json", r#"{"v":"sounds-old"}"#);
+    write(dir, "listeners.json", LISTENERS_OLD);
+    write(dir, "achievements.json", ACHIEVEMENTS_OLD);
+    write(dir, "achievement-progress.json", PROGRESS_OLD);
+    write(dir, "sounds.json", SOUNDS_OLD);
     write(dir, "sounds/ding.wav", "RIFF-ding");
     write(dir, "templates/custom/mine/index.html", "<html>mine</html>");
     write(dir, "skin/theme.css", "body{}");
@@ -202,7 +211,7 @@ fn unchanged_content_is_not_backed_up_twice() {
     assert!(create_backup(dir.path(), T0 + 1000).unwrap().is_none());
     assert_eq!(list_backups(dir.path()).len(), 1);
 
-    write(dir.path(), "listeners.json", r#"{"v":"listeners-changed"}"#);
+    write(dir.path(), "listeners.json", LISTENERS_CHANGED);
     let again = create_backup(dir.path(), T0 + 2000).unwrap();
     assert!(again.is_some(), "中身が変われば作る");
     assert_eq!(list_backups(dir.path()).len(), 2);
@@ -296,7 +305,7 @@ fn stage_restore_takes_safety_backup_first() {
     let dir = tempfile::tempdir().unwrap();
     populated(dir.path());
     create_backup(dir.path(), T0).unwrap().unwrap();
-    write(dir.path(), "listeners.json", r#"{"v":"listeners-current"}"#);
+    write(dir.path(), "listeners.json", LISTENERS_CURRENT);
     let before = list_backups(dir.path()).len();
 
     stage_restore(dir.path(), &format!("fc-backup-{T0}.zip"), T0 + 5000).unwrap();
@@ -308,12 +317,12 @@ fn stage_restore_takes_safety_backup_first() {
     let safety = zip_entries(&auto_dir(dir.path()).join(&after[0].file_name));
     assert_eq!(
         String::from_utf8_lossy(&safety["listeners.json"]),
-        r#"{"v":"listeners-current"}"#,
+        LISTENERS_CURRENT,
         "事前バックアップは復元前の今の状態"
     );
     assert!(dir.path().join("backups/restore-pending/READY").exists());
     // 適用は再起動後。この時点では今のファイルを触らない
-    assert_eq!(read(dir.path(), "listeners.json"), r#"{"v":"listeners-current"}"#);
+    assert_eq!(read(dir.path(), "listeners.json"), LISTENERS_CURRENT);
 }
 
 #[test]
@@ -324,8 +333,8 @@ fn apply_restore_replaces_files_and_keeps_current_credentials() {
     // バックアップ後に今の状態が変わった
     let now_creds = ["NOW-X-AUTH", "NOW-X-CSRF", "oauth:NOW-TWITCH", "NOW-YT-KEY"];
     write(dir.path(), "config.json", &config_json(7, now_creds));
-    write(dir.path(), "listeners.json", r#"{"v":"listeners-current"}"#);
-    write(dir.path(), "achievements.json", r#"{"v":"achievements-current"}"#);
+    write(dir.path(), "listeners.json", LISTENERS_CURRENT);
+    write(dir.path(), "achievements.json", ACHIEVEMENTS_CURRENT);
     write(dir.path(), "integrations.json", r#"{"webhook":"current-hook"}"#);
     write(dir.path(), "x-autopost-ledger.json", r#"{"posts":["current"]}"#);
     stage_restore(dir.path(), &format!("fc-backup-{T0}.zip"), T0 + 1000).unwrap();
@@ -333,8 +342,8 @@ fn apply_restore_replaces_files_and_keeps_current_credentials() {
     let applied = apply_pending_restore(dir.path(), T0 + 2000).unwrap();
 
     assert!(applied);
-    assert_eq!(read(dir.path(), "listeners.json"), r#"{"v":"listeners-old"}"#);
-    assert_eq!(read(dir.path(), "achievements.json"), r#"{"v":"achievements-old"}"#);
+    assert_eq!(read(dir.path(), "listeners.json"), LISTENERS_OLD);
+    assert_eq!(read(dir.path(), "achievements.json"), ACHIEVEMENTS_OLD);
     let cfg: Value = serde_json::from_str(&read(dir.path(), "config.json")).unwrap();
     assert_eq!(cfg["backup"]["keep"], 10, "資格情報以外はバックアップの内容");
     assert_eq!(cfg["credentials"]["xAuthToken"], "NOW-X-AUTH");
@@ -359,9 +368,9 @@ fn apply_without_pending_is_false() {
     assert!(!apply_pending_restore(dir.path(), T0).unwrap());
 
     // READY の無い restore-pending(展開の途中)は適用しない
-    write(dir.path(), "backups/restore-pending/listeners.json", r#"{"v":"half"}"#);
+    write(dir.path(), "backups/restore-pending/listeners.json", r#"{"twitch:x":{"name":"half"}}"#);
     assert!(!apply_pending_restore(dir.path(), T0 + 1).unwrap());
-    assert_eq!(read(dir.path(), "listeners.json"), r#"{"v":"listeners-old"}"#);
+    assert_eq!(read(dir.path(), "listeners.json"), LISTENERS_OLD);
 }
 
 #[test]
@@ -372,15 +381,15 @@ fn failed_apply_rolls_back() {
     // READY はあるが中身が壊れている(manifest と config.json が JSON でない)
     write(dir.path(), "backups/restore-pending/manifest.json", "{not json");
     write(dir.path(), "backups/restore-pending/config.json", "{broken");
-    write(dir.path(), "backups/restore-pending/listeners.json", r#"{"v":"from-broken"}"#);
+    write(dir.path(), "backups/restore-pending/listeners.json", r#"{"twitch:x":{"name":"from-broken"}}"#);
     write(dir.path(), "backups/restore-pending/READY", "");
 
     let r = apply_pending_restore(dir.path(), T0);
 
     assert!(!matches!(r, Ok(true)), "壊れた復元は成功扱いにしない: {r:?}");
     assert_eq!(read(dir.path(), "config.json"), config_before);
-    assert_eq!(read(dir.path(), "listeners.json"), r#"{"v":"listeners-old"}"#);
-    assert_eq!(read(dir.path(), "achievements.json"), r#"{"v":"achievements-old"}"#);
+    assert_eq!(read(dir.path(), "listeners.json"), LISTENERS_OLD);
+    assert_eq!(read(dir.path(), "achievements.json"), ACHIEVEMENTS_OLD);
     assert_eq!(read(dir.path(), "sounds/ding.wav"), "RIFF-ding");
     assert!(!dir.path().join("backups/restore-pending").exists());
     assert!(
