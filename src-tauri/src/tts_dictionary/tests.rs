@@ -1,5 +1,4 @@
 use super::*;
-use crate::config::TtsOptions;
 use serde_json::json;
 
 fn row(from: &str, to: &str, regex: bool) -> TtsDictEntry {
@@ -16,7 +15,10 @@ fn parse_json(value: Value) -> ParsedDictionary {
 
 #[test]
 fn bundle_round_trips_and_ignores_unknown_fields() {
-    let expected = vec![row("配信", "はいしん", false), row("(草)+", "$1", true)];
+    let expected = vec![
+        row(" 配信　", " はいしん ", false),
+        row(" (草)+ ", "$1", true),
+    ];
     let exported = export(&expected).unwrap();
     let mut bundle: Value = serde_json::from_str(&exported).unwrap();
     assert_eq!(
@@ -51,7 +53,7 @@ fn accepts_array_and_all_aliases() {
     assert_eq!(
         parsed.entries,
         [
-            row("w+", "わら", true),
+            row("  w+  ", "わら", true),
             row("配信", "はいしん", false),
             row("草", "", false)
         ]
@@ -76,7 +78,7 @@ fn limits_input_to_1000_rows_before_validating_rows() {
     rows.push(Value::Null);
     assert_eq!(
         parse(&serde_json::to_vec(&rows).unwrap()).err().as_deref(),
-        Some(ENTRY_LIMIT_ERROR)
+        Some(TTS_DICTIONARY_ENTRY_LIMIT_ERROR)
     );
 }
 
@@ -90,19 +92,20 @@ fn lengths_count_full_width_and_emoji_characters() {
         {"from": "草", "to": format!("{emoji}🍣")},
         {"from": "　 ", "to": ""},
         {"from": emoji, "to": full_width},
-        {"from": "🍣", "to": ""}
+        {"from": "🍣", "to": ""},
+        {"from": format!(" {}", "全".repeat(199)), "to": ""}
     ]));
     assert_eq!(
         parsed.entries,
         [
-            row(&full_width, &emoji, false),
             row(&emoji, &full_width, false),
-            row("🍣", "", false)
+            row("🍣", "", false),
+            row(&format!(" {}", "全".repeat(199)), "", false)
         ]
     );
     assert_eq!(
         parsed.rejected.iter().map(|r| r.index).collect::<Vec<_>>(),
-        [2, 3, 4]
+        [1, 2, 3, 4]
     );
 }
 
@@ -140,6 +143,8 @@ fn returns_at_most_first_20_rejection_details() {
     assert_eq!(dictionary, [row("草", "くさ", false)]);
     assert_eq!(result.rejected.len(), 20);
     assert_eq!(result.rejected[19].index, 20);
+    assert_eq!(result.rejected_count, 21);
+    assert_eq!(serde_json::to_value(&result).unwrap()["rejectedCount"], 21);
     assert_eq!(result.total, 1);
 }
 
@@ -149,6 +154,7 @@ fn append_keeps_order_and_skips_duplicate_keys() {
     let parsed = parse_json(json!([
         {"from": "草", "to": "既存を優先"},
         {"from": "草", "to": "わら", "regex": true},
+        {"from": " 草 ", "to": "空白あり", "regex": true},
         {"from": " 草 ", "to": "同じキー", "regex": true},
         {"from": "枠", "to": "わく"},
     ]));
@@ -159,6 +165,7 @@ fn append_keeps_order_and_skips_duplicate_keys() {
             current[0].clone(),
             current[1].clone(),
             row("草", "わら", true),
+            row(" 草 ", "空白あり", true),
             row("枠", "わく", false)
         ]
     );
@@ -169,7 +176,7 @@ fn append_keeps_order_and_skips_duplicate_keys() {
             result.skipped_duplicate,
             result.total
         ),
-        (2, 0, 2, 4)
+        (3, 0, 2, 5)
     );
 }
 
@@ -208,19 +215,45 @@ fn limits_combined_dictionary_after_duplicate_filtering() {
     let overflow = parse_json(json!([{"from": "1000", "to": ""}]));
     assert_eq!(
         merge(&full, overflow, ImportMode::Append).unwrap_err(),
-        ENTRY_LIMIT_ERROR
+        TTS_DICTIONARY_ENTRY_LIMIT_ERROR
     );
 }
 
 #[test]
-fn config_normalize_keeps_first_1000_entries() {
-    let mut options = TtsOptions {
-        dictionary: (0..=1000).map(|i| row(&i.to_string(), "", false)).collect(),
-        ..Default::default()
-    };
-    let expected = options.dictionary[..1000].to_vec();
-    options.normalize();
-    assert_eq!(options.dictionary, expected);
-    options.normalize();
-    assert_eq!(options.dictionary, expected);
+fn export_of_legacy_long_entries_reports_rejection_reasons_on_import() {
+    let legacy = [
+        row(&"全".repeat(201), "", false),
+        row("草", &"🍣".repeat(201), false),
+    ];
+    let parsed = parse(export(&legacy).unwrap().as_bytes()).unwrap();
+    assert!(parsed.entries.is_empty());
+    assert_eq!(parsed.rejected_count, 2);
+    assert_eq!(
+        parsed.rejected[0].reason,
+        "fromは空白を含めて200文字以内で指定してください"
+    );
+    assert_eq!(
+        parsed.rejected[1].reason,
+        "toは200文字以内で指定してください"
+    );
+}
+
+#[test]
+fn only_an_explicit_empty_bundle_clears_the_dictionary() {
+    let current = [row("旧", "きゅう", false)];
+    let empty_bundle = export(&[]).unwrap();
+    let (dictionary, result) = merge(
+        &current,
+        parse(empty_bundle.as_bytes()).unwrap(),
+        ImportMode::Replace,
+    )
+    .unwrap();
+    assert!(dictionary.is_empty());
+    assert_eq!(result.total, 0);
+
+    let empty_array = parse(b"[]").unwrap();
+    assert!(merge(&current, empty_array, ImportMode::Replace).is_err());
+    let (dictionary, result) = merge(&current, parse(b"[]").unwrap(), ImportMode::Append).unwrap();
+    assert_eq!(dictionary, current);
+    assert_eq!(result.rejected_count, 0);
 }

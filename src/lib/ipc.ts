@@ -789,6 +789,7 @@ export type TtsDictionaryCommit = ConfigCommit<{
   replaced: number;
   skippedDuplicate: number;
   rejected: { index: number; reason: string }[];
+  rejectedCount: number;
   total: number;
 }>;
 

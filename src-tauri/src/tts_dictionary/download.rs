@@ -1,7 +1,11 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
-use reqwest::{header::LOCATION, redirect::Policy, Response, StatusCode};
+use reqwest::{
+    header::{ACCEPT_ENCODING, LOCATION},
+    redirect::Policy,
+    RequestBuilder, Response, StatusCode,
+};
 use url::{Host, Url};
 
 const MAX_REDIRECTS: usize = 3;
@@ -133,6 +137,13 @@ fn is_public_v6(ip: Ipv6Addr) -> bool {
 }
 
 async fn request(url: Url, address: SocketAddr) -> Result<Response, String> {
+    request_builder(url, address)?
+        .send()
+        .await
+        .map_err(|_| REQUEST_ERROR.into())
+}
+
+fn request_builder(url: Url, address: SocketAddr) -> Result<RequestBuilder, String> {
     // プロキシや自動リダイレクトを使うと、検査済みのアドレス以外へ接続し得る。
     let mut client = reqwest::Client::builder()
         .no_proxy()
@@ -146,13 +157,8 @@ async fn request(url: Url, address: SocketAddr) -> Result<Response, String> {
         // ホスト名を保持したまま TLS 証明書を検証し、接続先だけを固定する。
         client = client.resolve(domain, address);
     }
-    client
-        .build()
-        .map_err(|_| REQUEST_ERROR)?
-        .get(url)
-        .send()
-        .await
-        .map_err(|_| REQUEST_ERROR.into())
+    let client = client.build().map_err(|_| REQUEST_ERROR)?;
+    Ok(client.get(url).header(ACCEPT_ENCODING, "identity"))
 }
 
 async fn read_body(mut response: Response) -> Result<Vec<u8>, String> {
@@ -299,6 +305,16 @@ mod tests {
             .header(header::LOCATION, location)
             .body(Body::empty())
             .unwrap()
+    }
+
+    #[test]
+    fn tts_dictionary_request_explicitly_accepts_identity_encoding() {
+        let url = Url::parse(PUBLIC_URL).unwrap();
+        let request = request_builder(url, "8.8.8.8:443".parse().unwrap())
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(request.headers()[ACCEPT_ENCODING], "identity");
     }
 
     #[tokio::test]

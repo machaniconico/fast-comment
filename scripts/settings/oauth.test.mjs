@@ -44,6 +44,71 @@ const initial = page => page.evaluate(() => window.mock.initial);
 const reloadSettings = page => page.getByRole('button', { name: '設定を再読み込み', exact: true });
 const moderationImport = page => page.locator('.portability').filter({ has: page.locator('#moderation-import-json') });
 
+for (const revisionGap of [false, true]) {
+  test('replacing the TTS dictionary clears unsaved edits' + (revisionGap ? ' across a revision gap' : ''), async t => withSettings(t, async page => {
+    const dictionary = [{ from: ' 草 ', to: 'くさ', regex: false }];
+    await page.evaluate(({ entries, revisionGap }) => {
+      window.mock.saved.tts.options.dictionary = entries;
+      window.mock.revision++;
+      window.mock.configSync.reloadRequired = true;
+      window.mock.importTtsDictionary = ({ raw, mode }) => {
+        if (mode !== 'replace') throw new Error('expected replace');
+        if (revisionGap) {
+          window.mock.saved.goals.showInApp = true;
+          window.mock.revision++;
+        }
+        const dictionary = JSON.parse(raw).entries.slice(0, 1);
+        window.mock.saved.tts.options.dictionary = dictionary;
+        return {
+          revision: ++window.mock.revision, dictionary, added: 0, replaced: 1,
+          skippedDuplicate: 0,
+          rejected: Array.from({ length: 20 }, (_, i) => ({ index: i + 2, reason: 'fromが不正です' })),
+          rejectedCount: 22, total: 1,
+        };
+      };
+    }, { entries: dictionary, revisionGap });
+    await reloadSettings(page).click();
+    const from = page.locator('#tts-dict-from-0');
+    await from.waitFor();
+    await from.fill('未保存');
+    await page.locator('#tts-dictionary-import-mode').selectOption('replace');
+    await page.locator('#tts-dictionary-import-text').fill(JSON.stringify({
+      schema: 'fast-comment-tts-dictionary', version: 1,
+      entries: [...dictionary, ...Array(22).fill({ to: '' })],
+    }));
+    await page.getByRole('button', { name: '貼り付けて取り込む' }).click();
+    await page.getByText('ほか 2 件', { exact: true }).waitFor();
+    await page.getByText('2 件目 — fromが不正です', { exact: true }).waitFor();
+    assert.equal(await from.inputValue(), ' 草 ');
+    if (revisionGap) {
+      assert.equal(await save(page).isDisabled(), true);
+      await reloadSettings(page).click();
+    }
+    const config = await saveSettings(page);
+    assert.deepEqual(config.tts.options.dictionary, dictionary);
+    if (revisionGap) assert.equal(config.goals.showInApp, true);
+  }));
+}
+
+test('the TTS dictionary editor limits row additions and both fields', async t => withSettings(t, async page => {
+  await page.evaluate(() => {
+    window.mock.saved.tts.options.dictionary = Array.from({ length: 1000 }, (_, i) => ({
+      from: String(i), to: '', regex: false,
+    }));
+    window.mock.revision++;
+    window.mock.configSync.reloadRequired = true;
+  });
+  await reloadSettings(page).click();
+  await page.locator('#tts-dict-from-999').waitFor();
+  const editor = page.getByRole('group', { name: '読み上げ辞書', exact: true });
+  const add = editor.getByRole('button', { name: '行追加' });
+  assert.equal(await add.isDisabled(), true);
+  assert.equal(await page.locator('#tts-dict-from-0').getAttribute('maxlength'), '200');
+  assert.equal(await page.locator('#tts-dict-to-0').getAttribute('maxlength'), '200');
+  await editor.getByRole('button', { name: '削除', exact: true }).first().click();
+  assert.equal(await add.isEnabled(), true);
+}));
+
 async function importModeration(page, moderation) {
   await page.locator('#moderation-import-json').fill(JSON.stringify({ moderation }));
   await moderationImport(page).getByRole('button', { name: 'テキストから読込' }).click();

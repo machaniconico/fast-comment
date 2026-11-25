@@ -156,6 +156,8 @@ if (location.search === '?browser') {
           }
           mock.saved.goals.showInApp = args.showInApp;
           return { revision: ++mock.revision, showInApp: args.showInApp };
+        case 'import_tts_dictionary':
+          return mock.importTtsDictionary(args);
         case 'append_moderation_value':
         case 'set_moderation': {
           if (mock.holdModerationWrites) {

@@ -24,6 +24,7 @@ pub mod worker;
 /// この定数は使用しない。長文 SuperChat 連発などで巨大ペイロードが IPC に
 /// 流れるのを防ぐバックストップとしてのみ機能する。
 const TTS_UNLIMITED_HARD_CAP: usize = 500;
+const TTS_DICTIONARY_UNLIMITED_CAP: usize = 10_000;
 const TTS_NOTICE_THROTTLE: std::time::Duration = std::time::Duration::from_secs(30);
 
 use regex::Regex;
@@ -391,7 +392,7 @@ impl TtsDispatcher {
             body = omit_urls(&body);
         }
 
-        body = dictionary.apply(body);
+        body = dictionary.apply(body, opt.max_length);
 
         // 手動 / 抽選 / ウェルカムはテンプレートを通さず `{text}` 固定。
         let mut text = if is_manual_text(msg) {
@@ -454,8 +455,8 @@ impl CompiledDictionary {
             if entry.regex {
                 match crate::tts_dictionary::compile_regex(&entry.from) {
                     Ok(pattern) => Some(CompiledReplacement::Pattern { pattern, to: entry.to.clone() }),
-                    Err(error) => {
-                        tracing::warn!(pattern = %entry.from, %error, "TTS 辞書の不正な正規表現を無視");
+                    Err(_) => {
+                        tracing::warn!("TTS 辞書の不正な正規表現を無視");
                         None
                     }
                 }
@@ -465,7 +466,12 @@ impl CompiledDictionary {
         }).collect())
     }
 
-    fn apply(&self, mut body: String) -> String {
+    fn apply(&self, mut body: String, max_length: usize) -> String {
+        let limit = if max_length == 0 {
+            TTS_DICTIONARY_UNLIMITED_CAP
+        } else {
+            max_length.saturating_mul(4)
+        };
         for entry in &self.0 {
             body = match entry {
                 CompiledReplacement::Literal { from, to } => body.replace(from, to),
@@ -473,6 +479,9 @@ impl CompiledDictionary {
                     pattern.replace_all(&body, to.as_str()).into_owned()
                 }
             };
+            if let Some((end, _)) = body.char_indices().nth(limit) {
+                body.truncate(end);
+            }
         }
         body
     }
@@ -985,9 +994,32 @@ mod tests {
             }]);
             assert!(cache.0.is_empty());
             for body in ["", "本文", "a b"] {
-                assert_eq!(cache.apply(body.into()), body);
+                assert_eq!(cache.apply(body.into(), 0), body);
             }
         }
+    }
+
+    #[test]
+    fn tts_dictionary_caps_1000_doubling_stages_in_chars() {
+        let doubling = TtsDictEntry {
+            from: "🍣".into(),
+            to: "🍣🍣".into(),
+            regex: false,
+        };
+        // 長い連鎖の前に、短い連鎖で各段に上限が効くことを確かめる。
+        let mut entries = vec![doubling.clone(); 9];
+        entries.push(TtsDictEntry {
+            from: "^🍣{80}$".into(),
+            to: "上限内".into(),
+            regex: true,
+        });
+        let cache = CompiledDictionary::new(&entries);
+        assert_eq!(cache.apply("🍣".into(), 20), "上限内");
+
+        let entries = vec![doubling; crate::config::MAX_TTS_DICTIONARY_ENTRIES];
+        let cache = CompiledDictionary::new(&entries);
+        assert_eq!(cache.apply("🍣".into(), 20), "🍣".repeat(80));
+        assert_eq!(cache.apply("🍣".into(), 0), "🍣".repeat(10_000));
     }
 
     #[test]
@@ -1057,6 +1089,11 @@ mod tests {
                 TtsDictEntry {
                     from: "[".into(),
                     to: "bad".into(),
+                    regex: true,
+                },
+                TtsDictEntry {
+                    from: "[A-Za-z]{900000}".into(),
+                    to: "ignored-oversized-regex".into(),
                     regex: true,
                 },
                 TtsDictEntry {

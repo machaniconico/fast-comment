@@ -4,7 +4,7 @@ use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::config::{TtsDictEntry, MAX_TTS_DICTIONARY_ENTRIES};
+use crate::config::{TtsDictEntry, MAX_TTS_DICTIONARY_ENTRIES, TTS_DICTIONARY_ENTRY_LIMIT_ERROR};
 
 mod download;
 pub(crate) use download::fetch;
@@ -14,9 +14,8 @@ const VERSION: u64 = 1;
 const MAX_CHARS: usize = 200;
 const MAX_REJECTIONS: usize = 20;
 const REGEX_LIMIT: usize = 1024 * 1024;
-const ENTRY_LIMIT_ERROR: &str = "読み上げ辞書は1000件までです";
 
-#[derive(Deserialize)]
+#[derive(Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) enum ImportMode {
     Append,
@@ -30,6 +29,7 @@ pub(crate) struct ImportResult {
     pub replaced: usize,
     pub skipped_duplicate: usize,
     pub rejected: Vec<Rejection>,
+    pub rejected_count: usize,
     pub total: usize,
 }
 
@@ -43,6 +43,8 @@ pub(crate) struct Rejection {
 pub(crate) struct ParsedDictionary {
     entries: Vec<TtsDictEntry>,
     rejected: Vec<Rejection>,
+    rejected_count: usize,
+    explicitly_empty: bool,
 }
 
 pub(crate) fn export(entries: &[TtsDictEntry]) -> Result<String, String> {
@@ -82,22 +84,32 @@ pub(crate) fn parse(raw: &[u8]) -> Result<ParsedDictionary, String> {
         _ => return Err("読み上げ辞書はオブジェクトまたは配列で指定してください".into()),
     };
     if rows.len() > MAX_TTS_DICTIONARY_ENTRIES {
-        return Err(ENTRY_LIMIT_ERROR.into());
+        return Err(TTS_DICTIONARY_ENTRY_LIMIT_ERROR.into());
     }
 
     let mut entries = Vec::with_capacity(rows.len());
     let mut rejected = Vec::new();
+    let mut rejected_count = 0;
     for (index, row) in rows.iter().enumerate() {
         match parse_entry(row) {
             Ok(entry) => entries.push(entry),
-            Err(reason) if rejected.len() < MAX_REJECTIONS => rejected.push(Rejection {
-                index: index + 1,
-                reason,
-            }),
-            Err(_) => {}
+            Err(reason) => {
+                rejected_count += 1;
+                if rejected.len() < MAX_REJECTIONS {
+                    rejected.push(Rejection {
+                        index: index + 1,
+                        reason,
+                    });
+                }
+            }
         }
     }
-    Ok(ParsedDictionary { entries, rejected })
+    Ok(ParsedDictionary {
+        entries,
+        rejected,
+        rejected_count,
+        explicitly_empty: root.is_object() && rows.is_empty(),
+    })
 }
 
 fn parse_entry(row: &Value) -> Result<TtsDictEntry, &'static str> {
@@ -107,10 +119,12 @@ fn parse_entry(row: &Value) -> Result<TtsDictEntry, &'static str> {
     let field = |names: &[&str]| names.iter().find_map(|name| row.get(*name));
     let from = field(&["from", "pattern", "word", "key"])
         .and_then(Value::as_str)
-        .ok_or("fromは文字列で指定してください")?
-        .trim();
-    if from.is_empty() || from.chars().take(MAX_CHARS + 1).count() > MAX_CHARS {
-        return Err("fromは前後の空白を除いて1〜200文字で指定してください");
+        .ok_or("fromは文字列で指定してください")?;
+    if from.trim().is_empty() {
+        return Err("fromに空白以外の文字を入力してください");
+    }
+    if from.chars().take(MAX_CHARS + 1).count() > MAX_CHARS {
+        return Err("fromは空白を含めて200文字以内で指定してください");
     }
     let to = field(&["to", "reading", "replace", "value"])
         .and_then(Value::as_str)
@@ -147,12 +161,39 @@ pub(crate) fn merge(
     parsed: ParsedDictionary,
     mode: ImportMode,
 ) -> Result<(Vec<TtsDictEntry>, ImportResult), String> {
-    let ParsedDictionary { entries, rejected } = parsed;
+    let ParsedDictionary {
+        entries,
+        rejected,
+        rejected_count,
+        explicitly_empty,
+    } = parsed;
+    if entries.is_empty() {
+        if rejected_count > 0 {
+            use std::fmt::Write as _;
+
+            let mut error =
+                format!("有効な読み上げ辞書の項目がありません（拒否 {rejected_count} 件）");
+            for Rejection { index, reason } in &rejected {
+                let _ = write!(error, "\n{index} 件目 — {reason}");
+            }
+            let remaining = rejected_count - rejected.len();
+            if remaining > 0 {
+                let _ = write!(error, "\nほか {remaining} 件");
+            }
+            return Err(error);
+        }
+        if mode == ImportMode::Replace && !explicitly_empty {
+            return Err(
+                "辞書を空にするには、書き出し形式の entries に空の配列を指定してください".into(),
+            );
+        }
+    }
     let mut result = ImportResult {
         added: 0,
         replaced: 0,
         skipped_duplicate: 0,
         rejected,
+        rejected_count,
         total: 0,
     };
     let dictionary = match mode {
@@ -178,7 +219,7 @@ pub(crate) fn merge(
         }
     };
     if dictionary.len() > MAX_TTS_DICTIONARY_ENTRIES {
-        return Err(ENTRY_LIMIT_ERROR.into());
+        return Err(TTS_DICTIONARY_ENTRY_LIMIT_ERROR.into());
     }
     result.total = dictionary.len();
     Ok((dictionary, result))

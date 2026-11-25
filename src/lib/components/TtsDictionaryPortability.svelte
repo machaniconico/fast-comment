@@ -148,12 +148,15 @@
     {:else if result}
       <p>追加 {result.added} 件、置き換え {result.replaced} 件、重複スキップ {result.skippedDuplicate} 件、辞書全体 {result.total} 件</p>
       {#if result.rejected.length}
-        <p>取り込めなかった項目（最大20件）</p>
+        <p>取り込めなかった項目 {result.rejectedCount} 件</p>
         <ul>
           {#each result.rejected as { index, reason } (index)}
-            <li>{index}行目 — {reason}</li>
+            <li>{index} 件目 — {reason}</li>
           {/each}
         </ul>
+        {#if result.rejectedCount > result.rejected.length}
+          <p>ほか {result.rejectedCount - result.rejected.length} 件</p>
+        {/if}
       {/if}
     {:else if message}
       <p>{message}</p>
@@ -225,5 +228,6 @@
 
   .error {
     color: #ef9a9a;
+    white-space: pre-line;
   }
 </style>

@@ -3,7 +3,7 @@
   import type {
     AppConfig, EffectRule, EffectsConfig, EffectTarget, GoalsConfig, InjectTestCommentOptions, TtsDictEntry, TtsOptions,
     TimerConfig, WelcomeConfig, YoutubeOauthStatus, TwitchOauthStatus, TwitchDeviceLogin, OAuthService,
-    ConfigCommit, OAuthClientSaved
+    ConfigCommit, OAuthClientSaved, TtsDictionaryCommit
   } from '../ipc';
   import {
     isTauri, getConfigSnapshot, setConfig, configChangedError, getObsUrl, getObsGoalsUrl, getObsTimerUrl, getObsPollUrl, exportCommentsCsv, injectTestComment, testKeywordEffect,
@@ -1018,6 +1018,18 @@
 
   function removeTtsDictionaryEntry(index: number) {
     ttsDictionary = ttsDictionary.filter((_, i) => i !== index);
+  }
+
+  function onTtsDictionaryImported({ revision, dictionary }: TtsDictionaryCommit) {
+    if (revision === null || destroyed || !newerThanBase(revision)) return;
+    // 取り込みの応答には保存済みの辞書全体があるので、他の設定に差分があっても辞書は反映できる。
+    ttsDictionary = normalizeTtsDictionary(dictionary);
+    if (config) config.tts.options.dictionary = dictionary;
+    if (baseRevision !== undefined && revision === baseRevision + 1) {
+      baseRevision = revision;
+    } else {
+      configSync.reloadRequired = true;
+    }
   }
 
   function refreshLogDir() {
@@ -2540,7 +2552,7 @@
     <fieldset class="dict-editor" disabled={configSync.importing === 'ttsDictionary'} aria-label="読み上げ辞書">
       <div class="dict-header">
         <span>読み上げ辞書</span>
-        <button type="button" class="copy-btn" onclick={addTtsDictionaryEntry}>行追加</button>
+        <button type="button" class="copy-btn" onclick={addTtsDictionaryEntry} disabled={ttsDictionary.length >= 1000}>行追加</button>
       </div>
       {#if ttsDictionary.length === 0}
         <p class="hint">置換前と置換後を入力すると、読み上げ本文だけに上から順に適用されます。</p>
@@ -2551,6 +2563,7 @@
           <input
             id={`tts-dict-from-${index}`}
             type="text"
+            maxlength="200"
             bind:value={entry.from}
             class="id-input dict-input"
             placeholder="置換前"
@@ -2559,6 +2572,7 @@
           <input
             id={`tts-dict-to-${index}`}
             type="text"
+            maxlength="200"
             bind:value={entry.to}
             class="id-input dict-input"
             placeholder="置換後"
@@ -2571,10 +2585,7 @@
     <TtsDictionaryPortability
       disabled={allFieldsLocked || configSync.reloadRequired}
       hasDictionaryEdits={hasTtsDictionaryEdits}
-      onImported={(commit) => applyCommit(commit.revision, () => {
-        ttsDictionary = normalizeTtsDictionary(commit.dictionary);
-        if (config) config.tts.options.dictionary = commit.dictionary;
-      })}
+      onImported={onTtsDictionaryImported}
     />
   </section>
 

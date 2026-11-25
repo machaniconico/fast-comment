@@ -1982,11 +1982,25 @@ async fn save_tts_dictionary(
     let parsed = tts_dictionary::parse(raw)?;
     let _write = state.config_write.lock().await;
     let mut current = state.config.lock().unwrap();
+    commit_tts_dictionary(&mut current, parsed, mode, |current, next| {
+        state.commit_config(current, next)
+    })
+}
+
+fn commit_tts_dictionary(
+    current: &mut AppConfig,
+    parsed: tts_dictionary::ParsedDictionary,
+    mode: tts_dictionary::ImportMode,
+    commit: impl FnOnce(&mut AppConfig, AppConfig) -> Result<u64, ConfigCommitError>,
+) -> Result<ConfigCommit<TtsDictionarySaved>, String> {
     let (dictionary, result) = tts_dictionary::merge(&current.tts.options.dictionary, parsed, mode)?;
-    let revision = if dictionary != current.tts.options.dictionary {
+    // 保存済みと同じ辞書への置き換えも、画面の未保存分を置き換えるため revision を進める。
+    let revision = if mode == tts_dictionary::ImportMode::Replace
+        || dictionary != current.tts.options.dictionary
+    {
         let mut next = current.clone();
         next.tts.options.dictionary = dictionary.clone();
-        Some(state.commit_config(&mut current, next).map_err(|error| error.to_string())?)
+        Some(commit(current, next).map_err(|error| error.to_string())?)
     } else {
         None
     };
@@ -3872,9 +3886,9 @@ where
     let env_filter = env
         .and_then(|value| EnvFilter::try_new(value).ok())
         .unwrap_or_else(|| EnvFilter::new("info"));
-    // WS ハンドシェイクの TRACE にはトークン付きリクエスト行が含まれる。
-    let ws_ceiling = filter_fn(|meta| {
-        let ws_target = ["tungstenite", "tokio_tungstenite"]
+    // HTTP/WS クライアントの詳細ログにはトークン付き URL が含まれ得る。
+    let network_ceiling = filter_fn(|meta| {
+        let network_target = ["tungstenite", "tokio_tungstenite", "reqwest", "hyper", "hyper_util"]
             .into_iter()
             .any(|target| {
                 meta.target() == target
@@ -3883,14 +3897,14 @@ where
                         .strip_prefix(target)
                         .is_some_and(|suffix| suffix.starts_with("::"))
             });
-        !ws_target || *meta.level() <= tracing::Level::INFO
+        !network_target || *meta.level() <= tracing::Level::INFO
     });
     tracing_subscriber::registry()
         .with(env_filter)
         .with(
             tracing_subscriber::fmt::layer()
                 .with_writer(writer)
-                .with_filter(ws_ceiling),
+                .with_filter(network_ceiling),
         )
 }
 
@@ -5381,6 +5395,59 @@ mod followup_tests {
     }
 
     #[test]
+    fn tts_dictionary_identical_replace_returns_a_revision_for_the_editor() {
+        let (dir, revision, tx, mut current) = commit_parts();
+        current.tts.options.dictionary.push(config::TtsDictEntry {
+            from: " 草 ".into(),
+            to: "くさ".into(),
+            regex: false,
+        });
+        let dictionary = current.tts.options.dictionary.clone();
+        let raw = tts_dictionary::export(&dictionary).unwrap();
+        let result = commit_tts_dictionary(
+            &mut current,
+            tts_dictionary::parse(raw.as_bytes()).unwrap(),
+            tts_dictionary::ImportMode::Replace,
+            |current, next| commit_config(dir.path(), &revision, &tx, current, next, None),
+        )
+        .unwrap();
+        assert_eq!(result.revision, Some(1));
+        assert_eq!(result.saved.dictionary, dictionary);
+        assert_eq!(AppConfig::load(dir.path()).unwrap().tts.options.dictionary, dictionary);
+    }
+
+    #[test]
+    fn tts_dictionary_all_rejected_imports_leave_config_untouched() {
+        let (dir, revision, tx, mut current) = commit_parts();
+        let mut next = current.clone();
+        next.tts.options.dictionary.push(config::TtsDictEntry {
+            from: "草".into(),
+            to: "くさ".into(),
+            regex: false,
+        });
+        commit_config(dir.path(), &revision, &tx, &mut current, next, None).unwrap();
+        let path = AppConfig::path_in(dir.path());
+        let before = std::fs::read(&path).unwrap();
+        let dictionary = current.tts.options.dictionary.clone();
+        let raw = serde_json::to_vec(&vec![serde_json::Value::Null; 21]).unwrap();
+        for mode in [tts_dictionary::ImportMode::Append, tts_dictionary::ImportMode::Replace] {
+            let result = commit_tts_dictionary(
+                &mut current,
+                tts_dictionary::parse(&raw).unwrap(),
+                mode,
+                |_, _| panic!("全件拒否した場合は保存しない"),
+            );
+            let error = result.err().unwrap();
+            assert!(error.contains("拒否 21 件"));
+            assert!(error.contains("1 件目 — 項目はオブジェクトで指定してください"));
+            assert!(error.contains("ほか 1 件"));
+            assert_eq!(current.tts.options.dictionary, dictionary);
+            assert_eq!(revision.load(Ordering::SeqCst), 1);
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+    }
+
+    #[test]
     fn stale_base_revision_update_is_rejected_without_changes() {
         let (dir, revision, tx, mut current) = commit_parts();
         // 画面が revision 0 で読んだ後、別経路(NG 追加など)が保存した。
@@ -5879,6 +5946,26 @@ mod log_filter_tests {
         let specific = logged(Some("tungstenite::handshake::client=trace"));
         assert!(specific.contains("ws-client-info"));
         assert!(!specific.contains("ws-info"));
+    }
+
+    #[test]
+    fn tts_dictionary_http_client_debug_and_trace_are_filtered() {
+        for env in ["trace", "reqwest::connect=trace,hyper=trace,hyper_util=trace"] {
+            let sink = Sink::default();
+            tracing::subscriber::with_default(log_subscriber(Some(env), sink.clone()), || {
+                tracing::debug!(target: "reqwest::connect", "https://example.test/?token=SECRET");
+                tracing::trace!(target: "reqwest::connect", "https://example.test/?token=SECRET");
+                tracing::debug!(target: "hyper", "https://example.test/?token=SECRET");
+                tracing::trace!(target: "hyper::client", "https://example.test/?token=SECRET");
+                tracing::debug!(target: "hyper_util::client", "https://example.test/?token=SECRET");
+                tracing::info!(target: "reqwest::connect", "reqwest-info");
+                tracing::info!(target: "hyper::client", "hyper-info");
+            });
+            let output = sink.output();
+            assert!(!output.contains("SECRET"), "RUST_LOG={env}");
+            assert!(output.contains("reqwest-info"), "RUST_LOG={env}");
+            assert!(output.contains("hyper-info"), "RUST_LOG={env}");
+        }
     }
 
     #[test]
