@@ -1,17 +1,17 @@
 <script lang="ts">
-  import { getConfig, setConfig, type AppConfig } from '../ipc';
+  import { exportConfig, importConfig, type ExportedConfig } from '../ipc';
   import { configReloadMessage, configSync } from '../configSync.svelte';
   import { theme, type AppearanceSnapshot } from '../theme.svelte';
 
   const SCHEMA = 'fast-comment/settings';
-  // update_config の型エラーは Rust が固定フィールド名だけで組み立てる。
+  // import_config の型エラーは Rust が固定フィールド名だけで組み立てる。
   const configTypeError = /^設定の形式が不正です \(項目 (?:\.|[a-zA-Z][a-zA-Z0-9]*(?:\.[a-zA-Z][a-zA-Z0-9]*)*)\)$/;
 
   interface SettingsBundle {
     schema: typeof SCHEMA;
     version: 1;
     exportedAt: string;
-    config: AppConfig;
+    config: ExportedConfig;
     appearance: AppearanceSnapshot;
   }
 
@@ -61,7 +61,7 @@
     status = { kind: 'error', message };
   }
 
-  function buildBundle(config: AppConfig): SettingsBundle {
+  function buildBundle(config: ExportedConfig): SettingsBundle {
     return {
       schema: SCHEMA,
       version: 1,
@@ -92,7 +92,7 @@
     status = null;
 
     try {
-      const config = await getConfig();
+      const config = await exportConfig();
       if (!config) {
         showError('設定を取得できませんでした。Tauri環境で開いてから再試行してください。');
         return;
@@ -125,7 +125,7 @@
     }
   }
 
-  function parseBundle(raw: string): { config: AppConfig; appearance?: unknown } {
+  function parseBundle(raw: string): { config: ExportedConfig; appearance?: unknown } {
     let parsed: unknown;
     try {
       parsed = JSON.parse(raw);
@@ -146,7 +146,7 @@
     }
 
     return {
-      config: parsed.config as unknown as AppConfig,
+      config: parsed.config,
       appearance: parsed.appearance,
     };
   }
@@ -160,7 +160,7 @@
       return;
     }
 
-    let parsed: { config: AppConfig; appearance?: unknown };
+    let parsed: { config: ExportedConfig; appearance?: unknown };
     try {
       parsed = parseBundle(trimmed);
     } catch (e) {
@@ -181,7 +181,7 @@
     configSync.importing = 'all';
     status = null;
     try {
-      const result = await setConfig(parsed.config);
+      const result = await importConfig(parsed.config);
       if (result && result.revision > configSync.revision) configSync.revision = result.revision;
       if (parsed.appearance !== undefined) theme.applySnapshot(parsed.appearance);
       if (!result) {
@@ -255,6 +255,7 @@
 
   <div class="portability-block">
     <h4>エクスポート</h4>
+    <p class="portability-note">ログイン情報(トークン・Cookie・API キー・Client ID)は書き出しません。URL のユーザー名とパスワードも消します。</p>
     <div class="field-row portability-actions">
       <button type="button" class="export-btn" onclick={onExport} disabled={exporting}>
         {exporting ? 'エクスポート中...' : '設定JSONをエクスポート'}
@@ -277,6 +278,7 @@
 
   <div class="portability-block">
     <h4>インポート</h4>
+    <p class="portability-note">ログイン情報と接続先 URL の欄は、ファイルの値を使わず今の設定のままにします。</p>
     <div class="field-row portability-actions">
       <label class="file-button" for="settings-import-file">JSONファイルを選択</label>
       <input
@@ -378,6 +380,12 @@
   .portability-label {
     color: #ccc;
     font-size: 12px;
+  }
+
+  .portability-note {
+    color: #757575;
+    font-size: 11px;
+    margin: 0;
   }
 
   .portability-textarea {

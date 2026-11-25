@@ -931,6 +931,13 @@ struct ConfigSnapshot {
     revision: u64,
 }
 
+/// 設定の書き出し用の写し。資格情報は Rust 側で消してから渡す(SPEC §8.1)。
+#[tauri::command]
+fn export_config(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    let config = state.config.lock().unwrap();
+    backup::export_config(&config).map_err(Into::into)
+}
+
 /// 現在の設定と、その revision を取得する。
 #[tauri::command]
 fn get_config(state: State<'_, AppState>) -> Result<ConfigSnapshot, String> {
@@ -1856,7 +1863,30 @@ async fn update_config(
     new_config: serde_json::Value,
     base_revision: Option<u64>,
 ) -> Result<UpdateConfigOutcome, String> {
+    save_config_update(app, state, new_config, base_revision, false).await
+}
+
+/// 書き出した設定(SPEC §8.1)を読み込む。資格情報と URL の欄は今の値のままにする。
+#[tauri::command]
+async fn import_config(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    new_config: serde_json::Value,
+) -> Result<UpdateConfigOutcome, String> {
+    save_config_update(app, state, new_config, None, true).await
+}
+
+async fn save_config_update(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    mut new_config: serde_json::Value,
+    base_revision: Option<u64>,
+    imported: bool,
+) -> Result<UpdateConfigOutcome, String> {
     let write = state.config_write.lock().await;
+    if imported {
+        backup::keep_current_redacted(&mut new_config, &state.config.lock().unwrap())?;
+    }
     let mut new_config = parse_config_update(
         state.config_revision.load(Ordering::SeqCst),
         base_revision,
@@ -4640,6 +4670,7 @@ pub fn run() {
             list_listeners,
             delete_listener,
             get_config,
+            export_config,
             take_startup_config_notice,
             get_comment_log_dir,
             open_comment_log_dir,
@@ -4665,6 +4696,7 @@ pub fn run() {
             moderate_ban_user,
             moderate_unban_user,
             update_config,
+            import_config,
             set_goals_show_in_app,
             append_moderation_value,
             set_moderation,

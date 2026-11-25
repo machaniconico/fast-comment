@@ -32,9 +32,10 @@ const OVERRIDE_SECRETS: &[&[&str]] = &[
     &["xOverrides", "bearerToken"],
     &["youtubeOverrides", "apiKey"],
 ];
-/// 復元時に今の値を引き継ぐ欄(資格情報、外部プログラムの起動、OAuth の redirect URI)。
+/// 資格情報の欄。zip では空にし、設定の書き出し(SPEC §8.1)では欄ごと消す。
+const CREDENTIALS: &[&str] = &["credentials"];
+/// 秘密ではないが、復元時に今の値を引き継ぐ欄(外部プログラムの起動、OAuth の redirect URI)。
 const LOCAL_CONFIG_FIELDS: &[&[&str]] = &[
-    &["credentials"],
     &["tts", "options", "bouyomiPath"],
     &["tts", "options", "bouyomiLaunchElevated"],
     // redirect URI のポートは、今の Client ID に登録した値と揃える。
@@ -48,6 +49,14 @@ const URL_FIELDS: &[&[&str]] = &[
     &["niconicoOverrides", "endpoints"],
     &["twitcastingOverrides", "endpoints"],
 ];
+const EXPORT_SECRET_ERROR: &str = "資格情報と同じ値が他の欄にあるため、設定を書き出せません";
+
+/// zip と設定の書き出しが値を伏せる欄。復元と設定の読み込みは、ここを今の値のままにする。
+fn redacted_fields() -> impl Iterator<Item = &'static [&'static str]> {
+    std::iter::once(CREDENTIALS)
+        .chain(OVERRIDE_SECRETS.iter().copied())
+        .chain(URL_FIELDS.iter().copied())
+}
 const SCHEMA: &str = "fast-comment-backup";
 const MANIFEST: &str = "manifest.json";
 const READY: &str = "READY";
@@ -644,6 +653,86 @@ fn set_config_field(
     }
 }
 
+/// 設定にある鍵・トークン・Cookie を、残存検査用の正規表現として集める。
+fn collect_secrets(config: &serde_json::Map<String, Value>) -> BTreeSet<String> {
+    let mut secrets = BTreeSet::new();
+    for field in CREDENTIAL_SECRETS {
+        collect_secret(config_field(config, &["credentials", field]), &mut secrets);
+    }
+    for path in OVERRIDE_SECRETS {
+        collect_secret(config_field(config, path), &mut secrets);
+    }
+    secrets
+}
+
+/// zip と設定の書き出しで共通の伏せ方。`credentials` の扱いだけ呼び出し側で分かれる。
+fn redact_overrides(config: &mut serde_json::Map<String, Value>) {
+    for path in OVERRIDE_SECRETS {
+        set_config_field(config, path, None);
+    }
+    for path in URL_FIELDS {
+        if let Some(mut value) = config_field(config, path).cloned() {
+            strip_url_user_info(&mut value);
+            set_config_field(config, path, Some(value));
+        }
+    }
+}
+
+fn contains_secret<'a>(
+    secrets: BTreeSet<String>,
+    mut haystacks: impl Iterator<Item = &'a [u8]>,
+) -> Result<bool> {
+    if secrets.is_empty() {
+        return Ok(false);
+    }
+    let matches =
+        regex::bytes::RegexSet::new(secrets).map_err(|_| BackupError::Invalid("資格情報の検査"))?;
+    Ok(haystacks.any(|bytes| matches.is_match(bytes)))
+}
+
+/// 設定の書き出し(SPEC §8.1)。zip と同じ欄を伏せ、`credentials` は欄ごと消す。
+/// 伏せた後も 8 文字以上の鍵・トークン・Cookie が残る設定は書き出さない。
+pub(crate) fn export_config(config: &AppConfig) -> std::result::Result<Value, &'static str> {
+    let Ok(Value::Object(mut exported)) = serde_json::to_value(config) else {
+        return Err("設定を書き出せません");
+    };
+    let secrets = collect_secrets(&exported);
+    redact_overrides(&mut exported);
+    set_config_field(&mut exported, CREDENTIALS, None);
+    let exported = Value::Object(exported);
+    let text = exported.to_string();
+    match contains_secret(secrets, std::iter::once(text.as_bytes())) {
+        Ok(false) => Ok(exported),
+        _ => Err(EXPORT_SECRET_ERROR),
+    }
+}
+
+/// 設定の読み込み(SPEC §8.1)。書き出しが伏せる欄はファイルの値を使わず、今の値に差し替える
+/// (旧版の書き出しに残る資格情報も適用しない)。エラー文は固定の欄名だけで組み立てる。
+pub(crate) fn keep_current_redacted(
+    imported: &mut Value,
+    current: &AppConfig,
+) -> std::result::Result<(), String> {
+    let invalid = |field: &str| format!("設定の形式が不正です (項目 {field})");
+    let imported = imported.as_object_mut().ok_or_else(|| invalid("."))?;
+    let Ok(Value::Object(current)) = serde_json::to_value(current) else {
+        return Err(invalid("."));
+    };
+    for path in redacted_fields() {
+        // serde の struct は配列からも読める。名前で辿れない親は差し替えられないので拒否する。
+        let mut object = &*imported;
+        for (depth, parent) in path[..path.len() - 1].iter().enumerate() {
+            match object.get(*parent) {
+                None => break,
+                Some(Value::Object(child)) => object = child,
+                Some(_) => return Err(invalid(&path[..=depth].join("."))),
+            }
+        }
+        set_config_field(imported, path, config_field(&current, path).cloned());
+    }
+    Ok(())
+}
+
 fn snapshot(config_dir: &Path, now_ms: u64) -> Result<Contents> {
     let mut contents = Contents::default();
     for &name in FILES {
@@ -662,20 +751,9 @@ fn snapshot(config_dir: &Path, now_ms: u64) -> Result<Contents> {
     let mut secrets = BTreeSet::new();
     if let Some(bytes) = contents.files.get_mut("config.json") {
         let mut config = config_object(bytes)?;
-        for field in CREDENTIAL_SECRETS {
-            collect_secret(config_field(&config, &["credentials", field]), &mut secrets);
-        }
-        for path in OVERRIDE_SECRETS {
-            collect_secret(config_field(&config, path), &mut secrets);
-            set_config_field(&mut config, path, None);
-        }
-        for path in URL_FIELDS {
-            if let Some(mut value) = config_field(&config, path).cloned() {
-                strip_url_user_info(&mut value);
-                set_config_field(&mut config, path, Some(value));
-            }
-        }
-        config.insert("credentials".into(), empty_credentials());
+        secrets = collect_secrets(&config);
+        redact_overrides(&mut config);
+        set_config_field(&mut config, CREDENTIALS, Some(empty_credentials()));
         contents.total_bytes -= bytes.len() as u64;
         *bytes = encode(&config)?;
         if bytes.len() as u64 > MAX_FILE_BYTES
@@ -696,18 +774,14 @@ fn snapshot(config_dir: &Path, now_ms: u64) -> Result<Contents> {
     contents.validate()?;
     // 復元できない写しで正常な世代を押し出さない。
     contents.validate_stores()?;
-    if !secrets.is_empty() {
-        let matches = regex::bytes::RegexSet::new(secrets)
-            .map_err(|_| BackupError::Invalid("資格情報の検査"))?;
-        if contents
-            .files
-            .iter()
-            .any(|(name, bytes)| matches.is_match(name.as_bytes()) || matches.is_match(bytes))
-        {
-            return Err(BackupError::Invalid(
-                "バックアップ対象に資格情報が含まれています",
-            ));
-        }
+    let files = contents
+        .files
+        .iter()
+        .flat_map(|(name, bytes)| [name.as_bytes(), bytes.as_slice()]);
+    if contains_secret(secrets, files)? {
+        return Err(BackupError::Invalid(
+            "バックアップ対象に資格情報が含まれています",
+        ));
     }
     Ok(contents)
 }
@@ -1011,13 +1085,13 @@ fn prepare_config(config_dir: &Path, snapshot: Option<&[u8]>) -> Result<Option<V
         let defaults =
             serde_json::to_value(AppConfig::default()).expect("default config serializes");
         let defaults = defaults.as_object().expect("config object");
-        for path in LOCAL_CONFIG_FIELDS.iter().chain(OVERRIDE_SECRETS).chain(URL_FIELDS) {
+        for path in LOCAL_CONFIG_FIELDS.iter().copied().chain(redacted_fields()) {
             if config_field(&current, path) == config_field(defaults, path) {
                 set_config_field(&mut current, path, None);
             }
         }
     }
-    for path in LOCAL_CONFIG_FIELDS.iter().chain(OVERRIDE_SECRETS).chain(URL_FIELDS) {
+    for path in LOCAL_CONFIG_FIELDS.iter().copied().chain(redacted_fields()) {
         set_config_field(&mut restored, path, config_field(&current, path).cloned());
     }
     if snapshot.is_none() && restored.is_empty() {
@@ -2020,6 +2094,184 @@ mod tests {
             [("watchPageBaseUrl".into(), "https://current.invalid/w/".into())].into()
         );
         assert!(config.twitcasting_overrides.endpoints.is_empty());
+    }
+
+    /// 合成値だけで作った設定。伏せる欄の値はすべて `syn-<tag>-` を含む。
+    fn synthetic_config(tag: &str) -> AppConfig {
+        let secret = |name: &str| format!("syn-{tag}-{name}");
+        let url = |host: &str| format!("https://syn-{tag}-user:syn-{tag}-pass@{host}/path");
+        let mut config = AppConfig {
+            // 全フィールドを列挙する(欄を足した時にコンパイルエラーで気付く)。
+            credentials: CredentialsConfig {
+                twitch_oauth: format!("oauth:{}", secret("twitch-oauth")),
+                twitch_username: secret("twitch-username"),
+                twitch_client_id: secret("twitch-client-id"),
+                twitch_client_secret: secret("twitch-client-secret"),
+                youtube_api_key: secret("youtube-api-key"),
+                youtube_oauth_client_id: secret("youtube-oauth-client-id"),
+                x_auth_token: secret("x-auth-token"),
+                x_csrf_token: secret("x-csrf-token"),
+                x_post_client_id: Some(secret("x-post-client-id")),
+                twitcasting_client_id: Some(secret("twitcasting-client-id")),
+            },
+            ..AppConfig::default()
+        };
+        config.x_overrides.bearer_token = Some(secret("bearer-token"));
+        config.youtube_overrides.api_key = Some(secret("innertube-key"));
+        config.tts.options.voicevox_url = url("voicevox.example.invalid");
+        config
+            .x_overrides
+            .endpoints
+            .insert("liveChatUrl".into(), url("x.example.invalid"));
+        config
+            .niconico_overrides
+            .endpoints
+            .insert("watchPageBaseUrl".into(), url("nico.example.invalid"));
+        config
+            .twitcasting_overrides
+            .endpoints
+            .insert("eventPubSubUrl".into(), url("tc.example.invalid"));
+        config
+    }
+
+    /// `imported` を読み込んだ時に期待する設定。伏せる欄だけ `current` の値になる。
+    fn with_redacted_fields_of(mut imported: AppConfig, current: &AppConfig) -> AppConfig {
+        imported.credentials = current.credentials.clone();
+        imported.x_overrides.bearer_token = current.x_overrides.bearer_token.clone();
+        imported.youtube_overrides.api_key = current.youtube_overrides.api_key.clone();
+        imported.tts.options.voicevox_url = current.tts.options.voicevox_url.clone();
+        imported.x_overrides.endpoints = current.x_overrides.endpoints.clone();
+        imported.niconico_overrides.endpoints = current.niconico_overrides.endpoints.clone();
+        imported.twitcasting_overrides.endpoints = current.twitcasting_overrides.endpoints.clone();
+        imported
+    }
+
+    #[test]
+    fn settings_export_contains_no_secret_value() {
+        let mut config = synthetic_config("exp");
+        config.obs.port = 11190;
+        let exported = export_config(&config).unwrap();
+        let text = exported.to_string();
+        assert!(!text.contains("syn-exp-"), "{text}");
+        assert!(exported.get("credentials").is_none());
+        assert!(exported["xOverrides"].get("bearerToken").is_none());
+        assert!(exported["youtubeOverrides"].get("apiKey").is_none());
+        // URL はユーザー情報だけを消し、接続先は残す。
+        for (path, url) in [
+            (&["tts", "options", "voicevoxUrl"][..], "https://voicevox.example.invalid/path"),
+            (&["xOverrides", "endpoints", "liveChatUrl"], "https://x.example.invalid/path"),
+            (&["niconicoOverrides", "endpoints", "watchPageBaseUrl"], "https://nico.example.invalid/path"),
+            (&["twitcastingOverrides", "endpoints", "eventPubSubUrl"], "https://tc.example.invalid/path"),
+        ] {
+            let object = exported.as_object().unwrap();
+            assert_eq!(config_field(object, path), Some(&Value::from(url)), "{path:?}");
+        }
+        // 資格情報ではない設定はそのまま書き出す。
+        assert_eq!(exported["obs"]["port"], 11190);
+
+        // 既定の設定には伏せる値が無く、欄だけが消える。
+        let exported = export_config(&AppConfig::default()).unwrap();
+        assert!(exported.get("credentials").is_none());
+
+        // 資格情報と同じ値が他の欄にあれば、書き出さない。
+        config.tts.options.name_format = config.credentials.x_auth_token.clone();
+        assert_eq!(export_config(&config), Err(EXPORT_SECRET_ERROR));
+    }
+
+    #[test]
+    fn settings_import_keeps_current_redacted_fields() {
+        let current = synthetic_config("cur");
+        let mut other = synthetic_config("new");
+        other.obs.port = 11190;
+        let expected = with_redacted_fields_of(other.clone(), &current);
+        for mut imported in [
+            // 今の版の書き出し(資格情報の欄が無い)。
+            export_config(&other).unwrap(),
+            // 旧版の書き出し(資格情報、鍵、URL のユーザー情報を含む)。
+            serde_json::to_value(&other).unwrap(),
+        ] {
+            keep_current_redacted(&mut imported, &current).unwrap();
+            assert!(!imported.to_string().contains("syn-new-"));
+            let merged = AppConfig::from_config_update(imported).unwrap();
+            assert_eq!(merged.obs.port, 11190);
+            assert_eq!(merged, expected);
+        }
+
+        // 欄が無い・空のファイルでも、今の値を空で上書きしない。
+        for mut imported in [
+            serde_json::json!({}),
+            serde_json::json!({
+                "credentials": {"xAuthToken": "", "xCsrfToken": ""},
+                "xOverrides": {},
+                "tts": {"options": {"voicevoxUrl": ""}},
+            }),
+            // 丸ごと差し替える欄は、配列で書かれていても今の値になる。
+            serde_json::json!({"credentials": ["syn-new-positional-oauth"]}),
+        ] {
+            keep_current_redacted(&mut imported, &current).unwrap();
+            let merged = AppConfig::from_config_update(imported).unwrap();
+            assert_eq!(merged, with_redacted_fields_of(AppConfig::default(), &current));
+        }
+    }
+
+    #[test]
+    fn settings_import_reads_an_older_export() {
+        let current = synthetic_config("cur");
+        // 旧版の形: 新しい節(backup・soundEffects・twitcasting 等)が無く、資格情報が入っている。
+        let mut imported = serde_json::json!({
+            "channels": [{"platform": "twitch", "identifier": "old_channel"}],
+            "obs": {"port": 11190},
+            "tts": {"options": {
+                "bouyomiPort": 50002,
+                "voicevoxUrl": "http://syn-old-user:syn-old-pass@127.0.0.1:50021",
+            }},
+            "xOverrides": {
+                "bearerToken": "syn-old-bearer-token",
+                "livePollSecs": 45,
+                "endpoints": {"liveChatUrl": "https://syn-old-user:syn-old-pass@x.example.invalid/c"},
+            },
+            "youtubeOverrides": {"apiKey": "syn-old-innertube-key", "clientVersion": "2.1"},
+            "credentials": {
+                "twitchOauth": "oauth:syn-old-twitch-oauth",
+                "twitchUsername": "syn-old-twitch-username",
+                "youtubeApiKey": "syn-old-youtube-api-key",
+                "xAuthToken": "syn-old-x-auth-token",
+                "xCsrfToken": "syn-old-x-csrf-token",
+            },
+        });
+        keep_current_redacted(&mut imported, &current).unwrap();
+        let merged = AppConfig::from_config_update(imported).unwrap();
+        assert!(!serde_json::to_string(&merged).unwrap().contains("syn-old-"));
+        // 資格情報ではない設定はファイルの値になる。
+        assert_eq!(merged.channels.len(), 1);
+        assert_eq!(merged.channels[0].identifier, "old_channel");
+        assert_eq!(merged.obs.port, 11190);
+        assert_eq!(merged.tts.options.bouyomi_port, 50002);
+        assert_eq!(merged.x_overrides.live_poll_secs, Some(45));
+        assert_eq!(merged.youtube_overrides.client_version.as_deref(), Some("2.1"));
+        // 伏せる欄は今の値のまま。
+        assert_eq!(with_redacted_fields_of(merged.clone(), &current), merged);
+    }
+
+    #[test]
+    fn settings_import_rejects_fields_it_cannot_address_by_name() {
+        let current = synthetic_config("cur");
+        for (imported, field) in [
+            (serde_json::json!([]), "."),
+            (serde_json::json!("syn-new-root"), "."),
+            (serde_json::json!({"xOverrides": ["syn-new-bearer-token"]}), "xOverrides"),
+            (serde_json::json!({"youtubeOverrides": ["syn-new-innertube-key"]}), "youtubeOverrides"),
+            (serde_json::json!({"tts": ["voicevox"]}), "tts"),
+            (serde_json::json!({"tts": {"options": ["127.0.0.1"]}}), "tts.options"),
+            (serde_json::json!({"niconicoOverrides": null}), "niconicoOverrides"),
+            (serde_json::json!({"twitcastingOverrides": [{}]}), "twitcastingOverrides"),
+        ] {
+            let mut imported = imported;
+            assert_eq!(
+                keep_current_redacted(&mut imported, &current),
+                Err(format!("設定の形式が不正です (項目 {field})")),
+            );
+        }
     }
 
     #[cfg(unix)]
