@@ -39,6 +39,7 @@
   import XPostSettings from './XPostSettings.svelte';
   import TwitcastingSettings from './TwitcastingSettings.svelte';
   import IntegrationsSettings from './IntegrationsSettings.svelte';
+  import StartupLaunchSettings from './StartupLaunchSettings.svelte';
   import AchievementsSettings from './AchievementsSettings.svelte';
   import { sanitizeXPostNumbers } from '../xAutopost';
   import { DEFAULT_TWITCASTING_CALLBACK_PORT } from '../twitcasting';
@@ -48,10 +49,11 @@
 
   interface Props {
     onConfigSaved?: (config: AppConfig, revision: number) => void;
+    onStartupLaunchApprovalChanged?: (needsApproval: boolean) => void;
     focus?: 'all' | 'goals' | 'danmaku' | 'achievements';
   }
 
-  let { onConfigSaved, focus = 'all' }: Props = $props();
+  let { onConfigSaved, onStartupLaunchApprovalChanged, focus = 'all' }: Props = $props();
   let localApiSettings: { refreshStatus: () => Promise<void> } | undefined = $state();
 
   function onThemeChange(event: Event) {
@@ -1686,6 +1688,12 @@
   </div>
   {/if}
   {:else}
+  {#if focus === 'all'}
+    <section id="settings-startup-launch">
+      <h3>起動時に開く</h3>
+      <StartupLaunchSettings onApprovalChanged={onStartupLaunchApprovalChanged} />
+    </section>
+  {/if}
   <fieldset class="settings-fields" disabled={allFieldsLocked}>
   <section id="settings-appearance">
     <h3>外観</h3>
