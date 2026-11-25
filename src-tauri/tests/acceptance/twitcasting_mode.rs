@@ -434,10 +434,13 @@ async fn mode_official_logged_in_never_touches_unofficial() {
 
 #[tokio::test]
 async fn switch_reuses_channel_name_and_live_event_dedupe() {
-    // 非公式が movie 42 の開始を告知する(eventpubsuburl が返す WS の接続先は閉じたポート)。その後 H1 ×3 で切替
+    // 非公式が movie 42 の開始を告知する。WS は接続直後に切れ、その後 H1 ×3 で切り替わる。
+    let ws = FakeApi::start().await;
+    ws.set_down(true);
+    let ws_url = format!("ws://{}/ws", ws.host());
     let announce = Step {
         html: Reply::html(PAGE_LIVE),
-        pubsub: Some(Reply::json(200, json!({"url": "ws://127.0.0.1:1/ws"}))),
+        pubsub: Some(Reply::json(200, json!({"url": ws_url}))),
     };
     let m = setup(true, vec![announce, h1(), h1(), h1()], h1()).await;
     m.site.set_listall(Reply::json(

@@ -17,7 +17,7 @@ use fast_comment_lib::sources::Source;
 use fast_comment_lib::stats::YoutubeMetadataUpdate;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -478,9 +478,23 @@ impl Script {
 
 // ---------------------------------------------------------------- 認証つきの環境
 
-pub fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap().port()
+pub fn callback_port() -> u16 {
+    // OS が偽サーバや発信ソケットに自動割当する範囲を避け、各 fixture に別の番号を渡す。
+    // OAuth の待受が実際に bind する両方のアドレスで空きを確認する。
+    static NEXT_PORT: AtomicU16 = AtomicU16::new(20_000);
+    loop {
+        let port = NEXT_PORT.fetch_add(1, Ordering::Relaxed);
+        assert!(port < 30_000, "テスト用の OAuth コールバックポートが見つからない");
+        let Ok(_ipv4) = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)) else {
+            continue;
+        };
+        match std::net::TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, port)) {
+            Ok(_) => return port,
+            Err(e) if e.kind() == std::io::ErrorKind::AddrNotAvailable
+                || matches!(e.raw_os_error(), Some(10047 | 97)) => return port,
+            Err(_) => {}
+        }
+    }
 }
 
 pub fn endpoints(base: &str) -> TwitcastingEndpoints {
@@ -515,7 +529,7 @@ pub async fn rig_default_budget() -> Rig {
 pub async fn rig_with(budget: RateBudget) -> Rig {
     let fake = FakeApi::start().await;
     let store = MemorySecretStore::new();
-    let port = free_port();
+    let port = callback_port();
     let options = AuthOptions { port, login_timeout: Duration::from_secs(10), read_timeout: Duration::from_secs(2) };
     let auth = TwitcastingAuth::new(store.clone(), endpoints(&fake.base), options);
     auth.load(Some(CLIENT), epoch_ms()).await;
@@ -537,12 +551,11 @@ pub async fn rig_logged_in_default_budget() -> Rig {
 
 /// 実フロー(認可 URL → ブラウザ役の POST → 検証)でログインする。ログイン済みでも再ログインとして使える。
 pub async fn login(auth: &Auth, port: u16, token: &str) {
-    // free_port は bind して手放した番号なので、他のテストの socket と取り合うことがある(PortInUse)。
-    // 待受の bind に負けて connect が早期終了したら、新しい番号で `connect_on` をやり直す。
+    // 別プロセスが先にポートを取得した場合は、次の番号で待受をやり直す。
     let mut port = port;
     for attempt in 0..8 {
         if attempt > 0 {
-            port = free_port();
+            port = callback_port();
         }
         if try_login(auth, port, token).await {
             return;

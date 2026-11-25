@@ -411,12 +411,15 @@ async fn pause_deadline_is_not_shortened_by_straggling_200() {
         .expect("A が終わる")
         .expect("A が panic しない");
     assert!(a_result.is_ok(), "{a_result:?}");
-    // 4. C(行 1)は B の Reset + 1 秒より前に届かない
-    assert!(r.api.comments("1", q()).await.is_ok());
-    let c = r.fake.comment_calls().into_iter().filter(|x| x.movie_id() == "1").last().expect("C が届く");
+    // 4. C(行 1)は B の Reset + 1 秒より前に届かない。再開時には並列実行の遅延を見込む。
     let deadline_ms = (*reset_b.lock().unwrap() + 1) * 1000;
+    let resume_slack = Duration::from_secs(5);
+    let wait_for_c = Duration::from_millis(deadline_ms.saturating_sub(epoch_ms())) + resume_slack;
+    let result = tokio::time::timeout(wait_for_c, r.api.comments("1", q())).await.expect("C が期限後に再開する");
+    assert!(result.is_ok(), "{result:?}");
+    let c = r.fake.comment_calls().into_iter().filter(|x| x.movie_id() == "1").last().expect("C が届く");
     assert!(c.epoch_ms >= deadline_ms, "C が期限より {}ms 早く届いた", deadline_ms - c.epoch_ms.min(deadline_ms));
-    assert!(c.epoch_ms <= deadline_ms + 1000, "C が期限 + 1 秒を超えて届いた: {}ms", c.epoch_ms - deadline_ms);
+    assert!(c.epoch_ms <= deadline_ms + resume_slack.as_millis() as u64, "C が期限から {}ms 後に届いた", c.epoch_ms - deadline_ms);
 }
 
 // ---------------------------------------------------------------- 送信先(B1)

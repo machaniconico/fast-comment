@@ -2996,9 +2996,17 @@ mod tests {
         assert_eq!(signals, vec![UnofficialSignal::Neutral], "HTML 5xx");
         assert!(notices.is_empty(), "{notices:?}");
 
-        let (signals, notices) =
-            collect_signals("http://127.0.0.1:1".into(), |s| !s.is_empty()).await;
-        assert_eq!(signals, vec![UnofficialSignal::Neutral], "接続拒否");
+        // 閉じたポートは環境によって応答しないため、受け付けた接続を即座に切る。
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let disconnect = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        let (signals, notices) = collect_signals(base, |s| !s.is_empty()).await;
+        disconnect.abort();
+        assert_eq!(signals, vec![UnofficialSignal::Neutral], "ネットワーク断");
         assert!(notices.is_empty(), "{notices:?}");
 
         let port = serve_routes((404, "no"), (200, "{}".into())).await;

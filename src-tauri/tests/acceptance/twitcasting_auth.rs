@@ -30,6 +30,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use crate::twitcasting_common::{callback_port, FakeApi};
+
 const NOW: u64 = 1_731_600_000_000;
 const EXPIRES_IN_MS: u64 = 15_552_000_000;
 const CLIENT: &str = "test-client-id";
@@ -84,11 +86,6 @@ async fn fake(app_client_id: &str, status: u16) -> Fake {
 
 // ---------------------------------------------------------------- 環境
 
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap().port()
-}
-
 struct Env {
     auth: Arc<TwitcastingAuth<MemorySecretStore>>,
     store: MemorySecretStore,
@@ -96,7 +93,7 @@ struct Env {
 }
 
 fn build(store: MemorySecretStore, api_base: String, login_timeout: Duration) -> Env {
-    let port = free_port();
+    let port = callback_port();
     let endpoints = TwitcastingEndpoints { authorize: "http://127.0.0.1:9/oauth2/authorize".into(), api_base };
     let options = AuthOptions { port, login_timeout, read_timeout: Duration::from_secs(2) };
     Env { auth: TwitcastingAuth::new(store.clone(), endpoints, options), store, port }
@@ -108,7 +105,13 @@ fn env_with(f: &Fake) -> Env {
 
 /// 検証先を使わない環境(`load` / `status` / `disconnect` 用)。
 fn env_plain() -> Env {
-    build(MemorySecretStore::new(), format!("http://127.0.0.1:{}", free_port()), Duration::from_secs(10))
+    build(MemorySecretStore::new(), "http://127.0.0.1:9".into(), Duration::from_secs(10))
+}
+
+async fn env_with_network_failure() -> Env {
+    let fake = FakeApi::start().await;
+    fake.set_down(true);
+    build(MemorySecretStore::new(), fake.base, Duration::from_secs(10))
 }
 
 fn record(client: &str, token: &str, expires: Option<u64>) -> String {
@@ -245,10 +248,10 @@ async fn begin_auth<S: SecretStore>(auth: Arc<TwitcastingAuth<S>>, client: &str,
         })
         .await
     });
-    let url = tokio::time::timeout(Duration::from_secs(5), rx)
-        .await
-        .expect("open_browser が呼ばれる")
-        .expect("open_browser が呼ばれる前に connect が終わった");
+    let url = match tokio::time::timeout(Duration::from_secs(5), rx).await.expect("open_browser が呼ばれる") {
+        Ok(url) => url,
+        Err(_) => panic!("open_browser が呼ばれる前に connect が終わった: {:?}", wait(handle).await),
+    };
     Login { handle, state: state_of(&url) }
 }
 
@@ -347,7 +350,7 @@ struct GateEnv {
 }
 
 fn gate_env(f: &Fake, login_timeout: Duration) -> GateEnv {
-    let port = free_port();
+    let port = callback_port();
     let store = GateStore::closed();
     let endpoints = TwitcastingEndpoints { authorize: "http://127.0.0.1:9/oauth2/authorize".into(), api_base: f.base.clone() };
     let options = AuthOptions { port, login_timeout, read_timeout: Duration::from_secs(2) };
@@ -763,7 +766,7 @@ async fn verify_401_rejects_token_and_stores_nothing() {
 
 #[tokio::test]
 async fn verify_network_failure_is_network_and_stores_nothing() {
-    let env = env_plain(); // api_base は閉じたポート
+    let env = env_with_network_failure().await;
     let (r, _) = run_login(&env, CLIENT, NOW, |s| success_body(s)).await;
     assert_eq!(code_str(&err_of(r).code), "network");
     assert!(env.store.keys().is_empty());
@@ -991,7 +994,7 @@ async fn debug_and_error_text_never_contain_token_or_state() {
     states.push(s);
     add_err(&mut texts, &err_of(r));
     // 通信失敗
-    let env = env_plain();
+    let env = env_with_network_failure().await;
     let (r, s) = run_login(&env, CLIENT, NOW, |s| success_body(s)).await;
     states.push(s);
     add_err(&mut texts, &err_of(r));
