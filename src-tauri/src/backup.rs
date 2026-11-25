@@ -497,7 +497,7 @@ pub(crate) enum BackupTrigger {
 }
 
 /// 自動・手動の作成と世代の整理。呼び出し側が直列化する。
-/// `flush` が返す値(ストアのロックなど)は、写しを作り終えるまで持つ。
+/// `flush` が返す値(ストアのロックなど)は、`sounds/` などを読み取る間だけ持つ。圧縮と書き込みの前に放す。
 pub(crate) fn run_backup<G>(
     config_dir: &Path,
     settings: BackupSettings,
@@ -515,8 +515,7 @@ pub(crate) fn run_backup<G>(
     {
         false
     } else {
-        let _held = flush()?;
-        create_backup(config_dir, now_ms)?.is_some()
+        create_backup_with(config_dir, now_ms, flush)?.is_some()
     };
     if !restore_failed {
         prune(config_dir, settings.keep)?;
@@ -766,6 +765,15 @@ fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 pub fn create_backup(config_dir: &Path, now_ms: u64) -> Result<Option<PathBuf>> {
+    create_backup_with(config_dir, now_ms, || Ok(()))
+}
+
+/// `flush` はストアを書き出し、読み取りの間だけ持つ値(ロック)を返す。写しを取り終えたら放す。
+fn create_backup_with<G>(
+    config_dir: &Path,
+    now_ms: u64,
+    flush: impl FnOnce() -> Result<G>,
+) -> Result<Option<PathBuf>> {
     let dir = auto_dir(config_dir)?;
     let backups = read_backups(config_dir)?;
     // 連続作成や時計が戻った場合にも、新しいファイルを最新世代にする。
@@ -777,7 +785,10 @@ pub fn create_backup(config_dir: &Path, now_ms: u64) -> Result<Option<PathBuf>> 
         .first()
         .and_then(|previous| read_archive(&dir.join(&previous.file_name)).ok())
         .map(|previous| previous.digest());
-    let contents = snapshot(config_dir, stamp)?;
+    let held = flush()?;
+    let contents = snapshot(config_dir, stamp);
+    drop(held);
+    let contents = contents?;
     if previous_digest.is_some_and(|previous| previous == contents.digest()) {
         return Ok(None);
     }
@@ -807,6 +818,16 @@ pub fn create_backup(config_dir: &Path, now_ms: u64) -> Result<Option<PathBuf>> 
 }
 
 pub fn stage_restore(config_dir: &Path, backup_file_name: &str, now_ms: u64) -> Result<()> {
+    stage_restore_with(config_dir, backup_file_name, now_ms, || Ok(()))
+}
+
+/// `flush` は、現在の状態の安全バックアップを取る直前に呼ぶ(`create_backup_with` と同じ)。
+pub(crate) fn stage_restore_with<G>(
+    config_dir: &Path,
+    backup_file_name: &str,
+    now_ms: u64,
+    flush: impl FnOnce() -> Result<G>,
+) -> Result<()> {
     if timestamp(backup_file_name).is_none() {
         return Err(BackupError::Invalid("バックアップ名"));
     }
@@ -834,7 +855,7 @@ pub fn stage_restore(config_dir: &Path, backup_file_name: &str, now_ms: u64) -> 
         }
         write_new(&pending.join(SOURCE), backup_file_name.as_bytes())?;
         // 適用するまで prune しない(失敗した復元の復元元を、別の世代の準備で押し出さない)。
-        create_backup(config_dir, now_ms)?;
+        create_backup_with(config_dir, now_ms, flush)?;
         let ready_tmp = pending.join("READY.tmp");
         write_new(&ready_tmp, b"")?;
         fs::rename(ready_tmp, pending.join(READY))?;

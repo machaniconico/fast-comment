@@ -155,17 +155,20 @@
     if (disconnecting) return;
     disconnecting = true;
     successClientId = null;
+    // 資格情報を消す前に拒否された時(保存禁止)は何も変わっていないので、フォームも戻さない。
+    let refused = false;
     try {
       latestStatus = await disconnectXPost(onModeSaved);
       authMsg = 'X との接続を切りました(この PC の認証を消しました。X 側の許可は X の設定から外せます)';
       authOk = true;
     } catch (e) {
+      refused = (e as { code?: unknown } | null)?.code === 'saveRefused';
       authMsg = errorText(e);
       authOk = false;
       await refreshStatus();
     } finally {
-      // Rust 側は切断の成否によらず API モードを Intent モードへ戻している。手元の未保存フォームも合わせる。
-      if (xPost.mode === 'api') xPost.mode = 'intent';
+      // 拒否以外では、Rust 側は切断の成否によらず API モードを Intent モードへ戻している。手元の未保存フォームも合わせる。
+      if (!refused && xPost.mode === 'api') xPost.mode = 'intent';
       disconnecting = false;
     }
   }

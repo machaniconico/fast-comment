@@ -750,6 +750,7 @@ fn error_reason(code: XPostErrorCode) -> &'static str {
         XPostErrorCode::PortInUse => "PortInUse",
         XPostErrorCode::LoginTimeout => "LoginTimeout",
         XPostErrorCode::TokenStore => "TokenStore",
+        XPostErrorCode::SaveRefused => "SaveRefused",
         XPostErrorCode::Other => "Other",
     }
 }

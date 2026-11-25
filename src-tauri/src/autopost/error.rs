@@ -19,6 +19,8 @@ pub enum XPostErrorCode {
     InsufficientCredits,
     RateLimited,
     Uncertain,
+    /// 設定を保存できない状態で、資格情報の削除を始める前に拒否した。
+    SaveRefused,
     Other,
 }
 
@@ -57,6 +59,7 @@ impl XPostError {
             }
             XPostErrorCode::RateLimited => "X の利用上限に達しました。",
             XPostErrorCode::Uncertain => "投稿されたか不明です。X を確認してください。",
+            XPostErrorCode::SaveRefused => "設定を保存できない状態です。",
             XPostErrorCode::Other => "X との連携に失敗しました。",
         };
         Self {

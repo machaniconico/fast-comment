@@ -327,15 +327,13 @@ async fn restore_backup(
         if state.app_cancel.is_cancelled() {
             return Err("アプリを終了しています".to_owned());
         }
-        flush_backup_stores(&state)
-            .and_then(|()| {
-                let _sounds = state.sounds.lock_for_backup();
-                backup::stage_restore(&state.config_dir, &file_name, timer_now_ms())
-            })
-            .map_err(|error| {
-                tracing::warn!("復元の準備に失敗しました: {error}");
-                error.to_string()
-            })?;
+        backup::stage_restore_with(&state.config_dir, &file_name, timer_now_ms(), || {
+            flush_backup_stores(&state).map(|()| state.sounds.lock_for_backup())
+        })
+        .map_err(|error| {
+            tracing::warn!("復元の準備に失敗しました: {error}");
+            error.to_string()
+        })?;
         state.app_cancel.cancel();
         Ok(())
     })
@@ -2665,13 +2663,11 @@ async fn disconnect_x_post(
     state: State<'_, AppState>,
     on_config_saved: tauri::ipc::Channel<ConfigCommit<serde_json::Value>>,
 ) -> Result<OAuthStatus<XPostStatus>, XPostError> {
-    // API モードを戻す保存ができない時は、資格情報を消す前に拒否する。
-    if state.config.lock().unwrap().x_post.mode == "api" {
-        config::ensure_save_allowed(&state.config_dir).map_err(|error| XPostError {
-            code: XPostErrorCode::Other,
-            message: error.to_string(),
-        })?;
-    }
+    // 保存禁止の間は、モードに関係なく資格情報を消す前に拒否する。
+    config::ensure_save_allowed(&state.config_dir).map_err(|error| XPostError {
+        code: XPostErrorCode::SaveRefused,
+        message: error.to_string(),
+    })?;
     let result = state.x_post_auth.disconnect().await;
     {
         let mut cfg = state.config.lock().unwrap();
@@ -3945,6 +3941,11 @@ fn test_keyword_effect(
 
 /// 効果音を判定して `msg.sound` に入れる。設定と実績のレート表は必要な時だけ読む。
 fn stamp_message_sound(state: &AppState, msg: &mut ChatMessage, verdict: &Verdict) {
+    if !state.config.lock().unwrap().sound_effects.enabled {
+        return;
+    }
+    // 効果音の索引は config のロックの外で読む(バックアップの読み取りと待ち合わせない)。
+    let known = state.sounds.known_ids();
     let cfg = state.config.lock().unwrap();
     if !cfg.sound_effects.enabled {
         return;
@@ -3956,7 +3957,8 @@ fn stamp_message_sound(state: &AppState, msg: &mut ChatMessage, verdict: &Verdic
         Default::default()
     };
     let mut gate = state.sound_gate.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    sound_effects::stamp_sound(msg, verdict, &cfg, (&rates, &symbols), |id| state.sounds.contains(id), &mut gate, std::time::Instant::now());
+    let exists = |id: &str| known.as_ref().is_none_or(|ids| ids.contains(id));
+    sound_effects::stamp_sound(msg, verdict, &cfg, (&rates, &symbols), exists, &mut gate, std::time::Instant::now());
 }
 
 fn spawn_achievement_events(
