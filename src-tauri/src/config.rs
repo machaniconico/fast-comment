@@ -1413,6 +1413,8 @@ impl LogConfig {
 #[serde(rename_all = "camelCase")]
 pub struct AppConfig {
     #[serde(default)]
+    pub backup: crate::backup::BackupSettings,
+    #[serde(default)]
     pub log: LogConfig,
     #[serde(default)]
     pub channels: Vec<ChannelConfig>,
@@ -1459,6 +1461,7 @@ pub struct AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         AppConfig {
+            backup: Default::default(),
             log: LogConfig::default(),
             channels: Vec::new(),
             obs: ObsConfig::default(),
@@ -1606,6 +1609,7 @@ impl AppConfig {
 
     /// 範囲外値の丸め。ロード時と更新(保存前)の双方から呼ぶ。
     pub fn normalize_all(&mut self) {
+        self.backup = self.backup.normalized();
         self.obs.normalize();
         self.log.normalize();
         self.tts.options.normalize();
@@ -2046,6 +2050,7 @@ mod tests {
         );
 
         let cfg = AppConfig {
+            backup: crate::backup::BackupSettings { enabled: false, keep: 25 },
             log: LogConfig::default(),
             channels: vec![ChannelConfig {
                 platform: ChannelPlatform::Youtube,

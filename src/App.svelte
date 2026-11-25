@@ -46,7 +46,7 @@
     setGoalsShowInApp,
     getTtsQueueState,
     onTtsNotice,
-    takeStartupConfigNotice,
+    takeStartupConfigNotice, takeStartupRestoreFailure,
     onTtsQueueState,
     setTtsPaused,
     toggleDanmakuOverlay,
@@ -62,6 +62,7 @@
   let unlistenTtsNotice: (() => void) | null = null;
   let unlistenTtsQueueState: (() => void) | null = null;
   let config: AppConfig | null = $state(null);
+  let restoreFailed = $state(false);
   let ttsNotice = $state<TtsNotice | null>(null);
   let ttsNoticeTimer: ReturnType<typeof setTimeout> | null = null;
   let toolsOpen = $state(false);
@@ -196,6 +197,9 @@
     void appUpdate.checkSilently();
     void loadConfig();
     void moderation.refreshAuth();
+    void takeStartupRestoreFailure().then((failed) => {
+      if (!destroyed && failed) restoreFailed = true;
+    }).catch(() => console.warn('[backup] startup notice load failed'));
     {
       const fn = await initStore();
       if (destroyed) fn();
@@ -577,6 +581,14 @@
         </button>
         <button class="update-later" onclick={() => appUpdate.dismiss()} aria-label="更新通知を閉じる（後で）">後で</button>
       {/if}
+    </div>
+  {/if}
+
+  {#if restoreFailed}
+    <div class="tts-notice-banner tts-notice-banner--error" role="status">
+      <span class="tts-notice-banner__text">復元に失敗しました</span>
+      <button class="tts-notice-dismiss" onclick={() => { restoreFailed = false; }}
+        aria-label="復元の通知を閉じる">×</button>
     </div>
   {/if}
 

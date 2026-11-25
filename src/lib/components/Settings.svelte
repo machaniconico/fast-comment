@@ -31,6 +31,7 @@
   } from '../theme.svelte';
   import { buildCsv, setNotify, store } from '../stores.svelte';
   import ConfigPortability from './ConfigPortability.svelte';
+  import BackupPanel from './BackupPanel.svelte';
   import SoundEffectsSettings from './SoundEffectsSettings.svelte';
   import DanmakuSettings from './DanmakuSettings.svelte';
   import ModerationPortability from './ModerationPortability.svelte';
@@ -361,6 +362,7 @@
     twitcastingPortInvalid = false;
     xPostPortInvalid = false;
     if (config) {
+      config.backup ??= { enabled: true, keep: 10 };
       applyModerationConfig(config.moderation);
       credTwitchOauth = config.credentials?.twitchOauth ?? '';
       credTwitchUsername = config.credentials?.twitchUsername ?? '';
@@ -1794,6 +1796,13 @@
       reloading={reloading.all > 0}
     />
   </section>
+
+  {#if config}
+    <section id="settings-backup">
+      <h3>自動バックアップ</h3>
+      <BackupPanel bind:settings={config.backup} />
+    </section>
+  {/if}
 
   <section id="settings-danmaku">
     <h3>弾幕（画面を流れるコメント）</h3>

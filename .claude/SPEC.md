@@ -479,6 +479,14 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
 - コメント画面の NG 追加は `append_moderation_value(kind, value)`、規則 JSON のインポートは `set_moderation(moderation)` を使う。Rust 側で保存を直列化し、最新設定の `moderation` だけを更新する。型とリスト種別は Rust 側で検証する。NG 追加は JavaScript の `String.prototype.trim` と同じ空白を前後から除いて重複を判定する。コメントの操作メニューでは保存失敗をトーストで知らせる。不正な正規表現は既存のモデレーション判定と同様に無視し、パターン本文を含まない警告を記録する。
 - **localStorage 併用**: 一部のUI/ウィンドウ局所設定は各ウィンドウの `localStorage` に保持する(`config.json` には載せない)。現状: 弾幕表示設定(`fc.danmaku`)、テーマ、最前面ピン状態、コマンドパレット履歴 等。これらはウィンドウローカルかつ低リスクなため意図的に localStorage 側に置いている。
 
+### 10.1 自動バックアップと復元 (`backup.rs`)
+
+- `config.json` の `backup { enabled, keep }` で制御する。既定は有効・10 世代。世代数は Rust 側で 1〜50 に丸める。最新が 20 時間以上前か初回なら起動時に作成し、稼働中は 24 時間ごとに作成する。前回と全データの SHA-256 が同じ場合は省略する。設定画面から手動作成、一覧、フォルダを開く操作ができる。
+- 保存先は `<app_config_dir>/backups/auto/fc-backup-<UTC ミリ秒>.zip`。世代の順序は名前の時刻で判定し、この名前の通常ファイルだけを整理する。zip は一時ファイルを同期してから rename で公開する。
+- 対象は `config.json`、`listeners.json`、`achievements.json`、`achievement-progress.json`、`sounds.json` と、`sounds/`、`templates/`、`skin/` のユーザーファイル。対象パスは `manifest.json`（schema `fast-comment-backup`、version 1）に記録する。設定の `credentials` は空にし、OS の資格情報ストアは除外する。対象データに資格情報の値が別途含まれていれば作成を中止する。URL や署名の秘密を保持する `integrations.json`、古い状態へ戻すと二重投稿につながる X 自動告知の台帳、ログ、エクスポート、バックアップ自体、一時ファイルや破損データの退避も除外する。
+- 復元はメイン画面の設定から行う。zip を検証し、対象の相対パスだけを受け付ける。最大 2,000 エントリ、展開後合計 200 MiB、1 エントリ 50 MiB。リンクは拒否する。現在の状態をバックアップした後、`backups/restore-pending/` に展開して `READY` を書き、再起動する。起動時に設定やストアの読み込み前に再検証し、既存の対象を `<名前>.pre-restore-<ms>` に退避してから置き換える。退避は最新 3 世代を残す。失敗時は元に戻し、`restore-failed-<ms>/` に作業データを残して画面に一度だけ通知する。
+- 既知の限界は 2 点。資格情報・ローカル API・Webhook は現在の値を引き継ぐ。X 自動告知の台帳も現在の状態を引き継ぐ。
+
 ## 11. フェーズ計画
 
 - **P0 足場**: 設定/モデル/Tauri雛形/Svelte雛形/ビルド導線(SETUP)

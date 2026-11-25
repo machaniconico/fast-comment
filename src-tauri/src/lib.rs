@@ -17,6 +17,7 @@ pub mod inject;
 pub mod integrations;
 pub mod webhook;
 pub mod autopost;
+pub mod backup;
 pub mod bus;
 pub mod chatlog;
 pub mod config;
@@ -107,6 +108,8 @@ pub struct AppState {
     config: Mutex<AppConfig>,
     /// メイン画面からの通知取得を待つ起動時ロード結果。
     startup_config_outcome: Mutex<Option<ConfigLoadOutcome>>,
+    startup_restore_failed: std::sync::atomic::AtomicBool,
+    backup_lock: Mutex<()>,
     /// 設定の revision。`config` のロック内で、保存に成功するたびに `commit_config` が 1 進める。
     /// プロセス内だけの値で永続化しない。全体保存の楽観的排他に使う。
     config_revision: AtomicU64,
@@ -191,21 +194,151 @@ async fn open_comment_log_dir(state: State<'_, AppState>) -> Result<(), String> 
     tokio::fs::create_dir_all(&dir)
         .await
         .map_err(|e| e.to_string())?;
+    tauri::async_runtime::spawn_blocking(move || open_directory(&dir))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
+}
+
+fn open_directory(dir: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(target_os = "windows")]
+    let mut command = std::process::Command::new("explorer.exe");
+    #[cfg(target_os = "macos")]
+    let mut command = std::process::Command::new("open");
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let mut command = std::process::Command::new("xdg-open");
+    command.arg(dir).spawn().map(|_| ())
+}
+
+#[tauri::command]
+async fn list_backups(state: State<'_, AppState>) -> Result<Vec<backup::BackupEntry>, String> {
+    let dir = state.config_dir.clone();
+    tauri::async_runtime::spawn_blocking(move || backup::list_backups(&dir))
+        .await
+        .map_err(|_| "バックアップの一覧を取得できませんでした".into())
+}
+
+fn flush_backup_stores(state: &AppState) -> Result<(), backup::BackupError> {
+    state.listeners.flush().map_err(|_| backup::BackupError::Io("listeners".into()))?;
+    let engine = state.lock_achievement_engine();
+    if let Some(engine) = engine.as_deref() {
+        engine.flush().map_err(|_| backup::BackupError::Io("achievements".into()))?;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum BackupTrigger {
+    Startup,
+    Interval,
+    Manual,
+}
+
+fn run_backup(app: &AppHandle, trigger: BackupTrigger) -> Result<bool, backup::BackupError> {
+    let state = app.state::<AppState>();
+    let _guard = state.backup_lock.lock().unwrap();
+    let settings = state.config_tx.borrow().backup;
+    let now_ms = timer_now_ms();
+    if state.app_cancel.is_cancelled()
+        || (!settings.enabled && !matches!(trigger, BackupTrigger::Manual))
+    {
+        return Ok(false);
+    }
+    let created = if matches!(trigger, BackupTrigger::Startup)
+        && !backup::due_at_startup(&state.config_dir, now_ms)
+    {
+        false
+    } else {
+        flush_backup_stores(&state)?;
+        backup::create_backup(&state.config_dir, now_ms)?.is_some()
+    };
+    backup::prune(&state.config_dir, settings.keep)?;
+    Ok(created)
+}
+
+fn spawn_auto_backup(app: AppHandle, cancel: CancellationToken) {
+    tauri::async_runtime::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(24 * 60 * 60));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut trigger = BackupTrigger::Startup;
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => break,
+                _ = interval.tick() => {
+                    let app = app.clone();
+                    match tauri::async_runtime::spawn_blocking(move || run_backup(&app, trigger)).await {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(error)) => tracing::warn!("自動バックアップに失敗しました: {error}"),
+                        Err(_) => tracing::warn!("自動バックアップの処理が中断されました"),
+                    }
+                    trigger = BackupTrigger::Interval;
+                }
+            }
+        }
+    });
+}
+
+#[tauri::command]
+async fn create_backup_now(app: AppHandle) -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(move || run_backup(&app, BackupTrigger::Manual))
+        .await
+        .map_err(|_| "バックアップの作成が中断されました".to_owned())?
+        .map_err(|error| {
+            tracing::warn!("バックアップの作成に失敗しました: {error}");
+            error.to_string()
+        })
+}
+
+#[tauri::command]
+async fn restore_backup(
+    app: AppHandle,
+    window: tauri::WebviewWindow,
+    file_name: String,
+) -> Result<(), String> {
+    if window.label() != "main" {
+        return Err("復元はメイン画面の設定から実行してください".into());
+    }
+    let worker_app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        #[cfg(target_os = "windows")]
-        let mut command = std::process::Command::new("explorer.exe");
-        #[cfg(target_os = "macos")]
-        let mut command = std::process::Command::new("open");
-        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-        let mut command = std::process::Command::new("xdg-open");
-        command
-            .arg(dir)
-            .spawn()
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+        let state = worker_app.state::<AppState>();
+        let _guard = state.backup_lock.lock().unwrap();
+        if state.app_cancel.is_cancelled() {
+            return Err("アプリを終了しています".to_owned());
+        }
+        flush_backup_stores(&state)
+            .and_then(|()| backup::stage_restore(&state.config_dir, &file_name, timer_now_ms()))
+            .map_err(|error| {
+                tracing::warn!("復元の準備に失敗しました: {error}");
+                error.to_string()
+            })?;
+        state.app_cancel.cancel();
+        Ok(())
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|_| "復元の準備が中断されました".to_owned())??;
+    // メインスレッドの外で起動し、RunEvent::Exit の終了処理を経て再起動する。
+    tauri::async_runtime::spawn_blocking(move || app.restart());
+    Ok(())
+}
+
+#[tauri::command]
+async fn open_backup_dir(state: State<'_, AppState>) -> Result<(), String> {
+    let config_dir = state.config_dir.clone();
+    const MESSAGE: &str = "バックアップフォルダを開けませんでした";
+    tauri::async_runtime::spawn_blocking(move || {
+        let dir = backup::auto_dir(&config_dir).map_err(|_| MESSAGE)?;
+        fs::create_dir_all(&dir).map_err(|_| MESSAGE)?;
+        open_directory(&dir).map_err(|_| MESSAGE)
+    })
+    .await
+    .map_err(|_| MESSAGE.to_owned())?
+    .map_err(str::to_owned)
+}
+
+#[tauri::command]
+fn take_startup_restore_failure(window: tauri::WebviewWindow, state: State<'_, AppState>) -> bool {
+    window.label() == "main" && state.startup_restore_failed.swap(false, Ordering::Relaxed)
 }
 
 #[tauri::command]
@@ -3876,6 +4009,11 @@ pub fn run() {
                 .clone()
                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
+            // 稼働中のストアがディスクを読む前に、再起動前に準備した復元を適用する。
+            let startup_restore_failed = backup::apply_pending_restore(&config_dir, timer_now_ms())
+                .inspect_err(|error| tracing::warn!("復元に失敗しました: {error}"))
+                .is_err();
+
             // 設定ロード(失敗時は壊れたファイルを退避して既定値で続行)。
             // 退避できなかった時は config.json への保存を止める。ロード結果は UI が取得するまで保持する。
             let (config, load_outcome) = AppConfig::load_or_preserve(&config_dir);
@@ -4023,6 +4161,8 @@ pub fn run() {
                         keyword_effects: Mutex::new(keyword_effects::KeywordEffects::default()),
                         config: Mutex::new(config.clone()),
                         startup_config_outcome: Mutex::new(Some(load_outcome)),
+                        startup_restore_failed: startup_restore_failed.into(),
+                        backup_lock: Mutex::new(()),
                         config_revision: AtomicU64::new(0),
                         config_tx,
                         timer_tx,
@@ -4091,6 +4231,7 @@ pub fn run() {
                 app_cancel.clone(),
             );
             spawn_autopost_status_emitter(autopost_status, handle.clone(), app_cancel.clone());
+            spawn_auto_backup(handle.clone(), app_cancel.clone());
             let listener_cancel = app_cancel.clone();
             let flush_app = handle.clone();
             tauri::async_runtime::spawn(async move {
@@ -4191,6 +4332,11 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            list_backups,
+            create_backup_now,
+            restore_backup,
+            open_backup_dir,
+            take_startup_restore_failure,
             list_achievements,
             achievement_schema,
             commit_achievements,

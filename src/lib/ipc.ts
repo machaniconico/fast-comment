@@ -416,7 +416,39 @@ export interface TtsOptions {
   skipCommands?: boolean;
 }
 
+export interface BackupSettings {
+  enabled: boolean;
+  keep: number;
+}
+
+export interface BackupEntry {
+  fileName: string;
+  createdAtMs: number;
+  size: number;
+}
+
+export function listBackups(): Promise<BackupEntry[] | null> {
+  return invoke<BackupEntry[]>('list_backups');
+}
+
+export function createBackupNow(): Promise<boolean | null> {
+  return invoke<boolean>('create_backup_now');
+}
+
+export function restoreBackup(fileName: string): Promise<void | null> {
+  return invoke<void>('restore_backup', { fileName });
+}
+
+export function openBackupDir(): Promise<void | null> {
+  return invoke<void>('open_backup_dir');
+}
+
+export function takeStartupRestoreFailure(): Promise<boolean | null> {
+  return invoke<boolean>('take_startup_restore_failure');
+}
+
 export interface AppConfig {
+  backup: BackupSettings;
   channels: ChannelConfig[];
   obs: {
     port: number;
