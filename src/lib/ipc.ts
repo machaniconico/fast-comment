@@ -446,7 +446,51 @@ export interface TtsOptions {
   skipCommands?: boolean;
 }
 
+export interface BackupSettings {
+  enabled: boolean;
+  keep: number;
+}
+
+export interface BackupEntry {
+  fileName: string;
+  createdAtMs: number;
+  size: number;
+}
+
+export function listBackups(): Promise<BackupEntry[] | null> {
+  return invoke<BackupEntry[]>('list_backups');
+}
+
+export function getLastAutoBackupFailure(): Promise<string | null> {
+  return invoke<string>('get_last_auto_backup_failure');
+}
+
+/** 自動作成の最後の失敗理由。成功したら null。 */
+export async function onAutoBackupStatus(cb: (reason: string | null) => void): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  return listen<string | null>('auto-backup-status', (event) => cb(event.payload));
+}
+
+export function createBackupNow(): Promise<boolean | null> {
+  return invoke<boolean>('create_backup_now');
+}
+
+export function restoreBackup(fileName: string): Promise<void | null> {
+  return invoke<void>('restore_backup', { fileName });
+}
+
+export function openBackupDir(): Promise<void | null> {
+  return invoke<void>('open_backup_dir');
+}
+
+export type RestoreFailureNotice = 'failed' | 'savesBlocked';
+
+export function takeStartupRestoreFailure(): Promise<RestoreFailureNotice | null> {
+  return invoke<RestoreFailureNotice>('take_startup_restore_failure');
+}
+
 export interface AppConfig {
+  backup: BackupSettings;
   channels: ChannelConfig[];
   obs: {
     port: number;

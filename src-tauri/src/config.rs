@@ -384,6 +384,8 @@ impl ConfigLoadOutcome {
 /// 退避できなかった設定ディレクトリ。元の config.json を既定値で上書きしないよう保存を止める。
 static SAVE_BLOCKED_DIRS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
 
+static RESTORE_BLOCKED_DIRS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
 pub const CONFIG_SAVE_BLOCKED_ERROR: &str =
     "設定ファイルを読めず退避もできなかったため、上書きしないよう保存を止めています。config.json を確認してアプリを再起動してください";
 
@@ -401,6 +403,17 @@ impl std::error::Error for ConfigSaveBlocked {}
 
 fn save_blocked(dir: &Path) -> bool {
     SAVE_BLOCKED_DIRS.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|d| d == dir)
+}
+
+/// `save` が保存禁止で拒否するかを、保存の前に確かめる(外部への操作を先に確定させない)。
+pub fn ensure_save_allowed(dir: &Path) -> anyhow::Result<()> {
+    if RESTORE_BLOCKED_DIRS.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|d| d == dir) {
+        return Err(crate::backup::RestoreSaveBlocked.into());
+    }
+    if save_blocked(dir) {
+        return Err(anyhow::Error::new(ConfigSaveBlocked));
+    }
+    Ok(())
 }
 
 const MAX_OBS_ROWS: u16 = 1000;
@@ -1426,6 +1439,8 @@ impl LogConfig {
 #[serde(rename_all = "camelCase")]
 pub struct AppConfig {
     #[serde(default)]
+    pub backup: crate::backup::BackupSettings,
+    #[serde(default)]
     pub log: LogConfig,
     #[serde(default)]
     pub channels: Vec<ChannelConfig>,
@@ -1472,6 +1487,7 @@ pub struct AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         AppConfig {
+            backup: Default::default(),
             log: LogConfig::default(),
             channels: Vec::new(),
             obs: ObsConfig::default(),
@@ -1611,6 +1627,14 @@ impl AppConfig {
         }
     }
 
+    pub(crate) fn load_read_only(dir: &Path) -> Self {
+        RESTORE_BLOCKED_DIRS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(dir.to_path_buf());
+        Self::load(dir).unwrap_or_default()
+    }
+
     /// IPC の入力値はエラー文に含めない。
     pub(crate) fn from_config_update(value: serde_json::Value) -> Result<Self, String> {
         let config: Self = serde_path_to_error::deserialize(value).map_err(|e| {
@@ -1624,6 +1648,7 @@ impl AppConfig {
 
     /// 範囲外値の丸め。ロード時と更新(保存前)の双方から呼ぶ。
     pub fn normalize_all(&mut self) {
+        self.backup = self.backup.normalized();
         self.obs.normalize();
         self.log.normalize();
         self.tts.options.normalize();
@@ -1651,9 +1676,7 @@ impl AppConfig {
     /// クレート内では `commit_config` だけが呼ぶ(revision を進めない保存を作らない。lib.rs の
     /// `every_config_write_goes_through_commit_config` で検査)。受け入れテストが使うので公開している。
     pub fn save(&self, dir: &Path) -> anyhow::Result<()> {
-        if save_blocked(dir) {
-            return Err(anyhow::Error::new(ConfigSaveBlocked));
-        }
+        ensure_save_allowed(dir)?;
         std::fs::create_dir_all(dir)
             .map_err(|e| anyhow::anyhow!("設定ディレクトリ作成失敗 {}: {e}", dir.display()))?;
         let path = Self::path_in(dir);
@@ -1727,6 +1750,9 @@ impl std::fmt::Display for ChannelOverridesCommitError {
             Self::Stale => f.write_str(CONFIG_CHANGED_ERROR),
             Self::NotFound => std::fmt::Display::fmt(&ChannelEditError::NotFound, f),
             Self::Save(e) if e.is::<ConfigSaveBlocked>() => f.write_str(CONFIG_SAVE_BLOCKED_ERROR),
+            Self::Save(e) if e.is::<crate::backup::RestoreSaveBlocked>() => {
+                f.write_str(crate::backup::RESTORE_SAVE_BLOCKED)
+            }
             Self::Save(_) => f.write_str("枠の設定を保存できませんでした"),
         }
     }
@@ -2064,6 +2090,7 @@ mod tests {
         );
 
         let cfg = AppConfig {
+            backup: crate::backup::BackupSettings { enabled: false, keep: 25 },
             log: LogConfig::default(),
             channels: vec![ChannelConfig {
                 platform: ChannelPlatform::Youtube,
@@ -3260,6 +3287,10 @@ mod tests {
         );
         let err = AppConfig::default().save(&invalid_dir).unwrap_err();
         assert_eq!(err.to_string(), CONFIG_SAVE_BLOCKED_ERROR);
+        // 外部への操作の前に使う事前の確認も、同じ理由で拒否する。
+        let err = ensure_save_allowed(&invalid_dir).unwrap_err();
+        assert_eq!(err.to_string(), CONFIG_SAVE_BLOCKED_ERROR);
+        assert!(ensure_save_allowed(dir.path()).is_ok());
     }
 
     #[test]

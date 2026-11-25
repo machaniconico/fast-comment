@@ -331,6 +331,7 @@ pub fn new_achievement(subject: SubjectKind) -> Achievement {
 /// 定義の状態に合わせてエンジンを開閉・再評価する。無効→有効では既存の進捗も再評価する。
 /// 無効化は呼ぶ前に `close_engine` を済ませておく(ここでは破棄だけ)。
 fn apply_to_engine(
+    store: &DefsStore,
     slot: &mut Option<Arc<AchievementEngine>>,
     dir: &Path,
     defs: AchievementDefs,
@@ -339,7 +340,7 @@ fn apply_to_engine(
     match (defs.enabled, slot.as_ref()) {
         (true, Some(engine)) => engine.set_definitions(defs, now_ms),
         (true, None) => {
-            let engine = Arc::new(AchievementEngine::open(dir, defs.clone(), now_ms));
+            let engine = Arc::new(AchievementEngine::open_with(dir, defs.clone(), now_ms, store.progress_io()));
             let unlocks = engine.set_definitions(defs, now_ms);
             *slot = Some(engine);
             unlocks
@@ -381,7 +382,7 @@ fn reload_and_apply(
         Ok(())
     })?;
     if changed {
-        closed.extend(apply_to_engine(slot, dir, store.current(), now_ms));
+        closed.extend(apply_to_engine(store, slot, dir, store.current(), now_ms));
     }
     Ok(closed)
 }
@@ -447,7 +448,7 @@ pub fn commit(
         return (reply_of(error), unlocks);
     }
     let reply = CommitReply::Ok { revision: store.current().revision };
-    unlocks.extend(apply_to_engine(&mut slot, dir, store.current(), now_ms));
+    unlocks.extend(apply_to_engine(store, &mut slot, dir, store.current(), now_ms));
     (reply, unlocks)
 }
 

@@ -36,6 +36,10 @@ struct Index {
     sounds: Vec<SoundEntry>,
 }
 
+pub(crate) fn validate_backup_index(bytes: &[u8]) -> bool {
+    serde_json::from_slice::<Index>(bytes).is_ok()
+}
+
 /// 再生用に UI へ返す中身。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SoundData {
@@ -48,7 +52,7 @@ pub struct SoundStore {
     dir: PathBuf,
     lock: Mutex<()>,
     /// 登録済み ID のキャッシュ(索引を書くたびに捨てる)。
-    ids: Mutex<Option<std::collections::HashSet<String>>>,
+    ids: Mutex<Option<std::sync::Arc<std::collections::HashSet<String>>>>,
 }
 
 /// マジックバイトから種別を判定する。`wav` / `mp3` / `ogg`。
@@ -153,23 +157,31 @@ impl SoundStore {
         result.map_err(|_| FAILED.to_owned())
     }
 
+    /// 索引と本体を変える操作を止める。バックアップが `sounds/` を読む間に持つ。
+    pub fn lock_for_backup(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.lock.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     pub fn list(&self) -> Result<Vec<SoundEntry>, String> {
         let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         self.load()
     }
 
-    /// 登録済みの ID か。パイプラインから毎回呼ぶので、索引は結果をキャッシュして読む。
-    /// 索引が読めない時は判断できないので true(規則は触らない)。
-    pub fn contains(&self, id: &str) -> bool {
+    /// 登録済みの ID の集合(キャッシュ)。索引が読めない時は None(判断できない)。
+    /// 呼び出し側は、他のロックを持たずに取り、その後で照合する。
+    pub fn known_ids(&self) -> Option<std::sync::Arc<std::collections::HashSet<String>>> {
         let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut cache = self.ids.lock().unwrap_or_else(|e| e.into_inner());
         if cache.is_none() {
-            match self.load() {
-                Ok(sounds) => *cache = Some(sounds.into_iter().map(|s| s.id).collect()),
-                Err(_) => return true,
-            }
+            let sounds = self.load().ok()?;
+            *cache = Some(std::sync::Arc::new(sounds.into_iter().map(|s| s.id).collect()));
         }
-        cache.as_ref().is_some_and(|ids| ids.contains(id))
+        cache.clone()
+    }
+
+    /// 登録済みの ID か。索引が読めない時は判断できないので true(規則は触らない)。
+    pub fn contains(&self, id: &str) -> bool {
+        self.known_ids().is_none_or(|ids| ids.contains(id))
     }
 
     /// `file_name` は拡張子の検査と表示名にだけ使う。
@@ -322,6 +334,25 @@ mod tests {
         assert!(s.list().unwrap().is_empty());
         assert!(!s.remove(&e.id).unwrap());
         assert!(s.read(&e.id).is_err());
+    }
+
+    #[test]
+    fn backup_lock_holds_off_removal_until_released() {
+        let (_d, s) = store();
+        let e = s.add("a.wav", &wav()).unwrap();
+        let s = std::sync::Arc::new(s);
+        let guard = s.lock_for_backup();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = {
+            let s = s.clone();
+            let id = e.id.clone();
+            std::thread::spawn(move || tx.send(s.remove(&id)).unwrap())
+        };
+        assert!(rx.recv_timeout(std::time::Duration::from_millis(200)).is_err());
+        assert!(s.file_path(&e).is_file(), "ロック中は本体を消さない");
+        drop(guard);
+        assert_eq!(rx.recv().unwrap(), Ok(true));
+        worker.join().unwrap();
     }
 
     #[test]

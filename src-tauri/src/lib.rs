@@ -17,6 +17,7 @@ pub mod inject;
 pub mod integrations;
 pub mod webhook;
 pub mod autopost;
+pub mod backup;
 pub mod bus;
 pub mod chatlog;
 pub mod config;
@@ -110,6 +111,12 @@ pub struct AppState {
     config: Mutex<AppConfig>,
     /// メイン画面からの通知取得を待つ起動時ロード結果。
     startup_config_outcome: Mutex<Option<ConfigLoadOutcome>>,
+    startup_restore_failed: std::sync::atomic::AtomicBool,
+    /// 起動時の復元が失敗した。通知を閉じても変わらない。復元元を残すため自動作成と整理を止める。
+    restore_failed_at_startup: bool,
+    restore_blocked: Vec<String>,
+    backup_lock: Mutex<()>,
+    last_auto_backup_failure: Mutex<Option<String>>,
     /// 設定の revision。`config` のロック内で、保存に成功するたびに `commit_config` が 1 進める。
     /// プロセス内だけの値で永続化しない。全体保存の楽観的排他に使う。
     config_revision: AtomicU64,
@@ -194,21 +201,184 @@ async fn open_comment_log_dir(state: State<'_, AppState>) -> Result<(), String> 
     tokio::fs::create_dir_all(&dir)
         .await
         .map_err(|e| e.to_string())?;
+    tauri::async_runtime::spawn_blocking(move || open_directory(&dir))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
+}
+
+fn open_directory(dir: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(target_os = "windows")]
+    let mut command = std::process::Command::new("explorer.exe");
+    #[cfg(target_os = "macos")]
+    let mut command = std::process::Command::new("open");
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let mut command = std::process::Command::new("xdg-open");
+    command.arg(dir).spawn().map(|_| ())
+}
+
+#[tauri::command]
+async fn list_backups(state: State<'_, AppState>) -> Result<Vec<backup::BackupEntry>, String> {
+    let dir = state.config_dir.clone();
+    tauri::async_runtime::spawn_blocking(move || backup::read_backups(&dir))
+        .await
+        .map_err(|_| "バックアップの一覧を取得できませんでした".to_owned())?
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn get_last_auto_backup_failure(state: State<'_, AppState>) -> Option<String> {
+    state.last_auto_backup_failure.lock().unwrap().clone()
+}
+
+fn flush_backup_stores(state: &AppState) -> Result<(), backup::BackupError> {
+    state.listeners.flush().map_err(|_| backup::BackupError::Io("listeners".into()))?;
+    let engine = state.lock_achievement_engine();
+    if let Some(engine) = engine.as_deref() {
+        engine.flush().map_err(|_| backup::BackupError::Io("achievements".into()))?;
+    }
+    Ok(())
+}
+
+use backup::BackupTrigger;
+
+fn run_backup(app: &AppHandle, trigger: BackupTrigger) -> Result<bool, backup::BackupError> {
+    let state = app.state::<AppState>();
+    let _guard = state.backup_lock.lock().unwrap();
+    let settings = state.config_tx.borrow().backup;
+    if state.app_cancel.is_cancelled()
+        || (!settings.enabled && !matches!(trigger, BackupTrigger::Manual))
+    {
+        return Ok(false);
+    }
+    if !state.restore_blocked.is_empty() {
+        return Err(backup::BackupError::Invalid(backup::RESTORE_SAVE_BLOCKED));
+    }
+    backup::run_backup(
+        &state.config_dir,
+        settings,
+        trigger,
+        state.restore_failed_at_startup,
+        timer_now_ms(),
+        // 効果音の削除・追加と重なって、索引と本体がずれた写しを作らない。
+        || flush_backup_stores(&state).map(|()| state.sounds.lock_for_backup()),
+    )
+}
+
+fn spawn_auto_backup(app: AppHandle, cancel: CancellationToken) {
+    tauri::async_runtime::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(24 * 60 * 60));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut trigger = BackupTrigger::Startup;
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => break,
+                _ = interval.tick() => {
+                    let worker_app = app.clone();
+                    let failure = match tauri::async_runtime::spawn_blocking(move || run_backup(&worker_app, trigger)).await {
+                        Ok(Ok(_)) => None,
+                        Ok(Err(error)) => Some(error.to_string()),
+                        Err(_) => Some("バックアップの処理が中断されました".to_owned()),
+                    };
+                    if let Some(reason) = &failure {
+                        tracing::warn!("自動バックアップに失敗しました: {reason}");
+                    }
+                    // 成功したら前回の失敗理由を消す。
+                    let state = app.state::<AppState>();
+                    let changed = {
+                        let mut last = state.last_auto_backup_failure.lock().unwrap();
+                        let changed = *last != failure;
+                        *last = failure.clone();
+                        changed
+                    };
+                    if changed {
+                        let _ = app.emit("auto-backup-status", failure);
+                    }
+                    trigger = BackupTrigger::Interval;
+                }
+            }
+        }
+    });
+}
+
+#[tauri::command]
+async fn create_backup_now(app: AppHandle) -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(move || run_backup(&app, BackupTrigger::Manual))
+        .await
+        .map_err(|_| "バックアップの作成が中断されました".to_owned())?
+        .map_err(|error| {
+            tracing::warn!("バックアップの作成に失敗しました: {error}");
+            error.to_string()
+        })
+}
+
+#[tauri::command]
+async fn restore_backup(
+    app: AppHandle,
+    window: tauri::WebviewWindow,
+    file_name: String,
+) -> Result<(), String> {
+    if window.label() != "main" {
+        return Err("復元はメイン画面の設定から実行してください".into());
+    }
+    let worker_app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        #[cfg(target_os = "windows")]
-        let mut command = std::process::Command::new("explorer.exe");
-        #[cfg(target_os = "macos")]
-        let mut command = std::process::Command::new("open");
-        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-        let mut command = std::process::Command::new("xdg-open");
-        command
-            .arg(dir)
-            .spawn()
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+        let state = worker_app.state::<AppState>();
+        let _guard = state.backup_lock.lock().unwrap();
+        if state.app_cancel.is_cancelled() {
+            return Err("アプリを終了しています".to_owned());
+        }
+        backup::stage_restore_with(&state.config_dir, &file_name, timer_now_ms(), || {
+            flush_backup_stores(&state).map(|()| state.sounds.lock_for_backup())
+        })
+        .map_err(|error| {
+            tracing::warn!("復元の準備に失敗しました: {error}");
+            error.to_string()
+        })?;
+        state.app_cancel.cancel();
+        Ok(())
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|_| "復元の準備が中断されました".to_owned())??;
+    // メインスレッドの外で起動し、RunEvent::Exit の終了処理を経て再起動する。
+    tauri::async_runtime::spawn_blocking(move || app.restart());
+    Ok(())
+}
+
+#[tauri::command]
+async fn open_backup_dir(state: State<'_, AppState>) -> Result<(), String> {
+    let config_dir = state.config_dir.clone();
+    const MESSAGE: &str = "バックアップフォルダを開けませんでした";
+    tauri::async_runtime::spawn_blocking(move || {
+        let dir = backup::auto_dir(&config_dir).map_err(|_| MESSAGE)?;
+        fs::create_dir_all(&dir).map_err(|_| MESSAGE)?;
+        open_directory(&dir).map_err(|_| MESSAGE)
+    })
+    .await
+    .map_err(|_| MESSAGE.to_owned())?
+    .map_err(str::to_owned)
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum RestoreFailureNotice {
+    Failed,
+    SavesBlocked,
+}
+
+#[tauri::command]
+fn take_startup_restore_failure(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+) -> Option<RestoreFailureNotice> {
+    if window.label() != "main" {
+        return None;
+    }
+    if !state.restore_blocked.is_empty() {
+        return Some(RestoreFailureNotice::SavesBlocked);
+    }
+    state.startup_restore_failed.swap(false, Ordering::Relaxed).then_some(RestoreFailureNotice::Failed)
 }
 
 #[tauri::command]
@@ -249,6 +419,7 @@ async fn reset_listener_donation(
     platform: String,
     author_id: String,
 ) -> Result<bool, String> {
+    state.ensure_restore_writable("listeners.json")?;
     let reset = state.listeners.reset_donation(&platform, &author_id);
     if reset {
         emit_listener_donation_changed(&app);
@@ -261,6 +432,7 @@ async fn reset_all_listener_donations(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<usize, String> {
+    state.ensure_restore_writable("listeners.json")?;
     let count = state.listeners.reset_all_donations();
     if count > 0 {
         emit_listener_donation_changed(&app);
@@ -285,6 +457,7 @@ async fn update_listener(
     memo: Option<String>,
     tts_muted: bool,
 ) -> Result<listeners::ListenerRecord, String> {
+    state.ensure_restore_writable("listeners.json")?;
     let record = state
         .listeners
         .update(&platform, &author_id, nickname, label, memo, tts_muted);
@@ -302,6 +475,7 @@ async fn set_listener_voice(
     author_id: String,
     voice: Option<listeners::TtsVoiceOverride>,
 ) -> Result<listeners::ListenerRecord, String> {
+    state.ensure_restore_writable("listeners.json")?;
     let record = state.listeners.set_voice(&platform, &author_id, voice);
     if let Err(e) = app.emit("listener-updated", &record) {
         tracing::warn!("listener-updated emit 失敗: {e}");
@@ -325,6 +499,9 @@ async fn delete_listener(
     platform: String,
     author_id: String,
 ) -> Result<bool, String> {
+    // 台帳と実績の進捗の片方だけを消して確定させない。
+    state.ensure_restore_writable("listeners.json")?;
+    state.ensure_restore_writable("achievement-progress.json")?;
     let deleted = state.listeners.delete(&platform, &author_id);
     if deleted {
         if let Err(e) = app.emit(
@@ -375,6 +552,11 @@ fn commit_achievements(
     rates: achievements::currency::RateTable,
     symbol_overrides: std::collections::BTreeMap<String, String>,
 ) -> achievements::ipc::CommitReply {
+    if state.ensure_restore_writable("achievements.json").is_err()
+        || state.ensure_restore_writable("achievement-progress.json").is_err()
+    {
+        return achievements::ipc::CommitReply::SaveRefused;
+    }
     let draft = achievements::ipc::AchievementDraft { enabled, achievements, rates, symbol_overrides };
     let (reply, unlocks) = achievements::ipc::commit_draft(
         &state.achievement_defs,
@@ -477,6 +659,13 @@ fn publish_achievement_event(
 }
 
 impl AppState {
+    fn ensure_restore_writable(&self, root: &str) -> Result<(), String> {
+        if self.restore_blocked.iter().any(|blocked| blocked == root) {
+            return Err(backup::RESTORE_SAVE_BLOCKED.into());
+        }
+        Ok(())
+    }
+
     /// チャンネルの一意キー(プラットフォーム + 識別子)。
     fn channel_key(ch: &ChannelConfig) -> String {
         config::channel_key(ch)
@@ -695,6 +884,12 @@ impl AppState {
         let mut current = self.config.lock().unwrap();
         let mut next = current.clone();
         match change {
+            PreferenceChange::Check(preferences) => {
+                if current.poll != *preferences {
+                    config::ensure_save_allowed(&self.config_dir).map_err(|_| PollError::Save)?;
+                }
+                return Ok(());
+            }
             PreferenceChange::Started(preferences) => next.poll = preferences.clone(),
             PreferenceChange::Display(settings) => next.poll.settings = settings,
         }
@@ -2542,6 +2737,11 @@ async fn disconnect_x_post(
     state: State<'_, AppState>,
     on_config_saved: tauri::ipc::Channel<ConfigCommit<serde_json::Value>>,
 ) -> Result<OAuthStatus<XPostStatus>, XPostError> {
+    // 保存禁止の間は、モードに関係なく資格情報を消す前に拒否する。
+    config::ensure_save_allowed(&state.config_dir).map_err(|error| XPostError {
+        code: XPostErrorCode::SaveRefused,
+        message: error.to_string(),
+    })?;
     let result = state.x_post_auth.disconnect().await;
     {
         let mut cfg = state.config.lock().unwrap();
@@ -2865,6 +3065,7 @@ fn write_template_file(
     file: String,
     contents: String,
 ) -> Result<(), String> {
+    state.ensure_restore_writable("templates")?;
     state
         .templates
         .write(&TemplateRef::parse(&name)?, &file, &contents)
@@ -2877,6 +3078,7 @@ fn duplicate_template(
     source: String,
     name: String,
 ) -> Result<TemplateInfo, String> {
+    state.ensure_restore_writable("templates")?;
     state
         .templates
         .duplicate(&TemplateRef::parse(&source)?, &name)
@@ -2885,6 +3087,7 @@ fn duplicate_template(
 /// カスタムテンプレート(ID)を削除する。内蔵は Err。
 #[tauri::command]
 fn delete_template(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    state.ensure_restore_writable("templates")?;
     state.templates.delete(&TemplateRef::parse(&id)?)
 }
 
@@ -2895,6 +3098,7 @@ async fn import_template_zip(
     state: State<'_, AppState>,
     request: tauri::ipc::Request<'_>,
 ) -> Result<template_import::ImportResult, String> {
+    state.ensure_restore_writable("templates")?;
     let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else {
         return Err("zip のバイト列(raw body)を渡してください".to_string());
     };
@@ -2925,6 +3129,8 @@ async fn add_custom_sound(
     state: State<'_, AppState>,
     request: tauri::ipc::Request<'_>,
 ) -> Result<sounds::SoundEntry, String> {
+    state.ensure_restore_writable("sounds")?;
+    state.ensure_restore_writable("sounds.json")?;
     let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else {
         return Err("音声のバイト列(raw body)を渡してください".to_string());
     };
@@ -2954,6 +3160,8 @@ fn read_custom_sound(state: State<'_, AppState>, id: String) -> Result<tauri::ip
 /// 設定の保存と順序を揃えるため、保存と同じ書込ロックを取る。
 #[tauri::command]
 async fn remove_custom_sound(state: State<'_, AppState>, id: String) -> Result<bool, String> {
+    state.ensure_restore_writable("sounds")?;
+    state.ensure_restore_writable("sounds.json")?;
     let _write = state.config_write.lock().await;
     state.sounds.remove(&id)
 }
@@ -2968,12 +3176,14 @@ struct GoalSkinInfo {
 /// ユーザー作成Goals PNGスキンの配置先とファイル一覧を返す。
 #[tauri::command]
 fn get_goal_skin_info(state: State<'_, AppState>) -> Result<GoalSkinInfo, String> {
-    fs::create_dir_all(&state.goals_skin_dir).map_err(|e| {
-        format!(
-            "skinフォルダの作成に失敗 {}: {e}",
-            state.goals_skin_dir.display()
-        )
-    })?;
+    if state.ensure_restore_writable("skin").is_ok() {
+        fs::create_dir_all(&state.goals_skin_dir).map_err(|e| {
+            format!(
+                "skinフォルダの作成に失敗 {}: {e}",
+                state.goals_skin_dir.display()
+            )
+        })?;
+    }
 
     let mut files = Vec::new();
     let entries = fs::read_dir(&state.goals_skin_dir).map_err(|e| {
@@ -3860,6 +4070,11 @@ fn test_keyword_effect(
 
 /// 効果音を判定して `msg.sound` に入れる。設定と実績のレート表は必要な時だけ読む。
 fn stamp_message_sound(state: &AppState, msg: &mut ChatMessage, verdict: &Verdict) {
+    if !state.config.lock().unwrap().sound_effects.enabled {
+        return;
+    }
+    // 効果音の索引は config のロックの外で読む(バックアップの読み取りと待ち合わせない)。
+    let known = state.sounds.known_ids();
     let cfg = state.config.lock().unwrap();
     if !cfg.sound_effects.enabled {
         return;
@@ -3871,7 +4086,8 @@ fn stamp_message_sound(state: &AppState, msg: &mut ChatMessage, verdict: &Verdic
         Default::default()
     };
     let mut gate = state.sound_gate.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    sound_effects::stamp_sound(msg, verdict, &cfg, (&rates, &symbols), |id| state.sounds.contains(id), &mut gate, std::time::Instant::now());
+    let exists = |id: &str| known.as_ref().is_none_or(|ids| ids.contains(id));
+    sound_effects::stamp_sound(msg, verdict, &cfg, (&rates, &symbols), exists, &mut gate, std::time::Instant::now());
 }
 
 fn spawn_achievement_events(
@@ -4013,9 +4229,20 @@ pub fn run() {
                 .clone()
                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
-            // 設定ロード(失敗時は壊れたファイルを退避して既定値で続行)。
-            // 退避できなかった時は config.json への保存を止める。ロード結果は UI が取得するまで保持する。
-            let (config, load_outcome) = AppConfig::load_or_preserve(&config_dir);
+            // 稼働中のストアがディスクを読む前に、再起動前に準備した復元を適用する。
+            let (restore_result, restore_blocked) =
+                backup::apply_pending_restore_at_startup(&config_dir, timer_now_ms());
+            let startup_restore_failed = restore_result
+                .inspect_err(|error| tracing::warn!("復元に失敗しました: {error}"))
+                .is_err();
+            let restore_blocks = |root: &str| restore_blocked.iter().any(|blocked| blocked == root);
+
+            let (config, load_outcome) = if restore_blocks("config.json") {
+                // 復元の通知を使う。設定破損時の退避処理は起動しない。
+                (AppConfig::load_read_only(&config_dir), ConfigLoadOutcome::Loaded)
+            } else {
+                AppConfig::load_or_preserve(&config_dir)
+            };
 
             let obs_port = config.obs.port;
 
@@ -4103,21 +4330,25 @@ pub fn run() {
             let templates =
                 TemplateStore::new(resolve_templates_dir(&handle), config_dir.join("templates"));
             // カスタムの保存先。失敗しても内蔵の配信は続ける。
-            if let Err(e) = fs::create_dir_all(templates.custom_root()) {
-                tracing::warn!(
-                    "カスタムテンプレートフォルダの作成に失敗 {}: {e}",
-                    templates.custom_root().display()
-                );
-            }
-            if let Err(e) = templates.cleanup_stale_staging() {
-                tracing::warn!("テンプレート staging の掃除に失敗: {e}");
+            if !restore_blocks("templates") {
+                if let Err(e) = fs::create_dir_all(templates.custom_root()) {
+                    tracing::warn!(
+                        "カスタムテンプレートフォルダの作成に失敗 {}: {e}",
+                        templates.custom_root().display()
+                    );
+                }
+                if let Err(e) = templates.cleanup_stale_staging() {
+                    tracing::warn!("テンプレート staging の掃除に失敗: {e}");
+                }
             }
             let goals_skin_dir = config_dir.join("skin");
-            if let Err(e) = fs::create_dir_all(&goals_skin_dir) {
-                tracing::warn!(
-                    "Goals skinフォルダの作成に失敗 {}: {e}",
-                    goals_skin_dir.display()
-                );
+            if !restore_blocks("skin") {
+                if let Err(e) = fs::create_dir_all(&goals_skin_dir) {
+                    tracing::warn!(
+                        "Goals skinフォルダの作成に失敗 {}: {e}",
+                        goals_skin_dir.display()
+                    );
+                }
             }
 
             let ((api_router, listener_store), _) = setup_twitcasting(
@@ -4144,12 +4375,21 @@ pub fn run() {
                     );
                     let webhook = webhook::WebhookRuntime::new(integrations.clone(), webhook::ReqwestSender::new());
                     let now_ms = timer_now_ms();
-                    let achievement_defs = Arc::new(DefsStore::load(&config_dir, now_ms));
-                    let listener_store = listeners::ListenerStore::load(&config_dir)
-                        .with_achievement_defs(achievement_defs.clone());
+                    let achievement_defs = Arc::new(DefsStore::load_for_startup(
+                        &config_dir, now_ms,
+                        restore_blocks("achievements.json"),
+                        restore_blocks("achievement-progress.json"),
+                    ));
+                    let listener_store = if restore_blocks("listeners.json") {
+                        listeners::ListenerStore::load_read_only(&config_dir)
+                    } else {
+                        listeners::ListenerStore::load(&config_dir)
+                    }.with_achievement_defs(achievement_defs.clone());
                     let defs = achievement_defs.current();
                     let achievement_engine = defs.enabled.then(|| {
-                        Arc::new(AchievementEngine::open(&config_dir, defs, now_ms))
+                        Arc::new(AchievementEngine::open_with(
+                            &config_dir, defs, now_ms, achievement_defs.progress_io(),
+                        ))
                     });
                     let state = AppState {
                         webhook,
@@ -4165,6 +4405,11 @@ pub fn run() {
                         keyword_effects: Mutex::new(keyword_effects::KeywordEffects::default()),
                         config: Mutex::new(config.clone()),
                         startup_config_outcome: Mutex::new(Some(load_outcome)),
+                        startup_restore_failed: startup_restore_failed.into(),
+                        restore_failed_at_startup: startup_restore_failed,
+                        restore_blocked: restore_blocked.clone(),
+                        backup_lock: Mutex::new(()),
+                        last_auto_backup_failure: Mutex::new(None),
                         config_revision: AtomicU64::new(0),
                         config_tx,
                         timer_tx,
@@ -4232,6 +4477,7 @@ pub fn run() {
                 app_cancel.clone(),
             );
             spawn_autopost_status_emitter(autopost_status, handle.clone(), app_cancel.clone());
+            spawn_auto_backup(handle.clone(), app_cancel.clone());
             let listener_cancel = app_cancel.clone();
             let flush_app = handle.clone();
             tauri::async_runtime::spawn(async move {
@@ -4359,6 +4605,12 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            list_backups,
+            get_last_auto_backup_failure,
+            create_backup_now,
+            restore_backup,
+            open_backup_dir,
+            take_startup_restore_failure,
             list_achievements,
             achievement_schema,
             commit_achievements,
@@ -5661,7 +5913,66 @@ mod followup_tests {
         assert_eq!(config.1.matches("next.save(dir)").count(), 1);
     }
 
+    #[test]
+    fn ipc_refuses_restore_blocked_stores_before_changing_them() {
+        // 保存禁止のストアを変える IPC は、何かを変える前に拒否する(片方だけ確定させない)。
+        // 設定は commit_config が保存の成功後にだけメモリを差し替えるので対象外。
+        let source: String = include_str!("lib.rs").chars().filter(|c| !c.is_whitespace()).collect();
+        let listeners = &["listeners.json"][..];
+        let listener_and_progress = &["listeners.json", "achievement-progress.json"][..];
+        let templates = &["templates"][..];
+        let sounds = &["sounds", "sounds.json"][..];
+        for (command, roots, change) in [
+            ("fnreset_listener_donation(", listeners, "state.listeners.reset_donation("),
+            ("fnreset_all_listener_donations(", listeners, "state.listeners.reset_all_donations("),
+            ("fnupdate_listener(", listeners, "state.listeners.update("),
+            ("fnset_listener_voice(", listeners, "state.listeners.set_voice("),
+            ("fndelete_listener(", listener_and_progress, "state.listeners.delete("),
+            (
+                "fncommit_achievements(",
+                &["achievements.json", "achievement-progress.json"][..],
+                "achievements::ipc::commit_draft(",
+            ),
+            ("fnwrite_template_file(", templates, ".templates.write("),
+            ("fnduplicate_template(", templates, ".templates.duplicate("),
+            ("fndelete_template(", templates, ".templates.delete("),
+            ("fnimport_template_zip(", templates, "template_import::import_zip("),
+            ("fnadd_custom_sound(", sounds, "state.sounds.add("),
+            ("fnremove_custom_sound(", sounds, "state.sounds.remove("),
+        ] {
+            let start = source.find(command).unwrap_or_else(|| panic!("{command}"));
+            let body = &source[start..];
+            let body = &body[..body.find("#[tauri::command]").unwrap_or(body.len())];
+            let change_at = body.find(change).unwrap_or_else(|| panic!("{command}: {change}"));
+            for root in roots {
+                let guard = format!("ensure_restore_writable(\"{root}\")");
+                let guard_at = body.find(&guard).unwrap_or_else(|| panic!("{command}: {guard}"));
+                assert!(guard_at < change_at, "{command}: {root} の確認が変更より後");
+            }
+        }
+    }
 
+
+
+    #[test]
+    fn x_disconnect_refuses_unsavable_config_before_clearing_credentials() {
+        let source: String = include_str!("lib.rs").chars().filter(|c| !c.is_whitespace()).collect();
+        let start = source.find("asyncfndisconnect_x_post(").unwrap();
+        let body = &source[start..];
+        let body = &body[..body.find("#[tauri::command]").unwrap()];
+        let guard = body.find("config::ensure_save_allowed(&state.config_dir)").expect("事前の確認");
+        let change = body.find("state.x_post_auth.disconnect()").unwrap();
+        assert!(guard < change, "資格情報を消す前に確認する");
+    }
+
+    #[test]
+    fn poll_start_check_uses_the_same_save_refusal_as_commit() {
+        // 公式投票の作成前の確認(PollControl::start → Check)は、質問が変わる時だけ保存禁止を見る。
+        let source: String = include_str!("lib.rs").chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(source.contains(
+            "PreferenceChange::Check(preferences)=>{ifcurrent.poll!=*preferences{config::ensure_save_allowed(&self.config_dir)"
+        ));
+    }
 
     #[tokio::test]
     async fn injected_test_flag_survives_broadcast_and_clone_but_not_serde() {

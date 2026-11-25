@@ -204,6 +204,14 @@ impl ListenerStore {
         Self::load_with_backup(dir, backup_corrupt)
     }
 
+    pub(crate) fn load_read_only(dir: &Path) -> Self {
+        let mut store = Self::load_with_backup(dir, |_, _| {
+            Err(std::io::ErrorKind::PermissionDenied.into())
+        });
+        store.flush_blocked = true;
+        store
+    }
+
     pub(crate) fn with_achievement_defs(mut self, defs: Arc<DefsStore>) -> Self {
         self.achievement_defs = Some(defs);
         self
