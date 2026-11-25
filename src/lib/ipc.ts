@@ -842,6 +842,18 @@ export async function setConfig(config: AppConfig, baseRevision?: number): Promi
   return invoke<UpdateConfigOutcome>('update_config', { newConfig: config, baseRevision: baseRevision ?? null });
 }
 
+/** 書き出し用の設定。資格情報は Rust 側で消してある(`AppConfig` の全欄は揃わない)。 */
+export type ExportedConfig = Record<string, unknown>;
+
+export async function exportConfig(): Promise<ExportedConfig | null> {
+  return invoke<ExportedConfig>('export_config');
+}
+
+/** 書き出した設定を読み込む。資格情報と X の接続先は Rust 側で今の値のままにし、X の自動告知は無効にする。 */
+export async function importConfig(config: ExportedConfig): Promise<UpdateConfigOutcome | null> {
+  return invoke<UpdateConfigOutcome>('import_config', { newConfig: config });
+}
+
 export async function setGoalsShowInApp(showInApp: boolean): Promise<ConfigCommit<{ showInApp: boolean }> | null> {
   return invoke<ConfigCommit<{ showInApp: boolean }>>('set_goals_show_in_app', { showInApp });
 }

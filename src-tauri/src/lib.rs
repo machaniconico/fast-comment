@@ -931,6 +931,22 @@ struct ConfigSnapshot {
     revision: u64,
 }
 
+const CONFIG_PORTABILITY_MAIN_ONLY: &str =
+    "設定の書き出しと読み込みはメインウィンドウからのみ行えます";
+
+/// 設定の書き出し用の写し。資格情報は Rust 側で消してから渡す(SPEC §8.1)。
+#[tauri::command]
+fn export_config(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    if window.label() != "main" {
+        return Err(CONFIG_PORTABILITY_MAIN_ONLY.into());
+    }
+    let config = state.config.lock().unwrap();
+    backup::export_config(&config).map_err(Into::into)
+}
+
 /// 現在の設定と、その revision を取得する。
 #[tauri::command]
 fn get_config(state: State<'_, AppState>) -> Result<ConfigSnapshot, String> {
@@ -1856,15 +1872,51 @@ async fn update_config(
     new_config: serde_json::Value,
     base_revision: Option<u64>,
 ) -> Result<UpdateConfigOutcome, String> {
+    save_config_update(app, state, new_config, base_revision, false).await
+}
+
+/// 書き出した設定(SPEC §8.1)を読み込む。資格情報と X の接続先は今の値のままにし、
+/// X の自動告知は無効にする。
+#[tauri::command]
+async fn import_config(
+    window: tauri::WebviewWindow,
+    app: AppHandle,
+    state: State<'_, AppState>,
+    new_config: serde_json::Value,
+) -> Result<UpdateConfigOutcome, String> {
+    if window.label() != "main" {
+        return Err(CONFIG_PORTABILITY_MAIN_ONLY.into());
+    }
+    save_config_update(app, state, new_config, None, true).await
+}
+
+async fn save_config_update(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    new_config: serde_json::Value,
+    base_revision: Option<u64>,
+    imported: bool,
+) -> Result<UpdateConfigOutcome, String> {
     let write = state.config_write.lock().await;
-    let mut new_config = parse_config_update(
-        state.config_revision.load(Ordering::SeqCst),
-        base_revision,
-        new_config,
-    )?;
+    let mut new_config = if imported {
+        backup::parse_import(new_config)?
+    } else {
+        parse_config_update(
+            state.config_revision.load(Ordering::SeqCst),
+            base_revision,
+            new_config,
+        )?
+    };
     validate_x_post_template(&new_config.x_post.template)?;
+    let mut import_notices = Vec::new();
     let protected_oauth = {
         let current = state.config.lock().unwrap();
+        if imported {
+            // 以降の検証(API モードの接続確認など)が、保存する資格情報を見るようにする。
+            let merged = backup::merge_import(&new_config, &current)?;
+            import_notices = backup::import_notices(&new_config, &current, &merged);
+            new_config = merged;
+        }
         tts_dictionary::validate_edit(
             &current.tts.options.dictionary,
             &new_config.tts.options.dictionary,
@@ -1877,7 +1929,15 @@ async fn update_config(
     new_config.normalize_all();
     // 削除済みのカスタム効果音を指す規則は既定の内蔵音にして保存する(保存値は画面へ返る)。
     new_config.sound_effects.resolve_missing(|id| state.sounds.contains(id));
-    validate_x_post_mode(&state, &new_config).await?;
+    let x_post_mode = validate_x_post_mode(&state, &new_config).await;
+    let current_mode = state.config.lock().unwrap().x_post.mode.clone();
+    settle_x_post_mode(
+        x_post_mode,
+        imported,
+        &mut new_config,
+        current_mode,
+        &mut import_notices,
+    )?;
     let (
         revision,
         youtube_source_config_changed,
@@ -1887,6 +1947,11 @@ async fn update_config(
         tts_purged,
     ) = {
         let mut current = state.config.lock().unwrap();
+        if imported {
+            // 検証の間に別経路(OAuth の接続など)が保存した値を、古い写しで戻さない。
+            // 今の値は、保存と同じロックの中で読む。
+            new_config = backup::merge_import(&new_config, &current)?;
+        }
         let changes = (
             current.youtube_overrides != new_config.youtube_overrides
                 || current.credentials.youtube_api_key.trim()
@@ -1940,6 +2005,7 @@ async fn update_config(
     if let Some(w) = configure_chatlog_nonfatal(&state.chatlog, new_config.log.clone()).await {
         warnings.push(w);
     }
+    warnings.extend(import_notices.into_iter().map(String::from));
 
     if youtube_source_config_changed {
         stop_active_youtube_channels(&state);
@@ -1962,7 +2028,7 @@ async fn update_config(
     // 棒読みちゃん自動起動: 設定保存時にも(起動時だけでなく)未起動なら立ち上げる。
     // パスを設定した直後に効くようにする。ensure_launched 側で TCP 接続を確認し、
     // 既起動なら何もしないため、保存のたびに呼んでも無害。
-    if new_config.tts.backend == config::TtsBackendKind::Bouyomi {
+    if launches_bouyomi_after_save(&new_config, imported) {
         let path = new_config.tts.options.bouyomi_path.trim().to_string();
         let host = new_config.tts.options.bouyomi_host.clone();
         let port = new_config.tts.options.bouyomi_port;
@@ -2452,6 +2518,30 @@ fn retry_x_autopost(state: State<'_, AppState>) -> Result<(), String> {
 
 /// API モードは X に接続済みの時だけ選べる。すでに API モードの設定を保存し直すのは
 /// (認証が切れていても)止めない。告知は `notConnected` で止まり、他の設定は保存できる。
+/// 取り込みでは、API モードを選べない(X に未接続の)時も全体を拒否せず、投稿方式だけ今の値に残す。
+fn settle_x_post_mode(
+    check: Result<(), String>,
+    imported: bool,
+    new_config: &mut AppConfig,
+    current_mode: String,
+    import_notices: &mut Vec<&'static str>,
+) -> Result<(), String> {
+    match check {
+        Err(_) if imported => {
+            new_config.x_post.mode = current_mode;
+            import_notices.push(backup::X_POST_MODE_KEPT);
+            Ok(())
+        }
+        check => check,
+    }
+}
+
+/// 保存の後に棒読みちゃんを起動するか。取り込みでは起動しない
+/// (ファイルを読み込んだだけで外部プログラムを起動させない)。
+fn launches_bouyomi_after_save(saved: &AppConfig, imported: bool) -> bool {
+    !imported && saved.tts.backend == config::TtsBackendKind::Bouyomi
+}
+
 async fn validate_x_post_mode(state: &AppState, new_config: &AppConfig) -> Result<(), String> {
     if new_config.x_post.mode != "api" {
         return Ok(());
@@ -4640,6 +4730,7 @@ pub fn run() {
             list_listeners,
             delete_listener,
             get_config,
+            export_config,
             take_startup_config_notice,
             get_comment_log_dir,
             open_comment_log_dir,
@@ -4665,6 +4756,7 @@ pub fn run() {
             moderate_ban_user,
             moderate_unban_user,
             update_config,
+            import_config,
             set_goals_show_in_app,
             append_moderation_value,
             set_moderation,
@@ -4949,6 +5041,45 @@ mod followup_tests {
             Some(preserved)
         );
         assert_eq!(rules.ng_users, ["bot", preserved]);
+    }
+
+    // 取り込みは、X に未接続で API モードを選べなくても拒否しない(SPEC §8.1)。
+    #[test]
+    fn import_keeps_x_post_mode_instead_of_rejecting() {
+        let rejected = || Err::<(), String>("API モードは X に接続してから選んでください".into());
+        let mut file = AppConfig::default();
+        file.x_post.mode = "api".into();
+
+        let mut imported = file.clone();
+        let mut notices = Vec::new();
+        let result = settle_x_post_mode(rejected(), true, &mut imported, "intent".into(), &mut notices);
+        assert_eq!(result, Ok(()));
+        assert_eq!(imported.x_post.mode, "intent");
+        assert_eq!(notices, [backup::X_POST_MODE_KEPT]);
+
+        // 接続済みなら、ファイルの投稿方式をそのまま使う。
+        let mut imported = file.clone();
+        let mut notices = Vec::new();
+        assert_eq!(settle_x_post_mode(Ok(()), true, &mut imported, "intent".into(), &mut notices), Ok(()));
+        assert_eq!(imported.x_post.mode, "api");
+        assert!(notices.is_empty());
+
+        // 通常の設定保存は、今までどおり拒否する。
+        let mut saved = file.clone();
+        let mut notices = Vec::new();
+        assert_eq!(settle_x_post_mode(rejected(), false, &mut saved, "intent".into(), &mut notices), rejected());
+        assert_eq!(saved.x_post.mode, "api");
+        assert!(notices.is_empty());
+    }
+
+    // 取り込みでは、保存後に棒読みちゃんを起動しない(SPEC §8.1)。
+    #[test]
+    fn import_does_not_launch_bouyomi() {
+        let mut saved = AppConfig::default();
+        assert!(!launches_bouyomi_after_save(&saved, false));
+        saved.tts.backend = config::TtsBackendKind::Bouyomi;
+        assert!(launches_bouyomi_after_save(&saved, false));
+        assert!(!launches_bouyomi_after_save(&saved, true));
     }
 
     // 指摘1: UI は `protectedOAuth` を読む。camelCase 変換の `protectedOauth` では届かない。

@@ -1,17 +1,21 @@
 <script lang="ts">
-  import { getConfig, setConfig, type AppConfig } from '../ipc';
+  import { exportConfig, importConfig, type ExportedConfig } from '../ipc';
   import { configReloadMessage, configSync } from '../configSync.svelte';
+  import { importMessage } from '../configPortability';
   import { theme, type AppearanceSnapshot } from '../theme.svelte';
 
-  const SCHEMA = 'fast-comment/settings';
-  // update_config の型エラーは Rust が固定フィールド名だけで組み立てる。
+  // v0.8.0 までの版は schema が違うファイルを拒否する。資格情報の欄が無い書き出しを
+  // 旧版が読み込んで今の資格情報を空にしないよう、書き出しの schema を変えた。
+  const SCHEMA = 'fast-comment/settings-v2';
+  const LEGACY_SCHEMA = 'fast-comment/settings';
+  // import_config の型エラーは Rust が固定フィールド名だけで組み立てる。
   const configTypeError = /^設定の形式が不正です \(項目 (?:\.|[a-zA-Z][a-zA-Z0-9]*(?:\.[a-zA-Z][a-zA-Z0-9]*)*)\)$/;
 
   interface SettingsBundle {
     schema: typeof SCHEMA;
-    version: 1;
+    version: 2;
     exportedAt: string;
-    config: AppConfig;
+    config: ExportedConfig;
     appearance: AppearanceSnapshot;
   }
 
@@ -61,10 +65,10 @@
     status = { kind: 'error', message };
   }
 
-  function buildBundle(config: AppConfig): SettingsBundle {
+  function buildBundle(config: ExportedConfig): SettingsBundle {
     return {
       schema: SCHEMA,
-      version: 1,
+      version: 2,
       exportedAt: new Date().toISOString(),
       config,
       appearance: theme.getSnapshot(),
@@ -92,7 +96,7 @@
     status = null;
 
     try {
-      const config = await getConfig();
+      const config = await exportConfig();
       if (!config) {
         showError('設定を取得できませんでした。Tauri環境で開いてから再試行してください。');
         return;
@@ -125,7 +129,7 @@
     }
   }
 
-  function parseBundle(raw: string): { config: AppConfig; appearance?: unknown } {
+  function parseBundle(raw: string): { config: ExportedConfig; appearance?: unknown } {
     let parsed: unknown;
     try {
       parsed = JSON.parse(raw);
@@ -137,7 +141,7 @@
       throw new Error('設定JSONのルートがオブジェクトではありません。');
     }
 
-    if ('schema' in parsed && parsed.schema !== SCHEMA) {
+    if ('schema' in parsed && parsed.schema !== SCHEMA && parsed.schema !== LEGACY_SCHEMA) {
       throw new Error('fast-comment の設定バックアップではないため読み込めません。');
     }
 
@@ -146,7 +150,7 @@
     }
 
     return {
-      config: parsed.config as unknown as AppConfig,
+      config: parsed.config,
       appearance: parsed.appearance,
     };
   }
@@ -160,7 +164,7 @@
       return;
     }
 
-    let parsed: { config: AppConfig; appearance?: unknown };
+    let parsed: { config: ExportedConfig; appearance?: unknown };
     try {
       parsed = parseBundle(trimmed);
     } catch (e) {
@@ -181,7 +185,7 @@
     configSync.importing = 'all';
     status = null;
     try {
-      const result = await setConfig(parsed.config);
+      const result = await importConfig(parsed.config);
       if (result && result.revision > configSync.revision) configSync.revision = result.revision;
       if (parsed.appearance !== undefined) theme.applySnapshot(parsed.appearance);
       if (!result) {
@@ -191,17 +195,9 @@
         return;
       }
 
-      if (!(await onImported?.())) return;
-
-      const notices = [...result.warnings];
-      if (result.protectedOAuth.length > 0) {
-        const services = result.protectedOAuth.map(service => service === 'xPost' ? 'X' : 'ツイキャス');
-        notices.push(`ログイン中の ${services.join('、')} の Client ID と待受ポートを保持しました。`);
-      }
-      const base = parsed.appearance === undefined
-        ? '設定をインポートしました。'
-        : '設定をインポートし、外観設定を反映しました。';
-      showSuccess([base, ...notices].join(' '));
+      const reloaded = !!(await onImported?.());
+      const message = importMessage(result, parsed.appearance !== undefined, reloaded);
+      if (message) showSuccess(message);
     } catch (e) {
       const typeError = typeof e === 'string' ? configTypeError.exec(e) : null;
       showError(typeError?.[0] ?? '設定のインポートに失敗しました。');
@@ -242,7 +238,8 @@
         {reloading ? '読込中...' : '設定を再読み込み'}
       </button>
     </div>
-  {:else if status}
+  {/if}
+  {#if status}
     <p
       class:banner-success={status.kind === 'success'}
       class:banner-error={status.kind === 'error'}
@@ -255,6 +252,7 @@
 
   <div class="portability-block">
     <h4>エクスポート</h4>
+    <p class="portability-note">ログイン情報(トークン・Cookie・API キー・Client ID)と棒読みちゃんの起動パスは書き出しません。URL のユーザー名とパスワードも消します。v0.8.0 までの版では読み込めません。</p>
     <div class="field-row portability-actions">
       <button type="button" class="export-btn" onclick={onExport} disabled={exporting}>
         {exporting ? 'エクスポート中...' : '設定JSONをエクスポート'}
@@ -277,6 +275,7 @@
 
   <div class="portability-block">
     <h4>インポート</h4>
+    <p class="portability-note">ログイン情報、X の接続先、棒読みちゃんの起動パスは、ファイルの値を使わず今の設定のままにします。読み上げの接続先は、この PC を指す時だけ読み込みます。X の自動告知は無効にします。</p>
     <div class="field-row portability-actions">
       <label class="file-button" for="settings-import-file">JSONファイルを選択</label>
       <input
@@ -378,6 +377,12 @@
   .portability-label {
     color: #ccc;
     font-size: 12px;
+  }
+
+  .portability-note {
+    color: #757575;
+    font-size: 11px;
+    margin: 0;
   }
 
   .portability-textarea {

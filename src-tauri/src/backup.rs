@@ -32,22 +32,48 @@ const OVERRIDE_SECRETS: &[&[&str]] = &[
     &["xOverrides", "bearerToken"],
     &["youtubeOverrides", "apiKey"],
 ];
-/// 復元時に今の値を引き継ぐ欄(資格情報、外部プログラムの起動、OAuth の redirect URI)。
+/// 資格情報の欄。zip では空にし、設定の書き出し(SPEC §8.1)では欄ごと消す。
+const CREDENTIALS: &[&str] = &["credentials"];
+/// 外部プログラムの起動の欄。ファイルを読んだだけで任意の exe を(昇格して)起動させないよう、
+/// 復元でも設定の読み込みでも今の値を引き継ぐ。
 const LOCAL_CONFIG_FIELDS: &[&[&str]] = &[
-    &["credentials"],
-    &["tts", "options", "bouyomiPath"],
+    BOUYOMI_PATH,
     &["tts", "options", "bouyomiLaunchElevated"],
-    // redirect URI のポートは、今の Client ID に登録した値と揃える。
+];
+/// 棒読みちゃんの起動パス。Windows のユーザー名を含みうるので、設定の書き出しには入れない。
+const BOUYOMI_PATH: &[&str] = &["tts", "options", "bouyomiPath"];
+/// OAuth の redirect URI のポート。今の Client ID に登録した値と揃えるため、
+/// 復元でも設定の読み込みでも今の値を引き継ぐ。
+const CALLBACK_PORTS: &[&[&str]] = &[
     &["xPost", "callbackPort"],
     &["twitcasting", "callbackPort"],
 ];
+/// X の接続先。ログイン cookie の送り先なので、設定の読み込みでも今の値を引き継ぐ。
+const X_ENDPOINTS: &[&str] = &["xOverrides", "endpoints"];
 /// URL の欄。zip ではユーザー情報(user:pass@)を消し、復元時は今の値を引き継ぐ。
 const URL_FIELDS: &[&[&str]] = &[
     &["tts", "options", "voicevoxUrl"],
-    &["xOverrides", "endpoints"],
+    X_ENDPOINTS,
     &["niconicoOverrides", "endpoints"],
     &["twitcastingOverrides", "endpoints"],
 ];
+const EXPORT_SECRET_ERROR: &str = "資格情報と同じ値が他の欄にあるため、設定を書き出せません";
+const EXPORT_CHECK_ERROR: &str = "資格情報の検査に失敗したため、設定を書き出せません";
+const IMPORT_ERROR: &str = "設定を取り込めません";
+const X_POST_DISABLED_BY_IMPORT: &str = "X の自動告知は取り込み後に無効にしました。設定画面で確認してから有効にしてください。有効にする前に、自分の配信(ownStream)の設定も確認してください。";
+const BOUYOMI_NOT_LAUNCHED_BY_IMPORT: &str = "棒読みちゃんは自動では起動しません。";
+const TTS_DESTINATION_KEPT: &str =
+    "読み上げの接続先は、この PC 以外を指していたため今の設定のままにしました。";
+pub(crate) const X_POST_MODE_KEPT: &str = "X の投稿方式は今の設定のままにしました。";
+
+/// 復元でも設定の読み込みでも、ファイルの値を使わず今の値を引き継ぐ欄。
+fn kept_fields() -> impl Iterator<Item = &'static [&'static str]> {
+    std::iter::once(CREDENTIALS)
+        .chain(OVERRIDE_SECRETS.iter().copied())
+        .chain(LOCAL_CONFIG_FIELDS.iter().copied())
+        .chain(CALLBACK_PORTS.iter().copied())
+        .chain(std::iter::once(X_ENDPOINTS))
+}
 const SCHEMA: &str = "fast-comment-backup";
 const MANIFEST: &str = "manifest.json";
 const READY: &str = "READY";
@@ -559,7 +585,8 @@ fn empty_credentials() -> Value {
 }
 
 fn collect_secret(value: Option<&Value>, secrets: &mut BTreeSet<String>) {
-    let Some(value) = value.and_then(Value::as_str) else {
+    // 設定は前後の空白を除いて使う。写しが空白なしで残っていても見つける。
+    let Some(value) = value.and_then(Value::as_str).map(str::trim) else {
         return;
     };
     // Twitch accepts the OAuth token with or without the "oauth:" prefix.
@@ -644,6 +671,160 @@ fn set_config_field(
     }
 }
 
+/// 設定にある鍵・トークン・Cookie を、残存検査用の正規表現として集める。
+fn collect_secrets(config: &serde_json::Map<String, Value>) -> BTreeSet<String> {
+    let mut secrets = BTreeSet::new();
+    for field in CREDENTIAL_SECRETS {
+        collect_secret(config_field(config, &["credentials", field]), &mut secrets);
+    }
+    for path in OVERRIDE_SECRETS {
+        collect_secret(config_field(config, path), &mut secrets);
+    }
+    secrets
+}
+
+/// zip と設定の書き出しで共通の伏せ方。`credentials` の扱いだけ呼び出し側で分かれる。
+fn redact_overrides(config: &mut serde_json::Map<String, Value>) {
+    for path in OVERRIDE_SECRETS {
+        set_config_field(config, path, None);
+    }
+    for path in URL_FIELDS {
+        if let Some(mut value) = config_field(config, path).cloned() {
+            strip_url_user_info(&mut value);
+            set_config_field(config, path, Some(value));
+        }
+    }
+}
+
+fn contains_secret<'a>(
+    secrets: BTreeSet<String>,
+    mut haystacks: impl Iterator<Item = &'a [u8]>,
+) -> Result<bool> {
+    if secrets.is_empty() {
+        return Ok(false);
+    }
+    let matches =
+        regex::bytes::RegexSet::new(secrets).map_err(|_| BackupError::Invalid("資格情報の検査"))?;
+    Ok(haystacks.any(|bytes| matches.is_match(bytes)))
+}
+
+/// 設定の書き出し(SPEC §8.1)。zip と同じ欄を伏せ、`credentials` と棒読みちゃんの起動パスは欄ごと消す。
+/// 伏せた後も 8 文字以上の鍵・トークン・Cookie が残る設定は書き出さない。
+pub(crate) fn export_config(config: &AppConfig) -> std::result::Result<Value, &'static str> {
+    let Ok(Value::Object(mut exported)) = serde_json::to_value(config) else {
+        return Err("設定を書き出せません");
+    };
+    let secrets = collect_secrets(&exported);
+    redact_overrides(&mut exported);
+    set_config_field(&mut exported, CREDENTIALS, None);
+    set_config_field(&mut exported, BOUYOMI_PATH, None);
+    let exported = Value::Object(exported);
+    let text = exported.to_string();
+    match contains_secret(secrets, std::iter::once(text.as_bytes())) {
+        Ok(false) => Ok(exported),
+        Ok(true) => Err(EXPORT_SECRET_ERROR),
+        Err(_) => Err(EXPORT_CHECK_ERROR),
+    }
+}
+
+/// 設定の読み込み(SPEC §8.1)の入力。`config` がオブジェクトでないファイルは、型変換の前に拒否する
+/// (serde は配列からも struct を読める)。エラー文は固定。
+pub(crate) fn parse_import(value: Value) -> std::result::Result<AppConfig, String> {
+    if !value.is_object() {
+        return Err("設定の形式が不正です (項目 .)".into());
+    }
+    AppConfig::from_config_update(value)
+}
+
+fn loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
+/// reqwest と同じ `url::Url` の解釈で、接続先がこの PC(localhost、127.0.0.0/8、::1)か。
+fn loopback_url(value: &str) -> bool {
+    let Ok(url) = url::Url::parse(value) else {
+        return false;
+    };
+    match url.host() {
+        Some(url::Host::Domain(domain)) => loopback_host(domain),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
+}
+
+/// 設定の読み込み(SPEC §8.1)。`incoming` はファイルから型変換した設定、戻り値は保存する設定。
+/// - 資格情報、上書き用の鍵、外部プログラムの起動、OAuth の待受ポート、X の接続先は今の値にする
+///   (旧版の書き出しに残る資格情報も適用しない)
+/// - 読み上げの本文の送り先(VOICEVOX の URL、棒読みちゃんのホスト)は、ファイルの値がこの PC を
+///   指す時だけ使う。ポートはファイルの値を使う
+/// - それ以外の URL の欄はファイルの値を使い、ユーザー情報を消す
+/// - X の自動告知は無効にする(今の資格情報と他人のファイルの組み合わせで投稿させない)
+pub(crate) fn merge_import(
+    incoming: &AppConfig,
+    current: &AppConfig,
+) -> std::result::Result<AppConfig, &'static str> {
+    // 型変換した後の値は必ず名前で辿れる(配列で書かれたファイルでも差し替えを外さない)。
+    let (Ok(Value::Object(mut merged)), Ok(Value::Object(kept))) =
+        (serde_json::to_value(incoming), serde_json::to_value(current))
+    else {
+        return Err(IMPORT_ERROR);
+    };
+    redact_overrides(&mut merged);
+    for path in kept_fields() {
+        set_config_field(&mut merged, path, config_field(&kept, path).cloned());
+    }
+    let mut merged: AppConfig =
+        serde_json::from_value(Value::Object(merged)).map_err(|_| IMPORT_ERROR)?;
+    let (options, current_options) = (&mut merged.tts.options, &current.tts.options);
+    // 接続先が今と同じなら、今の値(ユーザー情報を含む)をそのまま残す。保存直前にもう一度
+    // マージするので、1 回目で残した今の値が 2 回目で伏せられないようにするためでもある。
+    let without_user_info = |value: &str| match url::Url::parse(value) {
+        Ok(mut url) if !url.cannot_be_a_base() => {
+            let _ = url.set_username("");
+            let _ = url.set_password(None);
+            String::from(url)
+        }
+        _ => value.to_owned(),
+    };
+    if !loopback_url(&options.voicevox_url)
+        || without_user_info(&options.voicevox_url)
+            == without_user_info(&current_options.voicevox_url)
+    {
+        options.voicevox_url = current_options.voicevox_url.clone();
+    }
+    if !loopback_host(options.bouyomi_host.trim()) {
+        options.bouyomi_host = current_options.bouyomi_host.clone();
+    }
+    merged.x_post.enabled = false;
+    Ok(merged)
+}
+
+/// 読み込みがファイルの値を使わなかったことを知らせる固定の文。`merged` は `merge_import` の結果。
+pub(crate) fn import_notices(
+    file: &AppConfig,
+    current: &AppConfig,
+    merged: &AppConfig,
+) -> Vec<&'static str> {
+    use crate::config::TtsBackendKind::Bouyomi;
+    let mut notices = Vec::new();
+    if file.x_post.enabled || current.x_post.enabled {
+        notices.push(X_POST_DISABLED_BY_IMPORT);
+    }
+    // 取り込みでは、保存後の自動起動をしない(ファイルの接続先・ポートに合わせて起動させない)。
+    if merged.tts.backend == Bouyomi && current.tts.backend != Bouyomi {
+        notices.push(BOUYOMI_NOT_LAUNCHED_BY_IMPORT);
+    }
+    let (file, current) = (&file.tts.options, &current.tts.options);
+    if (!loopback_url(&file.voicevox_url) && file.voicevox_url != current.voicevox_url)
+        || (!loopback_host(file.bouyomi_host.trim()) && file.bouyomi_host != current.bouyomi_host)
+    {
+        notices.push(TTS_DESTINATION_KEPT);
+    }
+    notices
+}
+
 fn snapshot(config_dir: &Path, now_ms: u64) -> Result<Contents> {
     let mut contents = Contents::default();
     for &name in FILES {
@@ -662,20 +843,9 @@ fn snapshot(config_dir: &Path, now_ms: u64) -> Result<Contents> {
     let mut secrets = BTreeSet::new();
     if let Some(bytes) = contents.files.get_mut("config.json") {
         let mut config = config_object(bytes)?;
-        for field in CREDENTIAL_SECRETS {
-            collect_secret(config_field(&config, &["credentials", field]), &mut secrets);
-        }
-        for path in OVERRIDE_SECRETS {
-            collect_secret(config_field(&config, path), &mut secrets);
-            set_config_field(&mut config, path, None);
-        }
-        for path in URL_FIELDS {
-            if let Some(mut value) = config_field(&config, path).cloned() {
-                strip_url_user_info(&mut value);
-                set_config_field(&mut config, path, Some(value));
-            }
-        }
-        config.insert("credentials".into(), empty_credentials());
+        secrets = collect_secrets(&config);
+        redact_overrides(&mut config);
+        set_config_field(&mut config, CREDENTIALS, Some(empty_credentials()));
         contents.total_bytes -= bytes.len() as u64;
         *bytes = encode(&config)?;
         if bytes.len() as u64 > MAX_FILE_BYTES
@@ -696,18 +866,14 @@ fn snapshot(config_dir: &Path, now_ms: u64) -> Result<Contents> {
     contents.validate()?;
     // 復元できない写しで正常な世代を押し出さない。
     contents.validate_stores()?;
-    if !secrets.is_empty() {
-        let matches = regex::bytes::RegexSet::new(secrets)
-            .map_err(|_| BackupError::Invalid("資格情報の検査"))?;
-        if contents
-            .files
-            .iter()
-            .any(|(name, bytes)| matches.is_match(name.as_bytes()) || matches.is_match(bytes))
-        {
-            return Err(BackupError::Invalid(
-                "バックアップ対象に資格情報が含まれています",
-            ));
-        }
+    let files = contents
+        .files
+        .iter()
+        .flat_map(|(name, bytes)| [name.as_bytes(), bytes.as_slice()]);
+    if contains_secret(secrets, files)? {
+        return Err(BackupError::Invalid(
+            "バックアップ対象に資格情報が含まれています",
+        ));
     }
     Ok(contents)
 }
@@ -1011,13 +1177,13 @@ fn prepare_config(config_dir: &Path, snapshot: Option<&[u8]>) -> Result<Option<V
         let defaults =
             serde_json::to_value(AppConfig::default()).expect("default config serializes");
         let defaults = defaults.as_object().expect("config object");
-        for path in LOCAL_CONFIG_FIELDS.iter().chain(OVERRIDE_SECRETS).chain(URL_FIELDS) {
+        for path in URL_FIELDS.iter().copied().chain(kept_fields()) {
             if config_field(&current, path) == config_field(defaults, path) {
                 set_config_field(&mut current, path, None);
             }
         }
     }
-    for path in LOCAL_CONFIG_FIELDS.iter().chain(OVERRIDE_SECRETS).chain(URL_FIELDS) {
+    for path in URL_FIELDS.iter().copied().chain(kept_fields()) {
         set_config_field(&mut restored, path, config_field(&current, path).cloned());
     }
     if snapshot.is_none() && restored.is_empty() {
@@ -2020,6 +2186,399 @@ mod tests {
             [("watchPageBaseUrl".into(), "https://current.invalid/w/".into())].into()
         );
         assert!(config.twitcasting_overrides.endpoints.is_empty());
+    }
+
+    /// 合成値だけで作った設定。伏せる欄の値はすべて `syn-<tag>-` を含む。
+    fn synthetic_config(tag: &str) -> AppConfig {
+        let secret = |name: &str| format!("syn-{tag}-{name}");
+        let url = |host: &str| format!("https://syn-{tag}-user:syn-{tag}-pass@{host}/path");
+        let mut config = AppConfig {
+            // 全フィールドを列挙する(欄を足した時にコンパイルエラーで気付く)。
+            credentials: CredentialsConfig {
+                twitch_oauth: format!("oauth:{}", secret("twitch-oauth")),
+                twitch_username: secret("twitch-username"),
+                twitch_client_id: secret("twitch-client-id"),
+                twitch_client_secret: secret("twitch-client-secret"),
+                youtube_api_key: secret("youtube-api-key"),
+                youtube_oauth_client_id: secret("youtube-oauth-client-id"),
+                x_auth_token: secret("x-auth-token"),
+                x_csrf_token: secret("x-csrf-token"),
+                x_post_client_id: Some(secret("x-post-client-id")),
+                twitcasting_client_id: Some(secret("twitcasting-client-id")),
+            },
+            ..AppConfig::default()
+        };
+        config.x_overrides.bearer_token = Some(secret("bearer-token"));
+        config.youtube_overrides.api_key = Some(secret("innertube-key"));
+        // 読み上げの送り先はこの PC(取り込みでファイルの値を使う条件)。
+        config.tts.options.voicevox_url =
+            format!("http://syn-{tag}-user:syn-{tag}-pass@127.0.0.1:50021/{tag}");
+        config.tts.options.bouyomi_path = format!("C:\\Users\\syn-{tag}-user\\BouyomiChan.exe");
+        config
+            .x_overrides
+            .endpoints
+            .insert("liveChatUrl".into(), url("x.example.invalid"));
+        config
+            .niconico_overrides
+            .endpoints
+            .insert("watchPageBaseUrl".into(), url("nico.example.invalid"));
+        config
+            .twitcasting_overrides
+            .endpoints
+            .insert("eventPubSubUrl".into(), url("tc.example.invalid"));
+        config
+    }
+
+    /// `file` を読み込んだ時に期待する設定(SPEC §8.1 の規則を型の上で書いたもの)。
+    fn expected_import(mut file: AppConfig, current: &AppConfig) -> AppConfig {
+        file.credentials = current.credentials.clone();
+        file.x_overrides.bearer_token = current.x_overrides.bearer_token.clone();
+        file.youtube_overrides.api_key = current.youtube_overrides.api_key.clone();
+        file.x_overrides.endpoints = current.x_overrides.endpoints.clone();
+        file.x_post.callback_port = current.x_post.callback_port;
+        file.twitcasting.callback_port = current.twitcasting.callback_port;
+        file.tts.options.bouyomi_path = current.tts.options.bouyomi_path.clone();
+        file.tts.options.bouyomi_launch_elevated = current.tts.options.bouyomi_launch_elevated;
+        file.x_post.enabled = false;
+        if !loopback_host(file.tts.options.bouyomi_host.trim()) {
+            file.tts.options.bouyomi_host = current.tts.options.bouyomi_host.clone();
+        }
+        if !loopback_url(&file.tts.options.voicevox_url) {
+            file.tts.options.voicevox_url = current.tts.options.voicevox_url.clone();
+            return file_urls_stripped(file, false);
+        }
+        file_urls_stripped(file, true)
+    }
+
+    fn file_urls_stripped(mut file: AppConfig, voicevox: bool) -> AppConfig {
+        let voicevox = voicevox.then_some(&mut file.tts.options.voicevox_url);
+        let urls = voicevox
+            .into_iter()
+            .chain(file.niconico_overrides.endpoints.values_mut())
+            .chain(file.twitcasting_overrides.endpoints.values_mut());
+        for url in urls {
+            if let Some(stripped) = strip_user_info(url) {
+                *url = stripped;
+            }
+        }
+        file
+    }
+
+    #[test]
+    fn settings_export_contains_no_secret_value() {
+        let mut config = synthetic_config("exp");
+        config.obs.port = 11190;
+        let exported = export_config(&config).unwrap();
+        let text = exported.to_string();
+        assert!(!text.contains("syn-exp-"), "{text}");
+        assert!(exported.get("credentials").is_none());
+        assert!(exported["xOverrides"].get("bearerToken").is_none());
+        assert!(exported["youtubeOverrides"].get("apiKey").is_none());
+        // URL はユーザー情報だけを消し、接続先は残す。
+        for (path, url) in [
+            (&["tts", "options", "voicevoxUrl"][..], "http://127.0.0.1:50021/exp"),
+            (&["xOverrides", "endpoints", "liveChatUrl"], "https://x.example.invalid/path"),
+            (&["niconicoOverrides", "endpoints", "watchPageBaseUrl"], "https://nico.example.invalid/path"),
+            (&["twitcastingOverrides", "endpoints", "eventPubSubUrl"], "https://tc.example.invalid/path"),
+        ] {
+            let object = exported.as_object().unwrap();
+            assert_eq!(config_field(object, path), Some(&Value::from(url)), "{path:?}");
+        }
+        // 資格情報ではない設定はそのまま書き出す。
+        assert_eq!(exported["obs"]["port"], 11190);
+        // 起動パスは Windows のユーザー名を含みうるので書き出さない。取り込みは今の値を残す。
+        assert!(exported["tts"]["options"].get("bouyomiPath").is_none());
+        assert_eq!(exported["tts"]["options"]["bouyomiHost"], "127.0.0.1");
+
+        // 既定の設定には伏せる値が無く、欄だけが消える。
+        let exported = export_config(&AppConfig::default()).unwrap();
+        assert!(exported.get("credentials").is_none());
+
+        // 資格情報と同じ値が他の欄にあれば、書き出さない。
+        config.tts.options.name_format = config.credentials.x_auth_token.clone();
+        assert_eq!(export_config(&config), Err(EXPORT_SECRET_ERROR));
+        // 資格情報の前後に空白があっても、空白なしの写しを見つける。
+        config.credentials.x_auth_token = format!(" {}\n", config.tts.options.name_format);
+        assert_eq!(export_config(&config), Err(EXPORT_SECRET_ERROR));
+    }
+
+    #[test]
+    fn settings_import_keeps_current_secrets_and_x_endpoints() {
+        let current = synthetic_config("cur");
+        let mut other = synthetic_config("new");
+        other.obs.port = 11190;
+        other.x_post.callback_port = 47999;
+        other.twitcasting.callback_port = 39999;
+        let expected = expected_import(other.clone(), &current);
+        for file in [
+            // 今の版の書き出し(資格情報の欄が無い)。
+            export_config(&other).unwrap(),
+            // 旧版の書き出し(資格情報、鍵、URL のユーザー情報を含む)。
+            serde_json::to_value(&other).unwrap(),
+        ] {
+            let merged =
+                merge_import(&AppConfig::from_config_update(file).unwrap(), &current).unwrap();
+            assert_eq!(merged, expected);
+            // 資格情報、鍵、待受ポート、X の接続先は今の値のまま。
+            assert_eq!(merged.credentials, current.credentials);
+            assert_eq!(merged.x_overrides, current.x_overrides);
+            assert_eq!(merged.youtube_overrides.api_key, current.youtube_overrides.api_key);
+            assert_eq!(merged.x_post.callback_port, current.x_post.callback_port);
+            assert_eq!(merged.twitcasting.callback_port, current.twitcasting.callback_port);
+            // それ以外の URL はファイルの接続先を使い、ユーザー情報は持ち込まない。
+            assert_eq!(merged.tts.options.voicevox_url, "http://127.0.0.1:50021/new");
+            assert_eq!(
+                merged.niconico_overrides.endpoints["watchPageBaseUrl"],
+                "https://nico.example.invalid/path"
+            );
+            assert_eq!(
+                merged.twitcasting_overrides.endpoints["eventPubSubUrl"],
+                "https://tc.example.invalid/path"
+            );
+            assert_eq!(merged.obs.port, 11190);
+            let text = serde_json::to_string(&merged).unwrap();
+            assert!(!text.contains("syn-new-"), "{text}");
+            // 保存の直前にもう一度通しても変わらない。
+            assert_eq!(merge_import(&merged, &current).unwrap(), merged);
+        }
+
+        // 欄が無い・空のファイルでも、今の資格情報を空で上書きしない。
+        for file in [
+            serde_json::json!({}),
+            serde_json::json!({
+                "credentials": {"xAuthToken": "", "xCsrfToken": ""},
+                "xOverrides": {},
+            }),
+            // 配列で書かれた欄も、型変換の後で今の値に差し替わる。
+            serde_json::json!({
+                "credentials": ["oauth:syn-new-positional-oauth"],
+                "xOverrides": ["syn-new-positional-bearer", {"liveChatUrl": "https://new.example.invalid/c"}],
+            }),
+        ] {
+            let merged =
+                merge_import(&AppConfig::from_config_update(file).unwrap(), &current).unwrap();
+            assert_eq!(merged, expected_import(AppConfig::default(), &current));
+            assert_eq!(merged.credentials, current.credentials);
+            assert_eq!(merged.x_overrides, current.x_overrides);
+        }
+    }
+
+    #[test]
+    fn settings_import_drops_file_secrets_when_current_has_none() {
+        let current = AppConfig::default();
+        let file = synthetic_config("new");
+        let merged = merge_import(&file, &current).unwrap();
+        // 今の設定に無い鍵と X の接続先は、ファイルにあっても取り込まない。
+        assert_eq!(merged.credentials, CredentialsConfig::default());
+        assert_eq!(merged.x_overrides.bearer_token, None);
+        assert!(merged.x_overrides.endpoints.is_empty());
+        assert_eq!(merged.youtube_overrides.api_key, None);
+        // X 以外の接続先はファイルの値(ユーザー情報なし)。
+        assert_eq!(merged.tts.options.voicevox_url, "http://127.0.0.1:50021/new");
+        assert_eq!(merged.niconico_overrides.endpoints.len(), 1);
+        assert_eq!(merged.twitcasting_overrides.endpoints.len(), 1);
+        assert!(!serde_json::to_string(&merged).unwrap().contains("syn-new-"));
+        assert_eq!(merged, expected_import(file, &current));
+    }
+
+    #[test]
+    fn settings_import_never_enables_x_autopost() {
+        // 接続済みの環境(今の資格情報)に、API モードの自動告知を有効にした他の配信者のファイル。
+        let mut current = synthetic_config("cur");
+        let file = serde_json::json!({
+            "channels": [{"platform": "twitch", "identifier": "other_streamer", "ownStream": true}],
+            "xPost": {"enabled": true, "mode": "api", "intentOpen": "auto", "callbackPort": 47999},
+        });
+        let file = AppConfig::from_config_update(file).unwrap();
+        assert!(file.x_post.enabled && file.channels[0].own_stream);
+        for current_enabled in [false, true] {
+            current.x_post.enabled = current_enabled;
+            let merged = merge_import(&file, &current).unwrap();
+            assert!(!merged.x_post.enabled);
+            let notices = import_notices(&file, &current, &merged);
+            assert_eq!(notices, [X_POST_DISABLED_BY_IMPORT]);
+            assert!(notices[0].contains("ownStream"));
+            // 無効にするのは告知だけ。他はファイルの値を読む。
+            assert_eq!(merged.x_post.mode, "api");
+            assert!(merged.channels[0].own_stream);
+            assert_eq!(merged.credentials, current.credentials);
+            assert_eq!(merged.x_post.callback_port, current.x_post.callback_port);
+        }
+    }
+
+    #[test]
+    fn settings_import_takes_tts_destination_only_from_this_pc() {
+        let mut current = AppConfig::default();
+        current.tts.options.voicevox_url = "http://192.0.2.5:50021".into();
+        current.tts.options.bouyomi_host = "192.0.2.6".into();
+        let import = |voicevox: &str, bouyomi: &str| {
+            let file = AppConfig::from_config_update(serde_json::json!({
+                "tts": {"options": {
+                    "voicevoxUrl": voicevox,
+                    "bouyomiHost": bouyomi,
+                    "bouyomiPort": 50002,
+                }},
+            }))
+            .unwrap();
+            let merged = merge_import(&file, &current).unwrap();
+            // ポートはファイルの値を使う。
+            assert_eq!(merged.tts.options.bouyomi_port, 50002);
+            assert_eq!(merge_import(&merged, &current).unwrap(), merged);
+            let notices = import_notices(&file, &current, &merged);
+            (merged.tts.options, notices)
+        };
+        // この PC を指す値はファイルから取り込む(AivisSpeech の 10101 など)。
+        for (voicevox, bouyomi) in [
+            ("http://127.0.0.1:10101", "127.0.0.1"),
+            ("http://localhost:10101", "localhost"),
+            ("http://LOCALHOST:10101/", "LocalHost"),
+            ("http://127.8.9.10:50021/", "127.8.9.10"),
+            ("http://[::1]:50021/", "::1"),
+        ] {
+            let (options, notices) = import(voicevox, bouyomi);
+            assert_eq!(options.voicevox_url, voicevox);
+            assert_eq!(options.bouyomi_host, bouyomi);
+            assert!(notices.is_empty(), "{voicevox} {bouyomi}");
+        }
+        // この PC 以外を指す値・解析できない値は取り込まず、今の値を残して知らせる。
+        for (voicevox, bouyomi) in [
+            ("http://198.51.100.7:50021", "198.51.100.7"),
+            ("https://tts.example.invalid/", "tts.example.invalid"),
+            ("http://127.0.0.1@tts.example.invalid/", "127.0.0.1.example.invalid"),
+            ("http://localhost.example.invalid:50021/", "localhost.example.invalid"),
+            ("127.0.0.1:50021", "http://127.0.0.1"),
+            ("", ""),
+        ] {
+            for (voicevox, bouyomi) in [(voicevox, "127.0.0.1"), ("http://127.0.0.1:50021", bouyomi)] {
+                let (options, notices) = import(voicevox, bouyomi);
+                let kept = (
+                    options.voicevox_url == current.tts.options.voicevox_url,
+                    options.bouyomi_host == current.tts.options.bouyomi_host,
+                );
+                assert_eq!(kept, (bouyomi == "127.0.0.1", voicevox == "http://127.0.0.1:50021"));
+                assert_eq!(notices, [TTS_DESTINATION_KEPT], "{voicevox} {bouyomi}");
+            }
+        }
+        // 今の値と同じなら、残したことを知らせない(同じ PC での書き出しと読み込み)。
+        let (options, notices) = import("http://192.0.2.5:50021", "192.0.2.6");
+        assert_eq!(options.voicevox_url, "http://192.0.2.5:50021");
+        assert_eq!(options.bouyomi_host, "192.0.2.6");
+        assert!(notices.is_empty());
+    }
+
+    #[test]
+    fn settings_import_rejects_a_config_that_is_not_an_object() {
+        for value in [
+            serde_json::json!([]),
+            serde_json::json!([{"enabled": false}, {"enabled": true}]),
+            serde_json::json!("syn-new-root"),
+            serde_json::json!(null),
+        ] {
+            assert_eq!(
+                parse_import(value),
+                Err("設定の形式が不正です (項目 .)".to_string())
+            );
+        }
+        assert_eq!(parse_import(serde_json::json!({})), Ok(AppConfig::default()));
+    }
+
+    #[test]
+    fn settings_import_keeps_current_voicevox_user_info_through_both_merges() {
+        let mut current = AppConfig::default();
+        current.tts.options.voicevox_url = "http://syn-user:syn-pass@127.0.0.1:50021".into();
+        // ファイルの接続先が外部(今の値を残す)、または今と同じ接続先(ユーザー情報なし)。
+        for file_url in ["http://192.0.2.10:50021", "http://127.0.0.1:50021"] {
+            let file = AppConfig::from_config_update(serde_json::json!({
+                "tts": {"options": {"voicevoxUrl": file_url}},
+            }))
+            .unwrap();
+            // 保存処理と同じく 2 回マージする(検証の前と、保存直前のロックの中)。
+            let first = merge_import(&file, &current).unwrap();
+            let second = merge_import(&first, &current).unwrap();
+            assert_eq!(second.tts.options.voicevox_url, current.tts.options.voicevox_url, "{file_url}");
+        }
+        // 別のループバックのポートならファイルの値を使う(AivisSpeech を移すため)。
+        let file = AppConfig::from_config_update(serde_json::json!({
+            "tts": {"options": {"voicevoxUrl": "http://127.0.0.1:10101"}},
+        }))
+        .unwrap();
+        let first = merge_import(&file, &current).unwrap();
+        let second = merge_import(&first, &current).unwrap();
+        assert_eq!(second.tts.options.voicevox_url, "http://127.0.0.1:10101");
+    }
+
+    #[test]
+    fn settings_import_keeps_current_bouyomi_launch() {
+        // 棒読みちゃんを使う設定に、別の exe を昇格して起動させるファイル。
+        let file = serde_json::json!({
+            "tts": {"backend": "bouyomi", "options": {
+                "bouyomiPath": "C:\\syn-new\\other.exe",
+                "bouyomiLaunchElevated": true,
+                "bouyomiPort": 50002,
+            }},
+        });
+        let file = AppConfig::from_config_update(file).unwrap();
+        assert!(file.tts.options.bouyomi_launch_elevated);
+        assert_eq!(file.tts.backend, crate::config::TtsBackendKind::Bouyomi);
+        let mut current = AppConfig::default();
+        for (path, elevated) in [("", false), ("C:\\syn-cur\\BouyomiChan.exe", false)] {
+            current.tts.options.bouyomi_path = path.into();
+            current.tts.options.bouyomi_launch_elevated = elevated;
+            let merged = merge_import(&file, &current).unwrap();
+            assert_eq!(merged.tts.options.bouyomi_path, path);
+            assert_eq!(merged.tts.options.bouyomi_launch_elevated, elevated);
+            // 取り込みでは起動しないので、棒読みちゃんに切り替わった時はそれを知らせる。
+            assert_eq!(
+                import_notices(&file, &current, &merged),
+                [BOUYOMI_NOT_LAUNCHED_BY_IMPORT]
+            );
+            let mut already = current.clone();
+            already.tts.backend = crate::config::TtsBackendKind::Bouyomi;
+            assert!(import_notices(&file, &already, &merged).is_empty());
+            // 起動に関わらない読み上げ設定はファイルの値を読む。
+            assert_eq!(merged.tts.backend, crate::config::TtsBackendKind::Bouyomi);
+            assert_eq!(merged.tts.options.bouyomi_port, 50002);
+            assert_eq!(merged, expected_import(file.clone(), &current));
+        }
+    }
+
+    #[test]
+    fn settings_import_reads_an_older_export() {
+        let current = synthetic_config("cur");
+        // 旧版の形: 新しい節(backup・soundEffects・twitcasting 等)が無く、資格情報が入っている。
+        let file = serde_json::json!({
+            "channels": [{"platform": "twitch", "identifier": "old_channel"}],
+            "obs": {"port": 11190},
+            "tts": {"options": {
+                "bouyomiPort": 50002,
+                "voicevoxUrl": "http://syn-old-user:syn-old-pass@127.0.0.1:10101",
+            }},
+            "xOverrides": {
+                "bearerToken": "syn-old-bearer-token",
+                "livePollSecs": 45,
+                "endpoints": {"liveChatUrl": "https://syn-old-user:syn-old-pass@x.example.invalid/c"},
+            },
+            "youtubeOverrides": {"apiKey": "syn-old-innertube-key", "clientVersion": "2.1"},
+            "credentials": {
+                "twitchOauth": "oauth:syn-old-twitch-oauth",
+                "twitchUsername": "syn-old-twitch-username",
+                "youtubeApiKey": "syn-old-youtube-api-key",
+                "xAuthToken": "syn-old-x-auth-token",
+                "xCsrfToken": "syn-old-x-csrf-token",
+            },
+        });
+        let file = AppConfig::from_config_update(file).unwrap();
+        let merged = merge_import(&file, &current).unwrap();
+        assert!(!serde_json::to_string(&merged).unwrap().contains("syn-old-"));
+        // 資格情報ではない設定はファイルの値になる。
+        assert_eq!(merged.channels.len(), 1);
+        assert_eq!(merged.channels[0].identifier, "old_channel");
+        assert_eq!(merged.obs.port, 11190);
+        assert_eq!(merged.tts.options.bouyomi_port, 50002);
+        assert_eq!(merged.tts.options.voicevox_url, "http://127.0.0.1:10101/");
+        assert_eq!(merged.x_overrides.live_poll_secs, Some(45));
+        assert_eq!(merged.youtube_overrides.client_version.as_deref(), Some("2.1"));
+        assert_eq!(merged, expected_import(file, &current));
     }
 
     #[cfg(unix)]
