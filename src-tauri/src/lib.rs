@@ -36,6 +36,7 @@ pub mod sources;
 pub mod stats;
 mod templates;
 pub mod tts;
+mod tts_dictionary;
 mod update;
 
 use std::collections::{HashMap, VecDeque};
@@ -1935,6 +1936,61 @@ async fn set_moderation(
         .map_err(|_| "モデレーション規則の形式が不正です".to_string())?;
     let _write = state.config_write.lock().await;
     update_moderation(&state, |rules| *rules = moderation)
+}
+
+#[derive(Serialize)]
+struct TtsDictionarySaved {
+    dictionary: Vec<config::TtsDictEntry>,
+    #[serde(flatten)]
+    result: tts_dictionary::ImportResult,
+}
+
+#[tauri::command]
+fn export_tts_dictionary(state: State<'_, AppState>) -> Result<String, String> {
+    let current = state.config.lock().unwrap();
+    tts_dictionary::export(&current.tts.options.dictionary)
+}
+
+#[tauri::command]
+async fn import_tts_dictionary(
+    state: State<'_, AppState>,
+    raw: String,
+    mode: tts_dictionary::ImportMode,
+) -> Result<ConfigCommit<TtsDictionarySaved>, String> {
+    save_tts_dictionary(&state, raw.as_bytes(), mode).await
+}
+
+#[tauri::command]
+async fn import_tts_dictionary_url(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    url: String,
+    mode: tts_dictionary::ImportMode,
+) -> Result<ConfigCommit<TtsDictionarySaved>, String> {
+    if window.label() != "main" {
+        return Err("辞書URLはメインウィンドウからのみ取得できます".into());
+    }
+    let raw = tts_dictionary::fetch(&url).await?;
+    save_tts_dictionary(&state, &raw, mode).await
+}
+
+async fn save_tts_dictionary(
+    state: &AppState,
+    raw: &[u8],
+    mode: tts_dictionary::ImportMode,
+) -> Result<ConfigCommit<TtsDictionarySaved>, String> {
+    let parsed = tts_dictionary::parse(raw)?;
+    let _write = state.config_write.lock().await;
+    let mut current = state.config.lock().unwrap();
+    let (dictionary, result) = tts_dictionary::merge(&current.tts.options.dictionary, parsed, mode)?;
+    let revision = if dictionary != current.tts.options.dictionary {
+        let mut next = current.clone();
+        next.tts.options.dictionary = dictionary.clone();
+        Some(state.commit_config(&mut current, next).map_err(|error| error.to_string())?)
+    } else {
+        None
+    };
+    Ok(ConfigCommit::new(revision, TtsDictionarySaved { dictionary, result }))
 }
 
 /// チャンネルを1件追加または置き換え、有効なら起動する。
@@ -4246,6 +4302,9 @@ pub fn run() {
             set_goals_show_in_app,
             append_moderation_value,
             set_moderation,
+            export_tts_dictionary,
+            import_tts_dictionary,
+            import_tts_dictionary_url,
             add_channel,
             set_channel_overrides,
             remove_channel,

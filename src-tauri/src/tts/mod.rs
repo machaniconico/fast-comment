@@ -452,7 +452,7 @@ impl CompiledDictionary {
                 return None;
             }
             if entry.regex {
-                match Regex::new(&entry.from) {
+                match crate::tts_dictionary::compile_regex(&entry.from) {
                     Ok(pattern) => Some(CompiledReplacement::Pattern { pattern, to: entry.to.clone() }),
                     Err(error) => {
                         tracing::warn!(pattern = %entry.from, %error, "TTS 辞書の不正な正規表現を無視");

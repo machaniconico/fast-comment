@@ -770,6 +770,8 @@ pub enum TtsBackendKind {
     None,
 }
 
+pub(crate) const MAX_TTS_DICTIONARY_ENTRIES: usize = 1000;
+
 /// 読み上げ前に本文へ適用するユーザー定義置換の1件。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1097,6 +1099,14 @@ impl TtsOptions {
 
         self.queue.max_pending = self.queue.max_pending.clamp(1, 500);
         self.queue.max_wait_sec = self.queue.max_wait_sec.min(86_400);
+
+        if self.dictionary.len() > MAX_TTS_DICTIONARY_ENTRIES {
+            tracing::warn!(
+                discarded = self.dictionary.len() - MAX_TTS_DICTIONARY_ENTRIES,
+                "読み上げ辞書の件数上限を超えた項目を破棄"
+            );
+            self.dictionary.truncate(MAX_TTS_DICTIONARY_ENTRIES);
+        }
     }
 }
 

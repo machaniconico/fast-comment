@@ -781,6 +781,29 @@ export async function setModeration(moderation: AppConfig['moderation']): Promis
   return commit;
 }
 
+export type TtsDictionaryImportMode = 'append' | 'replace';
+
+export type TtsDictionaryCommit = ConfigCommit<{
+  dictionary: TtsDictEntry[];
+  added: number;
+  replaced: number;
+  skippedDuplicate: number;
+  rejected: { index: number; reason: string }[];
+  total: number;
+}>;
+
+export function exportTtsDictionary(): Promise<string | null> {
+  return invoke<string>('export_tts_dictionary');
+}
+
+export function importTtsDictionary(raw: string, mode: TtsDictionaryImportMode): Promise<TtsDictionaryCommit | null> {
+  return invoke<TtsDictionaryCommit>('import_tts_dictionary', { raw, mode });
+}
+
+export function importTtsDictionaryUrl(url: string, mode: TtsDictionaryImportMode): Promise<TtsDictionaryCommit | null> {
+  return invoke<TtsDictionaryCommit>('import_tts_dictionary_url', { url, mode });
+}
+
 export async function setTtsPaused(paused: boolean): Promise<void> {
   await invoke<void>('set_tts_paused', { paused });
 }

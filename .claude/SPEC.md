@@ -269,6 +269,14 @@ trait TtsBackend { async fn speak(&self, text: String) -> Result<()>; fn availab
   - UI は枠チップの右クリック「この枠の設定…」のダイアログだけ(選択肢は「全体に従う」「この枠は読まない」と声の項目)。読まない枠のチップには「読まない」の印を出す。
   - 枠を読み上げ OFF にすると、その枠の未読み上げ分をキューから捨てる(`purge_disabled_channel_tts`)。「この枠の設定」ダイアログの保存(`set_channel_overrides`)でも、設定画面の全体保存(`update_config`)でも同じ。
 
+### 6.1 読み上げ辞書
+
+- `config.json` の `tts.options.dictionary` に保存し、読み上げ本文へ上から順に適用する。設定の「読み上げ辞書」から保存済みの辞書を JSON でダウンロードまたはコピーできる。
+- 形式は `{ "schema": "fast-comment-tts-dictionary", "version": 1, "entries": [{ "from": "置換前", "to": "置換後", "regex": false }] }`。取り込みでは配列のみの JSON も受け付ける。バージョン 1 をサポートし、未知のフィールドは無視する。`from` は `pattern` / `word` / `key`、`to` は `reading` / `replace` / `value`、`regex` は `isRegex` でも指定できる。`regex` の既定値は `false`。
+- ファイル選択・貼り付け・URL に対応する。Rust が検証し、`from` は前後の空白を除いて 1〜200 文字、`to` は空文字列を含む 0〜200 文字とする。正規表現はコンパイル時のサイズと DFA キャッシュの上限をそれぞれ 1 MiB とする。不正な項目はスキップし、先頭 20 件まで項目の位置と理由を表示する。
+- 「追加」(既定)は保存済みの辞書を優先し、同じ `(from, regex)` の項目を飛ばして追記する。「置き換え」は確認後に辞書全体を入れ替える。入力と取り込み後の辞書はそれぞれ最大 1000 件。設定の正規化時に上限を超えた場合は先頭 1000 件を残し、警告をログに出す。
+- URL は HTTPS のみ。DNS 解決結果すべてを検査し、ループバック・プライベート・リンクローカル・CGNAT・マルチキャスト・未指定などの非公開アドレスを IPv4 / IPv6 および IPv4 射影を含めて拒否する。検査済み IP に接続先を固定する。リダイレクトは最大 3 回で毎回再検査し、DNS から本文まで全体で 10 秒、本文は最大 256 KiB。`Content-Type` にかかわらず本文を JSON として検証する。取得はメインウィンドウの専用 IPC のみで、URL のクエリをエラーやログに含めない。
+
 ## 7. モデレーション (`moderation.rs`) — ローカル処理 + 配信側(P6 Phase 1)
 
 - **NGワード/NGユーザー**(正規表現可) → マッチは UI/OBS に流さない or グレー表示。
@@ -327,6 +335,7 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
   - キーワードエフェクトは §9.2。アプリ内エフェクト有効時は、YouTube匿名リアクションの絵文字別増分を専用16msバッチIPCで受け、右端寄りに浮上・フェード表示する。初回pollはrolling windowの再送分なので、再接続時の重複を避けるため統計・演出とも更新しない。描画数は画面幅別の上限を設け、`prefers-reduced-motion` では演出を省略する。コメント/TTS/OBSには混ぜない。
 - **マルチカラム表示** (`MultiColumnView.svelte`): チャンネル/種別ごとの複数列ビュー。
 - **設定/モデレーションのポータビリティ** (`ConfigPortability.svelte`, `ModerationPortability.svelte`): 設定・NG/ハイライトのエクスポート/インポート。
+- **読み上げ辞書のポータビリティ** (`TtsDictionaryPortability.svelte`): 辞書の書き出しと、ファイル・貼り付け・URL からの取り込み (§6.1)。
 - **ウィンドウ最前面ピン**: メインウィンドウを最前面固定するトグル(`core:window:allow-set-always-on-top`)。
 
 ## 9. OBS テンプレ (`templates/`)
