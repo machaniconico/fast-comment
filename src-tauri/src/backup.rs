@@ -778,7 +778,20 @@ pub(crate) fn merge_import(
     let mut merged: AppConfig =
         serde_json::from_value(Value::Object(merged)).map_err(|_| IMPORT_ERROR)?;
     let (options, current_options) = (&mut merged.tts.options, &current.tts.options);
-    if !loopback_url(&options.voicevox_url) {
+    // 接続先が今と同じなら、今の値(ユーザー情報を含む)をそのまま残す。保存直前にもう一度
+    // マージするので、1 回目で残した今の値が 2 回目で伏せられないようにするためでもある。
+    let without_user_info = |value: &str| match url::Url::parse(value) {
+        Ok(mut url) if !url.cannot_be_a_base() => {
+            let _ = url.set_username("");
+            let _ = url.set_password(None);
+            String::from(url)
+        }
+        _ => value.to_owned(),
+    };
+    if !loopback_url(&options.voicevox_url)
+        || without_user_info(&options.voicevox_url)
+            == without_user_info(&current_options.voicevox_url)
+    {
         options.voicevox_url = current_options.voicevox_url.clone();
     }
     if !loopback_host(options.bouyomi_host.trim()) {
@@ -2467,6 +2480,31 @@ mod tests {
             );
         }
         assert_eq!(parse_import(serde_json::json!({})), Ok(AppConfig::default()));
+    }
+
+    #[test]
+    fn settings_import_keeps_current_voicevox_user_info_through_both_merges() {
+        let mut current = AppConfig::default();
+        current.tts.options.voicevox_url = "http://syn-user:syn-pass@127.0.0.1:50021".into();
+        // ファイルの接続先が外部(今の値を残す)、または今と同じ接続先(ユーザー情報なし)。
+        for file_url in ["http://192.0.2.10:50021", "http://127.0.0.1:50021"] {
+            let file = AppConfig::from_config_update(serde_json::json!({
+                "tts": {"options": {"voicevoxUrl": file_url}},
+            }))
+            .unwrap();
+            // 保存処理と同じく 2 回マージする(検証の前と、保存直前のロックの中)。
+            let first = merge_import(&file, &current).unwrap();
+            let second = merge_import(&first, &current).unwrap();
+            assert_eq!(second.tts.options.voicevox_url, current.tts.options.voicevox_url, "{file_url}");
+        }
+        // 別のループバックのポートならファイルの値を使う(AivisSpeech を移すため)。
+        let file = AppConfig::from_config_update(serde_json::json!({
+            "tts": {"options": {"voicevoxUrl": "http://127.0.0.1:10101"}},
+        }))
+        .unwrap();
+        let first = merge_import(&file, &current).unwrap();
+        let second = merge_import(&first, &current).unwrap();
+        assert_eq!(second.tts.options.voicevox_url, "http://127.0.0.1:10101");
     }
 
     #[test]
