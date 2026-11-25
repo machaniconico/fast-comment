@@ -68,5 +68,8 @@ mod poll_youtube_http;
 mod poll_youtube_validate;
 mod poll_youtube_poll;
 
+// 起動時に開くアプリと URL(.omc/plans/startup-launch.md)
+mod startup_launch;
+
 #[test]
 fn acceptance_harness_runs() {}
