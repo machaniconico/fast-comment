@@ -88,6 +88,7 @@ impl VoicevoxClient {
         let resp = self
             .http
             .post(format!("{}/audio_query", self.base_url))
+            .header(reqwest::header::CONTENT_LENGTH, "0")
             .query(&[("text", text), ("speaker", speaker.as_str())])
             .send()
             .await?;
@@ -256,7 +257,8 @@ pub(crate) mod test_support {
     use axum::{
         body::Bytes,
         extract::{Query, State},
-        http::StatusCode,
+        http::{header::CONTENT_LENGTH, HeaderMap, StatusCode},
+        response::IntoResponse,
         routing::{get, post},
         Json, Router,
     };
@@ -303,13 +305,20 @@ pub(crate) mod test_support {
                 "/audio_query",
                 post(
                     |State(s): State<Arc<Mutex<FakeState>>>,
-                     Query(q): Query<HashMap<String, String>>| async move {
+                     Query(q): Query<HashMap<String, String>>,
+                     headers: HeaderMap,
+                     body: Bytes| async move {
+                        if headers.get(CONTENT_LENGTH).is_none_or(|value| value != "0")
+                            || !body.is_empty()
+                        {
+                            return StatusCode::LENGTH_REQUIRED.into_response();
+                        }
                         let mut g = s.lock().unwrap();
                         g.queries.push((
                             q.get("text").cloned().unwrap_or_default(),
                             q.get("speaker").cloned().unwrap_or_default(),
                         ));
-                        Json(g.audio_query.clone())
+                        Json(g.audio_query.clone()).into_response()
                     },
                 ),
             )

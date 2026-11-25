@@ -1,5 +1,5 @@
 export type PollDisplay = 'bar-h' | 'bar-v' | 'pie' | 'donut' | 'number';
-export type PollSource = 'chat' | 'twitch';
+export type PollSource = 'chat' | 'twitch' | 'youtube';
 export type PollStatus = 'idle' | 'open' | 'closed';
 
 export interface PollDisplaySettings {
