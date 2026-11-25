@@ -258,7 +258,8 @@ fn run_backup(app: &AppHandle, trigger: BackupTrigger) -> Result<bool, backup::B
         trigger,
         state.restore_failed_at_startup,
         timer_now_ms(),
-        || flush_backup_stores(&state),
+        // 効果音の削除・追加と重なって、索引と本体がずれた写しを作らない。
+        || flush_backup_stores(&state).map(|()| state.sounds.lock_for_backup()),
     )
 }
 
@@ -327,7 +328,10 @@ async fn restore_backup(
             return Err("アプリを終了しています".to_owned());
         }
         flush_backup_stores(&state)
-            .and_then(|()| backup::stage_restore(&state.config_dir, &file_name, timer_now_ms()))
+            .and_then(|()| {
+                let _sounds = state.sounds.lock_for_backup();
+                backup::stage_restore(&state.config_dir, &file_name, timer_now_ms())
+            })
             .map_err(|error| {
                 tracing::warn!("復元の準備に失敗しました: {error}");
                 error.to_string()
@@ -880,6 +884,12 @@ impl AppState {
         let mut current = self.config.lock().unwrap();
         let mut next = current.clone();
         match change {
+            PreferenceChange::Check(preferences) => {
+                if current.poll != *preferences {
+                    config::ensure_save_allowed(&self.config_dir).map_err(|_| PollError::Save)?;
+                }
+                return Ok(());
+            }
             PreferenceChange::Started(preferences) => next.poll = preferences.clone(),
             PreferenceChange::Display(settings) => next.poll.settings = settings,
         }
@@ -2655,6 +2665,13 @@ async fn disconnect_x_post(
     state: State<'_, AppState>,
     on_config_saved: tauri::ipc::Channel<ConfigCommit<serde_json::Value>>,
 ) -> Result<OAuthStatus<XPostStatus>, XPostError> {
+    // API モードを戻す保存ができない時は、資格情報を消す前に拒否する。
+    if state.config.lock().unwrap().x_post.mode == "api" {
+        config::ensure_save_allowed(&state.config_dir).map_err(|error| XPostError {
+            code: XPostErrorCode::Other,
+            message: error.to_string(),
+        })?;
+    }
     let result = state.x_post_auth.disconnect().await;
     {
         let mut cfg = state.config.lock().unwrap();
@@ -5689,6 +5706,26 @@ mod followup_tests {
     }
 
 
+
+    #[test]
+    fn x_disconnect_refuses_unsavable_config_before_clearing_credentials() {
+        let source: String = include_str!("lib.rs").chars().filter(|c| !c.is_whitespace()).collect();
+        let start = source.find("asyncfndisconnect_x_post(").unwrap();
+        let body = &source[start..];
+        let body = &body[..body.find("#[tauri::command]").unwrap()];
+        let guard = body.find("config::ensure_save_allowed(&state.config_dir)").expect("事前の確認");
+        let change = body.find("state.x_post_auth.disconnect()").unwrap();
+        assert!(guard < change, "資格情報を消す前に確認する");
+    }
+
+    #[test]
+    fn poll_start_check_uses_the_same_save_refusal_as_commit() {
+        // 公式投票の作成前の確認(PollControl::start → Check)は、質問が変わる時だけ保存禁止を見る。
+        let source: String = include_str!("lib.rs").chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(source.contains(
+            "PreferenceChange::Check(preferences)=>{ifcurrent.poll!=*preferences{config::ensure_save_allowed(&self.config_dir)"
+        ));
+    }
 
     #[tokio::test]
     async fn injected_test_flag_survives_broadcast_and_clone_but_not_serde() {

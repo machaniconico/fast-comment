@@ -157,6 +157,11 @@ impl SoundStore {
         result.map_err(|_| FAILED.to_owned())
     }
 
+    /// 索引と本体を変える操作を止める。バックアップが `sounds/` を読む間に持つ。
+    pub fn lock_for_backup(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.lock.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     pub fn list(&self) -> Result<Vec<SoundEntry>, String> {
         let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         self.load()
@@ -326,6 +331,25 @@ mod tests {
         assert!(s.list().unwrap().is_empty());
         assert!(!s.remove(&e.id).unwrap());
         assert!(s.read(&e.id).is_err());
+    }
+
+    #[test]
+    fn backup_lock_holds_off_removal_until_released() {
+        let (_d, s) = store();
+        let e = s.add("a.wav", &wav()).unwrap();
+        let s = std::sync::Arc::new(s);
+        let guard = s.lock_for_backup();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = {
+            let s = s.clone();
+            let id = e.id.clone();
+            std::thread::spawn(move || tx.send(s.remove(&id)).unwrap())
+        };
+        assert!(rx.recv_timeout(std::time::Duration::from_millis(200)).is_err());
+        assert!(s.file_path(&e).is_file(), "ロック中は本体を消さない");
+        drop(guard);
+        assert_eq!(rx.recv().unwrap(), Ok(true));
+        worker.join().unwrap();
     }
 
     #[test]

@@ -150,3 +150,17 @@
 - 5: 引き継ぐ欄に xPost.callbackPort・twitcasting.callbackPort。YouTube は空きポートの loopback、Twitch はデバイスコードで、config に redirect の欄は無い。Client ID は credentials 内で引き継ぎ済み。
 - 6: URL の欄 = tts.options.voicevoxUrl、xOverrides.endpoints、niconicoOverrides.endpoints、twitcastingOverrides.endpoints。zip では `://` の後の authority の最後の `@` までを消す。復元時はユーザー情報の有無にかかわらず今の値(zip の値は消した後なので使わない)。チャンネルの identifier と bouyomiHost は URL の欄ではないので対象外。
 - MINOR: 掃除は最初の失敗を記録して続ける。自動作成の状態は `auto-backup-status`(成功で null)。手動作成の失敗理由を表示。
+
+## 修正3 の裁定(2026-11-25、ルート。Codex 再レビュー(392d9f4)の FAIL 5 件)
+1. ブロッカー: 復元の失敗後に別の世代を復元すると、最初の復元元が消える。復元の準備(`stage_restore`)と、復元を適用するまでの間は prune を一切しない。また、`restore-failed-*` で退避した世代と、復元に失敗した元の世代は、prune の対象から外す(次に復元が成功した起動で通常の扱いに戻す)。テスト: keep=1 で A の復元が失敗 → B を復元に準備 → A が残っていること。
+2. MINOR(直す): X の「切断」は、config が保存禁止の時は、資格情報を消す前に拒否する(ほかの書き込みの IPC と同じ事前の確認)。
+3. MINOR(直す): 公式投票の開始(Twitch・YouTube)は、新しい質問を config に保存する必要がある時、config が保存禁止なら遠隔で作成する前に拒否する。
+4. MINOR(直す): URL のユーザー情報の除去は `url::Url::parse`(または reqwest と同じ解釈)で行う。解析できた時に username か password があれば、それを除く。解析できない値で `@` を含むものは、安全側に倒して値ごと空にして zip に書く(復元の時は今の値を引き継ぐ)。テスト: `https:///u:p@h`、`https://u:pa/ss@h`、`user:pass@host:50021`。
+5. MINOR(既知の限界): 効果音の削除と自動作成が重なった時の、索引と本体のずれ。sounds に既存のロックがあれば、バックアップで `sounds/` を読む間はそれを持つ。無ければ SPEC の既知の限界に書く。
+
+## 修正3 の実施記録(2026-11-25、Opus)
+- 1: `stage_restore` から prune を外し、`restore-pending` に復元元の名前 `SOURCE` を書く。`prune` は `restore-pending` がある間は何も消さず、`restore-failed-*/SOURCE` に記録された zip を残す。起動時の掃除は SOURCE のある失敗世代を 3 世代の整理から外し、復元が成功した起動で SOURCE を消して通常の扱いに戻す。
+- 2: `config::ensure_save_allowed`(`save` と同じ判定)を足し、`disconnect_x_post` は API モードの時に資格情報を消す前に確認する。
+- 3: `PreferenceChange::Check` を足し、`PollControl::start` が遠隔作成の前に呼ぶ。質問が変わる時だけ保存禁止を見る。
+- 4: `url::Url::parse` で解析し、ユーザー情報を消す。解析できない値(ホストを持たない値を含む)で `@` を含むものは空にする。
+- 5: `SoundStore` に既存のロックがあるので、作成(`run_backup` の flush の後)と復元の準備の間、`lock_for_backup` で持つ。SPEC の既知の限界には足していない。

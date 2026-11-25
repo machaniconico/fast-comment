@@ -52,6 +52,8 @@ const SCHEMA: &str = "fast-comment-backup";
 const MANIFEST: &str = "manifest.json";
 const READY: &str = "READY";
 const APPLYING: &str = "APPLYING";
+/// 復元元の zip の名前。復元に失敗した世代では、次に復元が成功するまで prune から外す。
+const SOURCE: &str = "SOURCE";
 const PREPARED_CONFIG: &str = "config.restore.tmp";
 const MAX_ENTRIES: usize = 2000;
 const MAX_FILE_BYTES: u64 = 50 * 1024 * 1024;
@@ -467,16 +469,18 @@ pub fn due_at_startup(config_dir: &Path, now_ms: u64) -> bool {
         .is_none_or(|entry| now_ms.saturating_sub(entry.created_at_ms) >= 20 * 60 * 60 * 1000)
 }
 
+/// 復元の準備から適用までの間は何も消さない。復元に失敗した世代の復元元も消さない。
 pub fn prune(config_dir: &Path, keep: u32) -> Result<usize> {
-    prune_except(config_dir, keep, None)
-}
-
-fn prune_except(config_dir: &Path, keep: u32, source: Option<&str>) -> Result<usize> {
     let path = auto_dir(config_dir)?;
+    let dir = backups_dir(config_dir)?;
+    if metadata(&dir.join("restore-pending"))?.is_some() {
+        return Ok(0);
+    }
+    let protected = protected_sources(&dir)?;
     let mut removed = 0;
     let entries = read_backups(config_dir)?;
     for entry in entries.iter().skip(keep.clamp(1, 50) as usize).rev() {
-        if Some(entry.file_name.as_str()) == source {
+        if protected.contains(&entry.file_name) {
             continue;
         }
         fs::remove_file(path.join(&entry.file_name))?;
@@ -493,13 +497,14 @@ pub(crate) enum BackupTrigger {
 }
 
 /// 自動・手動の作成と世代の整理。呼び出し側が直列化する。
-pub(crate) fn run_backup(
+/// `flush` が返す値(ストアのロックなど)は、写しを作り終えるまで持つ。
+pub(crate) fn run_backup<G>(
     config_dir: &Path,
     settings: BackupSettings,
     trigger: BackupTrigger,
     restore_failed: bool,
     now_ms: u64,
-    flush: impl FnOnce() -> Result<()>,
+    flush: impl FnOnce() -> Result<G>,
 ) -> Result<bool> {
     let manual = matches!(trigger, BackupTrigger::Manual);
     // 復元に失敗した後の起動では、再試行できるよう復元元を残す(自動作成も整理もしない)。
@@ -510,7 +515,7 @@ pub(crate) fn run_backup(
     {
         false
     } else {
-        flush()?;
+        let _held = flush()?;
         create_backup(config_dir, now_ms)?.is_some()
     };
     if !restore_failed {
@@ -570,13 +575,21 @@ fn collect_secret(value: Option<&Value>, secrets: &mut BTreeSet<String>) {
     }
 }
 
-/// `scheme://user:pass@host/...` のユーザー情報を消した URL。無ければ None。
-fn strip_user_info(url: &str) -> Option<String> {
-    let start = url.find("://")? + 3;
-    let rest = &url[start..];
-    let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
-    let at = authority.rfind('@')?;
-    Some(format!("{}{}", &url[..start], &rest[at + 1..]))
+/// reqwest と同じ `url::Url` の解釈でユーザー情報を消した URL。無ければ None。
+/// 解析できない値(ホストを持たない値を含む)で `@` を含むものは、安全側に倒して空にする。
+fn strip_user_info(value: &str) -> Option<String> {
+    match url::Url::parse(value) {
+        Ok(mut url) if !url.cannot_be_a_base() => {
+            if url.username().is_empty() && url.password().is_none() {
+                return None;
+            }
+            url.set_username("").ok()?;
+            url.set_password(None).ok()?;
+            Some(url.into())
+        }
+        _ if value.contains('@') => Some(String::new()),
+        _ => None,
+    }
 }
 
 fn strip_url_user_info(value: &mut Value) {
@@ -807,14 +820,6 @@ pub fn stage_restore(config_dir: &Path, backup_file_name: &str, now_ms: u64) -> 
         return Err(BackupError::Invalid("準備済みの復元があります"));
     }
 
-    let settings = match read_config(config_dir)? {
-        Some(config) => config
-            .get("backup")
-            .cloned()
-            .and_then(|value| serde_json::from_value::<BackupSettings>(value).ok())
-            .unwrap_or_default(),
-        None => BackupSettings::default(),
-    };
     fs::create_dir(&pending)?;
     let result = (|| {
         for name in contents.directories {
@@ -827,8 +832,9 @@ pub fn stage_restore(config_dir: &Path, backup_file_name: &str, now_ms: u64) -> 
             }
             write_new(&path, &bytes)?;
         }
+        write_new(&pending.join(SOURCE), backup_file_name.as_bytes())?;
+        // 適用するまで prune しない(失敗した復元の復元元を、別の世代の準備で押し出さない)。
         create_backup(config_dir, now_ms)?;
-        prune_except(config_dir, settings.keep, Some(backup_file_name))?;
         let ready_tmp = pending.join("READY.tmp");
         write_new(&ready_tmp, b"")?;
         fs::rename(ready_tmp, pending.join(READY))?;
@@ -862,7 +868,7 @@ fn read_pending(pending: &Path) -> Result<Contents> {
         let meta = fs::symlink_metadata(entry.path())?;
         let directory = meta.is_dir();
         check_kind(&meta, directory)?;
-        if name == READY {
+        if name == READY || name == SOURCE {
             check_kind(&meta, false)?;
             continue;
         }
@@ -1141,6 +1147,35 @@ fn failed_timestamp(name: &str) -> Option<u64> {
     }
 }
 
+/// 復元に失敗した世代(`restore-failed-*`)が記録している復元元の名前。
+fn failed_source(failed: &Path) -> Result<Option<String>> {
+    let path = failed.join(SOURCE);
+    let Some(meta) = metadata(&path)? else {
+        return Ok(None);
+    };
+    check_kind(&meta, false)?;
+    let mut data = Vec::new();
+    File::open(path)?.take(256).read_to_end(&mut data)?;
+    Ok(String::from_utf8(data)
+        .ok()
+        .filter(|name| timestamp(name).is_some()))
+}
+
+fn protected_sources(dir: &Path) -> Result<BTreeSet<String>> {
+    let mut sources = BTreeSet::new();
+    if !directory_exists(dir)? {
+        return Ok(sources);
+    }
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let is_failed = entry.file_name().to_str().and_then(failed_timestamp).is_some();
+        if is_failed && check_kind(&fs::symlink_metadata(entry.path())?, true).is_ok() {
+            sources.extend(failed_source(&entry.path())?);
+        }
+    }
+    Ok(sources)
+}
+
 fn keep_first_error(first: &mut Option<BackupError>, result: Result<()>) {
     if let Err(error) = result {
         first.get_or_insert(error);
@@ -1160,8 +1195,13 @@ fn remove_auto_tmp(entry: io::Result<fs::DirEntry>) -> Result<()> {
     Ok(())
 }
 
-/// restore-applied-* を消し、restore-failed-* の世代を集める。
-fn sweep_restore_dir(entry: io::Result<fs::DirEntry>, failed: &mut Vec<(u64, PathBuf)>) -> Result<()> {
+/// restore-applied-* を消し、restore-failed-* の世代を集める。復元元を記録した世代は集めない
+/// (次に復元が成功した起動で記録を消し、通常の扱いに戻す)。
+fn sweep_restore_dir(
+    entry: io::Result<fs::DirEntry>,
+    restored: bool,
+    failed: &mut Vec<(u64, PathBuf)>,
+) -> Result<()> {
     let entry = entry?;
     let name = entry.file_name();
     let Some(name) = name.to_str() else {
@@ -1174,13 +1214,21 @@ fn sweep_restore_dir(entry: io::Result<fs::DirEntry>, failed: &mut Vec<(u64, Pat
     if name.starts_with("restore-applied-") && name.ends_with(".tmp") {
         fs::remove_dir_all(path)?;
     } else if let Some(stamp) = failed_timestamp(name) {
-        failed.push((stamp, path));
+        if restored {
+            match fs::remove_file(path.join(SOURCE)) {
+                Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error.into()),
+                _ => {}
+            }
+        }
+        if failed_source(&path)?.is_none() {
+            failed.push((stamp, path));
+        }
     }
     Ok(())
 }
 
 /// 起動時の掃除。1 件の失敗で残りを打ち切らず、最初の失敗を返す。
-fn cleanup_backup_work_files(config_dir: &Path, dir: &Path) -> Result<()> {
+fn cleanup_backup_work_files(config_dir: &Path, dir: &Path, restored: bool) -> Result<()> {
     let mut first = None;
     let auto = auto_dir(config_dir)?;
     if directory_exists(&auto)? {
@@ -1191,7 +1239,7 @@ fn cleanup_backup_work_files(config_dir: &Path, dir: &Path) -> Result<()> {
     if directory_exists(dir)? {
         let mut failed = Vec::new();
         for entry in fs::read_dir(dir)? {
-            keep_first_error(&mut first, sweep_restore_dir(entry, &mut failed));
+            keep_first_error(&mut first, sweep_restore_dir(entry, restored, &mut failed));
         }
         failed.sort_unstable();
         for (_, path) in failed.into_iter().rev().skip(3) {
@@ -1217,7 +1265,8 @@ pub(crate) fn apply_pending_restore_at_startup(
             }
         })?;
         let result = apply_restore(config_dir, &dir, now_ms, &mut blocked);
-        if let Err(error) = cleanup_backup_work_files(config_dir, &dir) {
+        let restored = matches!(result, Ok(true));
+        if let Err(error) = cleanup_backup_work_files(config_dir, &dir, restored) {
             tracing::warn!("バックアップの作業ファイルを整理できませんでした: {error}");
         }
         if blocked.is_empty() {
@@ -1757,10 +1806,51 @@ mod tests {
         assert!(run_backup(root, KEEP_ONE, BackupTrigger::Manual, true, 10, || Ok(())).unwrap());
         assert!(source.is_file());
         assert_eq!(backup_names(root).len(), 3);
-        // 失敗の無い起動では、通常どおり整理する。
+        // 失敗の無い起動でも、次に復元が成功するまでは復元元を残す。
         write(root, "skin/new.css", "changed again");
         assert!(run_backup(root, KEEP_ONE, BackupTrigger::Manual, false, 11, || Ok(())).unwrap());
-        assert_eq!(backup_names(root).len(), 1);
+        assert!(source.is_file());
+        assert_eq!(backup_names(root), ["fc-backup-11.zip", "fc-backup-1.zip"]);
+    }
+
+    #[test]
+    fn restoring_another_generation_after_a_failure_keeps_the_first_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let source = fail_restore_with_keep_one(root);
+        assert_eq!(backup_names(root), ["fc-backup-2.zip", "fc-backup-1.zip"]);
+        // 復元の準備から適用までは、手動・自動の作成でも prune しない。
+        stage_restore(root, "fc-backup-2.zip", 4).unwrap();
+        assert!(source.is_file());
+        write(root, "skin/new.css", "changed");
+        assert!(run_backup(root, KEEP_ONE, BackupTrigger::Manual, false, 5, || Ok(())).unwrap());
+        assert_eq!(prune(root, 1).unwrap(), 0);
+        assert!(source.is_file());
+        assert_eq!(backup_names(root).len(), 3);
+
+        // 復元が成功した起動で、失敗した世代の記録は通常の扱いに戻る。
+        assert!(apply_pending_restore(root, 6).unwrap());
+        let failed = root.join("backups/restore-failed-3");
+        assert!(failed.is_dir());
+        assert!(!failed.join(SOURCE).exists());
+        assert_eq!(prune(root, 1).unwrap(), 2);
+        assert!(!source.exists());
+    }
+
+    #[test]
+    fn failed_generations_with_a_source_are_not_swept() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for stamp in 1..=5 {
+            write(root, &format!("backups/restore-failed-{stamp}/READY"), "");
+        }
+        write(root, "backups/restore-failed-1/SOURCE", "fc-backup-1.zip");
+        assert!(!apply_pending_restore(root, 10).unwrap());
+        assert!(root.join("backups/restore-failed-1/SOURCE").is_file());
+        assert!(!root.join("backups/restore-failed-2").exists());
+        for stamp in 3..=5 {
+            assert!(root.join(format!("backups/restore-failed-{stamp}")).is_dir());
+        }
     }
 
     #[test]
@@ -1879,6 +1969,16 @@ mod tests {
             "https://tc.example.invalid/?a=b@c",
         ] {
             assert!(text.contains(kept), "{kept}: {text}");
+        }
+        for (value, expected) in [
+            // 空の authority の後ろもユーザー情報として読まれる(reqwest と同じ解釈)。
+            ("https:///u:p@h", Some("https://h/")),
+            // 解析できない値は、`@` があれば値ごと空にする。
+            ("https://u:pa/ss@h", Some("")),
+            ("user:pass@host:50021", Some("")),
+            ("http://127.0.0.1:50021", None),
+        ] {
+            assert_eq!(strip_user_info(value).as_deref(), expected, "{value}");
         }
 
         write(

@@ -95,6 +95,7 @@ struct Fixture {
     control: Arc<PollControl>,
     config: watch::Sender<AppConfig>,
     saved: Arc<StdMutex<Vec<PollPreferences>>>,
+    refuse_save: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Fixture {
@@ -119,8 +120,13 @@ impl Fixture {
         let (config, rx) = watch::channel(config);
         let saved = Arc::new(StdMutex::new(Vec::new()));
         let captured = saved.clone();
+        let refuse_save = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let refused = refuse_save.clone();
         let poll = Arc::new(Poll::new(
             move |change| {
+                if refused.load(SeqCst) {
+                    return Err(PollError::Save);
+                }
                 if let PreferenceChange::Started(preferences) = change {
                     captured.lock().unwrap().push(preferences.clone());
                 }
@@ -134,6 +140,7 @@ impl Fixture {
             control: Arc::new(control),
             config,
             saved,
+            refuse_save,
         }
     }
 
@@ -489,6 +496,28 @@ async fn polling_404_closes_with_last_votes_and_stops() {
     assert_eq!(snapshot.total_voters, 13);
     assert_eq!(requests.load(SeqCst), 1);
     assert!(fixture.control.active.lock().await.is_none());
+    server.abort();
+}
+
+#[tokio::test]
+async fn unsavable_preferences_are_refused_before_remote_create() {
+    let requests = Arc::new(AtomicUsize::new(0));
+    let captured = requests.clone();
+    let (base, server) = mock(move |_| {
+        captured.fetch_add(1, SeqCst);
+        async move { Json(json!({"data": [remote_poll("ACTIVE")]})).into_response() }
+    })
+    .await;
+    let fixture = Fixture::new(base, BROADCASTER).await;
+    fixture.refuse_save.store(true, SeqCst);
+    let error = fixture
+        .control
+        .start(request().validate().unwrap())
+        .await
+        .unwrap_err();
+    assert!(matches!(error, PollControlError::Local(PollError::Save)), "{error:?}");
+    assert_eq!(requests.load(SeqCst), 0, "Twitch に作成を送らない");
+    assert_eq!(fixture.control.snapshot().status, PollStatus::Idle);
     server.abort();
 }
 

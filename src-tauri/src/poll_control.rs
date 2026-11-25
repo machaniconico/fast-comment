@@ -162,6 +162,8 @@ impl PollControl {
             return Ok(self.poll.start(start)?);
         }
         self.poll.check_can_start()?;
+        // 作成後に質問を保存できないと分かっている時は、遠隔で作成する前に拒否する。
+        self.poll.check_start_preferences(&start)?;
         if start.preferences.source == PollSource::Youtube {
             return self.youtube.start(start).await;
         }

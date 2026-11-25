@@ -274,6 +274,8 @@ pub enum PollError {
 }
 
 pub enum PreferenceChange<'a> {
+    /// 開始で保存が要る時に、保存できるかだけを確かめる(遠隔で作成する前)。
+    Check(&'a PollPreferences),
     Started(&'a PollPreferences),
     Display(PollDisplaySettings),
 }
@@ -353,6 +355,10 @@ impl Poll {
             return Err(PollError::AlreadyOpen);
         }
         Ok(())
+    }
+
+    pub(crate) fn check_start_preferences(&self, start: &ValidatedStart) -> Result<(), PollError> {
+        (self.save_preferences)(PreferenceChange::Check(&start.preferences))
     }
 
     // 呼び出し側で開始・終了・リセットと直列化する。

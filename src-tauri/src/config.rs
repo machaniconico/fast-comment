@@ -405,6 +405,17 @@ fn save_blocked(dir: &Path) -> bool {
     SAVE_BLOCKED_DIRS.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|d| d == dir)
 }
 
+/// `save` が保存禁止で拒否するかを、保存の前に確かめる(外部への操作を先に確定させない)。
+pub fn ensure_save_allowed(dir: &Path) -> anyhow::Result<()> {
+    if RESTORE_BLOCKED_DIRS.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|d| d == dir) {
+        return Err(crate::backup::RestoreSaveBlocked.into());
+    }
+    if save_blocked(dir) {
+        return Err(anyhow::Error::new(ConfigSaveBlocked));
+    }
+    Ok(())
+}
+
 const MAX_OBS_ROWS: u16 = 1000;
 
 /// OBS overlay サーバ設定。
@@ -1647,12 +1658,7 @@ impl AppConfig {
     /// クレート内では `commit_config` だけが呼ぶ(revision を進めない保存を作らない。lib.rs の
     /// `every_config_write_goes_through_commit_config` で検査)。受け入れテストが使うので公開している。
     pub fn save(&self, dir: &Path) -> anyhow::Result<()> {
-        if RESTORE_BLOCKED_DIRS.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|d| d == dir) {
-            return Err(crate::backup::RestoreSaveBlocked.into());
-        }
-        if save_blocked(dir) {
-            return Err(anyhow::Error::new(ConfigSaveBlocked));
-        }
+        ensure_save_allowed(dir)?;
         std::fs::create_dir_all(dir)
             .map_err(|e| anyhow::anyhow!("設定ディレクトリ作成失敗 {}: {e}", dir.display()))?;
         let path = Self::path_in(dir);
@@ -3206,6 +3212,10 @@ mod tests {
         );
         let err = AppConfig::default().save(&invalid_dir).unwrap_err();
         assert_eq!(err.to_string(), CONFIG_SAVE_BLOCKED_ERROR);
+        // 外部への操作の前に使う事前の確認も、同じ理由で拒否する。
+        let err = ensure_save_allowed(&invalid_dir).unwrap_err();
+        assert_eq!(err.to_string(), CONFIG_SAVE_BLOCKED_ERROR);
+        assert!(ensure_save_allowed(dir.path()).is_ok());
     }
 
     #[test]
