@@ -1,6 +1,7 @@
 <script lang="ts">
   import { exportConfig, importConfig, type ExportedConfig } from '../ipc';
   import { configReloadMessage, configSync } from '../configSync.svelte';
+  import { importMessage } from '../configPortability';
   import { theme, type AppearanceSnapshot } from '../theme.svelte';
 
   // v0.8.0 までの版は schema が違うファイルを拒否する。資格情報の欄が無い書き出しを
@@ -194,17 +195,9 @@
         return;
       }
 
-      if (!(await onImported?.())) return;
-
-      const notices = [...result.warnings];
-      if (result.protectedOAuth.length > 0) {
-        const services = result.protectedOAuth.map(service => service === 'xPost' ? 'X' : 'ツイキャス');
-        notices.push(`ログイン中の ${services.join('、')} の Client ID と待受ポートを保持しました。`);
-      }
-      const base = parsed.appearance === undefined
-        ? '設定をインポートしました。'
-        : '設定をインポートし、外観設定を反映しました。';
-      showSuccess([base, ...notices].join(' '));
+      const reloaded = !!(await onImported?.());
+      const message = importMessage(result, parsed.appearance !== undefined, reloaded);
+      if (message) showSuccess(message);
     } catch (e) {
       const typeError = typeof e === 'string' ? configTypeError.exec(e) : null;
       showError(typeError?.[0] ?? '設定のインポートに失敗しました。');
@@ -245,7 +238,8 @@
         {reloading ? '読込中...' : '設定を再読み込み'}
       </button>
     </div>
-  {:else if status}
+  {/if}
+  {#if status}
     <p
       class:banner-success={status.kind === 'success'}
       class:banner-error={status.kind === 'error'}
@@ -258,7 +252,7 @@
 
   <div class="portability-block">
     <h4>エクスポート</h4>
-    <p class="portability-note">ログイン情報(トークン・Cookie・API キー・Client ID)は書き出しません。URL のユーザー名とパスワードも消します。v0.8.0 までの版では読み込めません。</p>
+    <p class="portability-note">ログイン情報(トークン・Cookie・API キー・Client ID)と棒読みちゃんの起動パスは書き出しません。URL のユーザー名とパスワードも消します。v0.8.0 までの版では読み込めません。</p>
     <div class="field-row portability-actions">
       <button type="button" class="export-btn" onclick={onExport} disabled={exporting}>
         {exporting ? 'エクスポート中...' : '設定JSONをエクスポート'}
@@ -281,7 +275,7 @@
 
   <div class="portability-block">
     <h4>インポート</h4>
-    <p class="portability-note">ログイン情報、X の接続先、棒読みちゃんの起動パスは、ファイルの値を使わず今の設定のままにします。X の自動告知は無効にします。</p>
+    <p class="portability-note">ログイン情報、X の接続先、棒読みちゃんの起動パスは、ファイルの値を使わず今の設定のままにします。読み上げの接続先は、この PC を指す時だけ読み込みます。X の自動告知は無効にします。</p>
     <div class="field-row portability-actions">
       <label class="file-button" for="settings-import-file">JSONファイルを選択</label>
       <input

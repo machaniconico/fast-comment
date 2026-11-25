@@ -339,13 +339,17 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
 - **設定/モデレーションのポータビリティ** (`ConfigPortability.svelte`, `ModerationPortability.svelte`): 設定・NG/ハイライトのエクスポート/インポート。
   - 設定の書き出しは `export_config`、読み込みは `import_config` で行い、どちらも Rust 側(`backup.rs` の `export_config` / `merge_import`)で資格情報を扱う。UI は受け取った JSON に外観設定を添えて表示・保存するだけで、`get_config` の値を書き出さない。両 IPC はメインウィンドウ以外からの呼び出しを固定文言で拒否する。
   - ファイルは `{ schema: "fast-comment/settings-v2", version: 2, exportedAt, config, appearance }`。読み込みは旧形式(`schema: "fast-comment/settings"`、または schema なし)も受け付ける。schema を変えたのは、v0.8.0 までの版が `credentials` の無いファイルを読み込んで今の資格情報を空にしないため(旧版は schema が違うファイルを拒否する)。
-  - 書き出す JSON には `credentials` の欄を入れない(鍵・トークン・Cookie に加え、Client ID と Twitch のユーザー名も含む欄全体)。`xOverrides.bearerToken` と `youtubeOverrides.apiKey` も入れない。URL の欄(`tts.options.voicevoxUrl`、`xOverrides.endpoints`、`niconicoOverrides.endpoints`、`twitcastingOverrides.endpoints`)はユーザー情報(`user:pass@`)を消す(解析できず `@` を含む値は空にする)。欄の一覧と URL の処理は自動バックアップ(§10.1)と同じ定数・関数を使う。
+  - 書き出す JSON には `credentials` の欄を入れない(鍵・トークン・Cookie に加え、Client ID と Twitch のユーザー名も含む欄全体)。`xOverrides.bearerToken` と `youtubeOverrides.apiKey` も入れない。`tts.options.bouyomiPath` も入れない(Windows のユーザー名を含みうる。読み込みは今の値を残すので不要)。URL の欄(`tts.options.voicevoxUrl`、`xOverrides.endpoints`、`niconicoOverrides.endpoints`、`twitcastingOverrides.endpoints`)はユーザー情報(`user:pass@`)を消す(解析できず `@` を含む値は空にする)。欄の一覧と URL の処理は自動バックアップ(§10.1)と同じ定数・関数を使う。
   - 伏せた後の JSON に、設定にある 8 文字以上の鍵・トークン・Cookie(前後の空白は除いて比べる)が残っていれば(他の欄に同じ値を貼っていた場合)、固定文言で書き出しを中止する。検査そのものに失敗した時は別の固定文言で中止する。
   - 読み込みで今の値をそのまま残す欄: `credentials` 全体、`xOverrides.bearerToken`、`youtubeOverrides.apiKey`、`xOverrides.endpoints`(ログイン cookie の送り先なので、ファイルが指す接続先へ今の cookie を送らない)、`xPost.callbackPort` と `twitcasting.callbackPort`(今の Client ID に登録した redirect URI と揃える)、`tts.options.bouyomiPath` と `tts.options.bouyomiLaunchElevated`(ファイルを読み込んだだけで、任意の exe を昇格つきで起動させない)。この一覧は復元(§10.1)と同じ定数を使う。ファイルに欄が無い・空でも今の値を空にせず、今の値が無い欄はファイルに値があっても取り込まない。
-  - 読み込みでファイルの値を使う URL の欄: `tts.options.voicevoxUrl`、`niconicoOverrides.endpoints`、`twitcastingOverrides.endpoints`。ユーザー情報は消して取り込む(旧版のファイルに残るユーザー情報を持ち込まない)。
-  - 読み込みは `xPost.enabled` を必ず false にする(ファイルが true でも、今が true でも)。今の資格情報と他人のファイルの `xPost`・`ownStream` の組み合わせで、確認なしに投稿させないため。ファイルか今の設定のどちらかで有効だった時は、固定文言「X の自動告知は取り込み後に無効にしました。設定画面で確認してから有効にしてください」を `warnings` で返し、UI が表示する。
+  - 読み込みでファイルの値を使う URL の欄: `niconicoOverrides.endpoints`、`twitcastingOverrides.endpoints`。ユーザー情報は消して取り込む(旧版のファイルに残るユーザー情報を持ち込まない)。
+  - 読み上げの本文の送り先(`tts.options.voicevoxUrl` と `tts.options.bouyomiHost`)は、ファイルの値のホストがこの PC(`localhost`、127.0.0.0/8、`::1`)の時だけファイルの値を使う(URL はユーザー情報を消す)。それ以外のホストや解析できない値なら今の値を残し、今の値と違っていた時は固定文言「読み上げの接続先は、この PC 以外を指していたため今の設定のままにしました。」を `warnings` で返す。ポート(`bouyomiPort` と、この PC を指す URL の中のポート)はファイルの値を使う。URL は reqwest と同じ `url::Url` で解析する。
+  - 読み込みでは、保存の後に棒読みちゃんを自動起動しない(通常の設定保存は従来どおり起動する)。読み込みで読み上げのバックエンドが棒読みちゃんに変わった時は、固定文言「棒読みちゃんは自動では起動しません。」を `warnings` で返す。
+  - X に未接続で API モードを選べない時(`update_config` なら拒否する条件)、読み込みは全体を拒否せず `xPost.mode` だけ今の値に残し、固定文言「X の投稿方式は今の設定のままにしました。」を `warnings` で返す。
+  - 読み込みは `xPost.enabled` を必ず false にする(ファイルが true でも、今が true でも)。今の資格情報と他人のファイルの `xPost`・`ownStream` の組み合わせで、確認なしに投稿させないため。ファイルか今の設定のどちらかで有効だった時は、固定文言「X の自動告知は取り込み後に無効にしました。設定画面で確認してから有効にしてください。有効にする前に、自分の配信(ownStream)の設定も確認してください。」を `warnings` で返し、UI が表示する。UI は、保存の後の画面の読み直しに失敗した時も `warnings` を表示する。
+  - 既知の限界。無効にする保存と配信開始が同時に来ると、読み込む前の設定(自分の設定)で告知を投稿することがある。
   - 旧版(v0.8.0 まで)が書き出したファイルは資格情報を含むが、読み込めるままにし、資格情報だけを適用しない(共有・改変されたファイルと本人の控えを区別できないため)。別の PC へ移す時は、ログイン情報を入力し直す。
-  - 差し替えは型変換した後の設定に対して行う(配列で書かれた欄でも外れない)。検証の前に一度、保存と同じ設定ロックの中でもう一度行い、検証の間に別経路(OAuth の接続など)が保存した値を古い写しで戻さない。それ以外の検証と保存は `update_config` と同じ。
+  - `import_config` は、`config` がオブジェクトでないファイル(`{"config": []}` など)を、型エラーと同じ固定文言「設定の形式が不正です (項目 .)」で拒否する。差し替えは型変換した後の設定に対して行う(配列で書かれた欄でも外れない)。検証の前に一度、保存と同じ設定ロックの中でもう一度行い、検証の間に別経路(OAuth の接続など)が保存した値を古い写しで戻さない。それ以外の検証と保存は `update_config` と同じ。
 - **読み上げ辞書のポータビリティ** (`TtsDictionaryPortability.svelte`): 辞書の書き出しと、ファイル・貼り付け・URL からの取り込み (§6.1)。
 - **ウィンドウ最前面ピン**: メインウィンドウを最前面固定するトグル(`core:window:allow-set-always-on-top`)。
 

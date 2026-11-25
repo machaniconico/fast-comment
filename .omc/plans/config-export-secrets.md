@@ -48,3 +48,31 @@
 ### X 以外の URL のユーザー情報
 
 - 裁定: 今のまま。接続先が今と同じでも今のユーザー情報は引き継がず、ファイルの値からユーザー情報を消して入れる。
+
+## 修正3 の裁定(2026-11-25、ルート。Codex 再レビュー(bdfa04c)の FAIL 5 件、critic は APPROVE)
+重大度の判定: 下の 1 と 4 はタイミングや異常な環境が重なった時だけ起きるので MINOR とする。2・3・5 は通常の取り込みで起きるので直す。
+1. MINOR(直さない): 無効化の保存と配信開始が同時に来ると、旧設定(取り込む前の自分の設定)で投稿する可能性がある。投稿するのは自分の設定のままなので、既知の限界として SPEC に 1 行書く。
+2. 直す: 取り込みでは、保存後の棒読みちゃんの自動起動をしない(通常の設定保存では今のまま)。取り込みで TTS のバックエンドが棒読みちゃんになった時は、「棒読みちゃんは自動では起動しません」と案内を warnings で返す。
+3. 直す: 読み上げの本文の送り先。`tts.options.voicevoxUrl` と `bouyomiHost` は、ファイルの値のホストがループバック(localhost、127.0.0.0/8、::1)の時だけファイルの値を使う。それ以外のホストなら今の値を残し、warnings で知らせる(「読み上げの接続先は、この PC 以外を指していたため今の設定のままにしました」)。ポート(bouyomiPort と URL 内のポート)はファイルの値でよい(AivisSpeech の 10101 を移すため)。
+4. MINOR(直さない): OBS のポート競合で bind に失敗した時の食い違い。これは既存の update_config と同じ挙動なので、この PR の範囲外とする。
+5. 直す(critic の MINOR 1 と同じ): X に未接続の PC で API モードのファイルを取り込んだ時は、xPost.mode を今の値のまま残す(enabled は false なので投稿は起きない)。取り込み全体は拒否しない。warnings で「X の投稿方式は今の設定のままにしました」と出す。
+6. 直す(Codex の MINOR): `config` がオブジェクトでない時(`{"config":[]}` など)は、Rust 側でも固定の文言で拒否する。
+7. 直す(critic の MINOR): onImported が false を返した時も、warnings の通知を出す。書き出しから `tts.options.bouyomiPath` を除く(取り込み時には今の値を残すので不要。Windows のユーザー名を含みうる)。X の自動告知を無効にした通知の文に「有効にする前に、自分の配信(ownStream)の設定も確認してください」を足す。
+
+### 修正3 の実装
+
+1. 直さない。SPEC §8.1 に既知の限界として 1 行足した。
+2. `launches_bouyomi_after_save(saved, imported)` が、取り込みでは false を返す(通常の保存は従来どおり)。`backup::import_notices` が、取り込みでバックエンドが棒読みちゃんに変わった時に案内を返す(今も棒読みちゃんなら出さない)。
+   - テスト: `import_does_not_launch_bouyomi`(lib.rs)、`settings_import_keeps_current_bouyomi_launch` の通知の確認。
+3. `merge_import` が型変換後の設定に対して、`voicevoxUrl` は `url::Url` で解析したホスト、`bouyomiHost` は文字列が、`localhost`・127.0.0.0/8・`::1` の時だけファイルの値を使う。解析できない値は今の値を残す。通知は、今の値と違っていた時だけ出す(同じ PC で書き出して読み込んだ時に出さない)。`bouyomiPort` はそのままファイルの値。
+   - テスト: `settings_import_takes_tts_destination_only_from_this_pc`。
+4. 直さない(範囲外)。
+5. `settle_x_post_mode` が、取り込みの時だけ `validate_x_post_mode` の拒否を「`xPost.mode` を今の値に戻す + 通知」に変える。通常の保存は従来どおり拒否する。
+   - テスト: `import_keeps_x_post_mode_instead_of_rejecting`(lib.rs)。接続状態を持つ `AppState` はテストで組めないので、検証結果を引数で受ける関数に分けて確かめている。
+6. `backup::parse_import` が、オブジェクトでない `config` を型変換の前に「設定の形式が不正です (項目 .)」で拒否する。UI の既存の型エラー表示にそのまま出る。
+   - テスト: `settings_import_rejects_a_config_that_is_not_an_object`。
+7. 3 点。
+   - 読み直しに失敗した時の通知: 文の組み立てを `src/lib/configPortability.ts` の `importMessage` に出し、`onImported` が false でも `warnings` があれば「設定は保存しました。」に続けて出す。読み直しを求める帯と並べて表示する(これまでは帯の間、状態の文を隠していた)。テスト: `src/lib/configPortability.test.ts`(`pnpm test` の一覧に追加)。
+   - 書き出しから `tts.options.bouyomiPath` を除いた(`BOUYOMI_PATH`)。`bouyomiLaunchElevated` は裁定に無いので書き出しに残している(読み込みは今の値を残す)。テスト: `settings_export_contains_no_secret_value`。
+   - X の自動告知を無効にした通知に ownStream の文を足した。テスト: `settings_import_never_enables_x_autopost`。
+- 通知の 4 文は、UI が 1 行につなげて出すので、末尾に「。」を付けた。
