@@ -387,9 +387,13 @@ impl YoutubeAuth {
         Err(SendError::Unauthorized)
     }
 
-    /// 次の `access_token` で refresh させる。401 を受けた呼び出し側が使う。
-    pub(crate) async fn forget_access_token(&self) {
-        *self.access_token.lock().await = None;
+    /// 401 を受けたトークンがキャッシュ中なら消し、次の `access_token` で refresh させる。
+    /// ほかの処理が更新済みの新しいトークンは消さない。
+    pub(crate) async fn forget_access_token(&self, rejected: &str) {
+        let mut cache = self.access_token.lock().await;
+        if cache.as_ref().is_some_and(|cached| cached.value == rejected) {
+            *cache = None;
+        }
     }
 
     pub(crate) async fn access_token(&self, client_id: &str) -> Result<String, String> {

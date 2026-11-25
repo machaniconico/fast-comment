@@ -183,6 +183,8 @@ struct Fixture {
     poll: Arc<Poll>,
     config: watch::Sender<AppConfig>,
     saved: Arc<StdMutex<usize>>,
+    // 設定の保存にかける時間。保存が遅い時の締め切りを確かめる。
+    save_delay: Arc<StdMutex<Duration>>,
     notices: tokio::sync::mpsc::UnboundedReceiver<String>,
     cancel: CancellationToken,
     server: tokio::task::JoinHandle<()>,
@@ -217,10 +219,13 @@ impl Fixture {
         let (config, rx) = watch::channel(config);
         let saved = Arc::new(StdMutex::new(0));
         let captured = saved.clone();
+        let save_delay = Arc::new(StdMutex::new(Duration::ZERO));
+        let delay = save_delay.clone();
         let poll = Arc::new(Poll::new(
             move |change| {
                 if matches!(change, PreferenceChange::Started(_)) {
                     *captured.lock().unwrap() += 1;
+                    std::thread::sleep(*delay.lock().unwrap());
                 }
                 Ok(())
             },
@@ -246,6 +251,7 @@ impl Fixture {
             poll,
             config,
             saved,
+            save_delay,
             notices,
             cancel,
             server,
@@ -627,16 +633,19 @@ async fn accepts_unsigned_integer_tallies_and_rejects_invalid_values() {
     }
 }
 
-#[tokio::test]
-async fn delayed_publish_uses_youtube_start_time_for_remaining_duration() {
-    let fixture = Fixture::new().await;
-    // 作成の応答が 2 秒遅れる。YouTube 側では POST の受信時に投票が始まっている。
-    let published = chrono::Utc::now();
+fn timed_start() -> ValidatedStart {
+    let mut start = request();
+    start.duration_secs = Some(10);
+    start.validate().unwrap()
+}
+
+/// 作成の応答を `delay` だけ遅らせる。publishedAt は `published` にする。
+fn push_create(fixture: &Fixture, published: chrono::DateTime<chrono::Utc>, delay: Duration) {
     let mut created = item(ID, "active");
     created["snippet"]["publishedAt"] = json!(published.to_rfc3339());
     let body = serde_json::to_vec(&created).unwrap();
     let chunks = futures_util::stream::once(async move {
-        time::sleep(Duration::from_secs(2)).await;
+        time::sleep(delay).await;
         Ok::<_, io::Error>(bytes::Bytes::from(body))
     });
     fixture
@@ -645,70 +654,110 @@ async fn delayed_publish_uses_youtube_start_time_for_remaining_duration() {
         .lock()
         .unwrap()
         .push_back(Body::from_stream(chunks).into_response());
-    let mut start = request();
-    start.duration_secs = Some(10);
-
-    let opened = fixture
-        .control
-        .start(start.validate().unwrap())
-        .await
-        .unwrap();
-    let opened_at = Instant::now();
-    let published_ms = published.timestamp_millis() as u64;
-    assert!(
-        opened.started_at_ms.abs_diff(published_ms) <= 300,
-        "{} {published_ms}",
-        opened.started_at_ms
-    );
-    assert_eq!(opened.ends_at_ms, Some(opened.started_at_ms + 10_000));
-    assert_eq!(fixture.poll.snapshot(), opened);
-    assert_eq!(
-        time::timeout(Duration::from_secs(10), fixture.closed())
-            .await
-            .unwrap()
-            .total_voters,
-        10
-    );
-    assert!(opened_at.elapsed() < Duration::from_millis(8_500));
 }
 
 #[tokio::test]
-async fn clock_ahead_of_youtube_does_not_shorten_the_poll() {
-    for interrupted_create in [false, true] {
+async fn deadline_counts_from_create_response_even_if_clock_is_off() {
+    // publishedAt が PC の時計より 60 秒前・後でも、締め切りは応答から 10 秒後。
+    for skew in [-60, 60] {
         let fixture = Fixture::new().await;
-        // PC の時計が YouTube より進んでいる。照合は公開時刻が POST 直前の 10 秒前より
-        // 後の時だけ採用するので、照合の経路では 9 秒にする。
-        let ahead = if interrupted_create { 9 } else { 60 };
-        let mut created = item(ID, "active");
-        created["snippet"]["publishedAt"] =
-            json!((chrono::Utc::now() - chrono::Duration::seconds(ahead)).to_rfc3339());
-        if interrupted_create {
-            fixture.mock.create.lock().unwrap().push_back(interrupted());
-            fixture.mock.push_active(created);
-        } else {
-            fixture
-                .mock
-                .create
-                .lock()
-                .unwrap()
-                .push_back(Json(created).into_response());
-        }
-        let mut start = request();
-        start.duration_secs = Some(10);
-        let opened = fixture
-            .control
-            .start(start.validate().unwrap())
-            .await
-            .unwrap();
-        let now_ms = chrono::Utc::now().timestamp_millis() as u64;
-        let ends_at_ms = opened.ends_at_ms.unwrap();
-        assert_eq!(ends_at_ms, opened.started_at_ms + 10_000);
-        // 照合の待機(1 秒)を含めても、差し引くのは POST からの経過時間まで。
-        assert!(ends_at_ms >= now_ms + 8_500, "{ends_at_ms} {now_ms}");
-        time::sleep(Duration::from_secs(2)).await;
-        assert_eq!(fixture.poll.snapshot().status, PollStatus::Open);
-        assert!(!fixture.mock.calls().contains(&"transition"));
+        push_create(
+            &fixture,
+            chrono::Utc::now() + chrono::Duration::seconds(skew),
+            Duration::ZERO,
+        );
+        let before = Instant::now();
+        let before_ms = chrono::Utc::now().timestamp_millis() as u64;
+        let opened = fixture.control.start(timed_start()).await.unwrap();
+        let after_ms = chrono::Utc::now().timestamp_millis() as u64;
+        assert!(
+            (before_ms..=after_ms).contains(&opened.started_at_ms),
+            "{skew}: {before_ms} {} {after_ms}",
+            opened.started_at_ms
+        );
+        assert_eq!(opened.ends_at_ms, Some(opened.started_at_ms + 10_000));
+        fixture.closed_within(Duration::from_secs(12)).await;
+        let elapsed = before.elapsed();
+        assert!(elapsed >= Duration::from_secs(10), "{skew}: {elapsed:?}");
+        assert!(
+            elapsed < Duration::from_millis(11_500),
+            "{skew}: {elapsed:?}"
+        );
     }
+}
+
+#[tokio::test]
+async fn delayed_create_response_still_gets_full_duration() {
+    // PC の時計が 60 秒進んでいて、YouTube の公開が POST から 3 秒遅れ、公開直後に応答が届く。
+    let fixture = Fixture::new().await;
+    push_create(
+        &fixture,
+        chrono::Utc::now() - chrono::Duration::seconds(57),
+        Duration::from_secs(3),
+    );
+    let before = Instant::now();
+    let opened = fixture.control.start(timed_start()).await.unwrap();
+    let responded = Instant::now();
+    assert!(responded - before >= Duration::from_secs(3));
+    assert_eq!(opened.ends_at_ms, Some(opened.started_at_ms + 10_000));
+    fixture.closed_within(Duration::from_secs(12)).await;
+    let elapsed = responded.elapsed();
+    assert!(elapsed >= Duration::from_millis(9_900), "{elapsed:?}");
+    assert!(elapsed < Duration::from_millis(11_500), "{elapsed:?}");
+}
+
+#[tokio::test]
+async fn slow_preference_save_does_not_extend_deadline() {
+    let fixture = Fixture::new().await;
+    *fixture.save_delay.lock().unwrap() = Duration::from_secs(3);
+    let before = Instant::now();
+    let before_ms = chrono::Utc::now().timestamp_millis() as u64;
+    let opened = fixture.control.start(timed_start()).await.unwrap();
+    assert!(before.elapsed() >= Duration::from_secs(3));
+    // 表示の起点も保存の前(応答を受けた時点)。
+    assert!(
+        opened.started_at_ms < before_ms + 1_000,
+        "{} {before_ms}",
+        opened.started_at_ms
+    );
+    assert_eq!(opened.ends_at_ms, Some(opened.started_at_ms + 10_000));
+    fixture.closed_within(Duration::from_secs(12)).await;
+    let elapsed = before.elapsed();
+    assert!(elapsed >= Duration::from_secs(10), "{elapsed:?}");
+    assert!(elapsed < Duration::from_millis(11_500), "{elapsed:?}");
+}
+
+#[tokio::test]
+async fn reconciled_poll_uses_its_polling_interval() {
+    let fixture = Fixture::new().await;
+    fixture.mock.create.lock().unwrap().push_back(interrupted());
+    fixture.mock.active.lock().unwrap().push_back(
+        Json(json!({"activePollItem": item(ID, "active"), "pollingIntervalMillis": 13_000}))
+            .into_response(),
+    );
+    fixture.mock.push_active(item(ID, "closed"));
+    fixture.start().await.unwrap();
+    fixture.closed_within(Duration::from_secs(20)).await;
+    let times = fixture.mock.get_times.lock().unwrap();
+    assert_eq!(times.len(), 2);
+    assert!(
+        times[1] - times[0] >= Duration::from_millis(12_950),
+        "{times:?}"
+    );
+}
+
+#[tokio::test]
+async fn forgetting_a_rejected_token_keeps_a_newer_cached_one() {
+    let fixture = Fixture::new().await;
+    let auth = &fixture.control.youtube.auth;
+    assert_eq!(auth.access_token(CLIENT_ID).await.unwrap(), TOKEN);
+    // 401 を受けたのが古いトークンなら、ほかの処理が更新した TOKEN は残す。
+    auth.forget_access_token(STALE_TOKEN).await;
+    assert_eq!(auth.access_token(CLIENT_ID).await.unwrap(), TOKEN);
+    assert_eq!(fixture.mock.calls(), ["token"]);
+    auth.forget_access_token(TOKEN).await;
+    assert_eq!(auth.access_token(CLIENT_ID).await.unwrap(), TOKEN);
+    assert_eq!(fixture.mock.calls(), ["token", "token"]);
 }
 
 #[tokio::test]

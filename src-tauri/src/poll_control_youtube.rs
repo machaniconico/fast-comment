@@ -178,16 +178,12 @@ impl YoutubePollControl {
         let question = &start.preferences.question;
         let options = &start.preferences.options;
         let sent_at_ms = chrono::Utc::now().timestamp_millis();
-        let posted_at = Instant::now();
-        let (remote_id, published_at_ms) = match self
+        let (remote_id, polling_interval_ms) = match self
             .api
             .create(&token, &live_chat_id, question, options)
             .await
         {
-            Ok(YtPollCreated {
-                id,
-                published_at_ms,
-            }) => (id, published_at_ms),
+            Ok(YtPollCreated { id, .. }) => (id, None),
             Err(YtPollsError::Network) => {
                 let found = self
                     .reconcile(
@@ -199,13 +195,15 @@ impl YoutubePollControl {
                         sent_at_ms,
                     )
                     .await?;
-                (found.id, found.published_at_ms)
+                (found.id, found.polling_interval_ms)
             }
             Err(error) => return Err(YoutubeControlError::from(error).into()),
         };
-        // YouTube 側で既に経過した時間は、POST 直前から応答(照合)までの実測を上限にする。
-        // 壁時計の差だけで決めると、PC の時計が進んでいる分だけ投票が早く閉じる。
-        let max_elapsed_ms = u64::try_from(posted_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        // 締め切りと残り時間の起点は、作成の応答(照合で採用した時は採用時)を受けた時点。
+        // publishedAt や壁時計の差は使わないので、時計がずれていても早く閉じない。
+        // 起点は設定の保存より前に取り、保存が遅くても締め切りを延ばさない。
+        let accepted_at = Instant::now();
+        let accepted_at_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
         let target = Target {
             client_id,
             live_chat_id,
@@ -215,20 +213,16 @@ impl YoutubePollControl {
         // 保存に失敗しても、YouTube に作成できた投票は追跡する。
         let saved = self.poll.save_start_preferences(&start);
         let duration_secs = start.duration_secs;
-        let opened_at = Instant::now();
         let mut snapshot = self.poll.open(start);
         let deadline = duration_secs.map(|secs| {
-            let local_start = snapshot.started_at_ms;
-            let elapsed_ms = published_at_ms
-                .and_then(|at| u64::try_from(at).ok())
-                .map_or(0, |at| local_start.saturating_sub(at).min(max_elapsed_ms));
-            // 表示用の開始・終了予定もローカルの壁時計で、期限と同じ基準にそろえる。
-            let started_at_ms = local_start - elapsed_ms;
-            let ends_at_ms = started_at_ms + u64::from(secs) * 1000;
-            self.poll
-                .set_remote_timing(&snapshot.id, started_at_ms, ends_at_ms);
+            let duration = Duration::from_secs(u64::from(secs));
+            self.poll.set_remote_timing(
+                &snapshot.id,
+                accepted_at_ms,
+                accepted_at_ms + u64::from(secs) * 1000,
+            );
             snapshot = self.poll.snapshot();
-            opened_at + Duration::from_millis(ends_at_ms.saturating_sub(local_start))
+            accepted_at + duration
         });
         let cancel = self.app_cancel.child_token();
         *self.active.lock().await = Some(ActivePoll {
@@ -247,6 +241,7 @@ impl YoutubePollControl {
         tauri::async_runtime::spawn(self.clone().run(
             snapshot.id.clone(),
             target,
+            accepted_at + next_poll_delay(polling_interval_ms),
             deadline,
             cancel,
         ));
@@ -271,7 +266,7 @@ impl YoutubePollControl {
                     time::sleep(Duration::from_secs(seconds)).await;
                     // 401 の後は、次の GET の前に refresh する(GET は合計 3 回まで)。
                     if refresh {
-                        self.auth.forget_access_token().await;
+                        self.auth.forget_access_token(&token).await;
                         token = self
                             .auth
                             .access_token(client_id)
@@ -382,10 +377,11 @@ impl YoutubePollControl {
         self: Arc<Self>,
         local_id: String,
         target: Target,
+        first_get: Instant,
         deadline: Option<Instant>,
         cancel: CancellationToken,
     ) {
-        let next_get = Mutex::new(Instant::now() + POLL_INTERVAL);
+        let next_get = Mutex::new(first_get);
         let mut last_error = None;
         loop {
             let scheduled = *next_get.lock().await;
