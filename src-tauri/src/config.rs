@@ -783,8 +783,11 @@ pub enum TtsBackendKind {
     None,
 }
 
+pub(crate) const MAX_TTS_DICTIONARY_ENTRIES: usize = 1000;
+pub(crate) const TTS_DICTIONARY_ENTRY_LIMIT_ERROR: &str = "読み上げ辞書は1000件までです";
+
 /// 読み上げ前に本文へ適用するユーザー定義置換の1件。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TtsDictEntry {
     /// 置換前の文字列または正規表現。平文の空文字列はスキップする。
@@ -1110,6 +1113,16 @@ impl TtsOptions {
 
         self.queue.max_pending = self.queue.max_pending.clamp(1, 500);
         self.queue.max_wait_sec = self.queue.max_wait_sec.min(86_400);
+    }
+
+    fn truncate_loaded_dictionary(&mut self) {
+        if self.dictionary.len() > MAX_TTS_DICTIONARY_ENTRIES {
+            tracing::warn!(
+                discarded = self.dictionary.len() - MAX_TTS_DICTIONARY_ENTRIES,
+                "読み上げ辞書の件数上限を超えた項目を破棄"
+            );
+            self.dictionary.truncate(MAX_TTS_DICTIONARY_ENTRIES);
+        }
     }
 }
 
@@ -1573,6 +1586,7 @@ impl AppConfig {
             )
         })?;
         cfg.normalize_all();
+        cfg.tts.options.truncate_loaded_dictionary();
         Ok(cfg)
     }
 
@@ -1623,9 +1637,13 @@ impl AppConfig {
 
     /// IPC の入力値はエラー文に含めない。
     pub(crate) fn from_config_update(value: serde_json::Value) -> Result<Self, String> {
-        serde_path_to_error::deserialize(value).map_err(|e| {
+        let config: Self = serde_path_to_error::deserialize(value).map_err(|e| {
             format!("設定の形式が不正です (項目 {})", config_error_path(e.path()))
-        })
+        })?;
+        if config.tts.options.dictionary.len() > MAX_TTS_DICTIONARY_ENTRIES {
+            return Err(TTS_DICTIONARY_ENTRY_LIMIT_ERROR.into());
+        }
+        Ok(config)
     }
 
     /// 範囲外値の丸め。ロード時と更新(保存前)の双方から呼ぶ。
@@ -2579,6 +2597,63 @@ mod tests {
         assert_eq!(cfg.credentials, CredentialsConfig::default());
         assert_eq!(cfg.youtube_overrides, YoutubeOverrides::default());
         assert_eq!(cfg.x_overrides, XOverrides::default());
+    }
+
+    #[test]
+    fn tts_dictionary_load_truncates_count_and_preserves_legacy_long_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = AppConfig::default();
+        let dictionary = &mut config.tts.options.dictionary;
+        dictionary.push(TtsDictEntry {
+            from: "全".repeat(201),
+            to: "🍣".repeat(201),
+            regex: false,
+        });
+        dictionary.extend((1..=MAX_TTS_DICTIONARY_ENTRIES).map(|i| TtsDictEntry {
+            from: i.to_string(),
+            to: String::new(),
+            regex: false,
+        }));
+        std::fs::write(
+            AppConfig::path_in(dir.path()),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = AppConfig::load(dir.path()).unwrap();
+        assert_eq!(
+            loaded.tts.options.dictionary,
+            config.tts.options.dictionary[..MAX_TTS_DICTIONARY_ENTRIES]
+        );
+        config.normalize_all();
+        assert_eq!(
+            config.tts.options.dictionary.len(),
+            MAX_TTS_DICTIONARY_ENTRIES + 1
+        );
+    }
+
+    #[test]
+    fn tts_dictionary_config_update_rejects_overflow_instead_of_truncating() {
+        let mut config = AppConfig::default();
+        config.tts.options.dictionary = vec![
+            TtsDictEntry {
+                from: "全".repeat(201),
+                to: "🍣".repeat(201),
+                regex: false,
+            };
+            MAX_TTS_DICTIONARY_ENTRIES
+        ];
+        let at_limit = serde_json::to_value(&config).unwrap();
+        let updated = AppConfig::from_config_update(at_limit).unwrap();
+        assert_eq!(updated.tts.options.dictionary, config.tts.options.dictionary);
+
+        let dictionary = &mut config.tts.options.dictionary;
+        dictionary.push(dictionary[0].clone());
+        let overflow = serde_json::to_value(&config).unwrap();
+        assert_eq!(
+            AppConfig::from_config_update(overflow).unwrap_err(),
+            TTS_DICTIONARY_ENTRY_LIMIT_ERROR
+        );
     }
 
     #[test]

@@ -3,7 +3,7 @@
   import type {
     AppConfig, EffectRule, EffectsConfig, EffectTarget, GoalsConfig, InjectTestCommentOptions, TtsDictEntry, TtsOptions,
     TimerConfig, WelcomeConfig, YoutubeOauthStatus, TwitchOauthStatus, TwitchDeviceLogin, OAuthService,
-    ConfigCommit, OAuthClientSaved
+    ConfigCommit, OAuthClientSaved, TtsDictionaryCommit
   } from '../ipc';
   import {
     isTauri, getConfigSnapshot, setConfig, configChangedError, getObsUrl, getObsGoalsUrl, getObsTimerUrl, getObsPollUrl, exportCommentsCsv, injectTestComment, testKeywordEffect,
@@ -35,11 +35,13 @@
   import SoundEffectsSettings from './SoundEffectsSettings.svelte';
   import DanmakuSettings from './DanmakuSettings.svelte';
   import ModerationPortability from './ModerationPortability.svelte';
+  import TtsDictionaryPortability from './TtsDictionaryPortability.svelte';
   import ModerationTester from './ModerationTester.svelte';
   import TemplateEditor from './TemplateEditor.svelte';
   import XPostSettings from './XPostSettings.svelte';
   import TwitcastingSettings from './TwitcastingSettings.svelte';
   import IntegrationsSettings from './IntegrationsSettings.svelte';
+  import StartupLaunchSettings from './StartupLaunchSettings.svelte';
   import AchievementsSettings from './AchievementsSettings.svelte';
   import { sanitizeXPostNumbers } from '../xAutopost';
   import { DEFAULT_TWITCASTING_CALLBACK_PORT } from '../twitcasting';
@@ -49,10 +51,11 @@
 
   interface Props {
     onConfigSaved?: (config: AppConfig, revision: number) => void;
+    onStartupLaunchApprovalChanged?: (needsApproval: boolean) => void;
     focus?: 'all' | 'goals' | 'danmaku' | 'achievements';
   }
 
-  let { onConfigSaved, focus = 'all' }: Props = $props();
+  let { onConfigSaved, onStartupLaunchApprovalChanged, focus = 'all' }: Props = $props();
   let localApiSettings: { refreshStatus: () => Promise<void> } | undefined = $state();
 
   function onThemeChange(event: Event) {
@@ -157,7 +160,8 @@
   const moderationFieldsLocked = $derived(reloading.moderation > 0 || configSync.importing === 'moderation');
   // 規則の保存が済み、再読込を待っている間は全体を読み直せる。
   const manualReloadDisabled = $derived(
-    saving || allFieldsLocked || (configSync.importing === 'moderation' && reloading.moderation === 0)
+    saving || allFieldsLocked || configSync.importing === 'ttsDictionary'
+      || (configSync.importing === 'moderation' && reloading.moderation === 0)
   );
   const saveBlockedReason = $derived.by(() => {
     if (configSync.reloadRequired) return configReloadMessage;
@@ -383,7 +387,6 @@
       webSpeechVolume = ttsNum('webSpeechVolume', 1);
       webSpeechVoice = config.tts.options.webSpeechVoice ?? '';
       ttsDictionary = normalizeTtsDictionary(config.tts.options.dictionary);
-      config.tts.options.dictionary = ttsDictionary;
       nameFormat = config.tts.options.nameFormat ?? '{name}';
       excludeUsersText = (config.tts.options.excludeUsers ?? []).join('\n');
       for (const [k] of READ_KIND_LABELS) readKinds[k] = config.tts.options.readKinds?.[k] !== false;
@@ -1005,6 +1008,14 @@
     }));
   }
 
+  function hasTtsDictionaryEdits(): boolean {
+    const saved = config?.tts.options.dictionary ?? [];
+    return saved.length !== ttsDictionary.length || saved.some((entry, index) => {
+      const draft = ttsDictionary[index];
+      return entry.from !== draft.from || entry.to !== draft.to || !!entry.regex !== !!draft.regex;
+    });
+  }
+
   function addTtsDictionaryEntry() {
     ttsDictionary = [...ttsDictionary, { from: '', to: '', regex: false }];
   }
@@ -1013,9 +1024,16 @@
     ttsDictionary = ttsDictionary.filter((_, i) => i !== index);
   }
 
-  function syncTtsDictionaryToConfig() {
-    if (!config) return;
-    config.tts.options.dictionary = normalizeTtsDictionary(ttsDictionary);
+  function onTtsDictionaryImported({ revision, dictionary }: TtsDictionaryCommit) {
+    if (revision === null || destroyed || !newerThanBase(revision)) return;
+    // 取り込みの応答には保存済みの辞書全体があるので、他の設定に差分があっても辞書は反映できる。
+    ttsDictionary = normalizeTtsDictionary(dictionary);
+    if (config) config.tts.options.dictionary = dictionary;
+    if (baseRevision !== undefined && revision === baseRevision + 1) {
+      baseRevision = revision;
+    } else {
+      configSync.reloadRequired = true;
+    }
   }
 
   function refreshLogDir() {
@@ -1373,7 +1391,6 @@
     setTtsNum('webSpeechPitch', webSpeechPitch);
     setTtsNum('webSpeechVolume', webSpeechVolume);
     config.tts.options.webSpeechVoice = webSpeechVoice;
-    syncTtsDictionaryToConfig();
     config.tts.options.nameFormat = nameFormat.trim() || '{name}';
     config.tts.options.excludeUsers = parseModerationText(excludeUsersText);
     config.tts.options.readKinds = { ...readKinds };
@@ -1425,7 +1442,13 @@
     saveWarned = false;
     try {
       if (saveBlockedReason) return;
-      const result = await setConfig(config, baseRevision);
+      const result = await setConfig({
+        ...config,
+        tts: {
+          ...config.tts,
+          options: { ...config.tts.options, dictionary: normalizeTtsDictionary(ttsDictionary) },
+        },
+      }, baseRevision);
       // Rust が正規化した保存値(ログイン中に保持した OAuth 項目を含む)でフォームを置き換える。
       if (result) applyCommit(result.revision, () => hydrateConfig(result.config));
       const warnings = result?.warnings ?? [];
@@ -1688,6 +1711,12 @@
   </div>
   {/if}
   {:else}
+  {#if focus === 'all'}
+    <section id="settings-startup-launch">
+      <h3>起動時に開く</h3>
+      <StartupLaunchSettings onApprovalChanged={onStartupLaunchApprovalChanged} />
+    </section>
+  {/if}
   <fieldset class="settings-fields" disabled={allFieldsLocked}>
   <section id="settings-appearance">
     <h3>外観</h3>
@@ -2537,15 +2566,17 @@
       <span class="hint-inline">「!」で始まるコメントをスキップ</span>
     </div>
 
-    <div class="dict-editor">
+    <fieldset class="dict-editor" disabled={configSync.importing === 'ttsDictionary'} aria-label="読み上げ辞書">
       <div class="dict-header">
         <span>読み上げ辞書</span>
-        <button type="button" class="copy-btn" onclick={addTtsDictionaryEntry}>行追加</button>
+        <button type="button" class="copy-btn" onclick={addTtsDictionaryEntry} disabled={ttsDictionary.length >= 1000}>行追加</button>
       </div>
       {#if ttsDictionary.length === 0}
         <p class="hint">置換前と置換後を入力すると、読み上げ本文だけに上から順に適用されます。</p>
       {/if}
       {#each ttsDictionary as entry, index (entry)}
+        {@const fromTooLong = Array.from(entry.from).length > 200}
+        {@const toTooLong = Array.from(entry.to).length > 200}
         <div class="dict-row">
           <label for={`tts-dict-from-${index}`} class="dict-label">from</label>
           <input
@@ -2553,6 +2584,8 @@
             type="text"
             bind:value={entry.from}
             class="id-input dict-input"
+            aria-invalid={fromTooLong}
+            title={fromTooLong ? '200文字以内で入力してください' : undefined}
             placeholder="置換前"
           />
           <label for={`tts-dict-to-${index}`} class="dict-label">to</label>
@@ -2561,13 +2594,20 @@
             type="text"
             bind:value={entry.to}
             class="id-input dict-input"
+            aria-invalid={toTooLong}
+            title={toTooLong ? '200文字以内で入力してください' : undefined}
             placeholder="置換後"
           />
           <label class="kind-check"><input type="checkbox" bind:checked={entry.regex} class="chk" /> 正規表現</label>
           <button type="button" class="copy-btn dict-delete" onclick={() => removeTtsDictionaryEntry(index)}>削除</button>
         </div>
       {/each}
-    </div>
+    </fieldset>
+    <TtsDictionaryPortability
+      disabled={allFieldsLocked || configSync.reloadRequired}
+      hasDictionaryEdits={hasTtsDictionaryEdits}
+      onImported={onTtsDictionaryImported}
+    />
   </section>
 
   <section id="settings-comment-log">
@@ -3608,6 +3648,13 @@
     margin-top: 10px;
   }
 
+  fieldset.dict-editor {
+    min-width: 0;
+    margin: 10px 0 0;
+    padding: 0;
+    border: 0;
+  }
+
   .dict-header {
     display: flex;
     align-items: center;
@@ -3646,6 +3693,10 @@
 
   .dict-input {
     min-width: 0;
+  }
+
+  .dict-input[aria-invalid="true"] {
+    border-color: #ef9a9a;
   }
 
   .effect-emoji-input {

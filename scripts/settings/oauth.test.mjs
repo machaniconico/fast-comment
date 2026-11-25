@@ -44,6 +44,92 @@ const initial = page => page.evaluate(() => window.mock.initial);
 const reloadSettings = page => page.getByRole('button', { name: '設定を再読み込み', exact: true });
 const moderationImport = page => page.locator('.portability').filter({ has: page.locator('#moderation-import-json') });
 
+for (const revisionGap of [false, true]) {
+  test('replacing the TTS dictionary clears unsaved edits' + (revisionGap ? ' across a revision gap' : ''), async t => withSettings(t, async page => {
+    const dictionary = [{ from: ' 草 ', to: 'くさ', regex: false }];
+    await page.evaluate(({ entries, revisionGap }) => {
+      window.mock.saved.tts.options.dictionary = entries;
+      window.mock.revision++;
+      window.mock.configSync.reloadRequired = true;
+      window.mock.importTtsDictionary = ({ raw, mode }) => {
+        if (mode !== 'replace') throw new Error('expected replace');
+        if (revisionGap) {
+          window.mock.saved.goals.showInApp = true;
+          window.mock.revision++;
+        }
+        const dictionary = JSON.parse(raw).entries.slice(0, 1);
+        window.mock.saved.tts.options.dictionary = dictionary;
+        return {
+          revision: ++window.mock.revision, dictionary, added: 0, replaced: 1,
+          skippedDuplicate: 0,
+          rejected: Array.from({ length: 20 }, (_, i) => ({ index: i + 2, reason: 'fromが不正です' })),
+          rejectedCount: 22, total: 1,
+        };
+      };
+    }, { entries: dictionary, revisionGap });
+    await reloadSettings(page).click();
+    const from = page.locator('#tts-dict-from-0');
+    await from.waitFor();
+    await from.fill('未保存');
+    await page.locator('#tts-dictionary-import-mode').selectOption('replace');
+    await page.locator('#tts-dictionary-import-text').fill(JSON.stringify({
+      schema: 'fast-comment-tts-dictionary', version: 1,
+      entries: [...dictionary, ...Array(22).fill({ to: '' })],
+    }));
+    await page.getByRole('button', { name: '貼り付けて取り込む' }).click();
+    await page.getByText('ほか 2 件', { exact: true }).waitFor();
+    await page.getByText('2 件目 — fromが不正です', { exact: true }).waitFor();
+    assert.equal(await from.inputValue(), ' 草 ');
+    if (revisionGap) {
+      assert.equal(await save(page).isDisabled(), true);
+      await reloadSettings(page).click();
+    }
+    const config = await saveSettings(page);
+    assert.deepEqual(config.tts.options.dictionary, dictionary);
+    if (revisionGap) assert.equal(config.goals.showInApp, true);
+  }));
+}
+
+test('the TTS dictionary editor limits row additions', async t => withSettings(t, async page => {
+  await page.evaluate(() => {
+    window.mock.saved.tts.options.dictionary = Array.from({ length: 1000 }, (_, i) => ({
+      from: String(i), to: '', regex: false,
+    }));
+    window.mock.revision++;
+    window.mock.configSync.reloadRequired = true;
+  });
+  await reloadSettings(page).click();
+  await page.locator('#tts-dict-from-999').waitFor();
+  const editor = page.getByRole('group', { name: '読み上げ辞書', exact: true });
+  const add = editor.getByRole('button', { name: '行追加' });
+  assert.equal(await add.isDisabled(), true);
+  await editor.getByRole('button', { name: '削除', exact: true }).first().click();
+  assert.equal(await add.isEnabled(), true);
+}));
+
+test('the TTS dictionary editor flags both fields at 201 Unicode characters', async t => withSettings(t, async page => {
+  const editor = page.getByRole('group', { name: '読み上げ辞書', exact: true });
+  await editor.getByRole('button', { name: '行追加' }).click();
+  const emoji = '🍣'.repeat(200);
+  for (const key of ['from', 'to']) {
+    const input = editor.locator(`#tts-dict-${key}-0`);
+    assert.equal(await input.getAttribute('maxlength'), null);
+    await input.fill(emoji);
+    assert.equal(await input.inputValue(), emoji);
+    assert.equal(await input.getAttribute('aria-invalid'), 'false');
+    await input.press('End');
+    await page.keyboard.insertText('あ');
+    assert.equal(await input.inputValue(), emoji + 'あ');
+    assert.equal(await input.getAttribute('aria-invalid'), 'true');
+    assert.equal(await input.evaluate(el => getComputedStyle(el).borderTopColor), 'rgb(239, 154, 154)');
+    await input.press('Backspace');
+    assert.equal(await input.inputValue(), emoji);
+    assert.equal(await input.getAttribute('aria-invalid'), 'false');
+  }
+  const config = await saveSettings(page);
+  assert.deepEqual(config.tts.options.dictionary, [{ from: emoji, to: emoji, regex: false }]);
+}));
+
 async function importModeration(page, moderation) {
   await page.locator('#moderation-import-json').fill(JSON.stringify({ moderation }));
   await moderationImport(page).getByRole('button', { name: 'テキストから読込' }).click();
@@ -1017,4 +1103,54 @@ test('a late X disconnect notice newer than the base asks for a reload', async t
   await page.evaluate(() => window.mock.heldConfigSaved.shift()());
   await page.waitForFunction(() => window.mock.configSync.reloadRequired === true);
   assert.equal(await save(page).isDisabled(), true);
+}, 'app'));
+
+test('startup launch approval warning stays on the main window until a save succeeds', async t => withSettings(t, async page => {
+  const warning = '起動時に開く設定が変更されています。設定画面で確認してください。';
+  const banner = page.locator('.tts-notice-banner').getByText(warning);
+  const section = page.locator('#settings-startup-launch');
+  await banner.waitFor();
+  await page.getByRole('tab', { name: '設定', exact: true }).click();
+  await section.getByText(warning).waitFor();
+  const review = section.getByRole('button', { name: '内容を確認して承認' });
+  const approve = page.getByRole('dialog').getByRole('button', { name: '承認して保存' });
+
+  await page.evaluate(() => { window.mock.startupLaunchSaveError = '承認情報の保存に失敗しました'; });
+  await review.click();
+  await approve.click();
+  await section.getByText('承認情報の保存に失敗しました').waitFor();
+  await banner.waitFor();
+  await page.getByRole('tab', { name: 'コメント', exact: true }).click();
+  await banner.waitFor();
+  await page.getByRole('tab', { name: '設定', exact: true }).click();
+
+  await page.evaluate(() => { window.mock.startupLaunchSaveError = null; });
+  await review.click();
+  await approve.click();
+  await section.getByText('保存しました。次回の起動から適用されます。').waitFor();
+  await banner.waitFor({ state: 'hidden' });
+}, 'startup-launch-app'));
+
+test('startup launch confirmation shows the pasted path and arguments that will be saved', async t => withSettings(t, async page => {
+  await page.getByRole('tab', { name: '設定', exact: true }).click();
+  const section = page.locator('#settings-startup-launch');
+  const target = 'C:\\Program Files\\Tools\\app.exe';
+  await section.getByLabel('アプリの絶対パス').fill(`"${target}"`);
+  await section.getByLabel('引数（1 行に 1 つ）').fill('--first\n\n --last \n\n');
+  await section.getByLabel('表示名（任意）').fill('アプリの表示名');
+  await section.getByRole('button', { name: '一覧に追加' }).click();
+  await section.getByRole('button', { name: '内容を確認して保存' }).click();
+
+  const dialog = page.getByRole('dialog');
+  const literals = dialog.locator('.literal');
+  assert.deepEqual(await literals.allTextContents(), ['アプリの表示名', target, '--first', '（空の引数）', ' --last ']);
+  assert.deepEqual(await literals.evaluateAll(nodes => nodes.map(node => getComputedStyle(node).unicodeBidi)),
+    Array(5).fill('plaintext'));
+  assert.deepEqual(await page.evaluate(() => window.mock.startupLaunchWrites), []);
+  await dialog.getByRole('button', { name: '承認して保存' }).click();
+  await section.getByText('保存しました。次回の起動から適用されます。').waitFor();
+  const [{ confirmed, items: [item] }] = await page.evaluate(() => window.mock.startupLaunchWrites);
+  assert.equal(confirmed, true);
+  assert.equal(item.target, target);
+  assert.deepEqual(item.args, ['--first', '', ' --last ']);
 }, 'app'));

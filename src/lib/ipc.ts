@@ -311,6 +311,36 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
   return tauriInvoke<T>(cmd, args);
 }
 
+export type LaunchKind = 'exe' | 'url';
+
+export interface LaunchItem {
+  id: string;
+  kind: LaunchKind;
+  target: string;
+  args: string[];
+  enabled: boolean;
+  label: string | null;
+}
+
+export interface StartupLaunchSettings {
+  items: LaunchItem[];
+  needsApproval: boolean;
+  readError: string | null;
+  failures: number;
+}
+
+export function getStartupLaunchSettings() {
+  return invoke<StartupLaunchSettings>('get_startup_launch_settings');
+}
+
+export async function saveStartupLaunchSettings(items: LaunchItem[]) {
+  await invoke<void>('save_startup_launch_settings', { items, confirmed: true });
+}
+
+export function onStartupLaunchFailure(handler: (failures: number) => void) {
+  return listen<number>('startup-launch-failure', ({ payload }) => handler(payload));
+}
+
 // Config
 
 // Mirror of Rust `TtsOptions` (src-tauri/src/config.rs), serde camelCase.
@@ -823,6 +853,30 @@ export async function setModeration(moderation: AppConfig['moderation']): Promis
   const commit = await invoke<ModerationCommit>('set_moderation', { moderation });
   if (!commit) throw new Error('Tauri環境で開いてから再試行してください。');
   return commit;
+}
+
+export type TtsDictionaryImportMode = 'append' | 'replace';
+
+export type TtsDictionaryCommit = ConfigCommit<{
+  dictionary: TtsDictEntry[];
+  added: number;
+  replaced: number;
+  skippedDuplicate: number;
+  rejected: { index: number; reason: string }[];
+  rejectedCount: number;
+  total: number;
+}>;
+
+export function exportTtsDictionary(): Promise<string | null> {
+  return invoke<string>('export_tts_dictionary');
+}
+
+export function importTtsDictionary(raw: string, mode: TtsDictionaryImportMode): Promise<TtsDictionaryCommit | null> {
+  return invoke<TtsDictionaryCommit>('import_tts_dictionary', { raw, mode });
+}
+
+export function importTtsDictionaryUrl(url: string, mode: TtsDictionaryImportMode): Promise<TtsDictionaryCommit | null> {
+  return invoke<TtsDictionaryCommit>('import_tts_dictionary_url', { url, mode });
 }
 
 export async function setTtsPaused(paused: boolean): Promise<void> {
