@@ -90,7 +90,7 @@ for (const revisionGap of [false, true]) {
   }));
 }
 
-test('the TTS dictionary editor limits row additions and both fields', async t => withSettings(t, async page => {
+test('the TTS dictionary editor limits row additions', async t => withSettings(t, async page => {
   await page.evaluate(() => {
     window.mock.saved.tts.options.dictionary = Array.from({ length: 1000 }, (_, i) => ({
       from: String(i), to: '', regex: false,
@@ -103,10 +103,31 @@ test('the TTS dictionary editor limits row additions and both fields', async t =
   const editor = page.getByRole('group', { name: '読み上げ辞書', exact: true });
   const add = editor.getByRole('button', { name: '行追加' });
   assert.equal(await add.isDisabled(), true);
-  assert.equal(await page.locator('#tts-dict-from-0').getAttribute('maxlength'), '200');
-  assert.equal(await page.locator('#tts-dict-to-0').getAttribute('maxlength'), '200');
   await editor.getByRole('button', { name: '削除', exact: true }).first().click();
   assert.equal(await add.isEnabled(), true);
+}));
+
+test('the TTS dictionary editor flags both fields at 201 Unicode characters', async t => withSettings(t, async page => {
+  const editor = page.getByRole('group', { name: '読み上げ辞書', exact: true });
+  await editor.getByRole('button', { name: '行追加' }).click();
+  const emoji = '🍣'.repeat(200);
+  for (const key of ['from', 'to']) {
+    const input = editor.locator(`#tts-dict-${key}-0`);
+    assert.equal(await input.getAttribute('maxlength'), null);
+    await input.fill(emoji);
+    assert.equal(await input.inputValue(), emoji);
+    assert.equal(await input.getAttribute('aria-invalid'), 'false');
+    await input.press('End');
+    await page.keyboard.insertText('あ');
+    assert.equal(await input.inputValue(), emoji + 'あ');
+    assert.equal(await input.getAttribute('aria-invalid'), 'true');
+    assert.equal(await input.evaluate(el => getComputedStyle(el).borderTopColor), 'rgb(239, 154, 154)');
+    await input.press('Backspace');
+    assert.equal(await input.inputValue(), emoji);
+    assert.equal(await input.getAttribute('aria-invalid'), 'false');
+  }
+  const config = await saveSettings(page);
+  assert.deepEqual(config.tts.options.dictionary, [{ from: emoji, to: emoji, regex: false }]);
 }));
 
 async function importModeration(page, moderation) {

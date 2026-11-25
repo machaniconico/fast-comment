@@ -774,7 +774,7 @@ pub(crate) const MAX_TTS_DICTIONARY_ENTRIES: usize = 1000;
 pub(crate) const TTS_DICTIONARY_ENTRY_LIMIT_ERROR: &str = "読み上げ辞書は1000件までです";
 
 /// 読み上げ前に本文へ適用するユーザー定義置換の1件。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TtsDictEntry {
     /// 置換前の文字列または正規表現。平文の空文字列はスキップする。

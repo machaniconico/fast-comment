@@ -1666,14 +1666,17 @@ async fn update_config(
         new_config,
     )?;
     validate_x_post_template(&new_config.x_post.template)?;
-    let protected_oauth = protect_oauth_config(
-        &state.config.lock().unwrap(),
-        &mut new_config,
-        |service| match service {
+    let protected_oauth = {
+        let current = state.config.lock().unwrap();
+        tts_dictionary::validate_edit(
+            &current.tts.options.dictionary,
+            &new_config.tts.options.dictionary,
+        )?;
+        protect_oauth_config(&current, &mut new_config, |service| match service {
             OAuthService::XPost => state.x_post_login.is_active(),
             OAuthService::Twitcasting => state.twitcasting_login.is_active(),
-        },
-    );
+        })
+    };
     new_config.normalize_all();
     // 削除済みのカスタム効果音を指す規則は既定の内蔵音にして保存する(保存値は画面へ返る)。
     new_config.sound_effects.resolve_missing(|id| state.sounds.contains(id));
@@ -5413,6 +5416,37 @@ mod followup_tests {
         .unwrap();
         assert_eq!(result.revision, Some(1));
         assert_eq!(result.saved.dictionary, dictionary);
+        assert_eq!(AppConfig::load(dir.path()).unwrap().tts.options.dictionary, dictionary);
+    }
+
+    #[test]
+    fn tts_dictionary_editor_save_export_and_replace_preserve_all_rows() {
+        use config::TtsDictEntry;
+
+        let (dir, revision, tx, mut current) = commit_parts();
+        let dictionary = vec![
+            TtsDictEntry { from: " ".into(), to: "、".into(), regex: false },
+            TtsDictEntry { from: "　 ".into(), to: " ".into(), regex: true },
+            TtsDictEntry { from: "🍣".repeat(200), to: "あ".repeat(200), regex: false },
+            TtsDictEntry { from: " ".into(), to: String::new(), regex: false },
+        ];
+        let mut draft = current.clone();
+        draft.tts.options.dictionary = dictionary.clone();
+        let next = parse_config_update(0, Some(0), serde_json::to_value(draft).unwrap()).unwrap();
+        tts_dictionary::validate_edit(&current.tts.options.dictionary, &next.tts.options.dictionary)
+            .unwrap();
+        commit_config(dir.path(), &revision, &tx, &mut current, next, Some(0)).unwrap();
+
+        let raw = tts_dictionary::export(&current.tts.options.dictionary).unwrap();
+        let outcome = commit_tts_dictionary(
+            &mut current,
+            tts_dictionary::parse(raw.as_bytes()).unwrap(),
+            tts_dictionary::ImportMode::Replace,
+            |current, next| commit_config(dir.path(), &revision, &tx, current, next, None),
+        )
+        .unwrap();
+        assert_eq!(outcome.saved.result.rejected_count, 0);
+        assert_eq!(outcome.saved.dictionary, dictionary);
         assert_eq!(AppConfig::load(dir.path()).unwrap().tts.options.dictionary, dictionary);
     }
 

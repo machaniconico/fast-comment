@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
@@ -120,33 +120,55 @@ fn parse_entry(row: &Value) -> Result<TtsDictEntry, &'static str> {
     let from = field(&["from", "pattern", "word", "key"])
         .and_then(Value::as_str)
         .ok_or("fromは文字列で指定してください")?;
-    if from.trim().is_empty() {
-        return Err("fromに空白以外の文字を入力してください");
-    }
-    if from.chars().take(MAX_CHARS + 1).count() > MAX_CHARS {
-        return Err("fromは空白を含めて200文字以内で指定してください");
-    }
     let to = field(&["to", "reading", "replace", "value"])
         .and_then(Value::as_str)
         .ok_or("toは文字列で指定してください")?;
-    if to.chars().take(MAX_CHARS + 1).count() > MAX_CHARS {
-        return Err("toは200文字以内で指定してください");
-    }
     let regex = match field(&["regex", "isRegex"]) {
         None => false,
         Some(value) => value.as_bool().ok_or("regexは真偽値で指定してください")?,
     };
+    validate_entry(from, to, regex)?;
+    Ok(TtsDictEntry {
+        from: from.into(),
+        to: to.into(),
+        regex,
+    })
+}
+
+fn validate_entry(from: &str, to: &str, regex: bool) -> Result<(), &'static str> {
+    if from.is_empty() {
+        return Err("fromは1文字以上で指定してください");
+    }
+    if from.chars().take(MAX_CHARS + 1).count() > MAX_CHARS {
+        return Err("fromは空白を含めて200文字以内で指定してください");
+    }
+    if to.chars().take(MAX_CHARS + 1).count() > MAX_CHARS {
+        return Err("toは200文字以内で指定してください");
+    }
     if regex {
         compile_regex(from).map_err(|error| match error {
             regex::Error::CompiledTooBig(_) => "正規表現がサイズ上限を超えています",
             _ => "正規表現が不正です",
         })?;
     }
-    Ok(TtsDictEntry {
-        from: from.into(),
-        to: to.into(),
-        regex,
-    })
+    Ok(())
+}
+
+/// 保存済みの行は並べ替えても保持し、新規・変更行は取り込みと同じ条件で検証する。
+pub(crate) fn validate_edit(current: &[TtsDictEntry], draft: &[TtsDictEntry]) -> Result<(), String> {
+    let mut remaining = HashMap::new();
+    for entry in current {
+        *remaining.entry(entry).or_insert(0) += 1;
+    }
+    for (index, entry) in draft.iter().enumerate() {
+        if let Some(count) = remaining.get_mut(entry).filter(|count| **count > 0) {
+            *count -= 1;
+            continue;
+        }
+        validate_entry(&entry.from, &entry.to, entry.regex)
+            .map_err(|reason| format!("読み上げ辞書の{}件目: {reason}", index + 1))?;
+    }
+    Ok(())
 }
 
 pub(crate) fn compile_regex(from: &str) -> Result<Regex, regex::Error> {

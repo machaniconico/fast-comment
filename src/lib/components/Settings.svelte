@@ -2558,23 +2558,27 @@
         <p class="hint">置換前と置換後を入力すると、読み上げ本文だけに上から順に適用されます。</p>
       {/if}
       {#each ttsDictionary as entry, index (entry)}
+        {@const fromTooLong = Array.from(entry.from).length > 200}
+        {@const toTooLong = Array.from(entry.to).length > 200}
         <div class="dict-row">
           <label for={`tts-dict-from-${index}`} class="dict-label">from</label>
           <input
             id={`tts-dict-from-${index}`}
             type="text"
-            maxlength="200"
             bind:value={entry.from}
             class="id-input dict-input"
+            aria-invalid={fromTooLong}
+            title={fromTooLong ? '200文字以内で入力してください' : undefined}
             placeholder="置換前"
           />
           <label for={`tts-dict-to-${index}`} class="dict-label">to</label>
           <input
             id={`tts-dict-to-${index}`}
             type="text"
-            maxlength="200"
             bind:value={entry.to}
             class="id-input dict-input"
+            aria-invalid={toTooLong}
+            title={toTooLong ? '200文字以内で入力してください' : undefined}
             placeholder="置換後"
           />
           <label class="kind-check"><input type="checkbox" bind:checked={entry.regex} class="chk" /> 正規表現</label>
@@ -3672,6 +3676,10 @@
 
   .dict-input {
     min-width: 0;
+  }
+
+  .dict-input[aria-invalid="true"] {
+    border-color: #ef9a9a;
   }
 
   .effect-emoji-input {

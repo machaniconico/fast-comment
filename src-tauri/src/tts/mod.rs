@@ -24,7 +24,7 @@ pub mod worker;
 /// この定数は使用しない。長文 SuperChat 連発などで巨大ペイロードが IPC に
 /// 流れるのを防ぐバックストップとしてのみ機能する。
 const TTS_UNLIMITED_HARD_CAP: usize = 500;
-const TTS_DICTIONARY_UNLIMITED_CAP: usize = 10_000;
+const TTS_DICTIONARY_HARD_CAP: usize = 10_000;
 const TTS_NOTICE_THROTTLE: std::time::Duration = std::time::Duration::from_secs(30);
 
 use regex::Regex;
@@ -468,9 +468,9 @@ impl CompiledDictionary {
 
     fn apply(&self, mut body: String, max_length: usize) -> String {
         let limit = if max_length == 0 {
-            TTS_DICTIONARY_UNLIMITED_CAP
+            TTS_DICTIONARY_HARD_CAP
         } else {
-            max_length.saturating_mul(4)
+            max_length.saturating_mul(4).min(TTS_DICTIONARY_HARD_CAP)
         };
         for entry in &self.0 {
             body = match entry {
@@ -1020,6 +1020,18 @@ mod tests {
         let cache = CompiledDictionary::new(&entries);
         assert_eq!(cache.apply("🍣".into(), 20), "🍣".repeat(80));
         assert_eq!(cache.apply("🍣".into(), 0), "🍣".repeat(10_000));
+    }
+
+    #[test]
+    fn tts_dictionary_caps_large_max_length_at_10000_chars() {
+        let entries = vec![
+            TtsDictEntry { from: "🍣".into(), to: "🍣🍣".into(), regex: false };
+            14
+        ];
+        let cache = CompiledDictionary::new(&entries);
+        for (max_length, expected) in [(2499, 9996), (2500, 10_000), (2501, 10_000), (usize::MAX, 10_000)] {
+            assert_eq!(cache.apply("🍣".into(), max_length), "🍣".repeat(expected));
+        }
     }
 
     #[test]

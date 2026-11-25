@@ -90,7 +90,7 @@ fn lengths_count_full_width_and_emoji_characters() {
         {"from": format!("　{full_width} "), "to": emoji},
         {"from": format!("{full_width}全"), "to": ""},
         {"from": "草", "to": format!("{emoji}🍣")},
-        {"from": "　 ", "to": ""},
+        {"from": "", "to": ""},
         {"from": emoji, "to": full_width},
         {"from": "🍣", "to": ""},
         {"from": format!(" {}", "全".repeat(199)), "to": ""}
@@ -107,6 +107,29 @@ fn lengths_count_full_width_and_emoji_characters() {
         parsed.rejected.iter().map(|r| r.index).collect::<Vec<_>>(),
         [1, 2, 3, 4]
     );
+    assert_eq!(parsed.rejected[3].reason, "fromは1文字以上で指定してください");
+}
+
+#[test]
+fn edits_preserve_existing_invalid_rows_and_reject_new_invalid_rows() {
+    let long_from = " ".repeat(201);
+    let long_to = "🍣".repeat(201);
+    let legacy = [row(&long_from, "", false), row("(", "", true)];
+    let reordered = [legacy[1].clone(), row("　", "、", false), legacy[0].clone()];
+    assert!(validate_edit(&legacy, &reordered).is_ok());
+
+    for (entry, reason) in [
+        (row("", "", false), "fromは1文字以上で指定してください"),
+        (row(&long_from, "", false), "fromは空白を含めて200文字以内で指定してください"),
+        (row("🍣", &long_to, false), "toは200文字以内で指定してください"),
+        (row("(", "", true), "正規表現が不正です"),
+    ] {
+        let draft = [legacy[0].clone(), legacy[1].clone(), entry];
+        assert_eq!(
+            validate_edit(&legacy, &draft).unwrap_err(),
+            format!("読み上げ辞書の3件目: {reason}")
+        );
+    }
 }
 
 #[test]
