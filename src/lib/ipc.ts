@@ -311,6 +311,36 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
   return tauriInvoke<T>(cmd, args);
 }
 
+export type LaunchKind = 'exe' | 'url';
+
+export interface LaunchItem {
+  id: string;
+  kind: LaunchKind;
+  target: string;
+  args: string[];
+  enabled: boolean;
+  label: string | null;
+}
+
+export interface StartupLaunchSettings {
+  items: LaunchItem[];
+  needsApproval: boolean;
+  readError: string | null;
+  failures: number;
+}
+
+export function getStartupLaunchSettings() {
+  return invoke<StartupLaunchSettings>('get_startup_launch_settings');
+}
+
+export async function saveStartupLaunchSettings(items: LaunchItem[]) {
+  await invoke<void>('save_startup_launch_settings', { items, confirmed: true });
+}
+
+export function onStartupLaunchFailure(handler: (failures: number) => void) {
+  return listen<number>('startup-launch-failure', ({ payload }) => handler(payload));
+}
+
 // Config
 
 // Mirror of Rust `TtsOptions` (src-tauri/src/config.rs), serde camelCase.
