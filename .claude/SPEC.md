@@ -317,10 +317,10 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
   - **端フェード**: 右端の出現(0→6%)と左端の消失(94→100%)を opacity アニメ(`danmaku-fade`)で柔らかく。移動アニメ(`danmaku-fly`)の linear タイミングは不変で、撤去は `animationName==='danmaku-fly'` 側のみ(2アニメでの二重/早期撤去を防ぐ)。全体不透明度(`?opacity=`/`--opacity`)と要素フェードは乗算合成。
   - **連投まとめ(×N)**: 同一本文(名前前置前の素の本文 `core` をキー)の連投を `COALESCE_WINDOW_MS`(1500ms)内なら1つの弾幕に集約し `×N` カウント表示(『草』『w』『888』のスパム抑制)。流れるコメント(非gift/非system)のみ対象。集約は既存要素のテキスト書き換えのみで `lanePrev`(追突防止状態)は触らない。撤去/間引き時に集約マップから掃除(OBSは `size<32` ガード)。デスクトップは設定トグル、OBS は `?coalesce=0` で無効化(既定 ON)。
   - **投げ銭固定強調弾幕**: SuperChat/Bits/メンバーは流さず画面上部に `PIN_SEC`(8秒)固定表示してフェード撤去(ニコ生 `ue` コマンド風・見逃し防止)。同時 `PIN_MAX`(6件)・最古から間引き・最新を上。半透明角丸ボックス+種別色。デスクトップは設定トグル(タイマは `onDestroy` で `clearTimeout` しリーク防止)、OBS は `?pin=0` で無効化(既定 ON、OFF時は従来通り流す)。
-- **コメント投稿** (`CommentComposer.svelte`, `sources/twitch_send.rs`, `sources/youtube_send.rs`): 自分でコメントを送信。Twitch は IRC、YouTube は公式Data API `liveChatMessages.insert` で送信する。YouTube認証はシステムブラウザ + loopback redirect + Authorization Code/PKCE、scopeは`youtube.force-ssl`。refresh tokenはOS資格情報ストア、access tokenは期限付きメモリキャッシュに保持し、受信ホットパスへ処理を追加しない。コメント投稿と YouTube 公式投票 (§20.2) に使う配信中の`liveChatId`は`liveBroadcasts.list`で解決して60秒キャッシュする。
+- **コメント投稿** (`CommentComposer.svelte`, `sources/twitch_send.rs`, `sources/youtube_send.rs`): 自分でコメントを送信。Twitch は IRC、YouTube は公式Data API `liveChatMessages.insert` で送信する。YouTube認証はシステムブラウザ + loopback redirect + Authorization Code/PKCE、scopeは`youtube.force-ssl`。refresh tokenはOS資格情報ストア、access tokenは期限付きメモリキャッシュに保持し、受信ホットパスへ処理を追加しない。コメント投稿と YouTube 公式投票 (§19.2) に使う配信中の`liveChatId`は`liveBroadcasts.list`で解決して60秒キャッシュする。
 - **参加型配信の管理** (`Participation.svelte`, `Raffle.svelte`): キーワード(既定「参加」)での参加登録、先着/ランダム抽選、専用タブ。既定 OFF。
 - **投げ銭パネル** (`DonationPanel.svelte`): SuperChat/Bits/メンバーを通常コメントと分けて表示(アプリ内タブ / OBS `?only=gift`)。既定 OFF。
-- **アンケート** (`Poll.svelte`): 「ツール ▾」からコメント投票を開始・終了し、5 種類のグラフで結果を表示。OBS に同じ結果を配信する(§20)。
+- **アンケート** (`Poll.svelte`): 「ツール ▾」からコメント投票を開始・終了し、5 種類のグラフで結果を表示。OBS に同じ結果を配信する(§19)。
 - **配信振り返りダッシュボード** (`Dashboard.svelte`, `Sparkline.svelte`): コメント数・視聴者推移などの集計表示。
 - **タイマー/ゴール/エフェクト/マイルストーン** (`Timer.svelte`, `GoalsBar.svelte`, `Effects.svelte`, `Milestone.svelte`): 配信演出系。OBS テンプレ `timer`/`goals` と連動。
   - Goals はコメント、視聴者、高評価、リアクションを表示できる。リアクションは YouTube 絵文字リアクション累計で、YouTube のみ有効(`reactionsAvailable=false` で自動非表示)。
@@ -345,7 +345,7 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
   | `goals` | 目標(ゴール)バー |
   | `donation` | 投げ銭(SuperChat/Bits)サマリー |
   | `timer` | カウントダウン/アップタイマー |
-  | `poll` | アンケートの集計・結果(透過背景、`/poll` WS、推奨 800×600。§20) |
+  | `poll` | アンケートの集計・結果(透過背景、`/poll` WS、推奨 800×600。§19) |
   | `danmaku` | ニコ生風に画面を横切る弾幕(後述 §8.1) |
   | `trophy` | 実績解除を等級別のアイコン・色で1件ずつ表示(チャット非表示、`?duration=<秒>` 既定5秒) |
   | `effects` | キーワードエフェクト(透過背景に絵文字等を CSS アニメで描く。推奨 1920x1080。§9.2) |
@@ -592,7 +592,7 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
 - `POST /test-comments`: platform 必須(twitch / youtube / x / niconico)、kind は normal(既定) / superChat / membership / bits / gift、count は 1〜20(既定 1)、name は 64 文字以下、text は 500 文字以下、amount は有限の 0〜1,000,000,000。負のゼロは 0 に正規化する。未知キー・不正な型・範囲外は丸めず 400 invalid_request。name / text 省略は空文字として扱い、生成時に空白を trim して空なら「テストユーザー」/「テストコメントです」。amount は superChat / bits のみ適用。成功は 202 `{injected,ids}`。ID はプロセスごとに一度生成する UUID と連番の `injected-test:<UUID>-<連番>`、injected_test フラグを持ち、Webhook の対象外。source_tx → 既存パイプラインを通す。
 - `GET /tts` は `{paused,depth,items:[{id,preview}]}`。`POST /tts/pause`・`resume`・`skip`・`clear` は既存コマンドの共通処理を使い、操作後のキュー状態を返す。pause / resume は冪等。UI の停止表示・発話停止・棒読みちゃんの停止/再開命令も既存どおり。
 - `GET /timer` は既存の TimerSnapshot。`POST /timer/start` は本文なし、または `{durationSec:1〜359999}`。省略時は設定の既定秒数。`POST /timer/pause`・`resume`・`reset` は本文なし。遷移は既存コマンドと共通の純関数で処理し、操作が返すスナップショットを応答する。UI / OBS の watch 通知も共用。
-- `GET /api/v1/poll` は PollSnapshot。`POST /api/v1/poll/start` は §20 の開始パラメータを JSON で受け、`POST /api/v1/poll/stop`・`POST /api/v1/poll/reset` は本文なし。各操作は IPC と同じ状態・入力検証を使い、成功時は操作後の PollSnapshot を返す。入力不正は 400 `invalid_request`、二重開始は 409 `poll_already_open`。
+- `GET /api/v1/poll` は PollSnapshot。`POST /api/v1/poll/start` は §19 の開始パラメータを JSON で受け、`POST /api/v1/poll/stop`・`POST /api/v1/poll/reset` は本文なし。各操作は IPC と同じ状態・入力検証を使い、成功時は操作後の PollSnapshot を返す。入力不正は 400 `invalid_request`、二重開始は 409 `poll_already_open`。
 - 操作本文は JSON オブジェクトのみ、最大 16 KiB(413 payload_too_large)。本文ありで JSON 以外なら 415 unsupported_media_type。本文なし操作に JSON 本文が来た場合も 400。変更系 POST 全体で容量 20・毎秒 10 補充のトークンバケット(tokio::time)を共有し、OBS ポート変更でも枠を維持する。認証・入力検証後に消費。超過時は 429 rate_limited と Retry-After: 1、操作を実行しない。GET は制限しない。依存未提供は 503 unavailable、操作内部エラーは詳細を伏せた 500 internal。
 - config / webhooks / token / chat/send / moderation/ban / tts/speak のルートは提供しない。Webhook は §16。
 
