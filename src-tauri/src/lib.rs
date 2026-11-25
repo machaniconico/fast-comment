@@ -38,6 +38,7 @@ pub mod stats;
 pub mod startup_launch;
 mod templates;
 pub mod tts;
+mod tts_dictionary;
 mod update;
 
 use std::collections::{HashMap, VecDeque};
@@ -1667,14 +1668,17 @@ async fn update_config(
         new_config,
     )?;
     validate_x_post_template(&new_config.x_post.template)?;
-    let protected_oauth = protect_oauth_config(
-        &state.config.lock().unwrap(),
-        &mut new_config,
-        |service| match service {
+    let protected_oauth = {
+        let current = state.config.lock().unwrap();
+        tts_dictionary::validate_edit(
+            &current.tts.options.dictionary,
+            &new_config.tts.options.dictionary,
+        )?;
+        protect_oauth_config(&current, &mut new_config, |service| match service {
             OAuthService::XPost => state.x_post_login.is_active(),
             OAuthService::Twitcasting => state.twitcasting_login.is_active(),
-        },
-    );
+        })
+    };
     new_config.normalize_all();
     // 削除済みのカスタム効果音を指す規則は既定の内蔵音にして保存する(保存値は画面へ返る)。
     new_config.sound_effects.resolve_missing(|id| state.sounds.contains(id));
@@ -1937,6 +1941,75 @@ async fn set_moderation(
         .map_err(|_| "モデレーション規則の形式が不正です".to_string())?;
     let _write = state.config_write.lock().await;
     update_moderation(&state, |rules| *rules = moderation)
+}
+
+#[derive(Serialize)]
+struct TtsDictionarySaved {
+    dictionary: Vec<config::TtsDictEntry>,
+    #[serde(flatten)]
+    result: tts_dictionary::ImportResult,
+}
+
+#[tauri::command]
+fn export_tts_dictionary(state: State<'_, AppState>) -> Result<String, String> {
+    let current = state.config.lock().unwrap();
+    tts_dictionary::export(&current.tts.options.dictionary)
+}
+
+#[tauri::command]
+async fn import_tts_dictionary(
+    state: State<'_, AppState>,
+    raw: String,
+    mode: tts_dictionary::ImportMode,
+) -> Result<ConfigCommit<TtsDictionarySaved>, String> {
+    save_tts_dictionary(&state, raw.as_bytes(), mode).await
+}
+
+#[tauri::command]
+async fn import_tts_dictionary_url(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    url: String,
+    mode: tts_dictionary::ImportMode,
+) -> Result<ConfigCommit<TtsDictionarySaved>, String> {
+    if window.label() != "main" {
+        return Err("辞書URLはメインウィンドウからのみ取得できます".into());
+    }
+    let raw = tts_dictionary::fetch(&url).await?;
+    save_tts_dictionary(&state, &raw, mode).await
+}
+
+async fn save_tts_dictionary(
+    state: &AppState,
+    raw: &[u8],
+    mode: tts_dictionary::ImportMode,
+) -> Result<ConfigCommit<TtsDictionarySaved>, String> {
+    let parsed = tts_dictionary::parse(raw)?;
+    let _write = state.config_write.lock().await;
+    let mut current = state.config.lock().unwrap();
+    commit_tts_dictionary(&mut current, parsed, mode, |current, next| {
+        state.commit_config(current, next)
+    })
+}
+
+fn commit_tts_dictionary(
+    current: &mut AppConfig,
+    parsed: tts_dictionary::ParsedDictionary,
+    mode: tts_dictionary::ImportMode,
+    commit: impl FnOnce(&mut AppConfig, AppConfig) -> Result<u64, ConfigCommitError>,
+) -> Result<ConfigCommit<TtsDictionarySaved>, String> {
+    let (dictionary, result) = tts_dictionary::merge(&current.tts.options.dictionary, parsed, mode)?;
+    // 保存済みと同じ辞書への置き換えも、画面の未保存分を置き換えるため revision を進める。
+    let revision = if mode == tts_dictionary::ImportMode::Replace
+        || dictionary != current.tts.options.dictionary
+    {
+        let mut next = current.clone();
+        next.tts.options.dictionary = dictionary.clone();
+        Some(commit(current, next).map_err(|error| error.to_string())?)
+    } else {
+        None
+    };
+    Ok(ConfigCommit::new(revision, TtsDictionarySaved { dictionary, result }))
 }
 
 /// チャンネルを1件追加または置き換え、有効なら起動する。
@@ -4343,6 +4416,9 @@ pub fn run() {
             set_goals_show_in_app,
             append_moderation_value,
             set_moderation,
+            export_tts_dictionary,
+            import_tts_dictionary,
+            import_tts_dictionary_url,
             add_channel,
             set_channel_overrides,
             remove_channel,
@@ -5419,6 +5495,90 @@ mod followup_tests {
     }
 
     #[test]
+    fn tts_dictionary_identical_replace_returns_a_revision_for_the_editor() {
+        let (dir, revision, tx, mut current) = commit_parts();
+        current.tts.options.dictionary.push(config::TtsDictEntry {
+            from: " 草 ".into(),
+            to: "くさ".into(),
+            regex: false,
+        });
+        let dictionary = current.tts.options.dictionary.clone();
+        let raw = tts_dictionary::export(&dictionary).unwrap();
+        let result = commit_tts_dictionary(
+            &mut current,
+            tts_dictionary::parse(raw.as_bytes()).unwrap(),
+            tts_dictionary::ImportMode::Replace,
+            |current, next| commit_config(dir.path(), &revision, &tx, current, next, None),
+        )
+        .unwrap();
+        assert_eq!(result.revision, Some(1));
+        assert_eq!(result.saved.dictionary, dictionary);
+        assert_eq!(AppConfig::load(dir.path()).unwrap().tts.options.dictionary, dictionary);
+    }
+
+    #[test]
+    fn tts_dictionary_editor_save_export_and_replace_preserve_all_rows() {
+        use config::TtsDictEntry;
+
+        let (dir, revision, tx, mut current) = commit_parts();
+        let dictionary = vec![
+            TtsDictEntry { from: " ".into(), to: "、".into(), regex: false },
+            TtsDictEntry { from: "　 ".into(), to: " ".into(), regex: true },
+            TtsDictEntry { from: "🍣".repeat(200), to: "あ".repeat(200), regex: false },
+            TtsDictEntry { from: " ".into(), to: String::new(), regex: false },
+        ];
+        let mut draft = current.clone();
+        draft.tts.options.dictionary = dictionary.clone();
+        let next = parse_config_update(0, Some(0), serde_json::to_value(draft).unwrap()).unwrap();
+        tts_dictionary::validate_edit(&current.tts.options.dictionary, &next.tts.options.dictionary)
+            .unwrap();
+        commit_config(dir.path(), &revision, &tx, &mut current, next, Some(0)).unwrap();
+
+        let raw = tts_dictionary::export(&current.tts.options.dictionary).unwrap();
+        let outcome = commit_tts_dictionary(
+            &mut current,
+            tts_dictionary::parse(raw.as_bytes()).unwrap(),
+            tts_dictionary::ImportMode::Replace,
+            |current, next| commit_config(dir.path(), &revision, &tx, current, next, None),
+        )
+        .unwrap();
+        assert_eq!(outcome.saved.result.rejected_count, 0);
+        assert_eq!(outcome.saved.dictionary, dictionary);
+        assert_eq!(AppConfig::load(dir.path()).unwrap().tts.options.dictionary, dictionary);
+    }
+
+    #[test]
+    fn tts_dictionary_all_rejected_imports_leave_config_untouched() {
+        let (dir, revision, tx, mut current) = commit_parts();
+        let mut next = current.clone();
+        next.tts.options.dictionary.push(config::TtsDictEntry {
+            from: "草".into(),
+            to: "くさ".into(),
+            regex: false,
+        });
+        commit_config(dir.path(), &revision, &tx, &mut current, next, None).unwrap();
+        let path = AppConfig::path_in(dir.path());
+        let before = std::fs::read(&path).unwrap();
+        let dictionary = current.tts.options.dictionary.clone();
+        let raw = serde_json::to_vec(&vec![serde_json::Value::Null; 21]).unwrap();
+        for mode in [tts_dictionary::ImportMode::Append, tts_dictionary::ImportMode::Replace] {
+            let result = commit_tts_dictionary(
+                &mut current,
+                tts_dictionary::parse(&raw).unwrap(),
+                mode,
+                |_, _| panic!("全件拒否した場合は保存しない"),
+            );
+            let error = result.err().unwrap();
+            assert!(error.contains("拒否 21 件"));
+            assert!(error.contains("1 件目 — 項目はオブジェクトで指定してください"));
+            assert!(error.contains("ほか 1 件"));
+            assert_eq!(current.tts.options.dictionary, dictionary);
+            assert_eq!(revision.load(Ordering::SeqCst), 1);
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+    }
+
+    #[test]
     fn stale_base_revision_update_is_rejected_without_changes() {
         let (dir, revision, tx, mut current) = commit_parts();
         // 画面が revision 0 で読んだ後、別経路(NG 追加など)が保存した。
@@ -5917,6 +6077,26 @@ mod log_filter_tests {
         let specific = logged(Some("tungstenite::handshake::client=trace"));
         assert!(specific.contains("ws-client-info"));
         assert!(!specific.contains("ws-info"));
+    }
+
+    #[test]
+    fn tts_dictionary_http_client_debug_and_trace_are_filtered() {
+        for env in ["trace", "reqwest::connect=trace,hyper=trace,hyper_util=trace"] {
+            let sink = Sink::default();
+            tracing::subscriber::with_default(log_subscriber(Some(env), sink.clone()), || {
+                tracing::debug!(target: "reqwest::connect", "https://example.test/?token=SECRET");
+                tracing::trace!(target: "reqwest::connect", "https://example.test/?token=SECRET");
+                tracing::debug!(target: "hyper", "https://example.test/?token=SECRET");
+                tracing::trace!(target: "hyper::client", "https://example.test/?token=SECRET");
+                tracing::debug!(target: "hyper_util::client", "https://example.test/?token=SECRET");
+                tracing::info!(target: "reqwest::connect", "reqwest-info");
+                tracing::info!(target: "hyper::client", "hyper-info");
+            });
+            let output = sink.output();
+            assert!(!output.contains("SECRET"), "RUST_LOG={env}");
+            assert!(output.contains("reqwest-info"), "RUST_LOG={env}");
+            assert!(output.contains("hyper-info"), "RUST_LOG={env}");
+        }
     }
 
     #[test]
