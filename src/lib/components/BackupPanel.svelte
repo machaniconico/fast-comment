@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
   import {
     createBackupNow, getLastAutoBackupFailure, isTauri, listBackups,
-    onAutoBackupFailed, openBackupDir, restoreBackup,
+    onAutoBackupStatus, openBackupDir, restoreBackup,
     type BackupEntry, type BackupSettings,
   } from '../ipc';
 
@@ -35,9 +35,11 @@
     void refresh();
     let active = true;
     let unlisten: (() => void) | undefined;
+    let received = false;
     void (async () => {
       try {
-        unlisten = await onAutoBackupFailed((reason) => {
+        unlisten = await onAutoBackupStatus((reason) => {
+          received = true;
           if (active) lastFailure = reason;
         });
         if (!active) {
@@ -45,7 +47,7 @@
           return;
         }
         const reason = await getLastAutoBackupFailure();
-        if (active && lastFailure === null) lastFailure = reason;
+        if (active && !received) lastFailure = reason;
       } catch {
         // 一覧と作成の操作は引き続き利用できる。
       }
@@ -63,8 +65,8 @@
       const created = await createBackupNow();
       await refresh();
       status = created ? 'バックアップを作成しました。' : '前回のバックアップから変更はありません。';
-    } catch {
-      status = 'バックアップを作成できませんでした。';
+    } catch (error) {
+      status = `バックアップを作成できませんでした。${typeof error === 'string' ? error : ''}`;
     } finally {
       busy = false;
     }

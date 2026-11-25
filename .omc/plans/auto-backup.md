@@ -131,3 +131,22 @@
 - 起動時の掃除: restore-applied-*.tmp、auto/*.tmp を消す。restore-failed-* と *.pre-restore-* は最新の 3 件だけ残す。
 - 上限を超えて自動作成できない時は、UI(バックアップ欄)に最後の失敗の理由を出す。一覧で権限エラーが出た時は空と見せず、エラーを出す。
 - 確認ダイアログに次の文言を足す:「事前バックアップの後、再起動までの変更は失われる」「X 自動告知の台帳は戻らない」「実行ファイルの指定や接続先の上書きは今の設定のまま」。
+
+## 修正2 の裁定(2026-11-25、ルート。Codex 再レビュー 2a8ee9d の 7 件)
+- 復元に失敗したあとの起動では、自動作成も prune もしない(復元元を残して再試行できるようにする)。
+- 名前の照合は大文字小文字を区別しない(Windows)。許可リストと同じ綴りでも、大小違いのエントリ(SOUNDS.JSON など)は Invalid にする。型検証も大小を無視した名前で行う。
+- 保存禁止のストアがあるときは、そのストアを変える IPC(リスナー削除・実績のリセットなど)を、何かを変える前に拒否する(片方だけ確定させない)。
+- 作成時にも、復元時と同じ型の検証をする。読めないストアがあれば作成は失敗にし、prune もしない(壊れた写しで正常な世代を押し出さない)。UI に理由を出す。
+- 復元時に今の値を引き継ぐ欄に `xPost.callbackPort`・`twitcasting.callbackPort`(と、OAuth の redirect に関わる欄すべて)を足す。
+- URL の欄にユーザー情報(user:pass@)が入っている場合は、zip ではユーザー情報を消す。復元時は、その欄の今の値を引き継ぐ(voicevoxUrl など、config.rs の URL 欄を走査して列挙する)。
+- 既知の限界(SPEC に書く): 配信中のバックアップでは、リスナー台帳と実績の進捗の写しの間にコメントが入ると、件数が 1 件ほどずれることがある。
+- MINOR: 起動時の掃除は、1 件の削除失敗で残りを打ち切らない。自動作成の失敗理由は、成功したら消す。手動作成の失敗理由も UI に出す。
+
+## 修正2 の実施記録(2026-11-25、Opus)
+- 1: `backup::run_backup` に集約。起動時の復元失敗(`AppState.restore_failed_at_startup`、通知を閉じても変わらない)の後は Startup・Interval とも Ok(false)。手動作成は行うが prune しない。
+- 2: `validate_path` で、ルートは FILES・DIRECTORIES・manifest.json、`sounds/` 直下は sounds.json と、`to_uppercase` で一致して綴りが違う名前を Invalid(`ſ` も含む)。`validate_stores` は大小を無視した名前で型を引く。
+- 3: 保存禁止の確認を変更より前に置いた IPC: update_listener・set_listener_voice・reset_listener_donation・reset_all_listener_donations・delete_listener(台帳と進捗の両方)・commit_achievements(定義と進捗、SaveRefused を返す)。テンプレート・効果音は既に先頭で確認済み(静的テストで固定)。設定は commit_config が保存成功後にだけメモリを差し替えるので対象外。
+- 4: 作成時も `validate_stores`。失敗理由はストアごと(設定・リスナー記録・実績の定義・実績の進捗・効果音の一覧の形式)。
+- 5: 引き継ぐ欄に xPost.callbackPort・twitcasting.callbackPort。YouTube は空きポートの loopback、Twitch はデバイスコードで、config に redirect の欄は無い。Client ID は credentials 内で引き継ぎ済み。
+- 6: URL の欄 = tts.options.voicevoxUrl、xOverrides.endpoints、niconicoOverrides.endpoints、twitcastingOverrides.endpoints。zip では `://` の後の authority の最後の `@` までを消す。復元時はユーザー情報の有無にかかわらず今の値(zip の値は消した後なので使わない)。チャンネルの identifier と bouyomiHost は URL の欄ではないので対象外。
+- MINOR: 掃除は最初の失敗を記録して続ける。自動作成の状態は `auto-backup-status`(成功で null)。手動作成の失敗理由を表示。

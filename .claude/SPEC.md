@@ -481,17 +481,20 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
 
 ### 10.1 自動バックアップと復元 (`backup.rs`)
 
-- `config.json` の `backup { enabled, keep }` で制御する。既定は有効・10 世代。世代数は Rust 側で 1〜50 に丸める。最新が 20 時間以上前か初回なら起動時に作成し、稼働中は 24 時間ごとに作成する。前回と全データの SHA-256 が同じ場合は省略する。設定画面から手動作成、一覧、フォルダを開く操作ができる。
+- `config.json` の `backup { enabled, keep }` で制御する。既定は有効・10 世代。世代数は Rust 側で 1〜50 に丸める。最新が 20 時間以上前か初回なら起動時に作成し、稼働中は 24 時間ごとに作成する。前回と全データの SHA-256 が同じ場合は省略する。作成時にも復元時と同じ型で各ストアを検証し、読めないストアがあれば作成を失敗にして世代を整理しない(理由をバックアップ欄に出す)。起動時の復元に失敗した起動では、復元元を残して再試行できるよう、自動作成と世代の整理をしない(手動作成はできるが整理しない)。設定画面から手動作成、一覧、フォルダを開く操作ができる。
 - 保存先は `<app_config_dir>/backups/auto/fc-backup-<UTC ミリ秒>.zip`。世代の順序は名前の時刻で判定し、この名前の通常ファイルだけを整理する。zip は一時ファイルを同期してから rename で公開する。
-- 対象は `config.json`、`listeners.json`、`achievements.json`、`achievement-progress.json`、`sounds.json` と、`sounds/`、`templates/`、`skin/` のユーザーファイル。対象パスは `manifest.json`（schema `fast-comment-backup`、version 1）に記録する。zip では `credentials`、`xOverrides.bearerToken`、`youtubeOverrides.apiKey` を空にする。設定にある8文字以上の鍵・トークン・Cookie がファイル名または内容に残っていれば作成を中止する。OS の資格情報、`integrations.json`、X 自動告知の台帳、ログ、エクスポート、バックアップ自体、トップレベルの一時ファイルや退避ファイルは対象外。カスタムテンプレートとスキンの中にある同名のファイルは対象に含める。
-- 復元はメイン画面の設定から行う。zip の相対パスと各ストアの JSON 形式を検証してから `backups/restore-pending/` に展開する。最大 2,000 エントリ、展開後合計 200 MiB、1 エントリ 50 MiB。リンクは拒否する。事前バックアップを作成して世代を整理する間は復元元 zip も保持する。`READY` を書いて再起動し、ストアの読み込み前に再検証する。既存の対象を `<名前>.pre-restore-<ms>` に退避して置き換え、zip に無い対象は退避した状態にする。
-- ロールバックは失敗した対象ごとに最大3回試す。回復できなければ `APPLYING` を保持し、該当ストアの保存を止めて起動中は失敗を表示する。次回起動時に再試行する。回復後は `restore-failed-<ms>/` に作業データを残し、一度だけ通知する。起動時に作業用の一時ファイルを掃除し、失敗記録と退避はそれぞれ最新3世代を残す。バックアップ欄では自動作成の最後の失敗理由と一覧取得エラーを表示する。
+- 対象は `config.json`、`listeners.json`、`achievements.json`、`achievement-progress.json`、`sounds.json` と、`sounds/`、`templates/`、`skin/` のユーザーファイル。対象パスは `manifest.json`（schema `fast-comment-backup`、version 1）に記録する。zip では `credentials`、`xOverrides.bearerToken`、`youtubeOverrides.apiKey` を空にし、URL の欄(`tts.options.voicevoxUrl`、`xOverrides.endpoints`、`niconicoOverrides.endpoints`、`twitcastingOverrides.endpoints`)からユーザー情報(`user:pass@`)を消す。設定にある8文字以上の鍵・トークン・Cookie がファイル名または内容に残っていれば作成を中止する。OS の資格情報、`integrations.json`、X 自動告知の台帳、ログ、エクスポート、バックアップ自体、トップレベルの一時ファイルや退避ファイルは対象外。カスタムテンプレートとスキンの中にある同名のファイルは対象に含める。
+- 復元はメイン画面の設定から行う。zip の相対パスと各ストアの JSON 形式を検証してから(名前は大小を無視して照合し、許可名と大小だけが違うエントリ、例えば `sounds/SOUNDS.JSON` は不正とする) `backups/restore-pending/` に展開する。最大 2,000 エントリ、展開後合計 200 MiB、1 エントリ 50 MiB。リンクは拒否する。事前バックアップを作成して世代を整理する間は復元元 zip も保持する。`READY` を書いて再起動し、ストアの読み込み前に再検証する。既存の対象を `<名前>.pre-restore-<ms>` に退避して置き換え、zip に無い対象は退避した状態にする。
+- ロールバックは失敗した対象ごとに最大3回試す。回復できなければ `APPLYING` を保持し、該当ストアの保存を止めて起動中は失敗を表示する。保存禁止のストアを変える IPC(リスナーの編集・削除・投げ銭のリセット、実績の保存、テンプレート・効果音の書き込み)は、何かを変える前に拒否する。次回起動時に再試行する。回復後は `restore-failed-<ms>/` に作業データを残し、一度だけ通知する。起動時に作業用の一時ファイルを掃除し、失敗記録と退避はそれぞれ最新3世代を残す(1 件の削除失敗で残りを打ち切らない)。バックアップ欄では自動作成の最後の失敗理由(成功したら消す)、手動作成の失敗理由、一覧取得エラーを表示する。
 - 既知の限界。事前バックアップの後、再起動までの変更は失われる。以下は現在の値・状態を引き継ぐ。
   - `credentials` 全体と OS の資格情報。
   - `xOverrides.bearerToken` と `youtubeOverrides.apiKey`。
   - `xOverrides.endpoints` 全体（`guestActivateUrl`、`broadcastShowUrl`、`liveChatUrl`、`userQueryUrl`、`userByScreenNameUrl`、`avatarContentUrl`）。
   - 棒読みちゃん自動起動の `tts.options.bouyomiPath` と `tts.options.bouyomiLaunchElevated`。
+  - OAuth の redirect URI に使う `xPost.callbackPort` と `twitcasting.callbackPort`(今の Client ID に登録したポートと揃える)。
+  - URL の欄 `tts.options.voicevoxUrl`、`niconicoOverrides.endpoints`、`twitcastingOverrides.endpoints`(zip ではユーザー情報を消しているため)。
   - ローカル API と Webhook の設定、X 自動告知の台帳。
+- 既知の限界。配信中のバックアップでは、リスナー台帳と実績の進捗を順に保存して写すので、その間にコメントが入ると同じリスナーの件数が 1 件ほどずれることがある。
 
 ## 11. フェーズ計画
 

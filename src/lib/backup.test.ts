@@ -29,3 +29,15 @@ test('一覧の取得に失敗した場合はエラーを表示する', () => {
   assert.match(panel, /entries = null;\s*listError =/);
   assert.match(panel, /\{#if listError\}[\s\S]*?\{:else if entries\?\.length\}/);
 });
+
+test('自動作成が成功したら前回の失敗理由を消す', () => {
+  const ipc = readFileSync(new URL('./ipc.ts', import.meta.url), 'utf8');
+  assert.match(ipc, /listen<string \| null>\('auto-backup-status'/);
+  assert.match(panel, /onAutoBackupStatus\(\(reason\) => \{\s*received = true;\s*if \(active\) lastFailure = reason;/);
+});
+
+test('手動作成の失敗理由を表示する', () => {
+  const create = panel.match(/async function create\(\) \{[\s\S]*?\n {2}\}/)?.[0];
+  assert.ok(create);
+  assert.match(create, /catch \(error\) \{\s*status = `バックアップを作成できませんでした。\$\{typeof error === 'string' \? error : ''\}`;/);
+});

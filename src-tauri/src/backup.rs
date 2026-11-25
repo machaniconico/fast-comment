@@ -32,11 +32,21 @@ const OVERRIDE_SECRETS: &[&[&str]] = &[
     &["xOverrides", "bearerToken"],
     &["youtubeOverrides", "apiKey"],
 ];
+/// 復元時に今の値を引き継ぐ欄(資格情報、外部プログラムの起動、OAuth の redirect URI)。
 const LOCAL_CONFIG_FIELDS: &[&[&str]] = &[
     &["credentials"],
-    &["xOverrides", "endpoints"],
     &["tts", "options", "bouyomiPath"],
     &["tts", "options", "bouyomiLaunchElevated"],
+    // redirect URI のポートは、今の Client ID に登録した値と揃える。
+    &["xPost", "callbackPort"],
+    &["twitcasting", "callbackPort"],
+];
+/// URL の欄。zip ではユーザー情報(user:pass@)を消し、復元時は今の値を引き継ぐ。
+const URL_FIELDS: &[&[&str]] = &[
+    &["tts", "options", "voicevoxUrl"],
+    &["xOverrides", "endpoints"],
+    &["niconicoOverrides", "endpoints"],
+    &["twitcastingOverrides", "endpoints"],
 ];
 const SCHEMA: &str = "fast-comment-backup";
 const MANIFEST: &str = "manifest.json";
@@ -219,28 +229,34 @@ impl Contents {
         Ok(())
     }
 
+    /// 実際のストアの読み込みと同じ型で検証する。作成・stage・apply で共通。
     fn validate_stores(&self) -> Result<()> {
         use crate::achievements::store::{validate_backup_defs, validate_backup_progress};
 
-        for name in FILES.iter().copied().chain(["sounds/sounds.json"]) {
-            let Some(bytes) = self.files.get(name) else {
+        for (name, bytes) in &self.files {
+            // Windows では大小違いの名前も同じストアを指すので、大小を無視して照合する。
+            let Some(store) = typed_store(name) else {
                 continue;
             };
-            if bytes.iter().find(|byte| !byte.is_ascii_whitespace()) != Some(&b'{') {
-                return Err(BackupError::Invalid("JSON の形式"));
-            }
-            let valid = match name {
-                "config.json" => config_object(bytes).is_ok(),
-                "listeners.json" => {
-                    serde_json::from_slice::<HashMap<String, ListenerRecord>>(bytes).is_ok()
+            let (valid, reason) = match store {
+                "config.json" => (config_object(bytes).is_ok(), "設定の形式"),
+                "listeners.json" => (
+                    serde_json::from_slice::<HashMap<String, ListenerRecord>>(bytes).is_ok(),
+                    "リスナー記録の形式",
+                ),
+                "achievements.json" => (validate_backup_defs(bytes), "実績の定義の形式"),
+                "achievement-progress.json" => {
+                    (validate_backup_progress(bytes), "実績の進捗の形式")
                 }
-                "achievements.json" => validate_backup_defs(bytes),
-                "achievement-progress.json" => validate_backup_progress(bytes),
-                "sounds.json" | "sounds/sounds.json" => crate::sounds::validate_backup_index(bytes),
+                "sounds.json" | "sounds/sounds.json" => (
+                    crate::sounds::validate_backup_index(bytes),
+                    "効果音の一覧の形式",
+                ),
                 _ => unreachable!("backup store"),
             };
-            if !valid {
-                return Err(BackupError::Invalid("ストアの JSON 形式"));
+            let object = bytes.iter().find(|byte| !byte.is_ascii_whitespace()) == Some(&b'{');
+            if !object || !valid {
+                return Err(BackupError::Invalid(reason));
             }
         }
         Ok(())
@@ -269,6 +285,24 @@ impl Contents {
         }
         Ok(())
     }
+}
+
+/// 型を検証するストアの正規名。
+fn typed_store(name: &str) -> Option<&'static str> {
+    let name = name.to_uppercase();
+    FILES
+        .iter()
+        .copied()
+        .chain(["sounds/sounds.json"])
+        .find(|store| store.to_uppercase() == name)
+}
+
+/// 許可された名前と大小だけが異なる(Windows では同じ場所を指す)。
+fn case_variant(part: &str, names: &[&str]) -> bool {
+    let upper = part.to_uppercase();
+    names
+        .iter()
+        .any(|name| part != *name && name.to_uppercase() == upper)
 }
 
 fn excluded(part: &str) -> bool {
@@ -304,6 +338,16 @@ fn validate_path(name: &str, directory: bool) -> Result<()> {
                 )
             })
         });
+        let variant = match index {
+            0 => [FILES, DIRECTORIES, &[MANIFEST]]
+                .iter()
+                .any(|names| case_variant(part, names)),
+            1 => root == "sounds" && case_variant(part, &["sounds.json"]),
+            _ => false,
+        };
+        if variant {
+            return Err(BackupError::Invalid("大文字小文字だけが異なる名前"));
+        }
         if part.is_empty()
             || part.ends_with(['.', ' '])
             || part.contains(|c: char| c.is_control() || "\\:\"<>|?*".contains(c))
@@ -441,6 +485,40 @@ fn prune_except(config_dir: &Path, keep: u32, source: Option<&str>) -> Result<us
     Ok(removed)
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum BackupTrigger {
+    Startup,
+    Interval,
+    Manual,
+}
+
+/// 自動・手動の作成と世代の整理。呼び出し側が直列化する。
+pub(crate) fn run_backup(
+    config_dir: &Path,
+    settings: BackupSettings,
+    trigger: BackupTrigger,
+    restore_failed: bool,
+    now_ms: u64,
+    flush: impl FnOnce() -> Result<()>,
+) -> Result<bool> {
+    let manual = matches!(trigger, BackupTrigger::Manual);
+    // 復元に失敗した後の起動では、再試行できるよう復元元を残す(自動作成も整理もしない)。
+    if (!settings.enabled || restore_failed) && !manual {
+        return Ok(false);
+    }
+    let created = if matches!(trigger, BackupTrigger::Startup) && !due_at_startup(config_dir, now_ms)
+    {
+        false
+    } else {
+        flush()?;
+        create_backup(config_dir, now_ms)?.is_some()
+    };
+    if !restore_failed {
+        prune(config_dir, settings.keep)?;
+    }
+    Ok(created)
+}
+
 fn json_object(bytes: &[u8]) -> Result<serde_json::Map<String, Value>> {
     serde_json::from_slice(bytes).map_err(|_| BackupError::Invalid("JSON の形式"))
 }
@@ -456,6 +534,10 @@ fn config_object(bytes: &[u8]) -> Result<serde_json::Map<String, Value>> {
         &["youtubeOverrides"],
         &["tts"],
         &["tts", "options"],
+        &["xPost"],
+        &["twitcasting"],
+        &["niconicoOverrides"],
+        &["twitcastingOverrides"],
     ] {
         if config_field(&config, path).is_some_and(|value| !value.is_object()) {
             return Err(BackupError::Invalid("設定の形式"));
@@ -485,6 +567,27 @@ fn collect_secret(value: Option<&Value>, secrets: &mut BTreeSet<String>) {
         if let Ok(encoded) = serde_json::to_string(secret) {
             secrets.insert(regex::escape(&encoded[1..encoded.len() - 1]));
         }
+    }
+}
+
+/// `scheme://user:pass@host/...` のユーザー情報を消した URL。無ければ None。
+fn strip_user_info(url: &str) -> Option<String> {
+    let start = url.find("://")? + 3;
+    let rest = &url[start..];
+    let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
+    let at = authority.rfind('@')?;
+    Some(format!("{}{}", &url[..start], &rest[at + 1..]))
+}
+
+fn strip_url_user_info(value: &mut Value) {
+    match value {
+        Value::String(url) => {
+            if let Some(stripped) = strip_user_info(url) {
+                *url = stripped;
+            }
+        }
+        Value::Object(map) => map.values_mut().for_each(strip_url_user_info),
+        _ => {}
     }
 }
 
@@ -554,6 +657,12 @@ fn snapshot(config_dir: &Path, now_ms: u64) -> Result<Contents> {
             collect_secret(config_field(&config, path), &mut secrets);
             set_config_field(&mut config, path, None);
         }
+        for path in URL_FIELDS {
+            if let Some(mut value) = config_field(&config, path).cloned() {
+                strip_url_user_info(&mut value);
+                set_config_field(&mut config, path, Some(value));
+            }
+        }
         config.insert("credentials".into(), empty_credentials());
         contents.total_bytes -= bytes.len() as u64;
         *bytes = encode(&config)?;
@@ -573,11 +682,8 @@ fn snapshot(config_dir: &Path, now_ms: u64) -> Result<Contents> {
     })?;
     contents.read_file(MANIFEST.into(), manifest.len() as u64, manifest.as_slice())?;
     contents.validate()?;
-    for name in FILES.iter().copied().chain(["sounds/sounds.json"]) {
-        if let Some(bytes) = contents.files.get(name) {
-            json_object(bytes)?;
-        }
-    }
+    // 復元できない写しで正常な世代を押し出さない。
+    contents.validate_stores()?;
     if !secrets.is_empty() {
         let matches = regex::bytes::RegexSet::new(secrets)
             .map_err(|_| BackupError::Invalid("資格情報の検査"))?;
@@ -878,13 +984,13 @@ fn prepare_config(config_dir: &Path, snapshot: Option<&[u8]>) -> Result<Option<V
         let defaults =
             serde_json::to_value(AppConfig::default()).expect("default config serializes");
         let defaults = defaults.as_object().expect("config object");
-        for path in LOCAL_CONFIG_FIELDS.iter().chain(OVERRIDE_SECRETS) {
+        for path in LOCAL_CONFIG_FIELDS.iter().chain(OVERRIDE_SECRETS).chain(URL_FIELDS) {
             if config_field(&current, path) == config_field(defaults, path) {
                 set_config_field(&mut current, path, None);
             }
         }
     }
-    for path in LOCAL_CONFIG_FIELDS.iter().chain(OVERRIDE_SECRETS) {
+    for path in LOCAL_CONFIG_FIELDS.iter().chain(OVERRIDE_SECRETS).chain(URL_FIELDS) {
         set_config_field(&mut restored, path, config_field(&current, path).cloned());
     }
     if snapshot.is_none() && restored.is_empty() {
@@ -1008,19 +1114,21 @@ fn prune_pre_restore(config_dir: &Path) -> Result<()> {
                 .push((entry.path(), directory));
         }
     }
+    let mut first_error = None;
     for (path, directory) in generations
         .into_iter()
         .rev()
         .skip(3)
         .flat_map(|(_, files)| files)
     {
-        if directory {
-            fs::remove_dir_all(path)?;
+        let result = if directory {
+            fs::remove_dir_all(path)
         } else {
-            fs::remove_file(path)?;
-        }
+            fs::remove_file(path)
+        };
+        keep_first_error(&mut first_error, result.map_err(Into::into));
     }
-    Ok(())
+    first_error.map_or(Ok(()), Err)
 }
 
 fn failed_timestamp(name: &str) -> Option<u64> {
@@ -1033,44 +1141,64 @@ fn failed_timestamp(name: &str) -> Option<u64> {
     }
 }
 
+fn keep_first_error(first: &mut Option<BackupError>, result: Result<()>) {
+    if let Err(error) = result {
+        first.get_or_insert(error);
+    }
+}
+
+fn remove_auto_tmp(entry: io::Result<fs::DirEntry>) -> Result<()> {
+    let entry = entry?;
+    if entry
+        .path()
+        .extension()
+        .is_some_and(|extension| extension == "tmp")
+        && check_kind(&fs::symlink_metadata(entry.path())?, false).is_ok()
+    {
+        fs::remove_file(entry.path())?;
+    }
+    Ok(())
+}
+
+/// restore-applied-* を消し、restore-failed-* の世代を集める。
+fn sweep_restore_dir(entry: io::Result<fs::DirEntry>, failed: &mut Vec<(u64, PathBuf)>) -> Result<()> {
+    let entry = entry?;
+    let name = entry.file_name();
+    let Some(name) = name.to_str() else {
+        return Ok(());
+    };
+    let path = entry.path();
+    if check_kind(&fs::symlink_metadata(&path)?, true).is_err() {
+        return Ok(());
+    }
+    if name.starts_with("restore-applied-") && name.ends_with(".tmp") {
+        fs::remove_dir_all(path)?;
+    } else if let Some(stamp) = failed_timestamp(name) {
+        failed.push((stamp, path));
+    }
+    Ok(())
+}
+
+/// 起動時の掃除。1 件の失敗で残りを打ち切らず、最初の失敗を返す。
 fn cleanup_backup_work_files(config_dir: &Path, dir: &Path) -> Result<()> {
+    let mut first = None;
     let auto = auto_dir(config_dir)?;
     if directory_exists(&auto)? {
         for entry in fs::read_dir(auto)? {
-            let entry = entry?;
-            if entry
-                .path()
-                .extension()
-                .is_some_and(|extension| extension == "tmp")
-                && check_kind(&fs::symlink_metadata(entry.path())?, false).is_ok()
-            {
-                fs::remove_file(entry.path())?;
-            }
+            keep_first_error(&mut first, remove_auto_tmp(entry));
         }
     }
-    if !directory_exists(dir)? {
-        return Ok(());
-    }
-    let mut failed = Vec::new();
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        let path = entry.path();
-        if check_kind(&fs::symlink_metadata(&path)?, true).is_err() {
-            continue;
+    if directory_exists(dir)? {
+        let mut failed = Vec::new();
+        for entry in fs::read_dir(dir)? {
+            keep_first_error(&mut first, sweep_restore_dir(entry, &mut failed));
         }
-        if name.starts_with("restore-applied-") && name.ends_with(".tmp") {
-            fs::remove_dir_all(path)?;
-        } else if let Some(stamp) = failed_timestamp(name) {
-            failed.push((stamp, path));
+        failed.sort_unstable();
+        for (_, path) in failed.into_iter().rev().skip(3) {
+            keep_first_error(&mut first, fs::remove_dir_all(path).map_err(Into::into));
         }
     }
-    failed.sort_unstable();
-    for (_, path) in failed.into_iter().rev().skip(3) {
-        fs::remove_dir_all(path)?;
-    }
-    Ok(())
+    first.map_or(Ok(()), Err)
 }
 
 pub fn apply_pending_restore(config_dir: &Path, now_ms: u64) -> Result<bool> {
@@ -1545,5 +1673,257 @@ mod tests {
         assert!(create_backup(root, 1).is_err());
         assert!(list_backups(root).is_empty());
         assert_eq!(fs::read(root.join("config.json")).unwrap(), config);
+    }
+
+    fn write_zip(root: &Path, stamp: u64, entries: &[(&str, &str)]) {
+        let manifest = encode(&Manifest {
+            schema: SCHEMA.into(),
+            version: 1,
+            created_at_ms: stamp,
+            app_version: String::new(),
+            entries: entries.iter().map(|(name, _)| (*name).into()).collect(),
+        })
+        .unwrap();
+        let archive = root.join(format!("backups/auto/fc-backup-{stamp}.zip"));
+        fs::create_dir_all(archive.parent().unwrap()).unwrap();
+        let mut zip = ZipWriter::new(File::create(archive).unwrap());
+        for (name, body) in entries
+            .iter()
+            .copied()
+            .chain([(MANIFEST, std::str::from_utf8(&manifest).unwrap())])
+        {
+            zip.start_file(name, SimpleFileOptions::default()).unwrap();
+            zip.write_all(body.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+
+    fn backup_names(root: &Path) -> Vec<String> {
+        list_backups(root)
+            .into_iter()
+            .map(|entry| entry.file_name)
+            .collect()
+    }
+
+    const KEEP_ONE: BackupSettings = BackupSettings {
+        enabled: true,
+        keep: 1,
+    };
+
+    /// keep=1 で復元元を選び、適用に失敗させる(ロールバックは成功する)。
+    fn fail_restore_with_keep_one(root: &Path) -> PathBuf {
+        write(root, "config.json", r#"{"backup":{"keep":1}}"#);
+        write(root, "listeners.json", "{}");
+        let source = create_backup(root, 1).unwrap().unwrap();
+        write(root, "listeners.json", "{ }");
+        stage_restore(root, "fc-backup-1.zip", 2).unwrap();
+        write(
+            &root.join("backups/restore-pending"),
+            "listeners.json",
+            r#"{"viewer":1}"#,
+        );
+        assert!(apply_pending_restore(root, 3).is_err());
+        assert!(source.is_file());
+        source
+    }
+
+    #[test]
+    fn startup_after_failed_restore_neither_creates_nor_prunes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let source = fail_restore_with_keep_one(root);
+        let before = backup_names(root);
+        let later = 3 + 21 * 60 * 60 * 1000;
+        for trigger in [BackupTrigger::Startup, BackupTrigger::Interval] {
+            write(root, "skin/new.css", "changed");
+            let flushed = std::cell::Cell::new(false);
+            let created = run_backup(root, KEEP_ONE, trigger, true, later, || {
+                flushed.set(true);
+                Ok(())
+            });
+            assert!(!created.unwrap());
+            assert!(!flushed.get());
+            assert!(source.is_file());
+            assert_eq!(backup_names(root), before);
+        }
+    }
+
+    #[test]
+    fn manual_backup_after_failed_restore_does_not_prune() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let source = fail_restore_with_keep_one(root);
+        write(root, "skin/new.css", "changed");
+        assert!(run_backup(root, KEEP_ONE, BackupTrigger::Manual, true, 10, || Ok(())).unwrap());
+        assert!(source.is_file());
+        assert_eq!(backup_names(root).len(), 3);
+        // 失敗の無い起動では、通常どおり整理する。
+        write(root, "skin/new.css", "changed again");
+        assert!(run_backup(root, KEEP_ONE, BackupTrigger::Manual, false, 11, || Ok(())).unwrap());
+        assert_eq!(backup_names(root).len(), 1);
+    }
+
+    #[test]
+    fn case_variants_of_store_names_are_invalid() {
+        for name in [
+            "sounds/SOUNDS.JSON",
+            "sounds/Sounds.json",
+            "sounds/sounds.JSON",
+            "sounds/\u{17f}ounds.json",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let body = r#"{"sounds":false}"#;
+            write_zip(root, 1, &[(name, body)]);
+            assert!(
+                matches!(
+                    stage_restore(root, "fc-backup-1.zip", 2),
+                    Err(BackupError::Invalid(_))
+                ),
+                "{name}"
+            );
+            let pending = root.join("backups/restore-pending");
+            assert!(!pending.exists(), "{name}");
+            let manifest = encode(&Manifest {
+                schema: SCHEMA.into(),
+                version: 1,
+                created_at_ms: 1,
+                app_version: String::new(),
+                entries: vec![name.into()],
+            })
+            .unwrap();
+            write(&pending, name, body);
+            write(&pending, MANIFEST, std::str::from_utf8(&manifest).unwrap());
+            write(&pending, READY, "");
+            assert!(
+                matches!(apply_pending_restore(root, 3), Err(BackupError::Invalid(_))),
+                "{name}"
+            );
+            assert!(!root.join("sounds").exists(), "{name}");
+        }
+    }
+
+    #[test]
+    fn create_rejects_unreadable_stores_without_pruning() {
+        for (name, body, reason) in [
+            ("sounds/sounds.json", r#"{"sounds":false}"#, "効果音"),
+            ("sounds.json", r#"{"sounds":false}"#, "効果音"),
+            ("listeners.json", r#"{"viewer":1}"#, "リスナー"),
+            ("achievements.json", r#"{"version":1,"achievements":false}"#, "実績"),
+            (
+                "achievement-progress.json",
+                r#"{"version":1,"unlocks":false}"#,
+                "実績",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            write(root, "config.json", r#"{"backup":{"keep":1}}"#);
+            create_backup(root, 1).unwrap().unwrap();
+            write(root, name, body);
+            for trigger in [BackupTrigger::Manual, BackupTrigger::Interval] {
+                let error = run_backup(root, KEEP_ONE, trigger, false, 2, || Ok(())).unwrap_err();
+                assert!(matches!(error, BackupError::Invalid(_)), "{name}");
+                assert!(error.to_string().contains(reason), "{name}: {error}");
+                assert_eq!(backup_names(root), ["fc-backup-1.zip"], "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn restore_keeps_current_oauth_callback_ports() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(
+            root,
+            "config.json",
+            r#"{"xPost":{"callbackPort":41002,"dailyLimit":9},"twitcasting":{"callbackPort":41003}}"#,
+        );
+        create_backup(root, 1).unwrap();
+        write(
+            root,
+            "config.json",
+            r#"{"xPost":{"callbackPort":41001},"twitcasting":{"callbackPort":41004}}"#,
+        );
+        stage_restore(root, "fc-backup-1.zip", 2).unwrap();
+        assert!(apply_pending_restore(root, 3).unwrap());
+        let config = AppConfig::load(root).unwrap();
+        assert_eq!(config.x_post.callback_port, 41001);
+        assert_eq!(config.twitcasting.callback_port, 41004);
+        assert_eq!(config.x_post.daily_limit, 9);
+    }
+
+    #[test]
+    fn backup_strips_url_user_info_and_restore_keeps_current_urls() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(
+            root,
+            "config.json",
+            r#"{
+            "tts":{"options":{"voicevoxUrl":"https://reader:example-pass@tts.example.invalid/v"}},
+            "xOverrides":{"endpoints":{"liveChatUrl":"https://u:example-pass@x.example.invalid/c"}},
+            "niconicoOverrides":{"endpoints":{"watchPageBaseUrl":"http://u@nico.example.invalid/w/"}},
+            "twitcastingOverrides":{"endpoints":{"userPageBaseUrl":"https://u:p%40ss@tc.example.invalid/?a=b@c"}}
+        }"#,
+        );
+        let path = create_backup(root, 1).unwrap().unwrap();
+        let text = String::from_utf8(read_archive(&path).unwrap().files["config.json"].clone()).unwrap();
+        for leaked in ["example-pass", "reader", "u@", "p%40ss"] {
+            assert!(!text.contains(leaked), "{leaked}: {text}");
+        }
+        for kept in [
+            "https://tts.example.invalid/v",
+            "https://x.example.invalid/c",
+            "http://nico.example.invalid/w/",
+            "https://tc.example.invalid/?a=b@c",
+        ] {
+            assert!(text.contains(kept), "{kept}: {text}");
+        }
+
+        write(
+            root,
+            "config.json",
+            r#"{
+            "tts":{"options":{"voicevoxUrl":"http://127.0.0.1:50099"}},
+            "niconicoOverrides":{"endpoints":{"watchPageBaseUrl":"https://current.invalid/w/"}}
+        }"#,
+        );
+        stage_restore(root, "fc-backup-1.zip", 2).unwrap();
+        assert!(apply_pending_restore(root, 3).unwrap());
+        let config = AppConfig::load(root).unwrap();
+        assert_eq!(config.tts.options.voicevox_url, "http://127.0.0.1:50099");
+        assert!(config.x_overrides.endpoints.is_empty());
+        assert_eq!(
+            config.niconico_overrides.endpoints,
+            [("watchPageBaseUrl".into(), "https://current.invalid/w/".into())].into()
+        );
+        assert!(config.twitcasting_overrides.endpoints.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_cleanup_continues_after_a_failed_removal() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "backups/auto/locked.tmp", "");
+        write(root, "backups/restore-applied-id.tmp/READY", "");
+        for stamp in 1..=4 {
+            write(root, &format!("backups/restore-failed-{stamp}/READY"), "");
+        }
+        let auto = root.join("backups/auto");
+        fs::set_permissions(&auto, fs::Permissions::from_mode(0o555)).unwrap();
+        let result = apply_pending_restore(root, 10);
+        let locked = auto.join("locked.tmp").exists();
+        fs::set_permissions(&auto, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!result.unwrap());
+        // A privileged runner can remove the file anyway.
+        if locked {
+            assert!(!root.join("backups/restore-applied-id.tmp").exists());
+            assert!(!root.join("backups/restore-failed-1").exists());
+            assert!(root.join("backups/restore-failed-2").is_dir());
+        }
     }
 }

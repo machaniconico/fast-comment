@@ -109,6 +109,8 @@ pub struct AppState {
     /// メイン画面からの通知取得を待つ起動時ロード結果。
     startup_config_outcome: Mutex<Option<ConfigLoadOutcome>>,
     startup_restore_failed: std::sync::atomic::AtomicBool,
+    /// 起動時の復元が失敗した。通知を閉じても変わらない。復元元を残すため自動作成と整理を止める。
+    restore_failed_at_startup: bool,
     restore_blocked: Vec<String>,
     backup_lock: Mutex<()>,
     last_auto_backup_failure: Mutex<Option<String>>,
@@ -235,18 +237,12 @@ fn flush_backup_stores(state: &AppState) -> Result<(), backup::BackupError> {
     Ok(())
 }
 
-#[derive(Clone, Copy)]
-enum BackupTrigger {
-    Startup,
-    Interval,
-    Manual,
-}
+use backup::BackupTrigger;
 
 fn run_backup(app: &AppHandle, trigger: BackupTrigger) -> Result<bool, backup::BackupError> {
     let state = app.state::<AppState>();
     let _guard = state.backup_lock.lock().unwrap();
     let settings = state.config_tx.borrow().backup;
-    let now_ms = timer_now_ms();
     if state.app_cancel.is_cancelled()
         || (!settings.enabled && !matches!(trigger, BackupTrigger::Manual))
     {
@@ -255,16 +251,14 @@ fn run_backup(app: &AppHandle, trigger: BackupTrigger) -> Result<bool, backup::B
     if !state.restore_blocked.is_empty() {
         return Err(backup::BackupError::Invalid(backup::RESTORE_SAVE_BLOCKED));
     }
-    let created = if matches!(trigger, BackupTrigger::Startup)
-        && !backup::due_at_startup(&state.config_dir, now_ms)
-    {
-        false
-    } else {
-        flush_backup_stores(&state)?;
-        backup::create_backup(&state.config_dir, now_ms)?.is_some()
-    };
-    backup::prune(&state.config_dir, settings.keep)?;
-    Ok(created)
+    backup::run_backup(
+        &state.config_dir,
+        settings,
+        trigger,
+        state.restore_failed_at_startup,
+        timer_now_ms(),
+        || flush_backup_stores(&state),
+    )
 }
 
 fn spawn_auto_backup(app: AppHandle, cancel: CancellationToken) {
@@ -283,11 +277,19 @@ fn spawn_auto_backup(app: AppHandle, cancel: CancellationToken) {
                         Ok(Err(error)) => Some(error.to_string()),
                         Err(_) => Some("バックアップの処理が中断されました".to_owned()),
                     };
-                    if let Some(reason) = failure {
+                    if let Some(reason) = &failure {
                         tracing::warn!("自動バックアップに失敗しました: {reason}");
-                        let state = app.state::<AppState>();
-                        *state.last_auto_backup_failure.lock().unwrap() = Some(reason.clone());
-                        let _ = app.emit("auto-backup-failed", reason);
+                    }
+                    // 成功したら前回の失敗理由を消す。
+                    let state = app.state::<AppState>();
+                    let changed = {
+                        let mut last = state.last_auto_backup_failure.lock().unwrap();
+                        let changed = *last != failure;
+                        *last = failure.clone();
+                        changed
+                    };
+                    if changed {
+                        let _ = app.emit("auto-backup-status", failure);
                     }
                     trigger = BackupTrigger::Interval;
                 }
@@ -412,6 +414,7 @@ async fn reset_listener_donation(
     platform: String,
     author_id: String,
 ) -> Result<bool, String> {
+    state.ensure_restore_writable("listeners.json")?;
     let reset = state.listeners.reset_donation(&platform, &author_id);
     if reset {
         emit_listener_donation_changed(&app);
@@ -424,6 +427,7 @@ async fn reset_all_listener_donations(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<usize, String> {
+    state.ensure_restore_writable("listeners.json")?;
     let count = state.listeners.reset_all_donations();
     if count > 0 {
         emit_listener_donation_changed(&app);
@@ -448,6 +452,7 @@ async fn update_listener(
     memo: Option<String>,
     tts_muted: bool,
 ) -> Result<listeners::ListenerRecord, String> {
+    state.ensure_restore_writable("listeners.json")?;
     let record = state
         .listeners
         .update(&platform, &author_id, nickname, label, memo, tts_muted);
@@ -465,6 +470,7 @@ async fn set_listener_voice(
     author_id: String,
     voice: Option<listeners::TtsVoiceOverride>,
 ) -> Result<listeners::ListenerRecord, String> {
+    state.ensure_restore_writable("listeners.json")?;
     let record = state.listeners.set_voice(&platform, &author_id, voice);
     if let Err(e) = app.emit("listener-updated", &record) {
         tracing::warn!("listener-updated emit 失敗: {e}");
@@ -488,6 +494,9 @@ async fn delete_listener(
     platform: String,
     author_id: String,
 ) -> Result<bool, String> {
+    // 台帳と実績の進捗の片方だけを消して確定させない。
+    state.ensure_restore_writable("listeners.json")?;
+    state.ensure_restore_writable("achievement-progress.json")?;
     let deleted = state.listeners.delete(&platform, &author_id);
     if deleted {
         if let Err(e) = app.emit(
@@ -499,7 +508,6 @@ async fn delete_listener(
     }
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        state.ensure_restore_writable("achievement-progress.json")?;
         let engine = state.lock_achievement_engine();
         delete_listener_achievement_progress(
             engine.as_deref(), &state.config_dir, &platform, &author_id,
@@ -539,6 +547,11 @@ fn commit_achievements(
     rates: achievements::currency::RateTable,
     symbol_overrides: std::collections::BTreeMap<String, String>,
 ) -> achievements::ipc::CommitReply {
+    if state.ensure_restore_writable("achievements.json").is_err()
+        || state.ensure_restore_writable("achievement-progress.json").is_err()
+    {
+        return achievements::ipc::CommitReply::SaveRefused;
+    }
     let draft = achievements::ipc::AchievementDraft { enabled, achievements, rates, symbol_overrides };
     let (reply, unlocks) = achievements::ipc::commit_draft(
         &state.achievement_defs,
@@ -4232,6 +4245,7 @@ pub fn run() {
                         config: Mutex::new(config.clone()),
                         startup_config_outcome: Mutex::new(Some(load_outcome)),
                         startup_restore_failed: startup_restore_failed.into(),
+                        restore_failed_at_startup: startup_restore_failed,
                         restore_blocked: restore_blocked.clone(),
                         backup_lock: Mutex::new(()),
                         last_auto_backup_failure: Mutex::new(None),
@@ -5621,6 +5635,45 @@ mod followup_tests {
         }
         let config = files.iter().find(|(p, _)| p.ends_with("config.rs")).unwrap();
         assert_eq!(config.1.matches("next.save(dir)").count(), 1);
+    }
+
+    #[test]
+    fn ipc_refuses_restore_blocked_stores_before_changing_them() {
+        // 保存禁止のストアを変える IPC は、何かを変える前に拒否する(片方だけ確定させない)。
+        // 設定は commit_config が保存の成功後にだけメモリを差し替えるので対象外。
+        let source: String = include_str!("lib.rs").chars().filter(|c| !c.is_whitespace()).collect();
+        let listeners = &["listeners.json"][..];
+        let listener_and_progress = &["listeners.json", "achievement-progress.json"][..];
+        let templates = &["templates"][..];
+        let sounds = &["sounds", "sounds.json"][..];
+        for (command, roots, change) in [
+            ("fnreset_listener_donation(", listeners, "state.listeners.reset_donation("),
+            ("fnreset_all_listener_donations(", listeners, "state.listeners.reset_all_donations("),
+            ("fnupdate_listener(", listeners, "state.listeners.update("),
+            ("fnset_listener_voice(", listeners, "state.listeners.set_voice("),
+            ("fndelete_listener(", listener_and_progress, "state.listeners.delete("),
+            (
+                "fncommit_achievements(",
+                &["achievements.json", "achievement-progress.json"][..],
+                "achievements::ipc::commit_draft(",
+            ),
+            ("fnwrite_template_file(", templates, ".templates.write("),
+            ("fnduplicate_template(", templates, ".templates.duplicate("),
+            ("fndelete_template(", templates, ".templates.delete("),
+            ("fnimport_template_zip(", templates, "template_import::import_zip("),
+            ("fnadd_custom_sound(", sounds, "state.sounds.add("),
+            ("fnremove_custom_sound(", sounds, "state.sounds.remove("),
+        ] {
+            let start = source.find(command).unwrap_or_else(|| panic!("{command}"));
+            let body = &source[start..];
+            let body = &body[..body.find("#[tauri::command]").unwrap_or(body.len())];
+            let change_at = body.find(change).unwrap_or_else(|| panic!("{command}: {change}"));
+            for root in roots {
+                let guard = format!("ensure_restore_writable(\"{root}\")");
+                let guard_at = body.find(&guard).unwrap_or_else(|| panic!("{command}: {guard}"));
+                assert!(guard_at < change_at, "{command}: {root} の確認が変更より後");
+            }
+        }
     }
 
 

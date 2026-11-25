@@ -435,9 +435,10 @@ export function getLastAutoBackupFailure(): Promise<string | null> {
   return invoke<string>('get_last_auto_backup_failure');
 }
 
-export async function onAutoBackupFailed(cb: (reason: string) => void): Promise<() => void> {
+/** 自動作成の最後の失敗理由。成功したら null。 */
+export async function onAutoBackupStatus(cb: (reason: string | null) => void): Promise<() => void> {
   if (!isTauri()) return () => {};
-  return listen<string>('auto-backup-failed', (event) => cb(event.payload));
+  return listen<string | null>('auto-backup-status', (event) => cb(event.payload));
 }
 
 export function createBackupNow(): Promise<boolean | null> {
