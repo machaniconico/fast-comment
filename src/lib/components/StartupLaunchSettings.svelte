@@ -8,6 +8,8 @@
     type LaunchKind,
   } from '../ipc';
 
+  let { onApprovalChanged }: { onApprovalChanged?: (needsApproval: boolean) => void } = $props();
+
   const desktop = isTauri();
   let items = $state.raw<LaunchItem[]>([]);
   let kind = $state<LaunchKind>('exe');
@@ -36,7 +38,7 @@
       const result = await getStartupLaunchSettings();
       if (!result) return;
       items = result.items;
-      needsApproval = result.needsApproval;
+      setNeedsApproval(result.needsApproval);
       readError = result.readError;
       loaded = true;
     } catch (e) {
@@ -44,6 +46,11 @@
     } finally {
       loading = false;
     }
+  }
+
+  function setNeedsApproval(value: boolean) {
+    needsApproval = value;
+    onApprovalChanged?.(value);
   }
 
   function updateItems(next: LaunchItem[]) {
@@ -55,11 +62,13 @@
 
   function add(event: SubmitEvent) {
     event.preventDefault();
+    const args = kind === 'exe' ? argsText.split('\n') : [];
+    while (args.at(-1) === '') args.pop();
     updateItems([...items, {
       id: crypto.randomUUID(),
       kind,
-      target,
-      args: kind === 'exe' && argsText !== '' ? argsText.split('\n') : [],
+      target: kind === 'exe' ? target.replace(/^"(.*)"$/s, '$1') : target,
+      args,
       enabled: true,
       label: label === '' ? null : label,
     }]);
@@ -88,7 +97,7 @@
     try {
       await saveStartupLaunchSettings(reviewItems);
       dirty = false;
-      needsApproval = false;
+      setNeedsApproval(false);
       readError = null;
       saved = true;
     } catch (e) {
@@ -98,7 +107,7 @@
       try {
         const result = await getStartupLaunchSettings();
         if (result) {
-          needsApproval = result.needsApproval;
+          setNeedsApproval(result.needsApproval);
           readError = result.readError;
         }
       } catch {
@@ -244,6 +253,7 @@
   .items { margin: 8px 0 12px; }
   .items > li { padding: 6px 0; }
   .literal { white-space: pre-wrap; overflow-wrap: anywhere; unicode-bidi: isolate; }
+  dialog .literal { unicode-bidi: plaintext; }
   .actions { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
   .actions label { display: flex; align-items: center; }
   .warning { padding: 8px; border-left: 3px solid #ef7777; color: #ffb4a9; background: #442224; }

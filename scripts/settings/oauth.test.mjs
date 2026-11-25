@@ -1018,3 +1018,53 @@ test('a late X disconnect notice newer than the base asks for a reload', async t
   await page.waitForFunction(() => window.mock.configSync.reloadRequired === true);
   assert.equal(await save(page).isDisabled(), true);
 }, 'app'));
+
+test('startup launch approval warning stays on the main window until a save succeeds', async t => withSettings(t, async page => {
+  const warning = '起動時に開く設定が変更されています。設定画面で確認してください。';
+  const banner = page.locator('.tts-notice-banner').getByText(warning);
+  const section = page.locator('#settings-startup-launch');
+  await banner.waitFor();
+  await page.getByRole('tab', { name: '設定', exact: true }).click();
+  await section.getByText(warning).waitFor();
+  const review = section.getByRole('button', { name: '内容を確認して承認' });
+  const approve = page.getByRole('dialog').getByRole('button', { name: '承認して保存' });
+
+  await page.evaluate(() => { window.mock.startupLaunchSaveError = '承認情報の保存に失敗しました'; });
+  await review.click();
+  await approve.click();
+  await section.getByText('承認情報の保存に失敗しました').waitFor();
+  await banner.waitFor();
+  await page.getByRole('tab', { name: 'コメント', exact: true }).click();
+  await banner.waitFor();
+  await page.getByRole('tab', { name: '設定', exact: true }).click();
+
+  await page.evaluate(() => { window.mock.startupLaunchSaveError = null; });
+  await review.click();
+  await approve.click();
+  await section.getByText('保存しました。次回の起動から適用されます。').waitFor();
+  await banner.waitFor({ state: 'hidden' });
+}, 'startup-launch-app'));
+
+test('startup launch confirmation shows the pasted path and arguments that will be saved', async t => withSettings(t, async page => {
+  await page.getByRole('tab', { name: '設定', exact: true }).click();
+  const section = page.locator('#settings-startup-launch');
+  const target = 'C:\\Program Files\\Tools\\app.exe';
+  await section.getByLabel('アプリの絶対パス').fill(`"${target}"`);
+  await section.getByLabel('引数（1 行に 1 つ）').fill('--first\n\n --last \n\n');
+  await section.getByLabel('表示名（任意）').fill('アプリの表示名');
+  await section.getByRole('button', { name: '一覧に追加' }).click();
+  await section.getByRole('button', { name: '内容を確認して保存' }).click();
+
+  const dialog = page.getByRole('dialog');
+  const literals = dialog.locator('.literal');
+  assert.deepEqual(await literals.allTextContents(), ['アプリの表示名', target, '--first', '（空の引数）', ' --last ']);
+  assert.deepEqual(await literals.evaluateAll(nodes => nodes.map(node => getComputedStyle(node).unicodeBidi)),
+    Array(5).fill('plaintext'));
+  assert.deepEqual(await page.evaluate(() => window.mock.startupLaunchWrites), []);
+  await dialog.getByRole('button', { name: '承認して保存' }).click();
+  await section.getByText('保存しました。次回の起動から適用されます。').waitFor();
+  const [{ confirmed, items: [item] }] = await page.evaluate(() => window.mock.startupLaunchWrites);
+  assert.equal(confirmed, true);
+  assert.equal(item.target, target);
+  assert.deepEqual(item.args, ['--first', '', ' --last ']);
+}, 'app'));

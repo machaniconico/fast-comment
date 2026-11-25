@@ -3218,18 +3218,16 @@ async fn get_startup_launch_settings(
 async fn save_startup_launch_settings(
     window: tauri::WebviewWindow,
     state: State<'_, StartupLaunchState>,
-    items: Vec<startup_launch::LaunchItem>,
-    confirmed: bool,
+    items: serde_json::Value,
+    confirmed: serde_json::Value,
 ) -> Result<(), String> {
     require_main_startup_launch_window(window.label())?;
-    if !confirmed {
-        return Err(startup_launch::LaunchError::NotConfirmed.to_string());
-    }
+    let items = startup_launch::items_from_ipc(items, confirmed)?;
     let dir = state.config_dir.clone().ok_or("設定フォルダーを取得できませんでした")?;
     let guard = state.gate.clone().lock_owned().await;
     tauri::async_runtime::spawn_blocking(move || {
         let _guard = guard;
-        startup_launch::save_approved(&dir, &startup_launch::KeyringApprovalStore, items, confirmed)
+        startup_launch::save_approved(&dir, &startup_launch::KeyringApprovalStore, items, true)
             .map_err(|error| error.to_string())
     })
     .await

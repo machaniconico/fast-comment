@@ -1,6 +1,6 @@
 //! 起動時に開く項目の検証・承認・実行(SPEC §20)。
 
-use std::{fs, io::Write, path::Path, time::Duration};
+use std::{collections::HashSet, fs, io::Write, path::Path, sync::LazyLock, time::Duration};
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use hmac::{Hmac, Mac};
@@ -12,6 +12,9 @@ const VERSION: u32 = 1;
 const APPROVAL_USER: &str = "launch-approval";
 const KEY_LEN: usize = 32;
 type HmacSha256 = Hmac<Sha256>;
+static UNSAFE_TEXT: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"[\p{Cc}\p{Cf}]").expect("control and format character regex")
+});
 
 #[derive(Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -36,6 +39,8 @@ pub enum LaunchError {
     NotConfirmed,
     #[error("{0}")]
     Invalid(&'static str),
+    #[error("{number}件目の項目：{reason}")]
+    InvalidItem { number: usize, reason: &'static str },
     #[error("起動時に開く設定のファイル操作に失敗しました")]
     Io(String),
     #[error("起動時に開く設定の承認情報を保存または取得できませんでした")]
@@ -50,34 +55,56 @@ pub fn validate_items(items: &[LaunchItem]) -> Result<(), LaunchError> {
     if items.len() > 20 {
         return Err(LaunchError::Invalid("登録できる項目は20件までです"));
     }
-    for item in items {
-        if item.target.chars().count() > 2048 {
-            return Err(LaunchError::Invalid("パスとURLは2048文字までです"));
-        }
-        if item.args.len() > 32 || item.args.iter().any(|arg| arg.chars().count() > 1024) {
-            return Err(LaunchError::Invalid(
-                "引数は32個まで、1個あたり1024文字までです",
+    let mut ids = HashSet::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        let invalid = |reason| LaunchError::InvalidItem {
+            number: index + 1,
+            reason,
+        };
+        if !(1..=64).contains(&item.id.len())
+            || !item
+                .id
+                .bytes()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, b'-' | b'_'))
+        {
+            return Err(invalid(
+                "IDは1〜64文字の半角英数字、ハイフン、アンダースコアで指定してください",
             ));
         }
-        if item.args.iter().any(|arg| arg.contains('\0')) {
-            return Err(LaunchError::Invalid("引数にNUL文字は使えません"));
+        if !ids.insert(item.id.as_str()) {
+            return Err(invalid("IDが重複しています"));
+        }
+        if item.target.chars().count() > 2048 {
+            return Err(invalid("パスとURLは2048文字までです"));
+        }
+        if item.args.len() > 32 || item.args.iter().any(|arg| arg.chars().count() > 1024) {
+            return Err(invalid("引数は32個まで、1個あたり1024文字までです"));
         }
         if item
             .label
             .as_ref()
             .is_some_and(|label| label.chars().count() > 100)
         {
-            return Err(LaunchError::Invalid("表示名は100文字までです"));
+            return Err(invalid("表示名は100文字までです"));
+        }
+        if std::iter::once(item.target.as_str())
+            .chain(item.args.iter().map(String::as_str))
+            .chain(item.label.as_deref())
+            .any(|text| UNSAFE_TEXT.is_match(text))
+        {
+            return Err(invalid(
+                "パス・URL・引数・表示名に制御文字や書式文字は使えません",
+            ));
         }
         match item.kind {
             LaunchKind::Exe if !is_absolute_exe(&item.target) => {
-                return Err(LaunchError::Invalid(
+                return Err(invalid(
                     "アプリには拡張子が .exe の Windows 絶対パスを指定してください",
                 ));
             }
             LaunchKind::Url if !is_web_url(&item.target) => {
-                return Err(LaunchError::Invalid(
-                    "ユーザー情報を含まない http:// または https:// のURLを指定してください",
+                return Err(invalid(
+                    "ユーザー情報・空白・二重引用符・山括弧を含まない http:// または https:// のURLを指定してください",
                 ));
             }
             _ => {}
@@ -89,7 +116,7 @@ pub fn validate_items(items: &[LaunchItem]) -> Result<(), LaunchError> {
 fn is_absolute_exe(target: &str) -> bool {
     if target
         .chars()
-        .any(|ch| ch.is_control() || matches!(ch, '"' | '<' | '>' | '|' | '*'))
+        .any(|ch| matches!(ch, '"' | '<' | '>' | '|' | '*'))
     {
         return false;
     }
@@ -152,12 +179,27 @@ fn is_web_url(target: &str) -> bool {
     let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
     !authority.is_empty()
         && !authority.contains('@')
-        && !target.contains('\\')
-        && target.trim() == target
-        && !target.chars().any(char::is_control)
+        && !target
+            .chars()
+            .any(|ch| ch.is_whitespace() || matches!(ch, '\\' | '"' | '<' | '>'))
         && url::Url::parse(target).is_ok_and(|url| {
             url.host().is_some() && url.username().is_empty() && url.password().is_none()
         })
+}
+
+pub(crate) fn items_from_ipc(
+    items: serde_json::Value,
+    confirmed: serde_json::Value,
+) -> Result<Vec<LaunchItem>, String> {
+    if !crate::from_ipc_value::<bool>(confirmed, "保存の承認")? {
+        return Err(LaunchError::NotConfirmed.to_string());
+    }
+    let items: Vec<serde_json::Value> = crate::from_ipc_value(items, "起動時に開く項目の一覧")?;
+    items
+        .into_iter()
+        .enumerate()
+        .map(|(index, item)| crate::from_ipc_value(item, &format!("{}件目の項目", index + 1)))
+        .collect()
 }
 
 fn approval_hmac(key: &[u8], items: &[LaunchItem]) -> HmacSha256 {
@@ -494,5 +536,123 @@ mod tests {
             assert!(validate_items(&items(url)).is_err());
         }
         assert!(validate_items(&items("https://example.com/path@name")).is_ok());
+    }
+
+    #[test]
+    fn target_args_and_label_reject_control_and_format_characters() {
+        let mut launch = items("C:\\Tools\\\u{202e}ppA\u{202c}.exe");
+        launch[0].kind = LaunchKind::Exe;
+        assert!(validate_items(&launch).is_err());
+
+        for ch in ['\u{200b}', '\n', '\u{85}', '\u{feff}', '\u{e0001}'] {
+            let mut launch = items(&format!("https://example.com/{ch}"));
+            assert!(validate_items(&launch).is_err());
+            launch[0].target = "https://example.com/".into();
+            launch[0].args = vec![format!("--flag={ch}")];
+            assert!(validate_items(&launch).is_err());
+            launch[0].args.clear();
+            launch[0].label = Some(format!("表示名{ch}"));
+            assert!(validate_items(&launch).is_err());
+        }
+    }
+
+    #[test]
+    fn previously_approved_file_with_format_characters_needs_review() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryApprovalStore::default();
+        let mut launch = items("https://example.com/");
+        launch[0].args.push("--flag=\u{200b}".into());
+        let key = [42; KEY_LEN];
+        store.save(&key, &approval_mac(&key, &launch)).unwrap();
+        let bytes = serde_json::to_vec(&LaunchFile {
+            version: VERSION,
+            items: launch,
+        })
+        .unwrap();
+        fs::write(dir.path().join(FILE_NAME), bytes).unwrap();
+
+        assert!(matches!(
+            load_for_startup(dir.path(), &store),
+            StartupDecision::NeedsApproval
+        ));
+    }
+
+    #[test]
+    fn raw_url_whitespace_quotes_and_angle_brackets_are_rejected() {
+        for ch in [' ', '\u{3000}', '"', '<', '>'] {
+            assert!(validate_items(&items(&format!("https://example.com/a{ch}b"))).is_err());
+        }
+        assert!(validate_items(&items("https://example.com/a%20%22%3C%3E")).is_ok());
+    }
+
+    #[test]
+    fn ids_have_ascii_limits_and_must_be_unique() {
+        let mut launch = items("https://example.com/");
+        for id in ["", &"a".repeat(65), "é", "a.b", "a b"] {
+            launch[0].id = id.into();
+            assert!(validate_items(&launch).is_err());
+        }
+        launch[0].id = format!("A-0_{}", "z".repeat(60));
+        assert!(validate_items(&launch).is_ok());
+
+        launch.extend(items("https://example.com/"));
+        assert!(validate_items(&launch).is_ok());
+        launch[1].id = launch[0].id.clone();
+        assert!(matches!(
+            validate_items(&launch),
+            Err(LaunchError::InvalidItem { number: 2, .. })
+        ));
+    }
+
+    #[test]
+    fn save_validation_errors_report_position_without_input_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryApprovalStore::default();
+        let mut launch = items("https://example.com/");
+        let mut second = items("https://example.com/PRIVATE_TARGET<");
+        second[0].id = "PRIVATE_ID".into();
+        second[0].args.push("PRIVATE_ARG".into());
+        launch.extend(second);
+
+        let error = save_approved(dir.path(), &store, launch, true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("2件目"), "{error}");
+        assert!(!error.contains("PRIVATE"), "{error}");
+        assert!(!dir.path().join(FILE_NAME).exists());
+    }
+
+    #[test]
+    fn ipc_type_errors_do_not_echo_inputs() {
+        use serde_json::json;
+
+        for (items, confirmed, expected) in [
+            (json!([]), json!("PRIVATE_CONFIRMATION"), "保存の承認"),
+            (json!("PRIVATE_LIST"), json!(true), "起動時に開く項目の一覧"),
+            (
+                json!([items("https://example.com/").remove(0), {
+                    "id": "second", "kind": "PRIVATE_KIND", "target": "PRIVATE_TARGET",
+                    "args": [], "enabled": true
+                }]),
+                json!(true),
+                "2件目",
+            ),
+        ] {
+            let error = items_from_ipc(items, confirmed)
+                .err()
+                .expect("invalid IPC input");
+            assert!(error.contains(expected), "{error}");
+            assert!(!error.contains("PRIVATE"), "{error}");
+        }
+        assert_eq!(
+            items_from_ipc(json!([]), json!(false)).err().as_deref(),
+            Some("保存するには内容の確認と承認が必要です")
+        );
+        assert_eq!(
+            items_from_ipc(json!(items("https://example.com/")), json!(true))
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }

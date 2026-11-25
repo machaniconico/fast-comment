@@ -49,10 +49,11 @@
 
   interface Props {
     onConfigSaved?: (config: AppConfig, revision: number) => void;
+    onStartupLaunchApprovalChanged?: (needsApproval: boolean) => void;
     focus?: 'all' | 'goals' | 'danmaku' | 'achievements';
   }
 
-  let { onConfigSaved, focus = 'all' }: Props = $props();
+  let { onConfigSaved, onStartupLaunchApprovalChanged, focus = 'all' }: Props = $props();
   let localApiSettings: { refreshStatus: () => Promise<void> } | undefined = $state();
 
   function onThemeChange(event: Event) {
@@ -1690,7 +1691,7 @@
   {#if focus === 'all'}
     <section id="settings-startup-launch">
       <h3>起動時に開く</h3>
-      <StartupLaunchSettings />
+      <StartupLaunchSettings onApprovalChanged={onStartupLaunchApprovalChanged} />
     </section>
   {/if}
   <fieldset class="settings-fields" disabled={allFieldsLocked}>
