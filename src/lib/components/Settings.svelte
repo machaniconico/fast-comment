@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, onDestroy, untrack } from 'svelte';
+  import { onMount, onDestroy, untrack, tick } from 'svelte';
   import type {
     AppConfig, EffectRule, EffectsConfig, EffectTarget, GoalsConfig, InjectTestCommentOptions, TtsDictEntry, TtsOptions,
     TimerConfig, WelcomeConfig, YoutubeOauthStatus, TwitchOauthStatus, TwitchDeviceLogin, OAuthService,
@@ -43,6 +43,8 @@
   import IntegrationsSettings from './IntegrationsSettings.svelte';
   import StartupLaunchSettings from './StartupLaunchSettings.svelte';
   import AchievementsSettings from './AchievementsSettings.svelte';
+  import SettingsSection from './SettingsSection.svelte';
+  import { settingsCollapse } from '../settingsCollapse.svelte';
   import { sanitizeXPostNumbers } from '../xAutopost';
   import { DEFAULT_TWITCASTING_CALLBACK_PORT } from '../twitcasting';
   import { appUpdate } from '../appUpdate.svelte';
@@ -220,11 +222,22 @@
   // `config` (so it is tracked as a dependency) and bail without clearing the
   // anchor until config resolves; the effect then re-fires and the scroll lands.
   $effect(() => {
+    settingsCollapse.enabled = focus === 'all';
+    return () => {
+      settingsCollapse.enabled = false;
+      settingsCollapse.query = '';
+    };
+  });
+
+  $effect(() => {
     const a = ui.settingsAnchor;
     if (!a) return;
     if (!config) return;
     const id = SETTINGS_ANCHOR_IDS[a];
-    requestAnimationFrame(() => {
+    // 畳まれた節の中にある目標は、先にその節を開いてからスクロールする。
+    const owner = document.getElementById(id)?.closest<HTMLElement>('[data-settings-section]');
+    if (owner?.dataset.settingsSection) settingsCollapse.open(owner.dataset.settingsSection);
+    void tick().then(() => requestAnimationFrame(() => {
       const target = document.getElementById(id);
       const container = target?.closest<HTMLElement>('.settings');
       if (!target || !container) return;
@@ -240,7 +253,7 @@
         - container.getBoundingClientRect().top
         - 12;
       container.scrollTo({ top: Math.max(0, top), behavior: 'smooth' });
-    });
+    }));
     ui.clearSettingsAnchor();
   });
 
@@ -1712,14 +1725,24 @@
   {/if}
   {:else}
   {#if focus === 'all'}
-    <section id="settings-startup-launch">
-      <h3>起動時に開く</h3>
+    <div class="settings-toolbar">
+      <input
+        type="search"
+        class="settings-search"
+        placeholder="設定を検索"
+        aria-label="設定を検索"
+        bind:value={settingsCollapse.query}
+      />
+      <button type="button" class="toolbar-btn" onclick={() => settingsCollapse.openAll()}>すべて開く</button>
+      <button type="button" class="toolbar-btn" onclick={() => settingsCollapse.closeAll()}>すべて畳む</button>
+    </div>
+    {#if settingsCollapse.noMatch}<p class="hint" role="status">該当する設定はありません</p>{/if}
+    <SettingsSection id="settings-startup-launch" title="起動時に開く">
       <StartupLaunchSettings onApprovalChanged={onStartupLaunchApprovalChanged} />
-    </section>
+    </SettingsSection>
   {/if}
   <fieldset class="settings-fields" disabled={allFieldsLocked}>
-  <section id="settings-appearance">
-    <h3>外観</h3>
+  <SettingsSection id="settings-appearance" title="外観">
     <div class="field-row">
       <label for="appearance-theme">テーマ</label>
       <select id="appearance-theme" value={theme.theme} class="platform-select" onchange={onThemeChange}>
@@ -1814,27 +1837,24 @@
         class="chk"
       />
     </div>
-  </section>
+  </SettingsSection>
 
-  <section id="settings-portability">
-    <h3>設定のバックアップ/移行</h3>
+  <SettingsSection id="settings-portability" title="設定のバックアップ/移行">
     <ConfigPortability
       onImported={() => reloadConfig('all')}
       onReload={reloadImportedConfig}
       disabled={manualReloadDisabled}
       reloading={reloading.all > 0}
     />
-  </section>
+  </SettingsSection>
 
   {#if config}
-    <section id="settings-backup">
-      <h3>自動バックアップ</h3>
+    <SettingsSection id="settings-backup" title="自動バックアップ">
       <BackupPanel bind:settings={config.backup} />
-    </section>
+    </SettingsSection>
   {/if}
 
-  <section id="settings-danmaku">
-    <h3>弾幕（画面を流れるコメント）</h3>
+  <SettingsSection id="settings-danmaku" title="弾幕（画面を流れるコメント）">
     <DanmakuSettings />
     {#if config}
       <div class="obs-label">OBS弾幕オーバーレイ用URL</div>
@@ -1859,12 +1879,11 @@
         </button>
       </div>
     {/if}
-  </section>
+  </SettingsSection>
 
   <!-- ── TTS ── -->
   {#if config}
-  <section id="settings-test">
-    <h3>テスト</h3>
+  <SettingsSection id="settings-test" title="テスト">
     <div class="field-row">
       <label for="test-platform">プラットフォーム</label>
       <select id="test-platform" bind:value={testPlatform} class="platform-select">
@@ -1930,10 +1949,9 @@
       </button>
       {#if testCommentMsg}<span class="hint-inline">{testCommentMsg}</span>{/if}
     </div>
-  </section>
+  </SettingsSection>
 
-  <section id="settings-youtube-low-latency">
-    <h3>YouTube低遅延受信</h3>
+  <SettingsSection id="settings-youtube-low-latency" title="YouTube低遅延受信">
     <p class="hint">
       Google CloudでYouTube Data API v3を有効にしたAPIキーを設定すると、公式streamListでコメントを低遅延受信します。
       未設定または公式接続に失敗した場合は、従来のInnerTube方式へ自動で切り替わります。
@@ -1953,15 +1971,14 @@
     <p class="hint">
       APIキーはこのPCのconfig.jsonに平文で保存されます。空欄のままでも従来方式で利用できます。
     </p>
-  </section>
+  </SettingsSection>
 
   {/if}
   </fieldset>
 
   {#if config}
   <div class="settings-fields">
-  <section id="settings-posting">
-    <h3>コメント投稿（送信）</h3>
+  <SettingsSection id="settings-posting" title="コメント投稿（送信）">
     <fieldset class="settings-fields" disabled={allFieldsLocked}>
     <p class="hint">
       コメント一覧の下にある「✍ 自分でコメントを投稿」から、配信チャットへ自分でコメントを送れます。
@@ -2243,10 +2260,9 @@
         if (config && port !== null) config.twitcasting = { ...(config.twitcasting ?? {}), callbackPort: port };
       }}
     />
-  </section>
+  </SettingsSection>
 
-  <section id="settings-x-post">
-    <h3>X への配信開始告知</h3>
+  <SettingsSection id="settings-x-post" title="X への配信開始告知">
     {#if config.xPost}
       <XPostSettings
         xPost={config.xPost}
@@ -2267,14 +2283,13 @@
         }}
       />
     {/if}
-  </section>
+  </SettingsSection>
   </div>
   {/if}
 
   <fieldset class="settings-fields" disabled={allFieldsLocked}>
   {#if config}
-  <section id="settings-tts">
-    <h3>TTS（読み上げ）</h3>
+  <SettingsSection id="settings-tts" title="TTS（読み上げ）">
     <div class="field-row">
       <label for="tts-backend">バックエンド</label>
       <select id="tts-backend" bind:value={config.tts.backend} class="platform-select">
@@ -2608,10 +2623,9 @@
       hasDictionaryEdits={hasTtsDictionaryEdits}
       onImported={onTtsDictionaryImported}
     />
-  </section>
+  </SettingsSection>
 
-  <section id="settings-comment-log">
-    <h3>コメントログ</h3>
+  <SettingsSection id="settings-comment-log" title="コメントログ">
     <div class="field-row">
       <label for="log-enabled">ログを保存する</label>
       <input id="log-enabled" type="checkbox" bind:checked={logEnabled} class="chk" />
@@ -2627,10 +2641,9 @@
       <button type="button" class="copy-btn" onclick={onOpenLogDir}>フォルダを開く</button>
       {#if logMsg}<span class="hint-inline">{logMsg}</span>{/if}
     </div>
-  </section>
+  </SettingsSection>
 
-  <section id="settings-listeners">
-    <h3>リスナー管理</h3>
+  <SettingsSection id="settings-listeners" title="リスナー管理">
     <div class="field-row">
       <input
         type="search"
@@ -2689,15 +2702,18 @@
           : `検索すると記録済みのリスナーが表示されます(空欄で先頭 ${LISTENER_LIMIT} 件)。行クリックで詳細。`}
       </p>
     {/if}
-  </section>
+  </SettingsSection>
 
   <!-- ── OBS URL ── -->
-  <IntegrationsSettings bind:this={localApiSettings} />
+  <SettingsSection id="settings-integrations" title="ローカル API / Webhook">
+    <IntegrationsSettings bind:this={localApiSettings} />
+  </SettingsSection>
 
-  <div class="achievements-wrap"><AchievementsSettings /></div>
+  <div class="achievements-wrap">
+    <SettingsSection id="settings-achievements-group" title="実績"><AchievementsSettings /></SettingsSection>
+  </div>
 
-  <section id="settings-obs">
-    <h3>OBSオーバーレイ URL</h3>
+  <SettingsSection id="settings-obs" title="OBSオーバーレイ URL">
     <div class="field-row">
       <label for="obs-template">テンプレート</label>
       <input
@@ -2800,11 +2816,10 @@
       <h3>OBSテンプレート編集</h3>
       <TemplateEditor obsPort={config.obs.port} currentTemplate={config.obs.template} {onTemplatesChange} />
     </div>
-  </section>
+  </SettingsSection>
 
   <!-- ── Goals ── -->
-  <section id="settings-goals">
-    <h3>目標（Goals）</h3>
+  <SettingsSection id="settings-goals" title="目標（Goals）">
     <div class="field-row">
       <label for="goals-enabled">目標ゲージを有効化</label>
       <input id="goals-enabled" type="checkbox" bind:checked={config.goals.enabled} class="chk" />
@@ -2921,11 +2936,10 @@
       </button>
     </div>
     <p class="hint">コメント・視聴者・高評価・リアクションの目標ゲージをOBSに表示します。高評価とリアクションはYouTubeのみです。</p>
-  </section>
+  </SettingsSection>
 
   <!-- ── Timer ── -->
-  <section id="settings-timer">
-    <h3>タイマー</h3>
+  <SettingsSection id="settings-timer" title="タイマー">
     <div class="field-row">
       <label for="timer-enabled">タイマーを有効化</label>
       <input id="timer-enabled" type="checkbox" bind:checked={config.timer.enabled} class="chk" />
@@ -2969,11 +2983,10 @@
       </button>
     </div>
     <p class="hint">タイマー/カウントダウンをOBSに表示します。</p>
-  </section>
+  </SettingsSection>
 
   <!-- ── Effects ── -->
-  <section id="settings-effects">
-    <h3>キーワードエフェクト</h3>
+  <SettingsSection id="settings-effects" title="キーワードエフェクト">
     <div class="field-row">
       <label for="effects-enabled">エフェクトを有効化</label>
       <input id="effects-enabled" type="checkbox" bind:checked={config.effects.enabled} class="chk" />
@@ -3074,11 +3087,10 @@
         「テスト」は保存前の内容を、間隔を無視して表示先へ1回流します。
       </p>
     </div>
-  </section>
+  </SettingsSection>
 
   <!-- ── Welcome ── -->
-  <section id="settings-welcome">
-    <h3>初見歓迎</h3>
+  <SettingsSection id="settings-welcome" title="初見歓迎">
     <div class="field-row">
       <label for="welcome-enabled">有効化</label>
       <input id="welcome-enabled" type="checkbox" bind:checked={config.welcome.enabled} class="chk" />
@@ -3118,11 +3130,10 @@
         class="num-input"
       />
     </div>
-  </section>
+  </SettingsSection>
 
   <!-- ── Participation ── -->
-  <section id="settings-participation">
-    <h3>参加型</h3>
+  <SettingsSection id="settings-participation" title="参加型">
     <div class="field-row">
       <label for="participation-enabled">参加管理を有効化</label>
       <input
@@ -3155,11 +3166,10 @@
       />
       <span class="hint-inline">（0で無制限）</span>
     </div>
-  </section>
+  </SettingsSection>
 
   <!-- ── Moderation ── -->
-  <section id="settings-moderation">
-    <h3>モデレーション</h3>
+  <SettingsSection id="settings-moderation" title="モデレーション">
     <fieldset class="settings-fields" disabled={moderationFieldsLocked}>
 
     <div class="mod-list">
@@ -3296,11 +3306,10 @@
       }}
       disabled={saving || allFieldsLocked}
     />
-  </section>
+  </SettingsSection>
 
   <!-- ── Notification ── -->
-  <section id="settings-notify">
-    <h3>通知</h3>
+  <SettingsSection id="settings-notify" title="通知">
     <div class="field-row">
       <label for="show-donation-panel">投げ銭を別タブで表示</label>
       <input
@@ -3348,11 +3357,10 @@
       bind:value={config.soundEffects}
       onVolume={(volume) => store.setSoundVolume(volume)}
     />
-  </section>
+  </SettingsSection>
 
   <!-- ── App update ── -->
-  <section id="settings-app-update">
-    <h3>アプリの更新</h3>
+  <SettingsSection id="settings-app-update" title="アプリの更新">
     <div class="field-row">
       <span>現在のバージョン: {appUpdate.currentVersion ? `v${appUpdate.currentVersion}` : '取得中...'}</span>
     </div>
@@ -3373,11 +3381,10 @@
       </p>
     {/if}
     <p class="hint">起動時に自動で確認します（失敗しても通知しません）。更新すると接続中の配信は一度切れます。</p>
-  </section>
+  </SettingsSection>
 
   <!-- ── Export ── -->
-  <section id="settings-export">
-    <h3>エクスポート</h3>
+  <SettingsSection id="settings-export" title="エクスポート">
     <div class="field-row">
       <button class="export-btn" onclick={onExportCommentsCsv} disabled={exportingCsv || store.totalCount === 0}>
         {exportingCsv ? 'CSV出力中...' : 'コメントログをCSV出力'}
@@ -3393,7 +3400,7 @@
         </button>
       </div>
     {/if}
-  </section>
+  </SettingsSection>
 
   {/if}
 
@@ -3427,15 +3434,15 @@
 
   .settings-fields { display: contents; }
 
-  .settings.focus-goals > .settings-fields > section:not(#settings-goals),
-  .settings.focus-danmaku > .settings-fields > section:not(#settings-danmaku),
+  .settings.focus-goals > .settings-fields > :global(section:not(#settings-goals)),
+  .settings.focus-danmaku > .settings-fields > :global(section:not(#settings-danmaku)),
   .settings.focus-goals > .settings-fields > .achievements-wrap,
   .settings.focus-danmaku > .settings-fields > .achievements-wrap {
     display: none;
   }
 
-  .settings:not(.focus-goals):not(.focus-danmaku) > .settings-fields > #settings-goals,
-  .settings:not(.focus-goals):not(.focus-danmaku) > .settings-fields > #settings-danmaku {
+  .settings:not(.focus-goals):not(.focus-danmaku) > .settings-fields > :global(#settings-goals),
+  .settings:not(.focus-goals):not(.focus-danmaku) > .settings-fields > :global(#settings-danmaku) {
     display: none;
   }
 
@@ -3455,11 +3462,36 @@
     margin: 14px 0 6px;
   }
 
-  section {
-    border-bottom: 1px solid rgba(255,255,255,0.07);
-    padding-bottom: 12px;
-    margin-bottom: 4px;
+  .settings-toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 8px;
   }
+
+  .settings-search {
+    flex: 1 1 160px;
+    min-width: 0;
+    background: rgba(255,255,255,0.07);
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 4px;
+    color: #e0e0e0;
+    padding: 5px 8px;
+    font-size: 13px;
+  }
+
+  .toolbar-btn {
+    background: rgba(255,255,255,0.07);
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 4px;
+    color: #e0e0e0;
+    padding: 5px 10px;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .toolbar-btn:hover { background: rgba(255,255,255,0.12); }
+
+  .achievements-wrap :global(#settings-achievements > h3) { display: none; }
 
   .platform-select, .id-input, .obs-input, .num-input {
     background: rgba(255,255,255,0.07);
