@@ -1,4 +1,4 @@
-//! 起動時に開く項目の検証・承認・実行(SPEC §18)。
+//! 起動時に開く項目の検証・承認・実行(SPEC §20)。
 
 use std::{fs, io::Write, path::Path, time::Duration};
 
