@@ -376,10 +376,10 @@ impl YoutubeAuth {
                 Ok(token) => token,
                 Err(message) => return Err(SendError::NotLoggedIn(message)),
             };
-            match action(access_token).await {
+            match action(access_token.clone()).await {
                 Ok(value) => return Ok(value),
                 Err(SendError::Unauthorized) if attempt == 0 => {
-                    *self.access_token.lock().await = None;
+                    self.forget_access_token(&access_token).await;
                 }
                 Err(error) => return Err(error),
             }

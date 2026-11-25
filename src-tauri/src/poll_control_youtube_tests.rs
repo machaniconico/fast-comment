@@ -1059,3 +1059,38 @@ fn polling_interval_from_youtube_is_capped() {
     assert_eq!(next_poll_delay(Some(13_000)), Duration::from_secs(13));
     assert_eq!(next_poll_delay(Some(600_000)), Duration::from_secs(60));
 }
+
+#[tokio::test]
+async fn adopted_tallies_survive_when_poll_ends_before_first_get() {
+    // 照合で A=7・B=3 を採用し、初回の集計 GET の前に配信者が YouTube 側で終了した。
+    let fixture = Fixture::new().await;
+    fixture.mock.create.lock().unwrap().push_back(interrupted());
+    fixture.mock.push_active(item(ID, "active"));
+    fixture
+        .mock
+        .active
+        .lock()
+        .unwrap()
+        .push_back(Json(json!({})).into_response());
+    let opened = fixture.start().await.unwrap();
+    let votes = |snapshot: &PollSnapshot| -> Vec<u32> {
+        snapshot.options.iter().map(|option| option.votes).collect()
+    };
+    assert_eq!(votes(&opened), [7, 3]);
+    let closed = fixture.closed_within(Duration::from_secs(15)).await;
+    assert_eq!((votes(&closed), closed.total_voters), (vec![7, 3], 10));
+}
+
+#[tokio::test]
+async fn create_response_tallies_are_applied_on_open() {
+    let fixture = Fixture::new().await;
+    let opened = fixture.start().await.unwrap();
+    assert_eq!(
+        opened
+            .options
+            .iter()
+            .map(|option| option.votes)
+            .collect::<Vec<_>>(),
+        [7, 3]
+    );
+}

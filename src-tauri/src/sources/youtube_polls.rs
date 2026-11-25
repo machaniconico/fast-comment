@@ -19,6 +19,8 @@ pub struct YoutubePolls {
 pub struct YtPollCreated {
     pub id: String,
     pub published_at_ms: Option<i64>,
+    /// 作成応答の snippet に票数があればその値。
+    pub tallies: Option<Vec<u64>>,
 }
 
 #[derive(Clone, Debug)]
@@ -129,6 +131,7 @@ impl YoutubePolls {
         Ok(YtPollCreated {
             id: item_id(&value).ok_or(YtPollsError::Network)?.to_owned(),
             published_at_ms: published_at_ms(&value),
+            tallies: parse_state(&value).and_then(|state| state.tallies),
         })
     }
 

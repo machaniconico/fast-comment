@@ -178,12 +178,12 @@ impl YoutubePollControl {
         let question = &start.preferences.question;
         let options = &start.preferences.options;
         let sent_at_ms = chrono::Utc::now().timestamp_millis();
-        let (remote_id, polling_interval_ms) = match self
+        let (remote_id, polling_interval_ms, tallies) = match self
             .api
             .create(&token, &live_chat_id, question, options)
             .await
         {
-            Ok(YtPollCreated { id, .. }) => (id, None),
+            Ok(YtPollCreated { id, tallies, .. }) => (id, None, tallies),
             Err(YtPollsError::Network) => {
                 let found = self
                     .reconcile(
@@ -195,7 +195,7 @@ impl YoutubePollControl {
                         sent_at_ms,
                     )
                     .await?;
-                (found.id, found.polling_interval_ms)
+                (found.id, found.polling_interval_ms, found.tallies)
             }
             Err(error) => return Err(YoutubeControlError::from(error).into()),
         };
@@ -214,6 +214,12 @@ impl YoutubePollControl {
         let saved = self.poll.save_start_preferences(&start);
         let duration_secs = start.duration_secs;
         let mut snapshot = self.poll.open(start);
+        // 作成応答や採用した照合の票数は、初回の集計 GET を待たずに反映する。
+        // 初回の GET より前に YouTube 側で終了しても、最終結果が 0 票にならない。
+        if let Some(votes) = snapshot_votes(tallies.as_deref(), snapshot.options.len()) {
+            self.poll.apply_external(&snapshot.id, &votes, false);
+            snapshot = self.poll.snapshot();
+        }
         let deadline = duration_secs.map(|secs| {
             let duration = Duration::from_secs(u64::from(secs));
             self.poll.set_remote_timing(
@@ -351,7 +357,7 @@ impl YoutubePollControl {
             let snapshot = self.poll.snapshot();
             match &result {
                 Ok(Some(state)) if snapshot.id == local_id => {
-                    match snapshot_votes(state, snapshot.options.len()) {
+                    match snapshot_votes(state.tallies.as_deref(), snapshot.options.len()) {
                         Some(votes) => {
                             self.poll.apply_external(&local_id, &votes, true);
                             self.poll.snapshot()
@@ -425,7 +431,10 @@ impl YoutubePollControl {
             }
             let error = match result {
                 Ok(Some(state)) if state.id == target.remote_id => {
-                    match snapshot_votes(&state, self.poll.snapshot().options.len()) {
+                    match snapshot_votes(
+                        state.tallies.as_deref(),
+                        self.poll.snapshot().options.len(),
+                    ) {
                         Some(votes) => {
                             last_error = None;
                             let delay = next_poll_delay(state.polling_interval_ms);
@@ -546,10 +555,8 @@ fn next_poll_delay(interval_ms: Option<u64>) -> Duration {
         })
 }
 
-fn snapshot_votes(state: &YtPollState, count: usize) -> Option<Vec<u32>> {
-    state
-        .tallies
-        .as_ref()
+fn snapshot_votes(tallies: Option<&[u64]>, count: usize) -> Option<Vec<u32>> {
+    tallies
         .filter(|tallies| tallies.len() == count)
         .map(|tallies| {
             tallies
