@@ -13,10 +13,12 @@ use crate::{
     config::{AppConfig, ChannelPlatform},
     moderation_error::{ModerationError, ModerationErrorCode},
     poll::{Poll, PollDisplaySettings, PollError, PollSnapshot, PollSource, ValidatedStart},
+    poll_control_youtube::{YoutubeControlError, YoutubePollControl},
     sources::{
         twitch_auth::{TwitchAccess, TwitchAuth, POLL_SCOPES},
         twitch_moderation::HelixError,
         twitch_polls::{HelixPolls, PollsError, RemotePoll, RemoteStatus, HELIX_BASE},
+        youtube_send::YoutubeAuth,
     },
 };
 
@@ -40,6 +42,8 @@ pub(crate) enum PollControlError {
     Local(#[from] PollError),
     #[error(transparent)]
     Remote(#[from] PollsError),
+    #[error(transparent)]
+    Youtube(#[from] YoutubeControlError),
 }
 
 impl From<ModerationError> for PollControlError {
@@ -103,16 +107,34 @@ pub(crate) struct PollControl {
     helix_base: String,
     // 操作と集計結果の反映を直列化する。ポーラーの HTTP 待ちには保持しない。
     active: Mutex<Option<ActivePoll>>,
+    pub(crate) youtube: Arc<YoutubePollControl>,
 }
 
 impl PollControl {
+    #[cfg(test)]
     pub(crate) fn new(
         poll: Arc<Poll>,
         auth: Arc<TwitchAuth>,
         config: watch::Receiver<AppConfig>,
         app_cancel: CancellationToken,
     ) -> Self {
+        Self::with_youtube_notice(poll, auth, config, app_cancel, |_| {})
+    }
+
+    pub(crate) fn with_youtube_notice(
+        poll: Arc<Poll>,
+        auth: Arc<TwitchAuth>,
+        config: watch::Receiver<AppConfig>,
+        app_cancel: CancellationToken,
+        notify: impl Fn(&str) + Send + Sync + 'static,
+    ) -> Self {
         Self {
+            youtube: Arc::new(YoutubePollControl::new(
+                poll.clone(),
+                config.clone(),
+                app_cancel.clone(),
+                notify,
+            )),
             poll,
             auth,
             config,
@@ -121,6 +143,10 @@ impl PollControl {
             helix_base: HELIX_BASE.to_owned(),
             active: Mutex::new(None),
         }
+    }
+
+    pub(crate) fn youtube_auth(&self) -> Arc<YoutubeAuth> {
+        self.youtube.auth.clone()
     }
 
     pub(crate) fn snapshot(&self) -> PollSnapshot {
@@ -136,6 +162,9 @@ impl PollControl {
             return Ok(self.poll.start(start)?);
         }
         self.poll.check_can_start()?;
+        if start.preferences.source == PollSource::Youtube {
+            return self.youtube.start(start).await;
+        }
 
         let login = {
             let config = self.config.borrow();
@@ -262,7 +291,10 @@ impl PollControl {
     pub(crate) async fn stop(&self) -> Result<PollSnapshot, PollControlError> {
         let mut active = self.active.lock().await;
         let Some(poll) = active.as_ref() else {
-            return Ok(self.poll.stop());
+            return match self.youtube.finish(None, false).await {
+                Some(result) => Ok(result?),
+                None => Ok(self.poll.stop()),
+            };
         };
         let result = self.stop_remote(&poll.target).await;
         match &result {
@@ -296,7 +328,12 @@ impl PollControl {
         let mut active = self.active.lock().await;
         let result = match active.as_ref() {
             Some(poll) => self.reset_remote(&poll.target).await,
-            None => Ok(()),
+            None => {
+                if let Some(result) = self.youtube.finish(None, true).await {
+                    return Ok(result?);
+                }
+                Ok(())
+            }
         };
         *active = None;
         let snapshot = self.poll.reset();
@@ -378,6 +415,7 @@ impl PollControl {
                     let class = match &error {
                         PollControlError::Local(_) => "Local",
                         PollControlError::Remote(error) => error.class(),
+                        PollControlError::Youtube(_) => "Youtube",
                     };
                     if last_error != Some(class) {
                         tracing::warn!(error_class = class, "Twitchアンケートの集計に失敗しました");

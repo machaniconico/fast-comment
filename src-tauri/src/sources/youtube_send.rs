@@ -1,4 +1,4 @@
-//! YouTube Live への運営コメント投稿。
+//! YouTube Live への運営コメント投稿と、公式 API で共用する OAuth。
 //!
 //! 認証・API呼び出しはユーザー操作時だけ行う。コメント受信ループには接続せず、
 //! access token と liveChatId を短時間だけメモリキャッシュして投稿の待ち時間と
@@ -54,18 +54,26 @@ struct CachedAccessToken {
 }
 
 struct CachedLiveChat {
-    target: String,
+    target: Option<String>,
     live_chat_id: String,
     valid_until: Instant,
 }
 
-/// OAuth・投稿専用の軽量状態。バックグラウンドタスクは持たない。
+/// OAuth とチャット ID 解決用の軽量状態。バックグラウンドタスクは持たない。
 pub struct YoutubeAuth {
     pub(super) http: reqwest::Client,
     login_lock: Mutex<()>,
     keyring_lock: Mutex<()>,
     access_token: Mutex<Option<CachedAccessToken>>,
     live_chat: Mutex<Option<CachedLiveChat>>,
+    #[cfg(test)]
+    poll_test_oauth: Option<PollTestOauth>,
+}
+
+#[cfg(test)]
+struct PollTestOauth {
+    client_id: String,
+    base_url: String,
 }
 
 impl YoutubeAuth {
@@ -83,7 +91,19 @@ impl YoutubeAuth {
             keyring_lock: Mutex::new(()),
             access_token: Mutex::new(None),
             live_chat: Mutex::new(None),
+            #[cfg(test)]
+            poll_test_oauth: None,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_poll_test(client_id: &str, base_url: &str) -> Self {
+        let mut auth = Self::new().unwrap();
+        auth.poll_test_oauth = Some(PollTestOauth {
+            client_id: client_id.to_owned(),
+            base_url: base_url.to_owned(),
+        });
+        auth
     }
 
     pub async fn status(&self, client_id: &str) -> Result<YoutubeOauthStatus, String> {
@@ -240,7 +260,7 @@ impl YoutubeAuth {
         text: &str,
         access_token: &str,
     ) -> Result<(), SendError> {
-        let live_chat_id = self.live_chat_id(target, access_token).await?;
+        let live_chat_id = self.live_chat_id(Some(target), access_token).await?;
         let response = self
             .http
             .post(LIVE_CHAT_MESSAGES_URL)
@@ -271,19 +291,33 @@ impl YoutubeAuth {
         Err(SendError::Message(map_google_api_error(status, &body)))
     }
 
-    async fn live_chat_id(&self, target: &str, access_token: &str) -> Result<String, SendError> {
+    /// 投票の対象は、認可したアカウントに現在配信中のライブが1件ある場合に限る。
+    pub(crate) async fn poll_live_chat_id(&self, access_token: &str) -> Result<String, SendError> {
+        self.live_chat_id(None, access_token).await
+    }
+
+    async fn live_chat_id(
+        &self,
+        target: Option<&str>,
+        access_token: &str,
+    ) -> Result<String, SendError> {
         {
             let cache = self.live_chat.lock().await;
             if let Some(cached) = cache.as_ref() {
-                if cached.target == target && cached.valid_until > Instant::now() {
+                if cached.target.as_deref() == target && cached.valid_until > Instant::now() {
                     return Ok(cached.live_chat_id.clone());
                 }
             }
         }
 
+        let url = ACTIVE_BROADCASTS_URL.to_owned();
+        #[cfg(test)]
+        let url = self.poll_test_oauth.as_ref().map_or(url, |test| {
+            format!("{}/liveBroadcasts", test.base_url)
+        });
         let response = self
             .http
-            .get(ACTIVE_BROADCASTS_URL)
+            .get(url)
             .bearer_auth(access_token)
             .query(&[
                 ("part", "snippet"),
@@ -293,8 +327,8 @@ impl YoutubeAuth {
             ])
             .send()
             .await
-            .map_err(|e| {
-                SendError::Message(format!("配信中のYouTubeチャット取得に失敗しました: {e}"))
+            .map_err(|error| {
+                SendError::Network(format!("配信中のYouTubeチャット取得に失敗しました: {error}"))
             })?;
 
         if response.status() == StatusCode::UNAUTHORIZED {
@@ -303,18 +337,19 @@ impl YoutubeAuth {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(SendError::Message(map_google_api_error(status, &body)));
+            return Err(SendError::Api { status, body });
         }
 
-        let body = response
-            .json::<Value>()
-            .await
-            .map_err(|e| SendError::Message(format!("YouTube配信情報の解析に失敗しました: {e}")))?;
-        let preferred_video_id = preferred_video_id(target);
-        let live_chat_id = select_live_chat_id(&body, preferred_video_id.as_deref())
-            .map_err(SendError::Message)?;
+        let body = response.json::<Value>().await.map_err(|error| {
+            SendError::Network(format!("YouTube配信情報の解析に失敗しました: {error}"))
+        })?;
+        let live_chat_id = match target {
+            Some(target) => select_live_chat_id(&body, preferred_video_id(target).as_deref()),
+            None => select_poll_live_chat_id(&body).map_err(str::to_owned),
+        }
+        .map_err(SendError::Message)?;
         *self.live_chat.lock().await = Some(CachedLiveChat {
-            target: target.to_string(),
+            target: target.map(str::to_owned),
             live_chat_id: live_chat_id.clone(),
             valid_until: Instant::now() + LIVE_CHAT_CACHE_TTL,
         });
@@ -327,7 +362,7 @@ impl YoutubeAuth {
     /// 2 回目も 401 の場合は `SendError::Unauthorized` を返すので、呼び出し側が
     /// 用途に応じた文言へ変換する。`action` は呼ばれるたびに新しい access token を
     /// 受け取るため、内部でトークンを保持しないこと。
-    pub(super) async fn with_token_retry<F, Fut, T>(
+    pub(crate) async fn with_token_retry<F, Fut, T>(
         &self,
         client_id: &str,
         mut action: F,
@@ -341,10 +376,10 @@ impl YoutubeAuth {
                 Ok(token) => token,
                 Err(message) => return Err(SendError::NotLoggedIn(message)),
             };
-            match action(access_token).await {
+            match action(access_token.clone()).await {
                 Ok(value) => return Ok(value),
                 Err(SendError::Unauthorized) if attempt == 0 => {
-                    *self.access_token.lock().await = None;
+                    self.forget_access_token(&access_token).await;
                 }
                 Err(error) => return Err(error),
             }
@@ -352,7 +387,16 @@ impl YoutubeAuth {
         Err(SendError::Unauthorized)
     }
 
-    pub(super) async fn access_token(&self, client_id: &str) -> Result<String, String> {
+    /// 401 を受けたトークンがキャッシュ中なら消し、次の `access_token` で refresh させる。
+    /// ほかの処理が更新済みの新しいトークンは消さない。
+    pub(crate) async fn forget_access_token(&self, rejected: &str) {
+        let mut cache = self.access_token.lock().await;
+        if cache.as_ref().is_some_and(|cached| cached.value == rejected) {
+            *cache = None;
+        }
+    }
+
+    pub(crate) async fn access_token(&self, client_id: &str) -> Result<String, String> {
         // refreshを同時実行しないため、更新完了まで同じmutexを保持する。
         let mut cache = self.access_token.lock().await;
         if let Some(cached) = cache.as_ref() {
@@ -366,8 +410,13 @@ impl YoutubeAuth {
             .await?
             .filter(|stored| stored.client_id == client_id)
             .ok_or_else(|| "設定からGoogleアカウントへ接続してください".to_string())?;
+        let token_url = GOOGLE_TOKEN_URL.to_owned();
+        #[cfg(test)]
+        let token_url = self.poll_test_oauth.as_ref().map_or(token_url, |test| {
+            format!("{}/oauth/token", test.base_url)
+        });
         let oauth = BasicClient::new(ClientId::new(client_id.to_string()))
-            .set_token_uri(TokenUrl::new(GOOGLE_TOKEN_URL.to_string()).map_err(|e| e.to_string())?);
+            .set_token_uri(TokenUrl::new(token_url).map_err(|e| e.to_string())?);
         let token = oauth
             .exchange_refresh_token(&RefreshToken::new(stored.refresh_token.clone()))
             .request_async(&self.http)
@@ -435,6 +484,14 @@ impl YoutubeAuth {
     }
 
     async fn load_refresh_token(&self) -> Result<Option<StoredRefreshToken>, String> {
+        #[cfg(test)]
+        if let Some(test) = &self.poll_test_oauth {
+            return Ok(Some(StoredRefreshToken {
+                client_id: test.client_id.clone(),
+                refresh_token: "test-refresh-token".to_owned(),
+                channel_title: None,
+            }));
+        }
         let _guard = self.keyring_lock.lock().await;
         tokio::task::spawn_blocking(|| {
             let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)
@@ -485,7 +542,7 @@ impl YoutubeAuth {
     }
 }
 
-pub(super) enum SendError {
+pub(crate) enum SendError {
     /// 401。共通ヘルパが 1 回だけ再試行し、最終的にこれを返す。
     Unauthorized,
     /// リフレッシュトークンが無い・更新できない等、未接続扱いの失敗。
@@ -547,6 +604,27 @@ fn select_live_chat_id(body: &Value, preferred_video_id: Option<&str>) -> Result
         [] => Err("接続したGoogleアカウントで配信中のYouTube Liveが見つかりません".to_string()),
         _ => Err("複数のYouTube Liveが配信中です。送信先に配信URLを指定してください".to_string()),
     }
+}
+
+fn select_poll_live_chat_id(body: &Value) -> Result<String, &'static str> {
+    let items = body["items"]
+        .as_array()
+        .ok_or("YouTubeから配信一覧が返りませんでした")?;
+    if items.len() > 1
+        || body["nextPageToken"]
+            .as_str()
+            .is_some_and(|token| !token.is_empty())
+    {
+        return Err("接続したGoogleアカウントで配信中のYouTube Liveを1件にしてください");
+    }
+    let only = items
+        .first()
+        .ok_or("接続したGoogleアカウントで配信中のYouTube Liveが見つかりません")?;
+    only.pointer("/snippet/liveChatId")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+        .ok_or("配信中のYouTube Liveのチャットが見つかりません")
 }
 
 fn map_google_api_error(status: StatusCode, body: &str) -> String {

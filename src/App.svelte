@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, onDestroy, tick, untrack } from 'svelte';
-  import { TauriEvent } from '@tauri-apps/api/event';
+  import { listen, TauriEvent } from '@tauri-apps/api/event';
   import type { Platform } from './lib/types';
   import CommentList from './lib/components/CommentList.svelte';
   import Dashboard from './lib/components/Dashboard.svelte';
@@ -59,6 +59,7 @@
   import { progressLabel, progressPercent } from './lib/appUpdate';
 
   let unlisten: (() => void) | null = null;
+  let unlistenPollError: (() => void) | null = null;
   let unlistenTtsNotice: (() => void) | null = null;
   let unlistenTtsQueueState: (() => void) | null = null;
   let config: AppConfig | null = $state(null);
@@ -200,6 +201,14 @@
     void takeStartupRestoreFailure().then((notice) => {
       if (!destroyed) restoreFailure = notice;
     }).catch(() => console.warn('[backup] startup notice load failed'));
+    if (isTauri()) {
+      void listen<string>('poll-error', ({ payload }) => ui.showToast(payload, 'error'))
+        .then((unlisten) => {
+          if (destroyed) unlisten();
+          else unlistenPollError = unlisten;
+        })
+        .catch(() => console.warn('[poll] error notification subscription failed'));
+    }
     {
       const fn = await initStore();
       if (destroyed) fn();
@@ -247,6 +256,7 @@
     window.removeEventListener('keydown', onWindowKey);
     unlisten?.();
     unlistenTtsNotice?.();
+    unlistenPollError?.();
     unlistenTtsQueueState?.();
     unlistenDanmakuState?.();
     if (searchDebounce) clearTimeout(searchDebounce);

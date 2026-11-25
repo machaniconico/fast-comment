@@ -27,6 +27,7 @@ pub mod live_fanout;
 pub mod model;
 pub mod poll;
 mod poll_control;
+mod poll_control_youtube;
 pub mod moderation;
 pub mod sound_effects;
 mod moderation_error;
@@ -177,8 +178,8 @@ pub struct AppState {
     x_post_auth: Arc<XPostAuth<KeyringTokenStore>>,
     /// 参加型配信の参加者一覧。
     participants: Mutex<Vec<Participant>>,
-    /// YouTube投稿用OAuth状態。バックグラウンド処理は持たず、操作時だけ通信する。
-    youtube_auth: YoutubeAuth,
+    /// YouTube の投稿・モデレーション・公式投票で共有する OAuth 状態。
+    youtube_auth: Arc<YoutubeAuth>,
     /// Twitchモデレーション用OAuth状態。access tokenはメモリのみ。
     twitch_auth: Arc<TwitchAuth>,
     twitcasting_auth: Arc<TwitcastingAuth<integrations::KeyringSecretStore>>,
@@ -4013,25 +4014,32 @@ where
     let env_filter = env
         .and_then(|value| EnvFilter::try_new(value).ok())
         .unwrap_or_else(|| EnvFilter::new("info"));
-    // WS ハンドシェイクの TRACE にはトークン付きリクエスト行が含まれる。
-    let ws_ceiling = filter_fn(|meta| {
-        let ws_target = ["tungstenite", "tokio_tungstenite"]
+    // WS のハンドシェイクや HTTP のトレースには認証情報やクエリが含まれ得る。
+    let transport_ceiling = filter_fn(|meta| {
+        let transport = [
+            "tungstenite",
+            "tokio_tungstenite",
+            "reqwest",
+            "hyper",
+            "hyper_util",
+            "h2",
+        ]
             .into_iter()
-            .any(|target| {
-                meta.target() == target
-                    || meta
-                        .target()
-                        .strip_prefix(target)
-                        .is_some_and(|suffix| suffix.starts_with("::"))
-            });
-        !ws_target || *meta.level() <= tracing::Level::INFO
+        .any(|target| {
+            meta.target() == target
+                || meta
+                    .target()
+                    .strip_prefix(target)
+                    .is_some_and(|suffix| suffix.starts_with("::"))
+        });
+        !transport || *meta.level() <= tracing::Level::INFO
     });
     tracing_subscriber::registry()
         .with(env_filter)
         .with(
             tracing_subscriber::fmt::layer()
                 .with_writer(writer)
-                .with_filter(ws_ceiling),
+                .with_filter(transport_ceiling),
         )
 }
 
@@ -4159,12 +4167,17 @@ pub fn run() {
             let twitch_auth = Arc::new(
                 TwitchAuth::new().expect("Twitch認証用HTTPクライアントの作成に失敗しました"),
             );
-            let poll_control = Arc::new(poll_control::PollControl::new(
+            let poll_notice_app = handle.clone();
+            let poll_control = Arc::new(poll_control::PollControl::with_youtube_notice(
                 poll.clone(),
                 twitch_auth.clone(),
                 config_tx.subscribe(),
                 app_cancel.clone(),
+                move |message| {
+                    let _ = poll_notice_app.emit("poll-error", message);
+                },
             ));
+            let youtube_auth = poll_control.youtube_auth();
             let obs_cancel = app_cancel.child_token();
             let templates =
                 TemplateStore::new(resolve_templates_dir(&handle), config_dir.join("templates"));
@@ -4281,8 +4294,7 @@ pub fn run() {
                         twitcasting_auth: twitcasting_auth.clone(),
                         twitcasting_api,
                         participants: Mutex::new(Vec::new()),
-                        youtube_auth: YoutubeAuth::new()
-                            .expect("YouTube投稿用HTTPクライアントの作成に失敗しました"),
+                        youtube_auth,
                         twitch_auth,
                     };
                     let listener_store = state.listeners.clone();

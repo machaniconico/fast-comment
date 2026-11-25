@@ -21,6 +21,7 @@ pub mod x;
 pub mod x_live;
 pub mod youtube;
 pub mod youtube_moderation;
+pub mod youtube_polls;
 pub mod youtube_send;
 
 use std::{sync::Arc, time::Duration};
