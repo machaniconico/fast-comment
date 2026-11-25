@@ -62,5 +62,8 @@ mod poll_twitch_helix;
 mod poll_twitch_validate;
 mod poll_twitch_poll;
 
+// 自動バックアップ(.omc/plans/auto-backup.md)
+mod backup;
+
 #[test]
 fn acceptance_harness_runs() {}
