@@ -127,8 +127,7 @@ pub struct AppState {
     listeners: Arc<listeners::ListenerStore>,
     /// 実績イベントは評価から Bus への発行まで、このロックで直列化する。
     achievement_engine: Mutex<Option<Arc<AchievementEngine>>>,
-    // 定義の保存 IPC(DefsStore::commit)は PR3 で足す。それまでは読まない。
-    #[allow(dead_code)]
+    /// 実績の定義と通貨の換算レート。実績の IPC のほか、金額の換算(リスナーごとのギフト金額・効果音)でも読む。
     achievement_defs: Arc<DefsStore>,
     chatlog: chatlog::ChatLog,
     /// カスタム効果音の保管庫。

@@ -110,6 +110,16 @@ export function isListenerDeleted(u: ListenerUpdate): u is ListenerDeleted {
   return 'deleted' in u && u.deleted === true;
 }
 
+/**
+ * バッチに、このリスナーのギフト金額を変えるコメントがあるか。
+ * 著者 ID が空のコメントは、台帳(src-tauri/src/listeners.rs)と同じく名前で照合する。
+ */
+export function hasDonationFrom(messages: readonly ChatMessage[], platform: string, authorId: string): boolean {
+  return messages.some((msg) =>
+    msg.platform === platform && (msg.author.id === '' ? msg.author.name : msg.author.id) === authorId &&
+    !!msg.amount && (msg.kind === 'superChat' || msg.kind === 'bits' || msg.kind === 'gift'));
+}
+
 export interface ChatMessage {
   listener?: ListenerInfo;
   id: string;
