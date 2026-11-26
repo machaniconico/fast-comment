@@ -423,7 +423,7 @@ const MAX_OBS_ROWS: u16 = 1000;
 #[serde(rename_all = "camelCase")]
 pub struct ObsConfig {
     /// axum サーバの待受ポート。既定 11180。
-    #[serde(default = "default_obs_port", deserialize_with = "deserialize_obs_port")]
+    #[serde(default = "default_obs_port")]
     pub port: u16,
     /// OBS オーバーレイで使うテンプレート名。既定 "default"。
     /// SPEC §10 に従い config を唯一の永続化先とする(localStorage 非使用)。
@@ -1574,6 +1574,7 @@ impl AppConfig {
         else {
             return Ok(AppConfig::default());
         };
+        let text = reset_loaded_obs_port_outside_u16(text);
         // serde の文面は不正な値をそのまま含む(トークン等が紛れうる)ので、項目と位置だけ出す。
         let mut deserializer = serde_json::Deserializer::from_str(&text);
         let mut cfg: AppConfig =
@@ -1802,21 +1803,28 @@ fn default_obs_port() -> u16 {
     11180
 }
 
-/// `u16` に収まらない値(65536 以上・負・小数・文字列など)は、設定全体を壊さずに既定値へ戻す。
-/// u16 の範囲の値はそのまま受け取り、1024 未満は読み込み時の補正と保存時の検査で扱う。
-fn deserialize_obs_port<'de, D>(deserializer: D) -> Result<u16, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = serde_json::Value::deserialize(deserializer)?;
-    match value.as_u64().and_then(|n| u16::try_from(n).ok()) {
-        Some(port) => Ok(port),
-        None => {
-            tracing::warn!("OBS のポートが範囲外だったため既定値に戻しました");
-            Ok(default_obs_port())
-        }
+/// 手で編集した config.json の `obs.port` が u16 に収まらない値(65536 以上・負・小数・文字列・null)
+/// なら、読み込みの時だけポートを既定値に置き換える。型エラーで設定全体が退避されないようにするため。
+/// 画面・取り込み・復元から来た値はここを通らず、従来どおり型エラーで拒否する。
+fn reset_loaded_obs_port_outside_u16(text: String) -> String {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return text;
+    };
+    let Some(port) = value
+        .get_mut("obs")
+        .and_then(|obs| obs.as_object_mut())
+        .and_then(|obs| obs.get_mut("port"))
+    else {
+        return text;
+    };
+    if port.as_u64().is_some_and(|n| n <= u64::from(u16::MAX)) {
+        return text;
     }
+    tracing::warn!("OBS のポートが範囲外だったため既定値に戻しました");
+    *port = serde_json::Value::from(default_obs_port());
+    serde_json::to_string(&value).unwrap_or(text)
 }
+
 fn default_obs_template() -> String {
     "default".to_string()
 }
@@ -3074,6 +3082,17 @@ mod tests {
             assert_eq!(cfg.obs.port, default_obs_port(), "{bad}");
             // ポート以外の設定は残る(設定全体が既定に戻らない)。
             assert_eq!(cfg.obs.max_rows, 7, "{bad}");
+        }
+    }
+
+    #[test]
+    fn obs_port_outside_u16_is_still_rejected_outside_load() {
+        // 画面・取り込み・復元の経路(from_config_update)では、黙って既定値に変えずに拒否する。
+        for bad in [serde_json::json!(65536), serde_json::json!(-1), serde_json::json!("11180")] {
+            assert!(
+                AppConfig::from_config_update(serde_json::json!({"obs": {"port": bad}})).is_err(),
+                "{bad}"
+            );
         }
     }
 
