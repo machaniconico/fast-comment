@@ -494,11 +494,12 @@ impl Bus {
             msg
         })?;
 
-        let app = self.obs_app(
+        let app = self.obs_app_until(
             templates_dir.clone(),
             custom_templates_dir.clone(),
             goals_skin_dir.clone(),
             extra,
+            cancel.clone(),
         );
 
         let handle = tauri::async_runtime::spawn(async move {
@@ -541,8 +542,30 @@ impl Bus {
         goals_skin_dir: PathBuf,
         extra: Option<Router>,
     ) -> Router {
+        self.obs_app_until(
+            templates_dir,
+            custom_templates_dir,
+            goals_skin_dir,
+            extra,
+            CancellationToken::new(),
+        )
+    }
+
+    /// `obs_app` と同じ。`cancel` 発火で確立済みの WebSocket も閉じる
+    /// (graceful shutdown はアップグレード後の接続を待たず、閉じもしない)。
+    fn obs_app_until(
+        &self,
+        templates_dir: PathBuf,
+        custom_templates_dir: PathBuf,
+        goals_skin_dir: PathBuf,
+        extra: Option<Router>,
+        cancel: CancellationToken,
+    ) -> Router {
         let app = obs_router(
-            self.obs_state(TemplateStore::new(templates_dir, custom_templates_dir)),
+            self.obs_state(
+                TemplateStore::new(templates_dir, custom_templates_dir),
+                cancel,
+            ),
             &goals_skin_dir,
         );
         match extra {
@@ -569,8 +592,9 @@ impl Bus {
         }
     }
 
-    fn obs_state(&self, templates: TemplateStore) -> ObsState {
+    fn obs_state(&self, templates: TemplateStore, cancel: CancellationToken) -> ObsState {
         ObsState {
+            cancel,
             tx: Arc::new(self.tx.clone()),
             mod_tx: Arc::new(self.mod_tx.clone()),
             achievement_tx: Arc::new(self.achievement_tx.clone()),
@@ -613,6 +637,8 @@ fn obs_router(state: ObsState, goals_skin_dir: &Path) -> Router {
 /// axum ハンドラ間で共有する状態。
 #[derive(Clone)]
 struct ObsState {
+    /// サーバの停止トークン。発火で各 WebSocket 接続を閉じる。
+    cancel: CancellationToken,
     tx: Arc<broadcast::Sender<SequencedChat>>,
     mod_tx: Arc<broadcast::Sender<ModerationEvent>>,
     achievement_tx: Arc<broadcast::Sender<SequencedAchievement>>,
@@ -818,7 +844,10 @@ async fn ws_handler(
     let achievement_rx = achievement_receiver(&state.achievement_tx, &query);
     let effect_rx = effect_receiver(&state.effect_tx, &query);
     ws.on_upgrade(move |socket| {
-        handle_ws_client(socket, rx, mod_rx, achievement_rx, effect_rx, query.channel)
+        until_stopped(
+            state.cancel,
+            handle_ws_client(socket, rx, mod_rx, achievement_rx, effect_rx, query.channel),
+        )
     })
 }
 
@@ -828,7 +857,7 @@ async fn stats_ws_handler(
     State(state): State<ObsState>,
 ) -> impl IntoResponse {
     let rx = state.stats_tx.subscribe();
-    ws.on_upgrade(move |socket| handle_stats_ws_client(socket, rx))
+    ws.on_upgrade(move |socket| until_stopped(state.cancel, handle_stats_ws_client(socket, rx)))
 }
 
 /// `/timer` のアップグレードハンドラ。
@@ -837,7 +866,9 @@ async fn timer_ws_handler(
     State(state): State<ObsState>,
 ) -> impl IntoResponse {
     let rx = state.timer_tx.subscribe();
-    ws.on_upgrade(move |socket| handle_snapshot_ws_client(socket, rx))
+    ws.on_upgrade(move |socket| {
+        until_stopped(state.cancel, handle_snapshot_ws_client(socket, rx))
+    })
 }
 
 async fn poll_ws_handler(
@@ -845,7 +876,14 @@ async fn poll_ws_handler(
     State(state): State<ObsState>,
 ) -> impl IntoResponse {
     let rx = state.poll_tx.subscribe();
-    ws.on_upgrade(move |socket| handle_snapshot_ws_client(socket, rx))
+    ws.on_upgrade(move |socket| {
+        until_stopped(state.cancel, handle_snapshot_ws_client(socket, rx))
+    })
+}
+
+/// サーバの停止で接続ごとのタスクを打ち切る。ソケットは future と一緒に破棄されて閉じる。
+async fn until_stopped(cancel: CancellationToken, client: impl std::future::Future<Output = ()>) {
+    cancel.run_until_cancelled(client).await;
 }
 
 /// 1 WS クライアントの送信ループ。
@@ -1442,7 +1480,10 @@ mod tests {
     }
 
     async fn serve_bus(bus: Bus, builtin: &Path, custom: &Path) -> String {
-        let state = bus.obs_state(TemplateStore::new(builtin.into(), custom.into()));
+        let state = bus.obs_state(
+            TemplateStore::new(builtin.into(), custom.into()),
+            CancellationToken::new(),
+        );
         let app = obs_router(state, &builtin.join("no-skin"));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1650,7 +1691,10 @@ mod tests {
         query: &str,
     ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
         let root = temp_root();
-        let state = bus.obs_state(TemplateStore::new(root.join("builtin"), root.join("custom")));
+        let state = bus.obs_state(
+            TemplateStore::new(root.join("builtin"), root.join("custom")),
+            CancellationToken::new(),
+        );
         let app = obs_router(state, &root.join("no-skin"));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1661,6 +1705,57 @@ mod tests {
             .await
             .unwrap();
         ws
+    }
+
+    #[tokio::test]
+    async fn stopping_obs_server_closes_established_websockets() {
+        use futures_util::StreamExt;
+        let bus = test_bus();
+        let root = temp_root();
+        let port = StdTcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let cancel = CancellationToken::new();
+        let _server = bus
+            .spawn_obs_server_on_port(
+                root.join("builtin"),
+                root.join("custom"),
+                root.join("no-skin"),
+                port,
+                cancel.clone(),
+                None,
+            )
+            .unwrap();
+        let mut clients = Vec::new();
+        for path in ["ws", "stats", "timer", "poll"] {
+            let (ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/{path}"))
+                .await
+                .unwrap();
+            clients.push((path, ws));
+        }
+        // 接続は確立したまま(初回スナップショットを読んでも閉じない)。
+        for (path, ws) in &mut clients {
+            if *path != "ws" {
+                assert!(ws.next().await.unwrap().is_ok(), "{path}");
+            }
+        }
+
+        cancel.cancel();
+        for (path, ws) in &mut clients {
+            let closed = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    match ws.next().await {
+                        None | Some(Err(_)) => break,
+                        Some(Ok(frame)) if frame.is_close() => break,
+                        Some(Ok(_)) => {}
+                    }
+                }
+            })
+            .await;
+            assert!(closed.is_ok(), "停止後も {path} が開いたまま");
+        }
     }
 
     fn test_bus() -> Bus {
