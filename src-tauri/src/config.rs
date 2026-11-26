@@ -453,6 +453,16 @@ pub struct ObsConfig {
 }
 
 impl ObsConfig {
+    /// 手で編集した config.json の 1024 未満のポートは、読み込みの時だけ既定値に戻す。
+    /// 保存時の検査(1024〜65535)で以後の保存がすべて止まらないようにするため。画面や取り込みから
+    /// 来た値はここを通らず、保存時の検査で拒否する。
+    pub fn reset_loaded_port_out_of_range(&mut self) {
+        if self.port < 1024 {
+            tracing::warn!("OBS のポートが範囲外だったため既定値に戻しました");
+            self.port = default_obs_port();
+        }
+    }
+
     pub fn normalize(&mut self) {
         self.max_rows = self.max_rows.clamp(1, MAX_OBS_ROWS);
         self.font_scale_pct = self.font_scale_pct.clamp(50, 200);
@@ -1587,6 +1597,7 @@ impl AppConfig {
         })?;
         cfg.normalize_all();
         cfg.tts.options.truncate_loaded_dictionary();
+        cfg.obs.reset_loaded_port_out_of_range();
         Ok(cfg)
     }
 
@@ -3026,6 +3037,15 @@ mod tests {
         let before = rule.clone();
         rule.normalize();
         assert_eq!(rule, before);
+    }
+
+    #[test]
+    fn loaded_obs_port_below_1024_is_reset_to_default() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.json"), r#"{"obs":{"port":0}}"#).unwrap();
+        assert_eq!(AppConfig::load(dir.path()).unwrap().obs.port, default_obs_port());
+        std::fs::write(dir.path().join("config.json"), r#"{"obs":{"port":2000}}"#).unwrap();
+        assert_eq!(AppConfig::load(dir.path()).unwrap().obs.port, 2000);
     }
 
     #[test]
