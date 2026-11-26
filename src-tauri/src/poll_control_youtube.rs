@@ -177,7 +177,7 @@ impl YoutubePollControl {
 
         let question = &start.preferences.question;
         let options = &start.preferences.options;
-        let sent_at_ms = chrono::Utc::now().timestamp_millis();
+        let sent = Instant::now();
         let (remote_id, polling_interval_ms, tallies) = match self
             .api
             .create(&token, &live_chat_id, question, options)
@@ -186,14 +186,7 @@ impl YoutubePollControl {
             Ok(YtPollCreated { id, tallies, .. }) => (id, None, tallies),
             Err(YtPollsError::Network) => {
                 let found = self
-                    .reconcile(
-                        &client_id,
-                        token,
-                        &live_chat_id,
-                        question,
-                        options,
-                        sent_at_ms,
-                    )
+                    .reconcile(&client_id, token, &live_chat_id, question, options, sent)
                     .await?;
                 (found.id, found.polling_interval_ms, found.tallies)
             }
@@ -213,23 +206,14 @@ impl YoutubePollControl {
         // 保存に失敗しても、YouTube に作成できた投票は追跡する。
         let saved = self.poll.save_start_preferences(&start);
         let duration_secs = start.duration_secs;
-        let mut snapshot = self.poll.open(start);
         // 作成応答や採用した照合の票数は、初回の集計 GET を待たずに反映する。
         // 初回の GET より前に YouTube 側で終了しても、最終結果が 0 票にならない。
-        if let Some(votes) = snapshot_votes(tallies.as_deref(), snapshot.options.len()) {
-            self.poll.apply_external(&snapshot.id, &votes, false);
-            snapshot = self.poll.snapshot();
-        }
-        let deadline = duration_secs.map(|secs| {
-            let duration = Duration::from_secs(u64::from(secs));
-            self.poll.set_remote_timing(
-                &snapshot.id,
-                accepted_at_ms,
-                accepted_at_ms + u64::from(secs) * 1000,
-            );
-            snapshot = self.poll.snapshot();
-            accepted_at + duration
-        });
+        // 票数と締め切りは開いた時の 1 回の配信に載せ、画面と OBS に 0 票のフレームを出さない。
+        let votes = snapshot_votes(tallies.as_deref(), start.preferences.options.len());
+        let timing =
+            duration_secs.map(|secs| (accepted_at_ms, accepted_at_ms + u64::from(secs) * 1000));
+        let snapshot = self.poll.open_external(start, votes.as_deref(), timing);
+        let deadline = duration_secs.map(|secs| accepted_at + Duration::from_secs(u64::from(secs)));
         let cancel = self.app_cancel.child_token();
         *self.active.lock().await = Some(ActivePoll {
             local_id: snapshot.id.clone(),
@@ -262,7 +246,7 @@ impl YoutubePollControl {
         live_chat_id: &str,
         question: &str,
         options: &[String],
-        sent_at_ms: i64,
+        sent: Instant,
     ) -> Result<YtPollState, YoutubeControlError> {
         let mut refresh = false;
         for seconds in MATCH_RETRY_SECS {
@@ -286,9 +270,7 @@ impl YoutubePollControl {
             match found {
                 Some(Ok(Some(found)))
                     if found.status == YtPollStatus::Active
-                        && found
-                            .published_at_ms
-                            .is_some_and(|time| time > sent_at_ms - 10_000)
+                        && published_after_post(&found, sent.elapsed())
                         && found.question.trim() == question
                         && found
                             .options
@@ -545,6 +527,21 @@ fn auth_error(error: SendError) -> YoutubeControlError {
         SendError::Network(_) => YtPollsError::Network.into(),
         _ => YoutubeControlError::Authentication,
     }
+}
+
+/// 照合で見つけた投票が、作成 POST の 10 秒前より後に公開されたか。
+/// 公開時刻は YouTube の時計なので、同じ応答の Date ヘッダと比べる。PC の時計は
+/// YouTube の時計とずれうるので、POST からの経過(単調時計)を測るのにだけ使う。
+/// Date は秒単位に切り捨てられているので 1 秒進める。Date を読めない時は PC の時計で代用する。
+fn published_after_post(found: &YtPollState, since_post: Duration) -> bool {
+    let now_ms = found.server_time_ms.map_or_else(
+        || chrono::Utc::now().timestamp_millis(),
+        |date_ms| date_ms + 1000,
+    );
+    let since_post_ms = i64::try_from(since_post.as_millis()).unwrap_or(i64::MAX);
+    found
+        .published_at_ms
+        .is_some_and(|published| published > now_ms.saturating_sub(since_post_ms) - 10_000)
 }
 
 fn next_poll_delay(interval_ms: Option<u64>) -> Duration {

@@ -2,7 +2,10 @@
 
 use std::{sync::LazyLock, time::Duration};
 
-use reqwest::{header::CONTENT_LENGTH, RequestBuilder, StatusCode, Url};
+use reqwest::{
+    header::{CONTENT_LENGTH, DATE},
+    RequestBuilder, StatusCode, Url,
+};
 use serde_json::{json, Value};
 
 use super::youtube_send::google_api_reason;
@@ -33,6 +36,8 @@ pub struct YtPollState {
     pub published_at_ms: Option<i64>,
     /// list 応答の `pollingIntervalMillis`。list 以外の応答では None。
     pub polling_interval_ms: Option<u64>,
+    /// list 応答の Date ヘッダ(YouTube 側の時計、UNIX ミリ秒)。欠落・不正と list 以外の応答では None。
+    pub server_time_ms: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -170,7 +175,7 @@ impl YoutubePolls {
             .http
             .get(&self.messages_url)
             .query(&[("liveChatId", live_chat_id), ("maxResults", "200")]);
-        let value = self.send(request, token, &[live_chat_id]).await?;
+        let (value, server_time_ms) = self.send_dated(request, token, &[live_chat_id]).await?;
         let interval = &value["pollingIntervalMillis"];
         let polling_interval_ms = interval
             .as_u64()
@@ -180,6 +185,7 @@ impl YoutubePolls {
             .and_then(parse_state)
             .map(|state| YtPollState {
                 polling_interval_ms,
+                server_time_ms,
                 ..state
             }))
     }
@@ -190,6 +196,16 @@ impl YoutubePolls {
         token: &str,
         identifiers: &[&str],
     ) -> Result<Value, YtPollsError> {
+        Ok(self.send_dated(request, token, identifiers).await?.0)
+    }
+
+    /// 応答の本文と、Date ヘッダの時刻(UNIX ミリ秒。欠落・不正なら None)を返す。
+    async fn send_dated(
+        &self,
+        request: RequestBuilder,
+        token: &str,
+        identifiers: &[&str],
+    ) -> Result<(Value, Option<i64>), YtPollsError> {
         let response = request
             .query(&[("part", "snippet")])
             .bearer_auth(token)
@@ -198,7 +214,13 @@ impl YoutubePolls {
             .map_err(|_| YtPollsError::Network)?;
         let status = response.status();
         if status.is_success() {
-            return response.json().await.map_err(|_| YtPollsError::Network);
+            let date = response
+                .headers()
+                .get(DATE)
+                .and_then(|date| chrono::DateTime::parse_from_rfc2822(date.to_str().ok()?).ok())
+                .map(|date| date.timestamp_millis());
+            let value = response.json().await.map_err(|_| YtPollsError::Network)?;
+            return Ok((value, date));
         }
         let body = response.text().await.unwrap_or_default();
         let host = Url::parse(&self.base_url)
@@ -313,6 +335,7 @@ fn parse_state(item: &Value) -> Option<YtPollState> {
             .flatten(),
         published_at_ms: published_at_ms(item),
         polling_interval_ms: None,
+        server_time_ms: None,
     })
 }
 
