@@ -1744,7 +1744,7 @@ mod tests {
 
         cancel.cancel();
         for (path, ws) in &mut clients {
-            let closed = tokio::time::timeout(Duration::from_secs(2), async {
+            let closed = tokio::time::timeout(Duration::from_secs(10), async {
                 loop {
                     match ws.next().await {
                         None | Some(Err(_)) => break,

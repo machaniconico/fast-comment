@@ -304,11 +304,14 @@ mod tests {
         }
     }
 
-    async fn free_port() -> u16 {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        port
+    /// 接続を必ず拒否するポート。bind だけして listen しないソケットを持ち続けるので、並列の
+    /// 他のテストにポートを取られず(手放した空きポートは再利用されて別の応答が返ることがある)、
+    /// WSL2 の mirrored networking でも即座に接続拒否になる。
+    fn refused_port() -> (tokio::net::TcpSocket, u16) {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let port = socket.local_addr().unwrap().port();
+        (socket, port)
     }
 
     #[tokio::test]
@@ -365,7 +368,7 @@ mod tests {
     #[tokio::test]
     async fn post_connect_failure_retries_then_network() {
         let (base, _server) = spawn_api_server().await;
-        let closed = free_port().await;
+        let (_refusing, closed) = refused_port();
         let mut endpoints = endpoints(&base);
         endpoints.tweets = format!("http://127.0.0.1:{closed}/tweets");
         let store = Arc::new(MemoryTokenStore::with_token(stored()));
