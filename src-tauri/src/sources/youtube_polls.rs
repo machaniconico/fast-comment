@@ -1,6 +1,7 @@
 //! YouTube Data API の公式投票。
 
 use std::{sync::LazyLock, time::Duration};
+use tokio::time::Instant;
 
 use reqwest::{
     header::{CONTENT_LENGTH, DATE},
@@ -38,6 +39,9 @@ pub struct YtPollState {
     pub polling_interval_ms: Option<u64>,
     /// list 応答の Date ヘッダ(YouTube 側の時計、UNIX ミリ秒)。欠落・不正と list 以外の応答では None。
     pub server_time_ms: Option<i64>,
+    /// list 応答のヘッダを受けた時刻(単調時計)。Date と同じ瞬間の値で、本文の受信時間を含まない。
+    /// list 以外の応答では None。
+    pub received_at: Option<Instant>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -175,7 +179,8 @@ impl YoutubePolls {
             .http
             .get(&self.messages_url)
             .query(&[("liveChatId", live_chat_id), ("maxResults", "200")]);
-        let (value, server_time_ms) = self.send_dated(request, token, &[live_chat_id]).await?;
+        let (value, server_time_ms, received_at) =
+            self.send_dated(request, token, &[live_chat_id]).await?;
         let interval = &value["pollingIntervalMillis"];
         let polling_interval_ms = interval
             .as_u64()
@@ -186,6 +191,7 @@ impl YoutubePolls {
             .map(|state| YtPollState {
                 polling_interval_ms,
                 server_time_ms,
+                received_at: Some(received_at),
                 ..state
             }))
     }
@@ -199,19 +205,21 @@ impl YoutubePolls {
         Ok(self.send_dated(request, token, identifiers).await?.0)
     }
 
-    /// 応答の本文と、Date ヘッダの時刻(UNIX ミリ秒。欠落・不正なら None)を返す。
+    /// 応答の本文と、Date ヘッダの時刻(UNIX ミリ秒。欠落・不正なら None)と、
+    /// ヘッダを受けた時刻(単調時計)を返す。本文の受信が遅れても、Date と対になる時刻はずれない。
     async fn send_dated(
         &self,
         request: RequestBuilder,
         token: &str,
         identifiers: &[&str],
-    ) -> Result<(Value, Option<i64>), YtPollsError> {
+    ) -> Result<(Value, Option<i64>, Instant), YtPollsError> {
         let response = request
             .query(&[("part", "snippet")])
             .bearer_auth(token)
             .send()
             .await
             .map_err(|_| YtPollsError::Network)?;
+        let received_at = Instant::now();
         let status = response.status();
         if status.is_success() {
             let date = response
@@ -220,7 +228,7 @@ impl YoutubePolls {
                 .and_then(|date| chrono::DateTime::parse_from_rfc2822(date.to_str().ok()?).ok())
                 .map(|date| date.timestamp_millis());
             let value = response.json().await.map_err(|_| YtPollsError::Network)?;
-            return Ok((value, date));
+            return Ok((value, date, received_at));
         }
         let body = response.text().await.unwrap_or_default();
         let host = Url::parse(&self.base_url)
@@ -336,6 +344,7 @@ fn parse_state(item: &Value) -> Option<YtPollState> {
         published_at_ms: published_at_ms(item),
         polling_interval_ms: None,
         server_time_ms: None,
+        received_at: None,
     })
 }
 

@@ -270,7 +270,7 @@ impl YoutubePollControl {
             match found {
                 Some(Ok(Some(found)))
                     if found.status == YtPollStatus::Active
-                        && published_after_post(&found, sent.elapsed())
+                        && published_after_post(&found, sent)
                         && found.question.trim() == question
                         && found
                             .options
@@ -532,12 +532,13 @@ fn auth_error(error: SendError) -> YoutubeControlError {
 /// 照合で見つけた投票が、作成 POST の 10 秒前より後に公開されたか。
 /// 公開時刻は YouTube の時計なので、同じ応答の Date ヘッダと比べる。PC の時計は
 /// YouTube の時計とずれうるので、POST からの経過(単調時計)を測るのにだけ使う。
+/// 経過は Date と同じ瞬間(応答ヘッダの受信時)までを測る。本文の受信が遅れても基準を早めない。
 /// Date は秒単位に切り捨てられているので 1 秒進める。Date を読めない時は PC の時計で代用する。
-fn published_after_post(found: &YtPollState, since_post: Duration) -> bool {
-    let now_ms = found.server_time_ms.map_or_else(
-        || chrono::Utc::now().timestamp_millis(),
-        |date_ms| date_ms + 1000,
-    );
+fn published_after_post(found: &YtPollState, sent: Instant) -> bool {
+    let (now_ms, since_post) = match (found.server_time_ms, found.received_at) {
+        (Some(date_ms), Some(at)) => (date_ms + 1000, at.saturating_duration_since(sent)),
+        _ => (chrono::Utc::now().timestamp_millis(), sent.elapsed()),
+    };
     let since_post_ms = i64::try_from(since_post.as_millis()).unwrap_or(i64::MAX);
     found
         .published_at_ms
