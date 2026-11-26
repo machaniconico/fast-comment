@@ -423,7 +423,7 @@ const MAX_OBS_ROWS: u16 = 1000;
 #[serde(rename_all = "camelCase")]
 pub struct ObsConfig {
     /// axum サーバの待受ポート。既定 11180。
-    #[serde(default = "default_obs_port")]
+    #[serde(default = "default_obs_port", deserialize_with = "deserialize_obs_port")]
     pub port: u16,
     /// OBS オーバーレイで使うテンプレート名。既定 "default"。
     /// SPEC §10 に従い config を唯一の永続化先とする(localStorage 非使用)。
@@ -1801,6 +1801,22 @@ fn default_minus_one() -> i16 {
 fn default_obs_port() -> u16 {
     11180
 }
+
+/// `u16` に収まらない値(65536 以上・負・小数・文字列など)は、設定全体を壊さずに既定値へ戻す。
+/// u16 の範囲の値はそのまま受け取り、1024 未満は読み込み時の補正と保存時の検査で扱う。
+fn deserialize_obs_port<'de, D>(deserializer: D) -> Result<u16, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match value.as_u64().and_then(|n| u16::try_from(n).ok()) {
+        Some(port) => Ok(port),
+        None => {
+            tracing::warn!("OBS のポートが範囲外だったため既定値に戻しました");
+            Ok(default_obs_port())
+        }
+    }
+}
 fn default_obs_template() -> String {
     "default".to_string()
 }
@@ -3046,6 +3062,19 @@ mod tests {
         assert_eq!(AppConfig::load(dir.path()).unwrap().obs.port, default_obs_port());
         std::fs::write(dir.path().join("config.json"), r#"{"obs":{"port":2000}}"#).unwrap();
         assert_eq!(AppConfig::load(dir.path()).unwrap().obs.port, 2000);
+    }
+
+    #[test]
+    fn loaded_obs_port_outside_u16_resets_only_the_port() {
+        let dir = tempfile::tempdir().unwrap();
+        for bad in ["65536", "-1", "1.5", "\"11180\"", "null", "99999999999"] {
+            let json = format!(r#"{{"obs":{{"port":{bad},"maxRows":7}},"log":{{"retentionDays":3}}}}"#);
+            std::fs::write(dir.path().join("config.json"), json).unwrap();
+            let cfg = AppConfig::load(dir.path()).unwrap_or_else(|e| panic!("{bad}: {e}"));
+            assert_eq!(cfg.obs.port, default_obs_port(), "{bad}");
+            // ポート以外の設定は残る(設定全体が既定に戻らない)。
+            assert_eq!(cfg.obs.max_rows, 7, "{bad}");
+        }
     }
 
     #[test]
