@@ -27,12 +27,14 @@ use crate::{
 mod tests;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
-/// 作成応答を失った後の照合 GET の待ち時間。Network と 5xx の時だけ次を試す。
+/// 作成応答を失った後の照合 GET の待ち時間。Network と 5xx、応答が無い時だけ次を試す。
 const MATCH_RETRY_DELAYS: [Duration; 3] = [
     Duration::from_secs(1),
     Duration::from_secs(2),
     Duration::from_secs(4),
 ];
+/// 照合を打ち切るまでの時間(作成の失敗から)。応答が無い GET を HTTP のタイムアウトまで待たない。
+const MATCH_TIMEOUT: Duration = Duration::from_secs(10);
 /// 操作回数制限の解除時刻が分からない時の待ち時間。Twitch の制限は 1 分単位で回復する。
 const UNKNOWN_RATE_LIMIT_RETRY_SECS: u64 = 60;
 
@@ -227,29 +229,37 @@ impl PollControl {
                     Err(PollsError::Network) => {
                         // 作成済みの可能性があるので POST は繰り返さず、最新の投票を照合する。
                         let mut matched = None;
-                        for delay in MATCH_RETRY_DELAYS {
-                            let waited = self
-                                .app_cancel
-                                .run_until_cancelled(tokio::time::sleep(delay))
-                                .await;
-                            if waited.is_none() {
-                                break;
-                            }
+                        let mut next_get = tokio::time::Instant::now();
+                        let give_up = next_get + MATCH_TIMEOUT;
+                        for (attempt, delay) in MATCH_RETRY_DELAYS.into_iter().enumerate() {
+                            next_get += delay;
+                            // 応答を待つのは次の GET の時刻まで。最後の GET は打ち切りの時刻まで。
+                            let wait_until = MATCH_RETRY_DELAYS
+                                .get(attempt + 1)
+                                .map_or(give_up, |next| next_get + *next);
                             let found = self
                                 .app_cancel
-                                .run_until_cancelled(helix.find_matching_latest(
-                                    &access.token,
-                                    &broadcaster_id,
-                                    title,
-                                    choices,
-                                    duration_secs,
-                                    sent_at_ms,
-                                ))
+                                .run_until_cancelled(async {
+                                    tokio::time::sleep_until(next_get).await;
+                                    tokio::time::timeout_at(
+                                        wait_until,
+                                        helix.find_matching_latest(
+                                            &access.token,
+                                            &broadcaster_id,
+                                            title,
+                                            choices,
+                                            duration_secs,
+                                            sent_at_ms,
+                                        ),
+                                    )
+                                    .await
+                                })
                                 .await;
                             match found {
-                                Some(Err(PollsError::Network)) => {}
-                                Some(Err(PollsError::Api(status))) if status >= 500 => {}
-                                Some(Ok(found)) => {
+                                // 応答が無いまま待ち切った GET は、通信失敗と同じく次を試す。
+                                Some(Err(_) | Ok(Err(PollsError::Network))) => {}
+                                Some(Ok(Err(PollsError::Api(status)))) if status >= 500 => {}
+                                Some(Ok(Ok(found))) => {
                                     matched = found;
                                     break;
                                 }
