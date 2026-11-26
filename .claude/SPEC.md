@@ -247,7 +247,7 @@ trait Source {
 
 - 内部: `tokio::sync::broadcast`（容量上限あり、lag は drop 容認=最新優先）。
 - **UI向け**: Tauri の `app_handle.emit("chat", batch)`。**個別送出せず ~16ms(1フレーム) でまとめて配列送出**(IPC往復削減)。
-- **OBS向け**: axum WebSocket `/ws`。接続クライアントへ同じ batch を push。`GET /?template=<name>` は `templates/<name>/index.html` を返す（未指定は `default`、`../` 等は拒否）。静的アセットは `/<name>/...` で配信。ポートは設定(既定 11180)で、変更時は新ポートの bind 成功後にサーバを再起動して再 bind する。
+- **OBS向け**: axum WebSocket `/ws`。接続クライアントへ同じ batch を push。`GET /?template=<name>` は `templates/<name>/index.html` を返す（未指定は `default`、`../` 等は拒否）。静的アセットは `/<name>/...` で配信。ポートは設定(既定 11180)。設定の保存(`update_config`・`import_config`)でポートが変わる時は、保存の前に新ポートを bind する。bind できたら、保存の確定後に旧サーバを止めて新ポートへ切り替える(保存に失敗した時は新ポートのサーバを止め、旧ポートのまま)。bind できない時(他のアプリが使用中など)は `obs.port` だけを今の待受ポートに戻して他の項目を保存し、応答の `warnings` で、開けなかったポートと、ポートを変更せず今の値のまま保存したことを知らせる(応答の設定でフォームのポート欄も今の値に戻る)。保存した `obs.port` と実際の待受ポートを食い違わせない。
 - バックプレッシャ: 各クライアントごとに bounded queue、溢れたら古いものから捨てる。
 - **モデレーションイベント**(P6 Phase 3): Source → `mpsc`(容量 1024、送信は `try_send` で chat 受信をブロックしない)→ `spawn_moderation_ui_forwarder` が 16ms バッチで `emit("chat-moderation", Vec<ModerationEvent>)`。同じ forwarder で `MessageDeleted` を Moderator の hidden_ids(上限 8192 の FIFO)へ入れ、未読み上げの該当コメントを TTS キューから除く。同じ forwarder から OBS(`/ws?modEvents=1`)へも流す(§9)。
 

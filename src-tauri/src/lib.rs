@@ -615,6 +615,13 @@ struct ObsServerControl {
     cancel: CancellationToken,
 }
 
+/// 設定の保存前に新しいポートで起動した OBS サーバ。
+/// `switch_obs_server` で切り替えずに捨てると止まる(保存に失敗した時に残さない)。
+struct PendingObsServer {
+    port: u16,
+    cancel: tokio_util::sync::DropGuard,
+}
+
 enum AchievementEvent<'a> {
     Chat(ChatMessage),
     Live(&'a LiveEvent),
@@ -1937,6 +1944,13 @@ async fn save_config_update(
         current_mode,
         &mut import_notices,
     )?;
+    // OBS のポートは保存の前に bind する。開けなければ今の待受ポートのまま保存し、
+    // 保存した値と実際の待受ポートを食い違わせない(SPEC §5)。
+    let listening_port = state.obs_server.lock().unwrap().port;
+    let (pending_obs_server, obs_port_warning) =
+        settle_obs_port(&mut new_config, listening_port, |port| {
+            start_obs_server(&app, &state, port)
+        });
     let (
         revision,
         youtube_source_config_changed,
@@ -1996,11 +2010,13 @@ async fn save_config_update(
         .unwrap()
         .update_config(&new_config.moderation);
 
-    // OBS ポート反映。ポートが変わった場合は旧サーバを停止し、新ポートで再 bind する。
-    restart_obs_server_if_needed(&app, &state, new_config.obs.port)?;
+    // OBS ポート反映。保存を確定できたので、旧サーバを止めて新ポートのサーバへ切り替える。
+    if let Some(pending) = pending_obs_server {
+        switch_obs_server(&state.obs_server, pending);
+    }
     drop(write);
 
-    let mut warnings = Vec::new();
+    let mut warnings = Vec::from_iter(obs_port_warning);
     if let Some(w) = configure_chatlog_nonfatal(&state.chatlog, new_config.log.clone()).await {
         warnings.push(w);
     }
@@ -3858,19 +3874,48 @@ fn spawn_webhook_forwarder(app: AppHandle, cancel: CancellationToken) {
     });
 }
 
-/// OBS サーバの待受ポートが変わったら、旧サーバを止めて新ポートで起動する。
-fn restart_obs_server_if_needed(
+/// 保存する OBS ポートが今の待受ポートと違えば、`bind` で新ポートの待ち受けを始める。
+/// bind できなければ `new_config` のポートを今の待受ポートへ戻し、画面へ出す警告を返す
+/// (他の項目は保存する。警告に載せるのはポート番号だけ)。
+fn settle_obs_port<T>(
+    new_config: &mut AppConfig,
+    listening_port: u16,
+    bind: impl FnOnce(u16) -> Result<T, String>,
+) -> (Option<T>, Option<String>) {
+    let requested = new_config.obs.port;
+    if requested == listening_port {
+        return (None, None);
+    }
+    match bind(requested) {
+        Ok(server) => (Some(server), None),
+        Err(_) => {
+            new_config.obs.port = listening_port;
+            let warning = format!(
+                "OBS のポート {requested} を開けませんでした(他のアプリが使用中の可能性があります)。\
+                 ポートは変更せず、{listening_port} のまま保存しました"
+            );
+            (None, Some(warning))
+        }
+    }
+}
+
+/// 旧サーバを止め、保存前に起動しておいた新ポートのサーバを現行にする。
+fn switch_obs_server(server: &Mutex<ObsServerControl>, pending: PendingObsServer) {
+    let mut server = server.lock().unwrap();
+    tracing::info!("OBS サーバを再起動: {} -> {}", server.port, pending.port);
+    server.cancel.cancel();
+    *server = ObsServerControl {
+        port: pending.port,
+        cancel: pending.cancel.disarm(),
+    };
+}
+
+/// 旧サーバを動かしたまま、新ポートで OBS サーバを起動する。bind できなければ Err。
+fn start_obs_server(
     app: &AppHandle,
     state: &AppState,
     new_port: u16,
-) -> Result<(), String> {
-    let mut server = state.obs_server.lock().unwrap();
-    if server.port == new_port {
-        return Ok(());
-    }
-
-    tracing::info!("OBS サーバを再起動: {} -> {}", server.port, new_port);
-
+) -> Result<PendingObsServer, String> {
     let cancel = state.app_cancel.child_token();
     let _obs_task = state.bus.spawn_obs_server_on_port(
         state.templates.builtin_root().to_path_buf(),
@@ -3887,13 +3932,10 @@ fn restart_obs_server_if_needed(
             new_port,
         )),
     )?;
-
-    server.cancel.cancel();
-    *server = ObsServerControl {
+    Ok(PendingObsServer {
         port: new_port,
-        cancel,
-    };
-    Ok(())
+        cancel: cancel.drop_guard(),
+    })
 }
 
 /// 最新の設定と起動状態を突き合わせる。追加・削除と同じ順でロックする。
@@ -5858,6 +5900,75 @@ mod followup_tests {
             .unwrap()
             .unwrap();
         assert!(channel.is_cancelled());
+    }
+
+    #[test]
+    fn obs_port_conflict_keeps_listening_port_and_warns() {
+        // 他のアプリが使用中のポートへ変えて保存する。
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let requested = occupied.local_addr().unwrap().port();
+        let mut config = AppConfig::default();
+        let listening = config.obs.port;
+        config.obs.port = requested;
+        let (server, warning) = settle_obs_port(&mut config, listening, |port| {
+            std::net::TcpListener::bind(("127.0.0.1", port)).map_err(|e| e.to_string())
+        });
+        assert!(server.is_none());
+        assert_eq!(config.obs.port, listening, "保存する値が待受ポートと食い違った");
+        let warning = warning.unwrap();
+        assert!(
+            warning.contains(&format!("ポート {requested} を開けませんでした"))
+                && warning.contains(&format!("変更せず、{listening} のまま保存しました")),
+            "{warning}"
+        );
+    }
+
+    #[test]
+    fn obs_port_change_binds_before_save_and_same_port_is_left_alone() {
+        let mut config = AppConfig::default();
+        let listening = config.obs.port;
+        let (server, warning) =
+            settle_obs_port(&mut config, listening, |_| -> Result<(), String> {
+                panic!("待受中のポートを bind し直した")
+            });
+        assert!(server.is_none() && warning.is_none());
+
+        // 開けたポートは、そのまま保存へ進む。
+        config.obs.port = listening + 1;
+        let (server, warning) = settle_obs_port(&mut config, listening, Ok::<u16, String>);
+        assert_eq!(
+            (server, warning, config.obs.port),
+            (Some(listening + 1), None, listening + 1)
+        );
+    }
+
+    #[test]
+    fn pending_obs_server_stops_unless_switched() {
+        let old = CancellationToken::new();
+        let server = Mutex::new(ObsServerControl {
+            port: 11180,
+            cancel: old.clone(),
+        });
+        // 保存に失敗して捨てた新サーバは止まり、旧サーバは待ち受けたまま。
+        let abandoned = CancellationToken::new();
+        drop(PendingObsServer {
+            port: 11181,
+            cancel: abandoned.clone().drop_guard(),
+        });
+        assert!(abandoned.is_cancelled() && !old.is_cancelled());
+        assert_eq!(server.lock().unwrap().port, 11180);
+
+        // 保存できた時は旧サーバを止め、新サーバを現行にする。
+        let new = CancellationToken::new();
+        switch_obs_server(
+            &server,
+            PendingObsServer {
+                port: 11181,
+                cancel: new.clone().drop_guard(),
+            },
+        );
+        assert!(old.is_cancelled() && !new.is_cancelled());
+        assert_eq!(server.lock().unwrap().port, 11181);
     }
 
     #[test]
