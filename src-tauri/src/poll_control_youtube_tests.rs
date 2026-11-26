@@ -1183,3 +1183,38 @@ async fn reconcile_uses_pc_clock_when_date_header_is_unusable() {
         assert_eq!(fixture.start().await.is_ok(), adopted, "age={age_secs}");
     }
 }
+
+#[tokio::test]
+async fn reconcile_measures_elapsed_when_date_header_arrives() {
+    // 照合 GET のヘッダ(Date)は届いたが、本文が 8 秒遅れる。経過を本文の受信後に測ると
+    // 基準が 8 秒早まり、POST の 15 秒前からある同じ内容の投票を採用してしまう。
+    let fixture = Fixture::new().await;
+    fixture.mock.create.lock().unwrap().push_back(interrupted());
+    let posted = chrono::Utc::now();
+    let mut candidate = item(ID, "active");
+    candidate["snippet"]["publishedAt"] =
+        json!((posted - chrono::Duration::seconds(15)).to_rfc3339());
+    let body = serde_json::to_vec(&json!({"activePollItem": candidate})).unwrap();
+    let chunks = futures_util::stream::once(async move {
+        time::sleep(Duration::from_secs(8)).await;
+        Ok::<_, io::Error>(bytes::Bytes::from(body))
+    });
+    let mut response = Body::from_stream(chunks).into_response();
+    let date = (posted + chrono::Duration::seconds(1))
+        .format("%a, %d %b %Y %H:%M:%S GMT")
+        .to_string();
+    response.headers_mut().insert("date", date.parse().unwrap());
+    fixture.mock.active.lock().unwrap().push_back(response);
+
+    assert!(matches!(
+        fixture.start().await,
+        Err(PollControlError::Youtube(
+            YoutubeControlError::CreateUnconfirmed
+        ))
+    ));
+    assert_eq!(fixture.control.snapshot().status, PollStatus::Idle);
+    assert_eq!(
+        fixture.mock.calls(),
+        ["token", "broadcasts", "create", "active"]
+    );
+}

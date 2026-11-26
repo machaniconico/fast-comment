@@ -1914,6 +1914,7 @@ async fn save_config_update(
         )?
     };
     validate_x_post_template(&new_config.x_post.template)?;
+    validate_obs_port(new_config.obs.port)?;
     let mut import_notices = Vec::new();
     let protected_oauth = {
         let current = state.config.lock().unwrap();
@@ -2911,6 +2912,15 @@ fn validate_x_post_template(template: &str) -> Result<(), String> {
         ),
         _ => Ok(()),
     }
+}
+
+/// 保存前の OBS ポート検査。0 は OS が選ぶ空きポートで待ち受けてしまい、保存値と食い違う。
+/// 下限は他のポート設定(コールバックポート)と同じ 1024。
+fn validate_obs_port(port: u16) -> Result<(), String> {
+    if port < 1024 {
+        return Err("OBS のポートは 1024〜65535 の整数にしてください".into());
+    }
+    Ok(())
 }
 
 /// 見本データでテンプレートを描画する。文字数は Rust 側で数える(UI は数えない)。
@@ -5649,6 +5659,20 @@ mod followup_tests {
         assert!(validate_x_post_template("配信開始").is_err());
         assert!(validate_x_post_template("{title}\n{url}").is_ok());
         assert!(validate_x_post_template(&AppConfig::default().x_post.template).is_ok());
+    }
+
+    #[test]
+    fn obs_port_below_1024_is_rejected_before_save() {
+        for bad in [0, 1, 1023] {
+            assert_eq!(
+                validate_obs_port(bad).unwrap_err(),
+                "OBS のポートは 1024〜65535 の整数にしてください",
+                "{bad}"
+            );
+        }
+        for ok in [1024, 65535, AppConfig::default().obs.port] {
+            assert!(validate_obs_port(ok).is_ok(), "{ok}");
+        }
     }
 
     #[test]
