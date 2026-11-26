@@ -367,6 +367,17 @@ impl Poll {
     }
 
     pub(crate) fn open(&self, start: ValidatedStart) -> PollSnapshot {
+        self.open_external(start, None, None)
+    }
+
+    /// 配信サービス側で作成済みの投票を開く。採用済みの票数と開始・終了予定時刻
+    /// (UNIX ミリ秒)は、開いた時の 1 回の配信に載せる(0 票のフレームを挟まない)。
+    pub(crate) fn open_external(
+        &self,
+        start: ValidatedStart,
+        votes: Option<&[u32]>,
+        timing: Option<(u64, u64)>,
+    ) -> PollSnapshot {
         let mut current = self.current.lock().unwrap();
         let started_at_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -410,6 +421,13 @@ impl Poll {
             },
             ..CurrentPoll::default()
         };
+        if let Some(votes) = votes {
+            set_votes(&mut current.snapshot, votes);
+        }
+        if let Some((started_at_ms, ends_at_ms)) = timing {
+            current.snapshot.started_at_ms = started_at_ms;
+            current.snapshot.ends_at_ms = Some(ends_at_ms);
+        }
         self.publish(&mut current);
         self.wake.notify_one();
         current.snapshot.clone()
@@ -420,14 +438,7 @@ impl Poll {
         if current.snapshot.id != poll_id || current.snapshot.source == PollSource::Chat {
             return false;
         }
-        for (index, option) in current.snapshot.options.iter_mut().enumerate() {
-            option.votes = votes.get(index).copied().unwrap_or_default();
-        }
-        current.snapshot.total_voters = current
-            .snapshot
-            .options
-            .iter()
-            .fold(0u32, |total, option| total.saturating_add(option.votes));
+        set_votes(&mut current.snapshot, votes);
         if closed {
             self.close(&mut current);
         } else {
@@ -598,6 +609,16 @@ impl Poll {
         self.tx.send_replace(current.snapshot.clone());
         (self.emit_snapshot)(&current.snapshot);
     }
+}
+
+fn set_votes(snapshot: &mut PollSnapshot, votes: &[u32]) {
+    for (index, option) in snapshot.options.iter_mut().enumerate() {
+        option.votes = votes.get(index).copied().unwrap_or_default();
+    }
+    snapshot.total_voters = snapshot
+        .options
+        .iter()
+        .fold(0u32, |total, option| total.saturating_add(option.votes));
 }
 
 fn eligible(msg: &ChatMessage, verdict: &Verdict) -> bool {

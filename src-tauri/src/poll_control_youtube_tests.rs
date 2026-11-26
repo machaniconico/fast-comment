@@ -183,6 +183,8 @@ struct Fixture {
     poll: Arc<Poll>,
     config: watch::Sender<AppConfig>,
     saved: Arc<StdMutex<usize>>,
+    // 画面と OBS へ配信したスナップショット(配信した順)。
+    emitted: Arc<StdMutex<Vec<PollSnapshot>>>,
     // 設定の保存にかける時間。保存が遅い時の締め切りを確かめる。
     save_delay: Arc<StdMutex<Duration>>,
     notices: tokio::sync::mpsc::UnboundedReceiver<String>,
@@ -221,6 +223,8 @@ impl Fixture {
         let captured = saved.clone();
         let save_delay = Arc::new(StdMutex::new(Duration::ZERO));
         let delay = save_delay.clone();
+        let emitted = Arc::new(StdMutex::new(Vec::new()));
+        let frames = emitted.clone();
         let poll = Arc::new(Poll::new(
             move |change| {
                 if matches!(change, PreferenceChange::Started(_)) {
@@ -229,7 +233,7 @@ impl Fixture {
                 }
                 Ok(())
             },
-            |_| {},
+            move |snapshot| frames.lock().unwrap().push(snapshot.clone()),
         ));
         let (notice_tx, notices) = tokio::sync::mpsc::unbounded_channel();
         let cancel = CancellationToken::new();
@@ -251,6 +255,7 @@ impl Fixture {
             poll,
             config,
             saved,
+            emitted,
             save_delay,
             notices,
             cancel,
@@ -1093,4 +1098,88 @@ async fn create_response_tallies_are_applied_on_open() {
             .collect::<Vec<_>>(),
         [7, 3]
     );
+}
+
+#[tokio::test]
+async fn open_publishes_adopted_tallies_and_timing_in_one_frame() {
+    // 作成応答の票数(A=7・B=3)と締め切りは、開いた時の 1 回の配信に載せる。
+    let fixture = Fixture::new().await;
+    let opened = fixture.control.start(timed_start()).await.unwrap();
+    let frames = fixture.emitted.lock().unwrap().clone();
+    assert_eq!(frames, [opened], "0 票や締め切り前のフレームを配信した");
+    let votes: Vec<_> = frames[0]
+        .options
+        .iter()
+        .map(|option| option.votes)
+        .collect();
+    assert_eq!((votes, frames[0].total_voters), (vec![7, 3], 10));
+    assert_eq!(frames[0].ends_at_ms, Some(frames[0].started_at_ms + 10_000));
+}
+
+/// 照合 GET の応答を積む。YouTube の時計は PC より `ahead_secs` 秒進んでいて、
+/// 同じ内容の投票は YouTube の時計で `age_secs` 秒前に公開された。
+/// `date` が None なら、その時計の時刻を Date ヘッダに入れる。
+fn push_match_on_youtube_clock(
+    fixture: &Fixture,
+    ahead_secs: i64,
+    age_secs: i64,
+    date: Option<&str>,
+) {
+    let youtube_now = chrono::Utc::now() + chrono::Duration::seconds(ahead_secs);
+    let mut candidate = item(ID, "active");
+    candidate["snippet"]["publishedAt"] =
+        json!((youtube_now - chrono::Duration::seconds(age_secs)).to_rfc3339());
+    let mut response = Json(json!({"activePollItem": candidate})).into_response();
+    let date = date.map_or_else(
+        || youtube_now.format("%a, %d %b %Y %H:%M:%S GMT").to_string(),
+        str::to_owned,
+    );
+    response.headers_mut().insert("date", date.parse().unwrap());
+    fixture.mock.active.lock().unwrap().push_back(response);
+}
+
+#[tokio::test]
+async fn reconcile_adopts_own_poll_when_pc_clock_is_ahead() {
+    // PC の時計が 60 秒進んでいる。作成した投票の公開時刻は PC の時計では 60 秒前に見える。
+    let fixture = Fixture::new().await;
+    fixture.mock.create.lock().unwrap().push_back(interrupted());
+    push_match_on_youtube_clock(&fixture, -60, 0, None);
+
+    assert_eq!(fixture.start().await.unwrap().status, PollStatus::Open);
+    assert_eq!(
+        fixture.mock.calls(),
+        ["token", "broadcasts", "create", "active"]
+    );
+}
+
+#[tokio::test]
+async fn reconcile_rejects_older_poll_when_pc_clock_is_behind() {
+    // PC の時計が 60 秒遅れている。30 秒前からある同じ内容の投票は、PC の時計では未来に見える。
+    let fixture = Fixture::new().await;
+    fixture.mock.create.lock().unwrap().push_back(interrupted());
+    push_match_on_youtube_clock(&fixture, 60, 30, None);
+
+    assert!(matches!(
+        fixture.start().await,
+        Err(PollControlError::Youtube(
+            YoutubeControlError::CreateUnconfirmed
+        ))
+    ));
+    assert_eq!(fixture.control.snapshot().status, PollStatus::Idle);
+    assert_eq!(
+        fixture.mock.calls(),
+        ["token", "broadcasts", "create", "active"]
+    );
+    assert_eq!(*fixture.saved.lock().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn reconcile_uses_pc_clock_when_date_header_is_unusable() {
+    // Date ヘッダを読めない時は PC の時計で比べる(時計が合っていれば採用・拒否とも正しい)。
+    for (age_secs, adopted) in [(0, true), (30, false)] {
+        let fixture = Fixture::new().await;
+        fixture.mock.create.lock().unwrap().push_back(interrupted());
+        push_match_on_youtube_clock(&fixture, 0, age_secs, Some("unknown"));
+        assert_eq!(fixture.start().await.is_ok(), adopted, "age={age_secs}");
+    }
 }

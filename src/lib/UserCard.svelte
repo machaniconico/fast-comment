@@ -9,7 +9,7 @@
   import { moderation } from './moderation.svelte';
   import { moderationAvailability, TIMEOUT_PRESETS, formatTimeoutLabel } from './moderationActions';
   import { trophyViews, type TrophyView } from './achievementsUi';
-  import { isListenerDeleted, safeAvatarUrl, type ListenerDonation, type ListenerRecord, type ListenerUpdate } from './types';
+  import { hasDonationFrom, isListenerDeleted, safeAvatarUrl, type ListenerDonation, type ListenerRecord, type ListenerUpdate } from './types';
 
   type LoadState = 'loading' | 'loaded' | 'error';
 
@@ -241,12 +241,7 @@
   onMount(() => {
     const stopBatches = store.subscribeBatches((messages) => {
       const t = ui.userCard;
-      if (t && messages.some((msg) =>
-        msg.platform === t.platform && msg.author.id === t.authorId && msg.amount &&
-        (msg.kind === 'superChat' || msg.kind === 'bits' || msg.kind === 'gift')
-      )) {
-        void refreshDonation();
-      }
+      if (t && hasDonationFrom(messages, t.platform, t.authorId)) void refreshDonation();
     });
     let disposed = false;
     let unlisten: (() => void) | undefined;

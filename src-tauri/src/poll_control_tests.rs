@@ -411,6 +411,49 @@ async fn create_match_retry_stops_immediately_on_cancel() {
 }
 
 #[tokio::test]
+async fn create_match_gives_up_10s_after_create_failure_without_resending_post() {
+    // 作成の応答を失った後、照合 GET にも応答が無い。
+    let posts = Arc::new(AtomicUsize::new(0));
+    let gets = Arc::new(AtomicUsize::new(0));
+    let (base, server) = mock({
+        let (posts, gets) = (posts.clone(), gets.clone());
+        move |req| {
+            let (posts, gets) = (posts.clone(), gets.clone());
+            async move {
+                if req.method() == "POST" {
+                    posts.fetch_add(1, SeqCst);
+                    return interrupted_body();
+                }
+                gets.fetch_add(1, SeqCst);
+                std::future::pending().await
+            }
+        }
+    })
+    .await;
+    let fixture = Fixture::new(base, BROADCASTER).await;
+    let started = tokio::time::Instant::now();
+    let result = tokio::time::timeout(
+        Duration::from_secs(12),
+        fixture.control.start(request().validate().unwrap()),
+    )
+    .await
+    .expect("照合の確認待ちが 10 秒を大きく超えた");
+    let waited = started.elapsed();
+    assert!(matches!(
+        result,
+        Err(PollControlError::Remote(PollsError::CreateUnconfirmed))
+    ));
+    assert!(
+        (Duration::from_secs(10)..Duration::from_millis(11_500)).contains(&waited),
+        "{waited:?}"
+    );
+    // 応答が無い GET は次の時刻(1 秒・3 秒・7 秒後)に送り直すが、POST は送り直さない。
+    assert_eq!((posts.load(SeqCst), gets.load(SeqCst)), (1, 3));
+    assert_eq!(fixture.control.snapshot().status, PollStatus::Idle);
+    server.abort();
+}
+
+#[tokio::test]
 async fn polling_syncs_remaining_time_to_twitch() {
     let started_at = chrono::Utc::now() - chrono::Duration::seconds(20);
     let (base, server) = mock(move |_| async move {
