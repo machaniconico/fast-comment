@@ -196,7 +196,11 @@
                   <button type="button" class="icon" title="表示名を変更" aria-label="表示名を変更"
                     onclick={() => (editingId = item.id)}>
                     <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
-                      <path fill="currentColor" d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zm17.71-10.21a1 1 0 0 0 0-1.41l-2.34-2.34a1 1 0 0 0-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z" />
+                      <!-- 独自に描いた鉛筆(外部アイコンセットの流用ではない) -->
+                      <g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <polygon points="16,4 20,8 9,19 4,20 5,15" />
+                        <line x1="13" y1="7" x2="17" y2="11" />
+                      </g>
                     </svg>
                   </button>
                 {/if}
