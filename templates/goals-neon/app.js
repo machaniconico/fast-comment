@@ -7,6 +7,8 @@ const METRICS = [
   { key: 'reactions', label: 'REACTIONS', className: 'reactions' },
   { key: 'comments', label: 'COMMENTS', className: 'comments' },
   { key: 'viewers', label: 'VIEWERS', className: 'viewers' },
+  { key: 'donation', label: 'DONATION', className: 'donation' },
+  { key: 'commenters', label: 'COMMENTERS', className: 'commenters' },
 ];
 
 const only = new Set(
@@ -155,11 +157,11 @@ function createCard(metric, current, target) {
 
   const currentEl = document.createElement('span');
   currentEl.className = 'goal-current';
-  currentEl.textContent = formatCount(current);
+  currentEl.textContent = formatValue(metric.key, current);
 
   const targetEl = document.createElement('span');
   targetEl.className = 'goal-target';
-  targetEl.textContent = `/ ${formatCount(target)}`;
+  targetEl.textContent = `/ ${formatValue(metric.key, target)}`;
 
   value.append(currentEl, targetEl);
 
@@ -182,6 +184,11 @@ function toCount(value) {
 
 function formatCount(value) {
   return new Intl.NumberFormat(undefined, { maximumFractionDigits: 0 }).format(value);
+}
+
+// 投げ銭は円の整数なので ¥ を付ける。
+function formatValue(key, value) {
+  return key === 'donation' ? `¥${formatCount(value)}` : formatCount(value);
 }
 
 function clampNumber(value, fallback, min, max) {

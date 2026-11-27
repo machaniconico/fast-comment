@@ -207,6 +207,18 @@ body {
   --glow: rgba(255, 160, 60, 0.6);
 }
 
+.donation {
+  --accent: #ffe23c;
+  --accent-2: #ff8a00;
+  --glow: rgba(255, 226, 60, 0.6);
+}
+
+.commenters {
+  --accent: #7c8cff;
+  --accent-2: #3cffc8;
+  --glow: rgba(124, 140, 255, 0.6);
+}
+
 @media (max-width: 620px) {
   .overlay {
     padding: 12px;

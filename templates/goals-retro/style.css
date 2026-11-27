@@ -204,6 +204,14 @@ body {
   --accent: #ffd23f;
 }
 
+.donation {
+  --accent: #ff9f1c;
+}
+
+.commenters {
+  --accent: #b388ff;
+}
+
 @media (max-width: 620px) {
   .overlay {
     padding: 12px;

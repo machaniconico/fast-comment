@@ -603,10 +603,16 @@ export interface GoalsConfig {
   showViewers: boolean;
   showLikes: boolean;
   showReactions: boolean;
+  showDonation: boolean;
+  showCommenters: boolean;
   comments: number;
   viewers: number;
   likes: number;
   reactions: number;
+  /** 投げ銭の円換算合計の目標(円)。 */
+  donation: number;
+  /** コメントした人数の目標。 */
+  commenters: number;
 }
 
 export interface TimerConfig {
@@ -663,6 +669,8 @@ export interface GoalsSnapshot {
   viewers: number;
   likes: number;
   reactions: number;
+  donation: number;
+  commenters: number;
 }
 
 export interface GoalsVisibilitySnapshot {
@@ -670,6 +678,8 @@ export interface GoalsVisibilitySnapshot {
   viewers: boolean;
   likes: boolean;
   reactions: boolean;
+  donation: boolean;
+  commenters: boolean;
 }
 
 export interface ChannelTitle {
@@ -696,6 +706,10 @@ export interface StatsSnapshot {
   likesAvailable: boolean;
   reactions: number;
   reactionsAvailable: boolean;
+  /** 投げ銭の円換算合計(円、切り捨て)。 */
+  donation: number;
+  /** コメントした人数(有効なチャンネルごとのユニーク発言者の和)。 */
+  commenters: number;
   goalsEnabled: boolean;
   goalsVisible: GoalsVisibilitySnapshot;
   goals: GoalsSnapshot;

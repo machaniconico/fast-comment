@@ -848,10 +848,14 @@
       showViewers: true,
       showLikes: true,
       showReactions: true,
+      showDonation: true,
+      showCommenters: true,
       comments: 0,
       viewers: 0,
       likes: 0,
       reactions: 0,
+      donation: 0,
+      commenters: 0,
     };
   }
 
@@ -909,10 +913,20 @@
       typeof editable.goals.showReactions === 'boolean'
         ? editable.goals.showReactions
         : Number(editable.goals.reactions) > 0;
+    editable.goals.showDonation =
+      typeof editable.goals.showDonation === 'boolean'
+        ? editable.goals.showDonation
+        : Number(editable.goals.donation) > 0;
+    editable.goals.showCommenters =
+      typeof editable.goals.showCommenters === 'boolean'
+        ? editable.goals.showCommenters
+        : Number(editable.goals.commenters) > 0;
     editable.goals.comments = clampInt(editable.goals.comments, 0, 0, 4294967295);
     editable.goals.viewers = clampInt(editable.goals.viewers, 0, 0, 4294967295);
     editable.goals.likes = clampInt(editable.goals.likes, 0, 0, 4294967295);
     editable.goals.reactions = clampInt(editable.goals.reactions, 0, 0, 4294967295);
+    editable.goals.donation = clampInt(editable.goals.donation, 0, 0, 4294967295);
+    editable.goals.commenters = clampInt(editable.goals.commenters, 0, 0, 4294967295);
   }
 
   function defaultTimer(): TimerConfig {
@@ -3005,6 +3019,38 @@
         表示
       </label>
     </div>
+    <div class="field-row">
+      <label for="goals-donation">投げ銭(円)</label>
+      <input
+        id="goals-donation"
+        type="number"
+        min="0"
+        max="4294967295"
+        step="1"
+        bind:value={config.goals.donation}
+        class="num-input"
+      />
+      <label class="goal-visibility">
+        <input type="checkbox" bind:checked={config.goals.showDonation} class="chk" />
+        表示
+      </label>
+    </div>
+    <div class="field-row">
+      <label for="goals-commenters">コメントした人数</label>
+      <input
+        id="goals-commenters"
+        type="number"
+        min="0"
+        max="4294967295"
+        step="1"
+        bind:value={config.goals.commenters}
+        class="num-input"
+      />
+      <label class="goal-visibility">
+        <input type="checkbox" bind:checked={config.goals.showCommenters} class="chk" />
+        表示
+      </label>
+    </div>
     <div class="obs-label">GoalsオーバーレイURL</div>
     <div class="obs-row">
       <input type="text" value={goalsObsUrl} readonly class="obs-input" />
@@ -3012,7 +3058,7 @@
         {copiedGoalsObs ? 'コピー済' : 'コピー'}
       </button>
     </div>
-    <p class="hint">コメント・視聴者・高評価・リアクションの目標ゲージをOBSに表示します。高評価とリアクションはYouTubeのみです。</p>
+    <p class="hint">コメント・視聴者・高評価・リアクション・投げ銭・コメントした人数の目標ゲージをOBSに表示します。高評価とリアクションはYouTubeのみです。投げ銭は実績のレート表で円に換算し、換算できない通貨は数えません。</p>
   </SettingsSection>
 
   <!-- ── Timer ── -->

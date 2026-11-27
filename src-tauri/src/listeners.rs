@@ -168,6 +168,23 @@ pub struct ListenerStore {
     flush_blocked: bool,
 }
 
+/// 投げ銭として累計に数えるメッセージか。リスナー記録と目標(Goals)の投げ銭合計で共有する。
+/// システム・テスト注入・集計対象外・SUBGIFT(個数)・非正の金額は数えない。
+pub(crate) fn counts_as_donation(msg: &ChatMessage) -> bool {
+    msg.kind != MessageKind::System
+        && !msg.is_injected_test_comment()
+        && !msg.route.uncounted
+        && matches!(
+            msg.kind,
+            MessageKind::SuperChat | MessageKind::Bits | MessageKind::Gift
+        )
+        && msg.amount.as_ref().is_some_and(|amount| {
+            amount.value.is_finite()
+                && amount.value > 0.0
+                && !trim_currency(&amount.currency).eq_ignore_ascii_case("SUBGIFT")
+        })
+}
+
 fn key(platform: &str, author_id: &str) -> String {
     format!("{platform}:{author_id}")
 }
@@ -280,16 +297,7 @@ impl ListenerStore {
         let donation = msg
             .amount
             .as_ref()
-            .filter(|amount| {
-                !msg.route.uncounted
-                    && matches!(
-                        msg.kind,
-                        MessageKind::SuperChat | MessageKind::Bits | MessageKind::Gift
-                    )
-                    && amount.value.is_finite()
-                    && amount.value > 0.0
-                    && !trim_currency(&amount.currency).eq_ignore_ascii_case("SUBGIFT")
-            })
+            .filter(|_| counts_as_donation(msg))
             .map(|amount| {
                 (
                     match &self.achievement_defs {

@@ -3,7 +3,8 @@
 //! chat bus と YouTube メタデータを集約し、最新 `StatsSnapshot` を watch channel で
 //! UI/OBS へ fan-out する。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -12,12 +13,16 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tokio::time::{interval, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 
+use crate::achievements::currency::RateTable;
+use crate::achievements::store::DefsStore;
 use crate::config::{AppConfig, ChannelPlatform};
-use crate::model::{ChatMessage, Platform};
+use crate::listeners::counts_as_donation;
+use crate::model::{ChatMessage, MessageKind, Platform};
 use crate::sources::niconico::extract_live_id;
 use crate::sources::twitcasting::channel_name as twitcasting_channel_name;
 use crate::sources::x::x_channel_name;
 use crate::sources::youtube::{extract_video_id, is_channel_identifier};
+use crate::sound_effects::jpy_milli;
 
 /// 接続中チャンネルに表示する補助タイトル。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -68,6 +73,12 @@ pub struct StatsSnapshot {
     pub likes_available: bool,
     pub reactions: u32,
     pub reactions_available: bool,
+    /// 投げ銭の円換算合計(円、切り捨て)。アプリ起動中の累計。
+    #[serde(default)]
+    pub donation: u32,
+    /// コメントした人数(有効なチャンネルごとのユニーク発言者の和)。
+    #[serde(default)]
+    pub commenters: u32,
     pub goals_enabled: bool,
     pub goals_visible: GoalsVisibilitySnapshot,
     #[serde(default)]
@@ -163,6 +174,11 @@ pub struct GoalsSnapshot {
     pub viewers: u32,
     pub likes: u32,
     pub reactions: u32,
+    /// 投げ銭の目標(円)。
+    #[serde(default)]
+    pub donation: u32,
+    #[serde(default)]
+    pub commenters: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -172,6 +188,10 @@ pub struct GoalsVisibilitySnapshot {
     pub viewers: bool,
     pub likes: bool,
     pub reactions: bool,
+    #[serde(default)]
+    pub donation: bool,
+    #[serde(default)]
+    pub commenters: bool,
 }
 
 /// メタデータ poller から集約タスクへ渡す更新。
@@ -234,17 +254,22 @@ impl YoutubeMetadataUpdate {
 ///
 /// `bus_rx` は chat bus の購読、`metadata_rx` は YouTube poller からの値、`config_rx`
 /// は設定変更通知。どれも await 中に MutexGuard を保持しない形で受け取る。
+/// `achievement_defs` は投げ銭の円換算用(効果音と同じレート表・通貨記号の上書き)。
+/// 再読込を反映するため、投げ銭を受けるたびに最新の定義を読む。
 pub fn spawn_stats_aggregator(
     mut bus_rx: broadcast::Receiver<crate::bus::SequencedChat>,
     stats_tx: watch::Sender<StatsSnapshot>,
     mut config_rx: watch::Receiver<AppConfig>,
     mut metadata_rx: mpsc::Receiver<YoutubeMetadataUpdate>,
+    achievement_defs: Arc<DefsStore>,
     app: AppHandle,
     cancel: CancellationToken,
 ) -> tauri::async_runtime::JoinHandle<()> {
     tauri::async_runtime::spawn(async move {
         let mut comments = 0u32;
         let mut reactions = 0u32;
+        // 投げ銭はミリ円で累計し、表示時に円へ切り捨てる(1 件ごとの丸め誤差を溜めない)。
+        let mut donation_milli = 0i64;
         let mut viewers_max = 0u32;
         let mut viewer_scopes: HashMap<String, HashSet<String>> = HashMap::new();
         let mut metadata: HashMap<String, MetadataState> = HashMap::new();
@@ -257,6 +282,7 @@ pub fn spawn_stats_aggregator(
             comments,
             viewers_max,
             reactions,
+            donation_milli,
             &viewer_scopes,
             &metadata,
             &config,
@@ -271,10 +297,19 @@ pub fn spawn_stats_aggregator(
                         Ok(chat) => {
                             comments = comments.saturating_add(1);
                             record_unique_viewer(&mut viewer_scopes, &chat.message);
+                            if counts_as_donation(&chat.message) {
+                                let defs = achievement_defs.current();
+                                donation_milli = donation_milli.saturating_add(donation_milli_of(
+                                    &chat.message,
+                                    &defs.rates,
+                                    &defs.symbol_overrides,
+                                ));
+                            }
                             snapshot = build_snapshot(
                                 comments,
                                 viewers_max,
                                 reactions,
+                                donation_milli,
                                 &viewer_scopes,
                                 &metadata,
                                 &config,
@@ -298,6 +333,7 @@ pub fn spawn_stats_aggregator(
                         comments,
                         viewers_max,
                         reactions,
+                        donation_milli,
                         &viewer_scopes,
                         &metadata,
                         &config,
@@ -317,6 +353,7 @@ pub fn spawn_stats_aggregator(
                         comments,
                         viewers_max,
                         reactions,
+                        donation_milli,
                         &viewer_scopes,
                         &metadata,
                         &config,
@@ -330,6 +367,7 @@ pub fn spawn_stats_aggregator(
                         comments,
                         viewers_max,
                         reactions,
+                        donation_milli,
                         &viewer_scopes,
                         &metadata,
                         &config,
@@ -361,14 +399,12 @@ fn build_snapshot(
     comments: u32,
     viewers_max: u32,
     reactions: u32,
+    donation_milli: i64,
     viewer_scopes: &HashMap<String, HashSet<String>>,
     metadata: &HashMap<String, MetadataState>,
     config: &AppConfig,
 ) -> StatsSnapshot {
-    let unique_count = viewer_scopes
-        .values()
-        .map(|set| set.len() as u32)
-        .fold(0u32, u32::saturating_add);
+    let unique_count = commenters_count(viewer_scopes);
     let concurrent_total = metadata
         .values()
         .filter(|m| m.viewers_kind == ViewerCountKind::Concurrent)
@@ -428,6 +464,8 @@ fn build_snapshot(
         likes_available: has_enabled_youtube(config),
         reactions,
         reactions_available: has_enabled_youtube(config),
+        donation: donation_yen(donation_milli),
+        commenters: unique_count,
         goals_enabled: config.goals.enabled,
         goals_visible: goals_visibility_from_config(config),
         channel_titles,
@@ -488,10 +526,40 @@ fn merge_metadata_update(
     }
 }
 
+/// 1 件の投げ銭のミリ円。効果音と同じ換算(`sound_effects::jpy_milli`)で、
+/// 数えない種別(`listeners::counts_as_donation`)・換算できない通貨は 0。
+fn donation_milli_of(
+    msg: &ChatMessage,
+    rates: &RateTable,
+    symbols: &BTreeMap<String, String>,
+) -> i64 {
+    if !counts_as_donation(msg) {
+        return 0;
+    }
+    jpy_milli(msg, rates, symbols).unwrap_or(0).max(0)
+}
+
+/// ミリ円の累計を円の整数へ切り捨てる。
+fn donation_yen(milli: i64) -> u32 {
+    u32::try_from(milli.max(0) / 1000).unwrap_or(u32::MAX)
+}
+
+/// コメントした人数。スコープ(プラットフォーム+チャンネル)ごとのユニーク発言者数の和。
+fn commenters_count(viewer_scopes: &HashMap<String, HashSet<String>>) -> u32 {
+    viewer_scopes
+        .values()
+        .map(|set| u32::try_from(set.len()).unwrap_or(u32::MAX))
+        .fold(0u32, u32::saturating_add)
+}
+
 fn record_unique_viewer(
     viewer_scopes: &mut HashMap<String, HashSet<String>>,
     msg: &ChatMessage,
 ) {
+    // システム通知・テスト注入・集計対象外は「コメントした人」に数えない(投げ銭の判定と揃える)。
+    if msg.kind == MessageKind::System || msg.is_injected_test_comment() || msg.route.uncounted {
+        return;
+    }
     let viewer = viewer_key(msg);
     if viewer.is_empty() {
         return;
@@ -561,7 +629,16 @@ fn retain_enabled_scopes(
         viewer_scopes.clear();
         return;
     }
-    viewer_scopes.retain(|scope, _| enabled.contains(scope));
+    // @handle / チャンネル URL で登録した YouTube は、発言が解決後の動画 ID で記録されるため
+    // 設定からキーを作れない。その場合は YouTube のスコープを丸ごと残す(人数を消さない方を優先)。
+    let keep_all_youtube = config.channels.iter().any(|ch| {
+        ch.enabled
+            && matches!(ch.platform, ChannelPlatform::Youtube)
+            && is_channel_identifier(&ch.identifier)
+    });
+    viewer_scopes.retain(|scope, _| {
+        enabled.contains(scope) || (keep_all_youtube && scope.starts_with("youtube:"))
+    });
 }
 
 fn enabled_metadata_keys(config: &AppConfig) -> HashSet<String> {
@@ -616,6 +693,8 @@ fn goals_from_config(config: &AppConfig) -> GoalsSnapshot {
         viewers: config.goals.viewers,
         likes: config.goals.likes,
         reactions: config.goals.reactions,
+        donation: config.goals.donation,
+        commenters: config.goals.commenters,
     }
 }
 
@@ -634,6 +713,14 @@ fn goals_visibility_from_config(config: &AppConfig) -> GoalsVisibilitySnapshot {
             .goals
             .show_reactions
             .unwrap_or(config.goals.reactions > 0),
+        donation: config
+            .goals
+            .show_donation
+            .unwrap_or(config.goals.donation > 0),
+        commenters: config
+            .goals
+            .show_commenters
+            .unwrap_or(config.goals.commenters > 0),
     }
 }
 
@@ -662,7 +749,7 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
     use crate::config::ChannelConfig;
-    use crate::model::{Author, Fragment, MessageKind, Roles};
+    use crate::model::{Amount, Author, Fragment, MessageKind, Roles};
 
     fn msg(platform: Platform, channel: &str, id: &str, name: &str) -> ChatMessage {
         ChatMessage {
@@ -690,6 +777,31 @@ mod tests {
             route: Default::default(),
             sound: None,
         }
+    }
+
+    #[test]
+    fn youtube_handle_channel_keeps_commenters_on_config_change() {
+        let config = config_with_youtube("@example");
+        let mut scopes = HashMap::new();
+        record_unique_viewer(&mut scopes, &msg(Platform::Youtube, "dQw4w9WgXcQ", "u1", "a"));
+        retain_enabled_scopes(&mut scopes, &config);
+        assert_eq!(commenters_count(&scopes), 1);
+    }
+
+    #[test]
+    fn commenters_skip_system_injected_and_uncounted() {
+        let mut scopes = HashMap::new();
+        record_unique_viewer(&mut scopes, &msg(Platform::Twitch, "ch", "u1", "a"));
+        let mut system = msg(Platform::Twitch, "ch", "sys", "system");
+        system.kind = MessageKind::System;
+        record_unique_viewer(&mut scopes, &system);
+        let mut injected = msg(Platform::Twitch, "ch", "t1", "test");
+        injected.injected_test = true;
+        record_unique_viewer(&mut scopes, &injected);
+        let mut uncounted = msg(Platform::Twitch, "ch", "x1", "x");
+        uncounted.route.uncounted = true;
+        record_unique_viewer(&mut scopes, &uncounted);
+        assert_eq!(commenters_count(&scopes), 1);
     }
 
     #[test]
@@ -732,10 +844,121 @@ mod tests {
             &config,
         );
 
-        let snapshot = build_snapshot(0, 0, 0, &HashMap::new(), &metadata, &config);
+        let snapshot = build_snapshot(0, 0, 0, 0, &HashMap::new(), &metadata, &config);
 
         assert_eq!(snapshot.viewers, 0);
         assert_eq!(snapshot.channel_status[0].viewers, None);
+    }
+
+    fn money(kind: MessageKind, value: f64, currency: &str) -> ChatMessage {
+        let mut m = msg(Platform::Youtube, "video", "donor", "Donor");
+        m.kind = kind;
+        m.amount = Some(Amount {
+            value,
+            currency: currency.to_string(),
+            raw_text: String::new(),
+        });
+        m
+    }
+
+    fn sum_donation(
+        msgs: &[ChatMessage],
+        rates: &RateTable,
+        symbols: &BTreeMap<String, String>,
+    ) -> u32 {
+        let milli = msgs
+            .iter()
+            .map(|m| donation_milli_of(m, rates, symbols))
+            .fold(0i64, i64::saturating_add);
+        donation_yen(milli)
+    }
+
+    #[test]
+    fn donation_sums_jpy_conversion_and_floors_to_yen() {
+        let rates = BTreeMap::from([("JPY".to_string(), 1.0), ("USD".to_string(), 150.0)]);
+        let msgs = [
+            money(MessageKind::SuperChat, 500.0, "JPY"),
+            money(MessageKind::SuperChat, 1.99, "USD"),
+            money(MessageKind::Gift, 100.0, "JPY"),
+        ];
+        // 500 + 298.5 + 100 = 898.5 円 → 切り捨てで 898 円。
+        assert_eq!(sum_donation(&msgs, &rates, &BTreeMap::new()), 898);
+    }
+
+    #[test]
+    fn donation_ignores_unconvertible_currency_and_uncounted_kinds() {
+        let rates = BTreeMap::from([("JPY".to_string(), 1.0)]);
+        let mut uncounted = money(MessageKind::SuperChat, 300.0, "JPY");
+        uncounted.route.uncounted = true;
+        let mut injected = money(MessageKind::SuperChat, 300.0, "JPY");
+        injected.injected_test = true;
+        let msgs = [
+            money(MessageKind::SuperChat, 1000.0, "JPY"),
+            money(MessageKind::SuperChat, 10.0, "XYZ"),
+            money(MessageKind::Bits, 100.0, "BITS"),
+            money(MessageKind::Gift, 5.0, "SUBGIFT"),
+            money(MessageKind::Normal, 200.0, "JPY"),
+            money(MessageKind::System, 200.0, "JPY"),
+            money(MessageKind::SuperChat, -50.0, "JPY"),
+            uncounted,
+            injected,
+        ];
+        assert_eq!(sum_donation(&msgs, &rates, &BTreeMap::new()), 1000);
+    }
+
+    #[test]
+    fn donation_uses_symbol_overrides_and_rates() {
+        let rates = BTreeMap::from([("USD".to_string(), 150.0)]);
+        let symbols = BTreeMap::from([("ZZ$".to_string(), "USD".to_string())]);
+        let msgs = [money(MessageKind::SuperChat, 2.0, "ZZ$")];
+        assert_eq!(sum_donation(&msgs, &rates, &BTreeMap::new()), 0);
+        assert_eq!(sum_donation(&msgs, &rates, &symbols), 300);
+    }
+
+    #[test]
+    fn commenters_is_sum_of_unique_speakers_per_enabled_scope() {
+        let mut config = config_with_youtube("video");
+        config.channels.push(ChannelConfig {
+            platform: ChannelPlatform::Twitch,
+            identifier: "streamer".to_string(),
+            enabled: true,
+            own_stream: false,
+            overrides: Default::default(),
+        });
+        let mut scopes = HashMap::new();
+        record_unique_viewer(&mut scopes, &msg(Platform::Youtube, "video", "a", "A"));
+        record_unique_viewer(&mut scopes, &msg(Platform::Youtube, "video", "a", "A"));
+        record_unique_viewer(&mut scopes, &msg(Platform::Youtube, "video", "b", "B"));
+        // 別スコープの同じ ID は別人として数える。
+        record_unique_viewer(&mut scopes, &msg(Platform::Twitch, "streamer", "a", "A"));
+        record_unique_viewer(&mut scopes, &msg(Platform::Twitch, "gone", "c", "C"));
+
+        retain_enabled_scopes(&mut scopes, &config);
+        let snapshot = build_snapshot(0, 0, 0, 0, &scopes, &HashMap::new(), &config);
+        assert_eq!(snapshot.commenters, 3);
+    }
+
+    #[test]
+    fn snapshot_exposes_donation_and_commenters_goals_and_visibility() {
+        let mut config = AppConfig::default();
+        config.goals.enabled = true;
+        config.goals.donation = 5000;
+        config.goals.commenters = 0;
+        config.goals.show_donation = None;
+        config.goals.show_commenters = None;
+
+        let snapshot = build_snapshot(0, 0, 0, 1_234_999, &HashMap::new(), &HashMap::new(), &config);
+        assert_eq!(snapshot.donation, 1234);
+        assert_eq!(snapshot.goals.donation, 5000);
+        assert_eq!(snapshot.goals.commenters, 0);
+        assert!(snapshot.goals_visible.donation);
+        assert!(!snapshot.goals_visible.commenters);
+
+        let json = serde_json::to_value(&snapshot).expect("serialize snapshot");
+        assert_eq!(json["donation"].as_u64(), Some(1234));
+        assert_eq!(json["commenters"].as_u64(), Some(0));
+        assert_eq!(json["goals"]["donation"].as_u64(), Some(5000));
+        assert_eq!(json["goalsVisible"]["commenters"].as_bool(), Some(false));
     }
 
     #[test]
@@ -760,7 +983,7 @@ mod tests {
         let mut config = AppConfig::default();
         config.goals.enabled = true;
 
-        let snapshot = build_snapshot(0, 0, 0, &HashMap::new(), &HashMap::new(), &config);
+        let snapshot = build_snapshot(0, 0, 0, 0, &HashMap::new(), &HashMap::new(), &config);
 
         assert!(snapshot.goals_enabled);
         assert_eq!(snapshot.goals.comments, 0);
@@ -852,7 +1075,7 @@ mod tests {
             },
         );
 
-        let snapshot = build_snapshot(0, 0, 0, &HashMap::new(), &metadata, &config);
+        let snapshot = build_snapshot(0, 0, 0, 0, &HashMap::new(), &metadata, &config);
 
         assert_eq!(snapshot.viewers, 17);
         assert_eq!(snapshot.likes, 3);
@@ -907,7 +1130,7 @@ mod tests {
             },
         );
 
-        let snapshot = build_snapshot(0, 0, 0, &HashMap::new(), &metadata, &config);
+        let snapshot = build_snapshot(0, 0, 0, 0, &HashMap::new(), &metadata, &config);
 
         assert_eq!(snapshot.viewers, 10);
         let niconico = snapshot
@@ -933,7 +1156,7 @@ mod tests {
             },
         );
 
-        let snapshot = build_snapshot(0, 0, 0, &HashMap::new(), &metadata, &config);
+        let snapshot = build_snapshot(0, 0, 0, 0, &HashMap::new(), &metadata, &config);
 
         assert_eq!(snapshot.channel_status.len(), 1);
         assert_eq!(snapshot.channel_status[0].identifier, "@example");
@@ -969,7 +1192,7 @@ mod tests {
             },
         );
 
-        let snapshot = build_snapshot(0, 0, 0, &HashMap::new(), &metadata, &config);
+        let snapshot = build_snapshot(0, 0, 0, 0, &HashMap::new(), &metadata, &config);
 
         assert_eq!(snapshot.viewers, 0);
         assert_eq!(snapshot.likes, 0);
@@ -1005,7 +1228,7 @@ mod tests {
             },
         );
 
-        let snapshot = build_snapshot(0, 0, 0, &HashMap::new(), &metadata, &config);
+        let snapshot = build_snapshot(0, 0, 0, 0, &HashMap::new(), &metadata, &config);
 
         assert_eq!(snapshot.channel_status.len(), 1);
         assert_eq!(snapshot.channel_status[0].title.as_deref(), Some("Updated title"));
@@ -1048,7 +1271,7 @@ mod tests {
             &config,
         );
 
-        let snapshot = build_snapshot(0, 0, reactions, &HashMap::new(), &metadata, &config);
+        let snapshot = build_snapshot(0, 0, reactions, 0, &HashMap::new(), &metadata, &config);
 
         assert_eq!(reactions, 7);
         assert_eq!(metadata.len(), 1);

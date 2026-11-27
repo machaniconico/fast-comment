@@ -4543,7 +4543,7 @@ pub fn run() {
                 }
             }
 
-            let ((api_router, listener_store), _) = setup_twitcasting(
+            let ((api_router, listener_store, stats_defs), _) = setup_twitcasting(
                 &twitcasting_auth,
                 twitcasting_client_id.as_deref(),
                 || {
@@ -4638,9 +4638,11 @@ pub fn run() {
                         twitch_auth,
                     };
                     let listener_store = state.listeners.clone();
+                    // 目標の投げ銭合計は効果音と同じ実績定義(レート表・通貨記号)で円換算する。
+                    let stats_defs = state.achievement_defs.clone();
                     move || {
                         app.manage(state);
-                        (api_router, listener_store)
+                        (api_router, listener_store, stats_defs)
                     }
                 },
             );
@@ -4774,6 +4776,7 @@ pub fn run() {
                 stats_tx,
                 config_rx,
                 metadata_rx,
+                stats_defs,
                 handle.clone(),
                 app_cancel.clone(),
             );
