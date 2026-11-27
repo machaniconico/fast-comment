@@ -15,6 +15,7 @@
   let kind = $state<LaunchKind>('exe');
   let target = $state('');
   let argsText = $state('');
+  let hideWindow = $state(false);
   let label = $state('');
   let loading = $state(desktop);
   let loaded = $state(false);
@@ -71,9 +72,11 @@
       args,
       enabled: true,
       label: label === '' ? null : label,
+      hideWindow: kind === 'exe' && hideWindow,
     }]);
     target = '';
     argsText = '';
+    hideWindow = false;
     label = '';
   }
 
@@ -142,13 +145,14 @@
           <option value="url">URL</option>
         </select>
       </label>
-      <label>{kind === 'exe' ? 'アプリの絶対パス' : 'URL'}
+      <label>{kind === 'exe' ? 'アプリの絶対パス(.exe / .bat / .cmd)' : 'URL'}
         <input type="text" bind:value={target} spellcheck="false" />
       </label>
       {#if kind === 'exe'}
         <label>引数（1 行に 1 つ）
           <textarea rows="2" bind:value={argsText} spellcheck="false"></textarea>
         </label>
+        <label class="check"><input type="checkbox" bind:checked={hideWindow} />ウィンドウを隠す(コンソール窓を出さない)</label>
       {/if}
       <label>表示名（任意）
         <input type="text" bind:value={label} />
@@ -165,6 +169,12 @@
             <div>
               <strong>{item.kind === 'exe' ? 'アプリ' : 'URL'}{item.label ? ` ・ ${item.label}` : ''}</strong>
               <div class="literal" dir="ltr">{item.target}</div>
+              {#if item.kind === 'exe'}
+                <label><input type="checkbox" checked={item.hideWindow}
+                  onchange={(event) => updateItems(items.map((entry, i) =>
+                    i === index ? { ...entry, hideWindow: event.currentTarget.checked } : entry
+                  ))} />ウィンドウを隠す(コンソール窓を出さない)</label>
+              {/if}
             </div>
             <div class="actions">
               <label><input type="checkbox" checked={item.enabled}
@@ -206,6 +216,9 @@
             <dl>
               <dt>種類</dt><dd>{item.kind === 'exe' ? 'アプリ' : 'URL'}</dd>
               <dt>状態</dt><dd>{item.enabled ? '有効' : '無効'}</dd>
+              {#if item.kind === 'exe'}
+                <dt>ウィンドウ</dt><dd>{item.hideWindow ? '隠す' : '隠さない'}</dd>
+              {/if}
               <dt>表示名</dt><dd class="literal">{item.label ?? '（なし）'}</dd>
               <dt>{item.kind === 'exe' ? 'パス' : 'URL'}</dt>
               <dd class="literal" dir="ltr">{item.target}</dd>
@@ -239,6 +252,7 @@
   p { margin: 6px 0; }
   .add { display: grid; gap: 8px; margin: 8px 0 12px; }
   .add label { display: grid; gap: 4px; }
+  .add label.check { display: flex; align-items: center; gap: 6px; }
   .add button { justify-self: start; }
   input, select, textarea, button {
     border: 1px solid #666;

@@ -320,6 +320,7 @@ export interface LaunchItem {
   args: string[];
   enabled: boolean;
   label: string | null;
+  hideWindow: boolean;
 }
 
 export interface StartupLaunchSettings {
