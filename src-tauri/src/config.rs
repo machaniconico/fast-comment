@@ -523,6 +523,8 @@ pub struct GoalsConfig {
     pub show_donation: Option<bool>,
     #[serde(default)]
     pub show_commenters: Option<bool>,
+    #[serde(default)]
+    pub show_first_comments: Option<bool>,
     /// コメント数目標。0 は 0% として表示。
     pub comments: u32,
     /// 視聴者数目標。0 は 0% として表示。
@@ -538,6 +540,9 @@ pub struct GoalsConfig {
     /// コメントした人数(ユニーク発言者)の目標。0 は 0% として表示。
     #[serde(default)]
     pub commenters: u32,
+    /// 初見コメント数の目標。0 は 0% として表示。
+    #[serde(default)]
+    pub first_comments: u32,
 }
 
 impl Default for GoalsConfig {
@@ -554,12 +559,14 @@ impl Default for GoalsConfig {
             show_reactions: Some(true),
             show_donation: Some(true),
             show_commenters: Some(true),
+            show_first_comments: Some(true),
             comments: 0,
             viewers: 0,
             likes: 0,
             reactions: 0,
             donation: 0,
             commenters: 0,
+            first_comments: 0,
         }
     }
 }
@@ -2179,12 +2186,14 @@ mod tests {
                 show_reactions: Some(false),
                 show_donation: Some(true),
                 show_commenters: Some(false),
+                show_first_comments: Some(true),
                 comments: 100,
                 viewers: 50,
                 likes: 25,
                 reactions: 0,
                 donation: 5000,
                 commenters: 30,
+                first_comments: 8,
             },
             timer: TimerConfig {
                 enabled: true,
@@ -2916,6 +2925,8 @@ mod tests {
         assert_eq!(legacy_goals.show_commenters, None);
         assert_eq!(legacy_goals.donation, 0);
         assert_eq!(legacy_goals.commenters, 0);
+        assert_eq!(legacy_goals.show_first_comments, None);
+        assert_eq!(legacy_goals.first_comments, 0);
 
         let cfg = GoalsConfig {
             enabled: true,
@@ -2929,12 +2940,14 @@ mod tests {
             show_reactions: Some(true),
             show_donation: Some(false),
             show_commenters: Some(true),
+            show_first_comments: Some(false),
             comments: 100,
             viewers: 50,
             likes: 25,
             reactions: 12,
             donation: 10000,
             commenters: 40,
+            first_comments: 15,
         };
         let text = serde_json::to_string(&cfg).expect("serialize goals config");
         let json: serde_json::Value = serde_json::from_str(&text).expect("parse goals json");
@@ -2948,6 +2961,8 @@ mod tests {
         assert_eq!(json["showCommenters"].as_bool(), Some(true));
         assert_eq!(json["donation"].as_u64(), Some(10000));
         assert_eq!(json["commenters"].as_u64(), Some(40));
+        assert_eq!(json["showFirstComments"].as_bool(), Some(false));
+        assert_eq!(json["firstComments"].as_u64(), Some(15));
 
         let decoded: GoalsConfig = serde_json::from_str(&text).expect("deserialize goals config");
         assert_eq!(decoded, cfg);

@@ -850,12 +850,14 @@
       showReactions: true,
       showDonation: true,
       showCommenters: true,
+      showFirstComments: true,
       comments: 0,
       viewers: 0,
       likes: 0,
       reactions: 0,
       donation: 0,
       commenters: 0,
+      firstComments: 0,
     };
   }
 
@@ -921,12 +923,17 @@
       typeof editable.goals.showCommenters === 'boolean'
         ? editable.goals.showCommenters
         : Number(editable.goals.commenters) > 0;
+    editable.goals.showFirstComments =
+      typeof editable.goals.showFirstComments === 'boolean'
+        ? editable.goals.showFirstComments
+        : Number(editable.goals.firstComments) > 0;
     editable.goals.comments = clampInt(editable.goals.comments, 0, 0, 4294967295);
     editable.goals.viewers = clampInt(editable.goals.viewers, 0, 0, 4294967295);
     editable.goals.likes = clampInt(editable.goals.likes, 0, 0, 4294967295);
     editable.goals.reactions = clampInt(editable.goals.reactions, 0, 0, 4294967295);
     editable.goals.donation = clampInt(editable.goals.donation, 0, 0, 4294967295);
     editable.goals.commenters = clampInt(editable.goals.commenters, 0, 0, 4294967295);
+    editable.goals.firstComments = clampInt(editable.goals.firstComments, 0, 0, 4294967295);
   }
 
   function defaultTimer(): TimerConfig {
@@ -3051,6 +3058,22 @@
         表示
       </label>
     </div>
+    <div class="field-row">
+      <label for="goals-first-comments">初見コメント</label>
+      <input
+        id="goals-first-comments"
+        type="number"
+        min="0"
+        max="4294967295"
+        step="1"
+        bind:value={config.goals.firstComments}
+        class="num-input"
+      />
+      <label class="goal-visibility">
+        <input type="checkbox" bind:checked={config.goals.showFirstComments} class="chk" />
+        表示
+      </label>
+    </div>
     <div class="obs-label">GoalsオーバーレイURL</div>
     <div class="obs-row">
       <input type="text" value={goalsObsUrl} readonly class="obs-input" />
@@ -3058,7 +3081,7 @@
         {copiedGoalsObs ? 'コピー済' : 'コピー'}
       </button>
     </div>
-    <p class="hint">コメント・視聴者・高評価・リアクション・投げ銭・コメントした人数の目標ゲージをOBSに表示します。高評価とリアクションはYouTubeのみです。投げ銭は実績のレート表で円に換算し、換算できない通貨は数えません。</p>
+    <p class="hint">コメント・視聴者・高評価・リアクション・投げ銭・コメントした人数・初見コメントの目標ゲージをOBSに表示します。高評価とリアクションはYouTubeのみです。投げ銭は実績のレート表で円に換算し、換算できない通貨は数えません。</p>
   </SettingsSection>
 
   <!-- ── Timer ── -->

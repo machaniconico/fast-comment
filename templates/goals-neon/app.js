@@ -9,6 +9,7 @@ const METRICS = [
   { key: 'viewers', label: 'VIEWERS', className: 'viewers' },
   { key: 'donation', label: 'DONATION', className: 'donation' },
   { key: 'commenters', label: 'COMMENTERS', className: 'commenters' },
+  { key: 'firstComments', label: 'FIRST TIMERS', className: 'first-comments' },
 ];
 
 const only = new Set(
@@ -118,7 +119,8 @@ function render(snapshot) {
   const cards = [];
 
   for (const metric of METRICS) {
-    if (only.size > 0 && !only.has(metric.key)) continue;
+    // only= は小文字化して比べる(firstComments は firstcomments でも指定できる)。
+    if (only.size > 0 && !only.has(metric.key.toLowerCase())) continue;
     if (visible[metric.key] === false) continue;
     if (metric.key === 'likes' && snapshot.likesAvailable === false) continue;
     if (metric.key === 'reactions' && snapshot.reactionsAvailable === false) continue;

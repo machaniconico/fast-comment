@@ -212,6 +212,10 @@ body {
   --accent: #b388ff;
 }
 
+.first-comments {
+  --accent: #ff6fae;
+}
+
 @media (max-width: 620px) {
   .overlay {
     padding: 12px;
