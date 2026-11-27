@@ -169,6 +169,15 @@
             <div>
               <strong>{item.kind === 'exe' ? 'アプリ' : 'URL'}{item.label ? ` ・ ${item.label}` : ''}</strong>
               <div class="literal" dir="ltr">{item.target}</div>
+              <label class="rename">表示名
+                <input type="text" maxlength="100" placeholder="（なし）" value={item.label ?? ''}
+                  onchange={(event) => {
+                    const value = event.currentTarget.value;
+                    updateItems(items.map((entry, i) =>
+                      i === index ? { ...entry, label: value === '' ? null : value } : entry
+                    ));
+                  }} />
+              </label>
               {#if item.kind === 'exe'}
                 <label><input type="checkbox" checked={item.hideWindow}
                   onchange={(event) => updateItems(items.map((entry, i) =>
@@ -270,6 +279,8 @@
   dialog .literal { unicode-bidi: plaintext; }
   .actions { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
   .actions label { display: flex; align-items: center; }
+  .rename { display: flex; align-items: center; gap: 6px; margin: 4px 0; }
+  .rename input { flex: 1; min-width: 0; max-width: 320px; }
   .warning { padding: 8px; border-left: 3px solid #ef7777; color: #ffb4a9; background: #442224; }
   dialog {
     box-sizing: border-box;
