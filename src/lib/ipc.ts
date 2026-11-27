@@ -484,6 +484,11 @@ export function openBackupDir(): Promise<void | null> {
   return invoke<void>('open_backup_dir');
 }
 
+/** 同梱のライセンス文書を既定のアプリで開く(ファイルはバックエンド側で固定)。 */
+export function openLicenseDoc(doc: 'thirdParty' | 'appLicense'): Promise<void | null> {
+  return invoke<void>('open_license_doc', { doc });
+}
+
 export type RestoreFailureNotice = 'failed' | 'savesBlocked';
 
 export function takeStartupRestoreFailure(): Promise<RestoreFailureNotice | null> {
