@@ -33,6 +33,7 @@ fn item(id: &str, kind: LaunchKind, target: &str, args: &[&str], enabled: bool, 
         args: args.iter().map(|s| s.to_string()).collect(),
         enabled,
         label: label.map(|s| s.to_string()),
+        hide_window: false,
     }
 }
 
@@ -101,8 +102,6 @@ fn validate_accepts_exe_and_https_url() {
 #[test]
 fn validate_rejects_non_exe_extensions() {
     for bad in [
-        "C:\\Tools\\a.bat",
-        "C:\\Tools\\a.cmd",
         "C:\\Tools\\a.lnk",
         "C:\\Tools\\a.ps1",
         "C:\\Tools\\a.vbs",
@@ -297,17 +296,17 @@ fn missing_store_or_corrupt_file_needs_approval() {
     write_json(dir.path(), &v);
     assert!(needs_approval(load_for_startup(dir.path(), &store)));
 
-    // mac は一致しているが validate に落ちる内容(.bat)
+    // mac は一致しているが validate に落ちる内容(.ps1)
     let dir = tempfile::tempdir().unwrap();
     let store = MemStore::default();
     save_sample(dir.path(), &store);
     let (key, _) = store.load().unwrap().unwrap();
-    let bad = vec![item("a", LaunchKind::Exe, "C:\\Tools\\run.bat", &[], true, None)];
+    let bad = vec![item("a", LaunchKind::Exe, "C:\\Tools\\run.ps1", &[], true, None)];
     store.save(&key, &approval_mac(&key, &bad)).unwrap();
     write_json(
         dir.path(),
         &json!({ "version": 1, "items": [
-            { "id": "a", "kind": "exe", "target": "C:\\Tools\\run.bat", "args": [], "enabled": true }
+            { "id": "a", "kind": "exe", "target": "C:\\Tools\\run.ps1", "args": [], "enabled": true }
         ]}),
     );
     assert!(needs_approval(load_for_startup(dir.path(), &store)));
@@ -334,7 +333,7 @@ fn errors_do_not_leak_targets_or_args() {
     };
 
     // validate に落ちる項目(拡張子・ユーザー情報・相対パス・上限超過)
-    let mut bad_ext = item("a", LaunchKind::Exe, "C:\\SECRETEXE\\run.bat", &["--token=SECRETARG"], true, None);
+    let mut bad_ext = item("a", LaunchKind::Exe, "C:\\SECRETEXE\\run.ps1", &["--token=SECRETARG"], true, None);
     push(validate_items(std::slice::from_ref(&bad_ext)));
     bad_ext.target = "SECRETEXE\\run.exe".into();
     push(validate_items(&[bad_ext]));

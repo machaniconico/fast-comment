@@ -24,6 +24,7 @@ pub enum LaunchKind {
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct LaunchItem {
     pub id: String,
     pub kind: LaunchKind,
@@ -31,6 +32,9 @@ pub struct LaunchItem {
     pub args: Vec<String>,
     pub enabled: bool,
     pub label: Option<String>,
+    /// 起動したアプリのウィンドウを出さない(Windows の CREATE_NO_WINDOW)。アプリ項目だけ。
+    #[serde(default)]
+    pub hide_window: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -97,10 +101,13 @@ pub fn validate_items(items: &[LaunchItem]) -> Result<(), LaunchError> {
             ));
         }
         match item.kind {
-            LaunchKind::Exe if !is_absolute_exe(&item.target) => {
+            LaunchKind::Exe if !is_absolute_app_path(&item.target) => {
                 return Err(invalid(
-                    "アプリには拡張子が .exe の Windows 絶対パスを指定してください",
+                    "アプリには拡張子が .exe / .bat / .cmd の Windows 絶対パスを指定してください",
                 ));
+            }
+            LaunchKind::Url if item.hide_window => {
+                return Err(invalid("URLにはウィンドウを隠す設定を使えません"));
             }
             LaunchKind::Url if !is_web_url(&item.target) => {
                 return Err(invalid(
@@ -113,7 +120,7 @@ pub fn validate_items(items: &[LaunchItem]) -> Result<(), LaunchError> {
     Ok(())
 }
 
-fn is_absolute_exe(target: &str) -> bool {
+fn is_absolute_app_path(target: &str) -> bool {
     if target
         .chars()
         .any(|ch| matches!(ch, '"' | '<' | '>' | '|' | '*'))
@@ -162,9 +169,11 @@ fn is_absolute_exe(target: &str) -> bool {
     path.is_some_and(|path| {
         !path.contains([':', '?'])
             && path.rsplit('\\').next().is_some_and(|file| {
-                Path::new(file)
-                    .extension()
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
+                Path::new(file).extension().is_some_and(|ext| {
+                    ["exe", "bat", "cmd"]
+                        .iter()
+                        .any(|allowed| ext.eq_ignore_ascii_case(allowed))
+                })
             })
     })
 }
@@ -211,6 +220,9 @@ fn approval_hmac(key: &[u8], items: &[LaunchItem]) -> HmacSha256 {
         target: &'a str,
         args: &'a [String],
         enabled: bool,
+        // false の時はキーを出さず、この項目追加前に承認済みの一覧の MAC を変えない。
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        hide_window: bool,
     }
 
     let approved: Vec<_> = items
@@ -221,6 +233,7 @@ fn approval_hmac(key: &[u8], items: &[LaunchItem]) -> HmacSha256 {
             target: &item.target,
             args: &item.args,
             enabled: item.enabled,
+            hide_window: item.hide_window,
         })
         .collect();
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
@@ -417,12 +430,14 @@ fn launch(item: &LaunchItem) -> Result<(), &'static str> {
             {
                 return Err("notAFile");
             }
-            std::process::Command::new(target)
-                .args(&item.args)
-                .current_dir(parent)
-                .spawn()
-                .map(|_| ())
-                .map_err(|_| "appOpenFailed")
+            let mut command = std::process::Command::new(target);
+            command.args(&item.args).current_dir(parent);
+            #[cfg(windows)]
+            if item.hide_window {
+                use std::os::windows::process::CommandExt;
+                command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+            }
+            command.spawn().map(|_| ()).map_err(|_| "appOpenFailed")
         }
         LaunchKind::Url => {
             crate::update::open_url(item.target.clone()).map_err(|_| "urlOpenFailed")
@@ -482,7 +497,86 @@ mod tests {
             args: vec![],
             enabled: true,
             label: None,
+            hide_window: false,
         }]
+    }
+
+    fn app(target: &str, hide_window: bool) -> Vec<LaunchItem> {
+        let mut launch = items("https://example.com/");
+        launch[0].kind = LaunchKind::Exe;
+        launch[0].target = target.into();
+        launch[0].hide_window = hide_window;
+        launch
+    }
+
+    #[test]
+    fn app_paths_accept_exe_bat_and_cmd_only() {
+        for path in [
+            r"C:\Tools\a.exe",
+            r"C:\Tools\a.bat",
+            r"C:\Tools\a.CMD",
+            r"C:\Tools\a.Bat",
+            r"\\server\share\a.bat",
+        ] {
+            assert!(validate_items(&app(path, false)).is_ok(), "{path}");
+        }
+        for path in [
+            r"C:\Tools\a.bat.txt",
+            r"C:\Tools\a.ps1",
+            r"C:\Tools\a.bat:stream",
+            "x.bat",
+            r"C:\Tools\a",
+        ] {
+            assert!(validate_items(&app(path, false)).is_err(), "{path}");
+        }
+    }
+
+    #[test]
+    fn legacy_json_without_hide_window_reads_as_false() {
+        let item: LaunchItem = serde_json::from_str(
+            r#"{"id":"a","kind":"exe","target":"C:\\a.exe","args":[],"enabled":true,"label":null}"#,
+        )
+        .unwrap();
+        assert!(!item.hide_window);
+        let json = serde_json::to_value(app(r"C:\a.bat", true).remove(0)).unwrap();
+        assert_eq!(json["hideWindow"], true);
+    }
+
+    #[test]
+    fn mac_omits_hide_window_when_false_for_compatibility() {
+        let key = [7; KEY_LEN];
+        let launch = app(r"C:\a.exe", false);
+        // hideWindow 導入前の形式(id,kind,target,args,enabled の順)を直接組み立てる。
+        let legacy =
+            r#"[{"id":"test","kind":"exe","target":"C:\\a.exe","args":[],"enabled":true}]"#;
+        let mut mac = HmacSha256::new_from_slice(&key).unwrap();
+        mac.update(legacy.as_bytes());
+        assert_eq!(
+            approval_mac(&key, &launch),
+            mac.finalize().into_bytes().to_vec()
+        );
+    }
+
+    #[test]
+    fn changing_hide_window_changes_mac_and_revokes_approval() {
+        let store = MemoryApprovalStore::default();
+        let key = [7; KEY_LEN];
+        let mut launch = app(r"C:\a.bat", false);
+        store.save(&key, &approval_mac(&key, &launch)).unwrap();
+        assert!(is_approved(&store, &launch));
+        let before = approval_mac(&key, &launch);
+        launch[0].hide_window = true;
+        assert_ne!(before, approval_mac(&key, &launch));
+        assert!(!is_approved(&store, &launch));
+    }
+
+    #[test]
+    fn url_with_hide_window_is_rejected_without_input_values() {
+        let mut launch = items("https://example.com/PRIVATE");
+        launch[0].hide_window = true;
+        let error = validate_items(&launch).unwrap_err().to_string();
+        assert!(error.contains("1件目"), "{error}");
+        assert!(!error.contains("PRIVATE"), "{error}");
     }
 
     #[test]
