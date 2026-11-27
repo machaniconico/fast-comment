@@ -201,3 +201,12 @@ test('individual goal visibility hides only unchecked metrics', () => {
   assert.equal(harness.goals.children[0].children[0].children[0].textContent, 'LIKES');
   assert.equal(harness.goals.children[1].children[0].children[0].textContent, 'COMMENTS');
 });
+
+test('goals-neon / goals-retro use the same app.js as goals', () => {
+  // 見た目は style.css だけで変える。app.js が分岐すると上のテストが変種を守れなくなる。
+  const base = readFileSync(new URL('./app.js', import.meta.url), 'utf8');
+  for (const name of ['goals-neon', 'goals-retro']) {
+    const variant = readFileSync(new URL(`../${name}/app.js`, import.meta.url), 'utf8');
+    assert.equal(variant, base, `${name}/app.js must match goals/app.js`);
+  }
+});

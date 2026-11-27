@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { applyDeleted, applyDuplicated, groupTemplates, resolveTemplateId, suggestCopyName, templateKindLabel } from './templateCatalog.ts';
+import { applyDeleted, applyDuplicated, groupTemplates, resolveTemplateId, suggestCopyName, templateKindLabel, templateWsPath } from './templateCatalog.ts';
 import type { TemplateInfo } from './ipc.ts';
 
 const t = (id: string, kind: TemplateInfo['kind']): TemplateInfo => ({
@@ -76,4 +76,15 @@ test('applyDeleted removes the id and resets a matching selection to default', (
   assert.equal(applyDeleted(list, 'custom:a', 'simple').current, 'simple');
   // 再取得後の一覧(既に消えている)に掛けても結果は同じ。
   assert.deepEqual(applyDeleted(r.list, 'custom:a', 'custom:a'), r);
+});
+
+test('templateWsPath: 集計系の内蔵は専用エンドポイント、それ以外は /ws', () => {
+  assert.equal(templateWsPath('goals'), '/stats');
+  assert.equal(templateWsPath('goals-neon'), '/stats');
+  assert.equal(templateWsPath('goals-retro'), '/stats');
+  assert.equal(templateWsPath('timer'), '/timer');
+  assert.equal(templateWsPath('poll'), '/poll');
+  assert.equal(templateWsPath('default'), '/ws');
+  assert.equal(templateWsPath('custom:goals'), '/ws');
+  assert.equal(templateWsPath('toString'), '/ws');
 });

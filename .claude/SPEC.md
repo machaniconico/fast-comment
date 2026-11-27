@@ -357,7 +357,7 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
 
 - 各テンプレは index.html + style.css + app.js の独立した静的サイト。`/ws` に接続し、届いた batch を描画する。ユーザーが CSS を差し替えて見た目をカスタムできる。
 - OBS には「ブラウザソース」で `http://127.0.0.1:11180/?template=<name>&ws=ws://127.0.0.1:11180/ws&channel=...` を指定。`template` 未指定時は `default`。OBS ポート変更時は `ws` も同じポートを指す。
-- 出荷済みテンプレ(12種):
+- 出荷済みテンプレ(14種):
 
   | テンプレ | 用途 |
   |---|---|
@@ -367,6 +367,8 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
   | `ticker` | 1件ずつ横帯で巡回表示 |
   | `ranking` | 発言数ランキング集計表示 |
   | `goals` | 目標(ゴール)バー |
+  | `goals-neon` | 目標バーのネオン版(発光する縁取り。`app.js` は `goals` と同一、スキン指定は効かない) |
+  | `goals-retro` | 目標バーのレトロ版(角枠・ブロック状ゲージ。`app.js` は `goals` と同一、スキン指定は効かない) |
   | `donation` | 投げ銭(SuperChat/Bits)サマリー |
   | `timer` | カウントダウン/アップタイマー |
   | `poll` | アンケートの集計・結果(透過背景、`/poll` WS、推奨 800×600。§19) |
@@ -411,6 +413,8 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
 | 保存先 | リソースの `templates/<name>/`(読み取り専用) | `app_config_dir/templates/<name>/` |
 | 配信 | `/?template=<name>` と `/<name>/...`(従来どおり) | `/?template=custom:<name>` と `/custom/<name>/...` |
 | 編集・削除 | 不可(`write_template_file` / `delete_template` は Err) | 可 |
+
+- テンプレートエディタのプレビューと URL コピーは、`ws` に `templateWsPath(id)` のパスを載せる(内蔵の `goals` / `goals-neon` / `goals-retro` は `/stats`、`timer` は `/timer`、`poll` は `/poll`、その他とカスタムは `/ws`)。カスタムは複製元が分からないので、集計系を複製した物は URL の `ws` を手で直す。
 
 - **ID の文法**: `<name>` は ASCII 英数・`-`・`_`、1〜64 バイト(`is_valid_template_name`)。`custom:` 接頭辞があればカスタム、無ければ内蔵。内蔵名 `custom` は不可(配信パス `/custom/` と衝突するため)。文法に合わない ID は `/` が 400、文法は合うがカスタムが存在しなければ 404。内蔵の URL とルーティングは変えていないので、既存の OBS ソースはそのまま動く。カスタム `custom:default` と内蔵 `default` は別物で共存する(カスタムが内蔵を隠す経路は無い)。
 - **配信**: `/?template=custom:<name>` は `<base href="/custom/<name>/">` を注入した index.html を返す。`/custom/<name>/...` は `ServeDir` で静的配信する。URL 上の `:` は `custom%3Afoo` とエンコードされても同じに解決される。
@@ -499,6 +503,7 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
 - 読込成功時は対象項目だけをフォームに反映する。ログイン後は該当サービスの ClientID と待受ポート、規則取込後は `moderation`、手動再読込と設定全体のインポート後は設定全体を反映する。失敗・期限切れ時は入力欄を解放し、設定全体の再読込に成功するまで全体保存を止める。設定画面の破棄後に完了した読込では何もしない。
 - コメント画面は読んだ設定の revision を持ち、インポートなどで新しい revision を知ったら設定を読み直す。読み直すまで「コメビュに表示」を無効にする。読込に失敗したら(Tauri の外で読めない時を含む)1・2・4 秒あけて再試行し、それでも失敗したら止めて「設定を読み直してください」を出す。全体読込の成功、設定画面からの反映、新しい revision を知った時に再試行の回数を戻す。
 - 接続と取消には UI が発行した試行 ID を渡す。設定画面を閉じると進行中の試行を取り消す。取消は対応する試行だけに効く。進行中の試行は重複開始を拒否する。開始前に取り消した試行と終了済みの試行は、サービスごとに直近 32 件を保持し、その間の再利用を拒否する。
+- 目標設定の「OBSテンプレート」は `goals.template`(既定 `goals`)に保存し、目標の OBS 用 URL の `template=` に載せる。選べるのは内蔵の `goals` / `goals-neon` / `goals-retro` と `custom:<name>`。それ以外の値は UI の正規化で `goals` に戻す。選んでいたカスタムが一覧に無い時(削除済みなど)は、一覧の取得に成功した時点で `goals` に戻す(取得前・失敗時は値を保つ)。スキン選択は `goals-neon` / `goals-retro` の時は無効にする。
 - コメント画面の「コメビュに表示」は `set_goals_show_in_app` で保存済み設定の `goals.showInApp` だけを更新する。
 - コメント画面の NG 追加は `append_moderation_value(kind, value)`、規則 JSON のインポートは `set_moderation(moderation)` を使う。Rust 側で保存を直列化し、最新設定の `moderation` だけを更新する。型とリスト種別は Rust 側で検証する。NG 追加は JavaScript の `String.prototype.trim` と同じ空白を前後から除いて重複を判定する。コメントの操作メニューでは保存失敗をトーストで知らせる。不正な正規表現は既存のモデレーション判定と同様に無視し、パターン本文を含まない警告を記録する。
 - **localStorage 併用**: 一部のUI/ウィンドウ局所設定は各ウィンドウの `localStorage` に保持する(`config.json` には載せない)。現状: 弾幕表示設定(`fc.danmaku`)、テーマ、最前面ピン状態、コマンドパレット履歴 等。これらはウィンドウローカルかつ低リスクなため意図的に localStorage 側に置いている。

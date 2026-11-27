@@ -1,0 +1,227 @@
+* {
+  box-sizing: border-box;
+}
+
+:root {
+  --font-scale: 1;
+  --bg-alpha: 0.82;
+}
+
+html,
+body {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+  background: transparent;
+  font-family: Inter, "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+  letter-spacing: 0;
+}
+
+.overlay {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  padding: 22px;
+  pointer-events: none;
+}
+
+.overlay.top {
+  align-items: flex-start;
+  justify-content: center;
+}
+
+.overlay.bottom {
+  align-items: flex-end;
+  justify-content: center;
+}
+
+.overlay.left {
+  align-items: center;
+  justify-content: flex-start;
+}
+
+.overlay.right {
+  align-items: center;
+  justify-content: flex-end;
+}
+
+.goals {
+  display: flex;
+  justify-content: center;
+  gap: 12px;
+  max-width: min(96vw, 1120px);
+  transform: scale(var(--font-scale));
+  transform-origin: bottom center;
+}
+
+.goals.layout-horizontal {
+  flex-flow: row nowrap;
+}
+
+.goals.layout-vertical {
+  flex-flow: column nowrap;
+}
+
+.goals.layout-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(220px, 330px));
+}
+
+.overlay.top .goals {
+  transform-origin: top center;
+}
+
+.overlay.left .goals {
+  transform-origin: center left;
+}
+
+.overlay.right .goals {
+  transform-origin: center right;
+}
+
+/* ネオン: 暗い面に発光する縁取りと文字。達成すると縁がゆっくり明滅する。 */
+.goal-card {
+  width: clamp(220px, 28vw, 330px);
+  border-radius: 10px;
+  padding: 12px 14px 14px;
+  color: #ffffff;
+  background: rgba(8, 6, 20, var(--bg-alpha));
+  border: 2px solid var(--accent);
+  box-shadow:
+    0 0 6px var(--glow),
+    0 0 18px var(--glow),
+    inset 0 0 12px color-mix(in srgb, var(--accent) 25%, transparent);
+}
+
+.goal-card.reached {
+  animation: neon-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes neon-pulse {
+  0%, 100% { box-shadow: 0 0 6px var(--glow), 0 0 18px var(--glow), inset 0 0 12px color-mix(in srgb, var(--accent) 25%, transparent); }
+  50% { box-shadow: 0 0 10px var(--glow), 0 0 32px var(--glow), 0 0 48px var(--glow), inset 0 0 18px color-mix(in srgb, var(--accent) 40%, transparent); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .goal-card.reached {
+    animation: none;
+    box-shadow: 0 0 10px var(--glow), 0 0 32px var(--glow);
+  }
+}
+
+.goal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.goal-title {
+  font-size: 13px;
+  line-height: 1;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  color: var(--accent);
+  text-shadow: 0 0 6px var(--glow), 0 0 12px var(--glow);
+}
+
+.goal-percent {
+  flex: 0 0 auto;
+  min-width: 48px;
+  border: 1px solid var(--accent);
+  border-radius: 999px;
+  padding: 3px 8px;
+  text-align: center;
+  font-size: 12px;
+  line-height: 1;
+  font-weight: 800;
+  color: #ffffff;
+  text-shadow: 0 0 6px var(--glow);
+  box-shadow: 0 0 8px var(--glow);
+}
+
+.goal-value {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+
+.goal-current {
+  font-size: 34px;
+  line-height: 1;
+  font-weight: 900;
+  color: #ffffff;
+  text-shadow: 0 0 4px #ffffff, 0 0 12px var(--glow), 0 0 24px var(--glow);
+}
+
+.goal-target {
+  font-size: 15px;
+  line-height: 1;
+  font-weight: 700;
+  color: rgba(255,255,255,0.7);
+}
+
+.goal-bar {
+  position: relative;
+  width: 100%;
+  height: 8px;
+  margin-top: 12px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+}
+
+.goal-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 0;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--accent-2), var(--accent));
+  box-shadow: 0 0 8px var(--glow), 0 0 16px var(--glow);
+  transition: width 220ms ease;
+}
+
+.viewers {
+  --accent: #3cf2ff;
+  --accent-2: #1e90ff;
+  --glow: rgba(60, 242, 255, 0.65);
+}
+
+.comments {
+  --accent: #ff4fd8;
+  --accent-2: #a23cff;
+  --glow: rgba(255, 79, 216, 0.6);
+}
+
+.likes {
+  --accent: #b6ff3c;
+  --accent-2: #2ee88a;
+  --glow: rgba(182, 255, 60, 0.55);
+}
+
+.reactions {
+  --accent: #ffb03c;
+  --accent-2: #ff4f6d;
+  --glow: rgba(255, 160, 60, 0.6);
+}
+
+@media (max-width: 620px) {
+  .overlay {
+    padding: 12px;
+  }
+
+  .goals {
+    gap: 8px;
+  }
+
+  .goal-card {
+    width: min(92vw, 320px);
+    padding: 10px 12px 12px;
+  }
+
+  .goal-current {
+    font-size: 28px;
+  }
+}

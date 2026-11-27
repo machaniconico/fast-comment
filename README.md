@@ -11,7 +11,7 @@ Twitch / YouTube のライブコメントを1つの画面に集約し、OBS オ�
 - **URL自動判別でチャンネル追加** — 配信URLを貼るだけでプラットフォーム/チャンネルを判別して追加
 - **低遅延・高負荷耐性** — バックプレッシャ + フレーム単位バッチ送出 + UI仮想スクロール
 - **YouTube仕様変更に強い** — 寛容パース + `config.json` の `youtubeOverrides` で再ビルド無しにホットパッチ
-- **OBS オーバーレイ** — 内蔵HTTP/WebSocketサーバでコメントをリアルタイム配信。9種類のテンプレート(default / simple / bubble / ticker / ranking / goals / donation / timer / danmaku)・フォント倍率・最大行数・表示時間・背景透過・表示位置などを設定可能
+- **OBS オーバーレイ** — 内蔵HTTP/WebSocketサーバでコメントをリアルタイム配信。14種類のテンプレート(default / simple / bubble / ticker / ranking / goals / goals-neon / goals-retro / donation / timer / poll / danmaku / trophy / effects)・フォント倍率・最大行数・表示時間・背景透過・表示位置などを設定可能
 - **弾幕オーバーレイ** — ニコ生風に画面を流れるコメント。デスクトップ用の透過・クリックスルー・最前面オーバーレイ窓と、OBSブラウザソース用 `danmaku` テンプレの両方に対応
 - **読み上げ(TTS) 3バックエンド** — 棒読みちゃん / VOICEVOX / ブラウザ Web Speech をアダプタ化。速度・音程・音量・声質、名前読み上げ/URL省略/絵文字除去/最大文字数などを細かく調整可能。棒読みちゃんは自動起動にも対応
 - **投げ銭の別表示** — SuperChat / Bits / メンバーシップを通常コメントと分けて表示（アプリ内タブ / OBS `?only=gift`）。既定OFF

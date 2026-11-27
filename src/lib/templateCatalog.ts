@@ -4,6 +4,20 @@ import type { TemplateInfo } from './ipc';
 export const DEFAULT_TEMPLATE_ID = 'default';
 const MAX_NAME_LEN = 64;
 
+// 集計値を専用の WebSocket で受け取る内蔵テンプレ。それ以外は /ws(コメント)。
+const BUILTIN_WS_PATHS: Readonly<Record<string, string>> = {
+  goals: '/stats',
+  'goals-neon': '/stats',
+  'goals-retro': '/stats',
+  timer: '/timer',
+  poll: '/poll',
+};
+
+/** テンプレエディタのプレビュー / URL コピーで `ws` に載せるパス。カスタムは由来が分からないので /ws。 */
+export function templateWsPath(id: string): string {
+  return Object.hasOwn(BUILTIN_WS_PATHS, id) ? BUILTIN_WS_PATHS[id] : '/ws';
+}
+
 export function templateKindLabel(kind: TemplateInfo['kind']): string {
   return kind === 'builtin' ? '内蔵' : 'カスタム';
 }

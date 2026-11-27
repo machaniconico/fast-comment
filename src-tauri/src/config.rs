@@ -506,6 +506,10 @@ pub struct GoalsConfig {
     /// OBS上の外観("glass" / "solid" / "minimal")。
     #[serde(default = "default_goals_skin")]
     pub skin: String,
+    /// OBS 用 URL に載せるテンプレ ID。内蔵の "goals" / "goals-neon" / "goals-retro" か、
+    /// "custom:<name>"(複製したカスタム)。値の検証は UI 側で行い、ここでは既定だけ持つ。
+    #[serde(default = "default_goals_template")]
+    pub template: String,
     /// 各ゲージの表示可否。None は旧設定との互換用で、目標値が1以上なら表示。
     #[serde(default)]
     pub show_comments: Option<bool>,
@@ -533,6 +537,7 @@ impl Default for GoalsConfig {
             show_in_app: false,
             layout: default_goals_layout(),
             skin: default_goals_skin(),
+            template: default_goals_template(),
             show_comments: Some(true),
             show_viewers: Some(true),
             show_likes: Some(true),
@@ -1852,6 +1857,9 @@ fn default_goals_layout() -> String {
 fn default_goals_skin() -> String {
     "glass".to_string()
 }
+fn default_goals_template() -> String {
+    "goals".to_string()
+}
 fn default_timer_duration_sec() -> u32 {
     300
 }
@@ -2150,6 +2158,7 @@ mod tests {
                 show_in_app: true,
                 layout: "grid".to_string(),
                 skin: "solid".to_string(),
+                template: "goals-neon".to_string(),
                 show_comments: Some(true),
                 show_viewers: Some(false),
                 show_likes: Some(true),
@@ -2301,6 +2310,7 @@ mod tests {
         assert_eq!(json["goals"]["enabled"].as_bool(), Some(true));
         assert_eq!(json["goals"]["showInApp"].as_bool(), Some(true));
         assert_eq!(json["goals"]["layout"].as_str(), Some("grid"));
+        assert_eq!(json["goals"]["template"].as_str(), Some("goals-neon"));
         assert_eq!(json["goals"]["skin"].as_str(), Some("solid"));
         assert_eq!(json["goals"]["showComments"].as_bool(), Some(true));
         assert_eq!(json["goals"]["showViewers"].as_bool(), Some(false));
@@ -2875,6 +2885,7 @@ mod tests {
         assert!(!legacy_goals.show_in_app);
         assert_eq!(legacy_goals.layout, "horizontal");
         assert_eq!(legacy_goals.skin, "glass");
+        assert_eq!(legacy_goals.template, "goals");
         assert_eq!(legacy_goals.show_comments, None);
         assert_eq!(legacy_goals.show_viewers, None);
         assert_eq!(legacy_goals.show_likes, None);
@@ -2889,6 +2900,7 @@ mod tests {
             show_in_app: true,
             layout: "vertical".to_string(),
             skin: "minimal".to_string(),
+            template: "custom:my-goals".to_string(),
             show_comments: Some(false),
             show_viewers: Some(true),
             show_likes: Some(false),
@@ -2903,6 +2915,7 @@ mod tests {
         assert_eq!(json["showInApp"].as_bool(), Some(true));
         assert_eq!(json["layout"].as_str(), Some("vertical"));
         assert_eq!(json["skin"].as_str(), Some("minimal"));
+        assert_eq!(json["template"].as_str(), Some("custom:my-goals"));
         assert_eq!(json["showComments"].as_bool(), Some(false));
         assert_eq!(json["reactions"].as_u64(), Some(12));
 
