@@ -26,6 +26,20 @@
   let saved = $state(false);
   let dirty = $state(false);
   let reviewItems = $state.raw<LaunchItem[]>([]);
+  let editingId = $state<string | null>(null);
+
+  function focusSelect(node: HTMLInputElement) {
+    node.focus();
+    node.select();
+  }
+
+  function commitLabel(index: number, value: string) {
+    if (editingId === null) return;
+    editingId = null;
+    const next = value === '' ? null : value;
+    if ((items[index]?.label ?? null) === next) return;
+    updateItems(items.map((entry, i) => (i === index ? { ...entry, label: next } : entry)));
+  }
   let dialog: HTMLDialogElement;
 
   onMount(() => {
@@ -167,17 +181,27 @@
         {#each items as item, index}
           <li>
             <div>
-              <strong>{item.kind === 'exe' ? 'アプリ' : 'URL'}{item.label ? ` ・ ${item.label}` : ''}</strong>
+              <div class="title">
+                <strong>{item.kind === 'exe' ? 'アプリ' : 'URL'}</strong>
+                {#if editingId === item.id}
+                  <input class="rename" type="text" maxlength="100" placeholder="表示名（空でなし）"
+                    aria-label="表示名" value={item.label ?? ''} use:focusSelect
+                    onkeydown={(event) => {
+                      if (event.key === 'Enter') { event.preventDefault(); commitLabel(index, event.currentTarget.value); }
+                      else if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); editingId = null; }
+                    }}
+                    onblur={(event) => commitLabel(index, event.currentTarget.value)} />
+                {:else}
+                  {#if item.label}<strong> ・ {item.label}</strong>{/if}
+                  <button type="button" class="icon" title="表示名を変更" aria-label="表示名を変更"
+                    onclick={() => (editingId = item.id)}>
+                    <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+                      <path fill="currentColor" d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zm17.71-10.21a1 1 0 0 0 0-1.41l-2.34-2.34a1 1 0 0 0-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z" />
+                    </svg>
+                  </button>
+                {/if}
+              </div>
               <div class="literal" dir="ltr">{item.target}</div>
-              <label class="rename">表示名
-                <input type="text" maxlength="100" placeholder="（なし）" value={item.label ?? ''}
-                  onchange={(event) => {
-                    const value = event.currentTarget.value;
-                    updateItems(items.map((entry, i) =>
-                      i === index ? { ...entry, label: value === '' ? null : value } : entry
-                    ));
-                  }} />
-              </label>
               {#if item.kind === 'exe'}
                 <label><input type="checkbox" checked={item.hideWindow}
                   onchange={(event) => updateItems(items.map((entry, i) =>
@@ -279,8 +303,10 @@
   dialog .literal { unicode-bidi: plaintext; }
   .actions { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
   .actions label { display: flex; align-items: center; }
-  .rename { display: flex; align-items: center; gap: 6px; margin: 4px 0; }
-  .rename input { flex: 1; min-width: 0; max-width: 320px; }
+  .title { display: flex; align-items: center; gap: 4px; min-width: 0; }
+  .title input.rename { flex: 1; min-width: 0; max-width: 320px; padding: 2px 6px; }
+  button.icon { display: inline-flex; align-items: center; padding: 2px 4px; border-color: transparent; background: transparent; opacity: 0.7; }
+  button.icon:hover, button.icon:focus-visible { opacity: 1; border-color: #666; }
   .warning { padding: 8px; border-left: 3px solid #ef7777; color: #ffb4a9; background: #442224; }
   dialog {
     box-sizing: border-box;
