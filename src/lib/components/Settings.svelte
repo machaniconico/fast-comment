@@ -141,11 +141,51 @@
   // 候補は TemplateEditor が list_templates で取った ID(複製・削除の直後にも届く)。
   let templateIds: string[] = $state([]);
 
+  // 目標バーの内蔵テンプレ。値は templates/<id>/ のディレクトリ名。
+  const DEFAULT_GOALS_TEMPLATE = 'goals';
+  const BUILTIN_GOALS_TEMPLATES: ReadonlyArray<{ id: string; label: string }> = [
+    { id: 'goals', label: '標準' },
+    { id: 'goals-neon', label: 'ネオン' },
+    { id: 'goals-retro', label: 'レトロ' },
+  ];
+  // スキン(グラス等・自作PNG)は標準テンプレと、その複製でだけ効く。
+  const SKINLESS_GOALS_TEMPLATES = new Set(['goals-neon', 'goals-retro']);
+
+  function normalizeGoalsTemplate(value: unknown): string {
+    if (typeof value !== 'string') return DEFAULT_GOALS_TEMPLATE;
+    const v = value.trim();
+    if (BUILTIN_GOALS_TEMPLATES.some((t) => t.id === v)) return v;
+    // templates.rs の is_valid_template_name と同じ文法(ASCII 英数・-・_、1〜64 バイト)。
+    if (/^custom:[A-Za-z0-9_-]{1,64}$/.test(v)) return v;
+    return DEFAULT_GOALS_TEMPLATE;
+  }
+
+  // 一覧の取得に成功した後、選んでいたカスタムが無ければ(削除済みなど) 標準に戻す。
+  // 取得前・失敗時(templateIds が空)は値を保つ。
+  function dropMissingGoalsTemplate() {
+    if (!config || templateIds.length === 0) return;
+    const current = config.goals.template;
+    if (current.startsWith('custom:') && !templateIds.includes(current)) {
+      config.goals.template = DEFAULT_GOALS_TEMPLATE;
+    }
+  }
+
+  const customGoalsTemplateIds = $derived.by(() => {
+    const ids = templateIds.filter((id) => id.startsWith('custom:'));
+    const current = config?.goals.template;
+    // 一覧の取得前や、一覧に無いカスタムを選んでいる時も選択肢から消さない。
+    if (typeof current === 'string' && current.startsWith('custom:') && !ids.includes(current)) {
+      ids.unshift(current);
+    }
+    return ids;
+  });
+
   function onTemplatesChange(list: TemplateInfo[], removedId?: string) {
     templateIds = list.map((t) => t.id);
     if (config && removedId !== undefined) {
       config.obs.template = applyDeleted(list, removedId, config.obs.template).current;
     }
+    dropMissingGoalsTemplate();
   }
 
   let saving: boolean = $state(false);
@@ -711,7 +751,7 @@
   ): string {
     try {
       const u = new URL(url);
-      u.searchParams.set('template', 'goals');
+      u.searchParams.set('template', normalizeGoalsTemplate(goals?.template));
       u.searchParams.set('font', String(clampInt(obs?.fontScalePct, 100, 50, 200)));
       u.searchParams.set('bg', String(clampInt(obs?.bgOpacityPct, 0, 0, 100)));
       u.searchParams.set('pos', obs?.position === 'top' ? 'top' : 'bottom');
@@ -803,6 +843,7 @@
       showInApp: false,
       layout: 'horizontal',
       skin: 'glass',
+      template: DEFAULT_GOALS_TEMPLATE,
       showComments: true,
       showViewers: true,
       showLikes: true,
@@ -850,6 +891,8 @@
       || customGoalSkinFile(editable.goals.skin)
         ? editable.goals.skin
         : 'glass';
+    editable.goals.template = normalizeGoalsTemplate(editable.goals.template);
+    dropMissingGoalsTemplate();
     editable.goals.showComments =
       typeof editable.goals.showComments === 'boolean'
         ? editable.goals.showComments
@@ -2847,8 +2890,32 @@
       </select>
     </div>
     <div class="field-row">
+      <label for="goals-template">OBSテンプレート</label>
+      <select id="goals-template" bind:value={config.goals.template} class="platform-select">
+        {#each BUILTIN_GOALS_TEMPLATES as t (t.id)}
+          <option value={t.id}>{t.label}</option>
+        {/each}
+        {#if customGoalsTemplateIds.length > 0}
+          <optgroup label="カスタム">
+            {#each customGoalsTemplateIds as id (id)}
+              <option value={id}>{id.slice('custom:'.length)}</option>
+            {/each}
+          </optgroup>
+        {/if}
+      </select>
+    </div>
+    <p class="hint">
+      カスタムは、テンプレートエディタで「標準」の goals を複製して編集した物を選べます。
+    </p>
+    <div class="field-row">
       <label for="goals-skin">OBSスキン</label>
-      <select id="goals-skin" bind:value={config.goals.skin} class="platform-select">
+      <select
+        id="goals-skin"
+        bind:value={config.goals.skin}
+        class="platform-select"
+        disabled={SKINLESS_GOALS_TEMPLATES.has(config.goals.template)}
+        title={SKINLESS_GOALS_TEMPLATES.has(config.goals.template) ? 'ネオン・レトロはスキンを使いません' : undefined}
+      >
         <option value="glass">グラス</option>
         <option value="solid">ソリッド</option>
         <option value="minimal">ミニマル</option>

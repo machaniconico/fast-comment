@@ -14,7 +14,8 @@
     applyDuplicated,
     groupTemplates,
     suggestCopyName,
-    templateKindLabel
+    templateKindLabel,
+    templateWsPath
   } from '../templateCatalog';
 
   const FILES = ['style.css', 'index.html', 'app.js'] as const;
@@ -79,7 +80,7 @@
     const template = selectedTemplate || 'default';
     const url = new URL(`http://127.0.0.1:${port}/`);
     url.searchParams.set('template', template);
-    url.searchParams.set('ws', `ws://127.0.0.1:${port}/ws`);
+    url.searchParams.set('ws', `ws://127.0.0.1:${port}${templateWsPath(template)}`);
     url.searchParams.set('t', String(previewNonce));
     return url.toString();
   });
@@ -89,7 +90,7 @@
     const template = selectedTemplate || 'default';
     const url = new URL(`http://127.0.0.1:${port}/`);
     url.searchParams.set('template', template);
-    url.searchParams.set('ws', `ws://127.0.0.1:${port}/ws`);
+    url.searchParams.set('ws', `ws://127.0.0.1:${port}${templateWsPath(template)}`);
     return url.toString();
   });
 

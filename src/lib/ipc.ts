@@ -597,6 +597,8 @@ export interface GoalsConfig {
   showInApp: boolean;
   layout: 'horizontal' | 'vertical' | 'grid';
   skin: 'glass' | 'solid' | 'minimal' | `png:${string}`;
+  /** 内蔵 'goals' / 'goals-neon' / 'goals-retro' か 'custom:<name>'。 */
+  template: string;
   showComments: boolean;
   showViewers: boolean;
   showLikes: boolean;
