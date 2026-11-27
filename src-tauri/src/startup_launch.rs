@@ -106,6 +106,23 @@ pub fn validate_items(items: &[LaunchItem]) -> Result<(), LaunchError> {
                     "アプリには拡張子が .exe / .bat / .cmd の Windows 絶対パスを指定してください",
                 ));
             }
+            LaunchKind::Exe if is_batch(&item.target) => {
+                if item.target.contains('%') {
+                    return Err(invalid(
+                        ".bat / .cmd のパスに % は使えません(cmd.exe が環境変数として展開します)",
+                    ));
+                }
+                if is_unc(&item.target) {
+                    return Err(invalid(
+                        ".bat / .cmd はネットワークパス(UNC)では使えません。ドライブ文字付きのパスを指定してください",
+                    ));
+                }
+                if batch_command_line_estimate(item) > BATCH_COMMAND_LINE_LIMIT {
+                    return Err(invalid(
+                        ".bat / .cmd のパスと引数が長すぎます(cmd.exe のコマンドライン上限を超えます)",
+                    ));
+                }
+            }
             LaunchKind::Url if item.hide_window => {
                 return Err(invalid("URLにはウィンドウを隠す設定を使えません"));
             }
@@ -118,6 +135,56 @@ pub fn validate_items(items: &[LaunchItem]) -> Result<(), LaunchError> {
         }
     }
     Ok(())
+}
+
+/// cmd.exe のコマンドライン上限 8191 文字に対する、保守的な見積もりの上限。
+const BATCH_COMMAND_LINE_LIMIT: usize = 8000;
+
+fn is_batch(target: &str) -> bool {
+    Path::new(target)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("bat") || ext.eq_ignore_ascii_case("cmd"))
+}
+
+/// `\\server\share` と `\\?\UNC\...`。`\\?\C:\...` はドライブ付きなので含めない。
+fn is_unc(target: &str) -> bool {
+    let normalized = target.replace('/', "\\");
+    match normalized.strip_prefix(r"\\?\") {
+        Some(rest) => rest
+            .get(..4)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("UNC\\")),
+        None => normalized.starts_with(r"\\"),
+    }
+}
+
+/// cmd.exe /e:ON /v:OFF /d /c 経由で起動した時のコマンドライン長の見積もり(UTF-16 単位)。
+/// `%` は 8、`"` は 2 に数える。
+fn batch_command_line_estimate(item: &LaunchItem) -> usize {
+    let utf16 = |text: &str| text.encode_utf16().count();
+    let args: usize = item
+        .args
+        .iter()
+        .map(|arg| {
+            3 + arg
+                .chars()
+                .map(|ch| match ch {
+                    '%' => 8,
+                    '"' => 2,
+                    _ => ch.len_utf16(),
+                })
+                .sum::<usize>()
+        })
+        .sum();
+    32 + utf16(&item.target) + 2 + args
+}
+
+/// `run.cmd` と `run.cmd.exe` が並ぶと、Rust 標準ライブラリは後者を先に選ぶ。
+/// 承認していない exe を起動しないため、.bat / .cmd の起動前に確かめる。
+fn has_ambiguous_exe_sibling(target: &Path) -> bool {
+    let is_batch_target = target.to_str().is_some_and(is_batch);
+    let mut sibling = target.as_os_str().to_owned();
+    sibling.push(".exe");
+    is_batch_target && Path::new(&sibling).exists()
 }
 
 fn is_absolute_app_path(target: &str) -> bool {
@@ -221,7 +288,7 @@ fn approval_hmac(key: &[u8], items: &[LaunchItem]) -> HmacSha256 {
         args: &'a [String],
         enabled: bool,
         // false の時はキーを出さず、この項目追加前に承認済みの一覧の MAC を変えない。
-        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        #[serde(rename = "hideWindow", skip_serializing_if = "std::ops::Not::not")]
         hide_window: bool,
     }
 
@@ -430,6 +497,9 @@ fn launch(item: &LaunchItem) -> Result<(), &'static str> {
             {
                 return Err("notAFile");
             }
+            if has_ambiguous_exe_sibling(target) {
+                return Err("ambiguousPath");
+            }
             let mut command = std::process::Command::new(target);
             command.args(&item.args).current_dir(parent);
             #[cfg(windows)]
@@ -516,7 +586,7 @@ mod tests {
             r"C:\Tools\a.bat",
             r"C:\Tools\a.CMD",
             r"C:\Tools\a.Bat",
-            r"\\server\share\a.bat",
+            r"\\server\share\a.exe",
         ] {
             assert!(validate_items(&app(path, false)).is_ok(), "{path}");
         }
@@ -529,6 +599,90 @@ mod tests {
         ] {
             assert!(validate_items(&app(path, false)).is_err(), "{path}");
         }
+    }
+
+    fn batch_app(args: Vec<String>) -> Vec<LaunchItem> {
+        let mut launch = app(r"C:\a.bat", false);
+        launch[0].args = args;
+        launch
+    }
+
+    #[test]
+    fn batch_rejects_percent_and_unc_but_exe_unc_is_allowed() {
+        for path in [r"C:\100%\a.bat", r"C:\a%PATH%.CMD"] {
+            let error = validate_items(&app(path, false)).unwrap_err().to_string();
+            assert!(
+                error.contains("1件目") && !error.contains("PATH"),
+                "{error}"
+            );
+        }
+        assert!(validate_items(&app(r"C:\100%\a.exe", false)).is_ok());
+        for path in [
+            r"\\server\share\a.bat",
+            r"\\server\share\a.cmd",
+            r"\\?\UNC\server\share\a.bat",
+            "//server/share/a.cmd",
+        ] {
+            assert!(validate_items(&app(path, false)).is_err(), "{path}");
+        }
+        for path in [
+            r"\\server\share\a.exe",
+            r"\\?\UNC\server\share\a.exe",
+            r"\\?\C:\Tools\a.bat",
+        ] {
+            assert!(validate_items(&app(path, false)).is_ok(), "{path}");
+        }
+    }
+
+    #[test]
+    fn batch_command_line_estimate_boundary_is_8000() {
+        // 見積もり = 32 + 8(target) + 2 + Σ(3 + 引数長) = 42 + 引数ごとの 3 + 文字数
+        let args_of = |total: usize| {
+            let mut args = vec!["a".repeat(1024); 7];
+            args.push("a".repeat(total - 7 * 1027 - 3));
+            args
+        };
+        let exact = batch_app(args_of(8000 - 42));
+        assert_eq!(batch_command_line_estimate(&exact[0]), 8000);
+        assert!(validate_items(&exact).is_ok());
+        let over = batch_app(args_of(8000 - 42 + 1));
+        assert_eq!(batch_command_line_estimate(&over[0]), 8001);
+        assert!(validate_items(&over).is_err());
+        // % は 8、" は 2、BMP 外は 2 に数える。
+        let weighted = batch_app(vec!["%\"\u{1F600}".into()]);
+        assert_eq!(
+            batch_command_line_estimate(&weighted[0]),
+            42 + 3 + 8 + 2 + 2
+        );
+        // .exe は対象外。
+        let mut exe = batch_app(args_of(8000 - 42 + 1));
+        exe[0].target = r"C:\a.exe".into();
+        assert!(validate_items(&exe).is_ok());
+    }
+
+    #[test]
+    fn ambiguous_exe_sibling_is_detected_only_for_batch_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let cmd = dir.path().join("run.cmd");
+        fs::write(&cmd, "").unwrap();
+        assert!(!has_ambiguous_exe_sibling(&cmd));
+        fs::write(dir.path().join("run.cmd.exe"), "").unwrap();
+        assert!(has_ambiguous_exe_sibling(&cmd));
+        let exe = dir.path().join("run.cmd.exe");
+        assert!(!has_ambiguous_exe_sibling(&exe));
+    }
+
+    #[test]
+    fn mac_for_hide_window_true_uses_camel_case_key() {
+        let key = [7; KEY_LEN];
+        let launch = app(r"C:\a.exe", true);
+        let fixed = r#"[{"id":"test","kind":"exe","target":"C:\\a.exe","args":[],"enabled":true,"hideWindow":true}]"#;
+        let mut mac = HmacSha256::new_from_slice(&key).unwrap();
+        mac.update(fixed.as_bytes());
+        assert_eq!(
+            approval_mac(&key, &launch),
+            mac.finalize().into_bytes().to_vec()
+        );
     }
 
     #[test]
