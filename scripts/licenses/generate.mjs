@@ -14,6 +14,7 @@ import { fileURLToPath } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const tauriDir = path.join(root, 'src-tauri');
+const textsDir = path.join(path.dirname(fileURLToPath(import.meta.url)), 'texts');
 const outFile = path.join(root, 'THIRD_PARTY_NOTICES.txt');
 const WINDOWS_TARGET = 'x86_64-pc-windows-msvc';
 const COPYLEFT = /\b(A?GPL|LGPL|MPL|EPL|CDDL|OSL|EUPL|CPL|SSPL)/i;
@@ -70,6 +71,8 @@ function rustPackages() {
       license: p.license ?? (p.license_file ? `(license-file: ${p.license_file})` : ''),
       dir: path.dirname(p.manifest_path),
       extraFile: p.license_file ?? undefined,
+      authors: p.authors ?? [],
+      repository: p.repository ?? '',
     };
   });
 }
@@ -118,20 +121,45 @@ const packages = [...rustPackages(), ...npmPackages()].sort(
   (a, b) => a.ecosystem.localeCompare(b.ecosystem) || a.name.localeCompare(b.name) || a.version.localeCompare(b.version),
 );
 
-const groups = new Map(); // 本文 -> { texts の由来ファイル名, パッケージ }
+/**
+ * LICENSE ファイルが配布物に無いパッケージ向けに、宣言された SPDX 種別の標準全文(texts/<SPDX>.txt。
+ * 他 crate に同梱の全文からコピーしたもの)を補う。MIT / BSD は Cargo.toml の authors から著作権表示を作る。
+ */
+function supplementText(pkg) {
+  const file = path.join(textsDir, `${pkg.license}.txt`);
+  if (!pkg.license || !existsSync(file)) return null;
+  const body = readText(file);
+  if (pkg.license !== 'MIT' && pkg.license !== 'BSD-3-Clause') return body;
+  const owner = pkg.authors?.length ? pkg.authors.join(', ') : `${pkg.name} の作者`;
+  return `Copyright (c) ${owner}\n\n${body}`;
+}
+
+const groups = new Map();
+const supplemented = [];
+const mpl = []; // 本文 -> { texts の由来ファイル名, パッケージ }
 const missing = [];
 const copyleft = [];
 for (const pkg of packages) {
   const label = `${pkg.name} ${pkg.version} (${pkg.license || 'ライセンス種別不明'})`;
   const kind = copyleftKind(pkg.license);
   if (kind) copyleft.push({ label, kind });
-  const texts = collectTexts(pkg.dir, pkg.extraFile);
+  if (pkg.license === 'MPL-2.0' && pkg.ecosystem === 'Rust') mpl.push(pkg);
+  let texts = collectTexts(pkg.dir, pkg.extraFile);
+  let note = '';
+  if (texts.length === 0) {
+    const text = supplementText(pkg);
+    if (text) {
+      texts = [{ name: `(標準全文を補足: ${pkg.license})`, text }];
+      note = ` ※配布元にライセンス文が無いため、宣言された種別の標準全文を補いました。repository: ${pkg.repository || '(未記載)'}`;
+      supplemented.push({ label, pkg });
+    }
+  }
   if (texts.length === 0 || !pkg.license) missing.push({ label, pkg, hasText: texts.length > 0 });
   for (const { name, text } of texts) {
     if (!groups.has(text)) groups.set(text, { files: new Set(), labels: [] });
     const group = groups.get(text);
     group.files.add(name);
-    group.labels.push(`[${pkg.ecosystem}] ${label}`);
+    group.labels.push(`[${pkg.ecosystem}] ${label}${note}`);
   }
 }
 
@@ -146,9 +174,23 @@ lines.push('');
 lines.push('このファイルは fast-comment に同梱される第三者ソフトウェアのライセンス表記です。');
 lines.push('scripts/licenses/generate.mjs が自動生成します。手で編集しないでください。');
 lines.push(`対象: Rust ${count('Rust')} 件(Windows ターゲットの実行時依存)、npm ${count('npm')} 件(本番 dependencies とその実行時依存)`);
+lines.push('LICENSE ファイルが配布元に無いパッケージは、宣言された種別の標準全文を補い、その旨を各項目に明記しています。');
 lines.push('同一の本文は 1 回にまとめ、その本文を持つパッケージを列挙しています。');
 lines.push('各パッケージの著作権表示は、本文に含まれるものをそのまま掲載しています。');
 lines.push('');
+if (mpl.length > 0) {
+  lines.push(bar);
+  lines.push('MPL-2.0 のコンポーネントのソースコード入手先');
+  lines.push(bar);
+  lines.push('以下の MPL-2.0 のコンポーネントは改変せずに使用しています。ソースコードは次の場所から入手できます。');
+  lines.push('');
+  for (const p of mpl) {
+    lines.push(`  - ${p.name} ${p.version}`);
+    lines.push(`      https://crates.io/crates/${p.name}/${p.version}`);
+    if (p.repository) lines.push(`      ${p.repository}`);
+  }
+  lines.push('');
+}
 if (missing.length > 0) {
   lines.push(bar);
   lines.push('ライセンス文が見つからなかったパッケージ');
@@ -174,6 +216,10 @@ const err = (s) => process.stderr.write(s + '\n');
 err(`THIRD_PARTY_NOTICES.txt: Rust ${count('Rust')} 件 / npm ${count('npm')} 件、本文 ${groups.size} 種、${statSync(outFile).size} バイト`);
 err('ライセンス種別の内訳:');
 for (const [license, n] of [...licenseCounts].sort((a, b) => b[1] - a[1])) err(`  ${n}\t${license}`);
+if (supplemented.length > 0) {
+  err(`情報: 標準全文を補ったパッケージ ${supplemented.length} 件`);
+  for (const m of supplemented) err(`  - ${m.label}`);
+}
 if (missing.length > 0) {
   err(`警告: ライセンス文または種別が見つからないパッケージ ${missing.length} 件`);
   for (const m of missing) err(`  - ${m.label}${m.hasText ? ' (種別の宣言なし)' : ''}`);
