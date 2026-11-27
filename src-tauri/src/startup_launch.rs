@@ -112,6 +112,11 @@ pub fn validate_items(items: &[LaunchItem]) -> Result<(), LaunchError> {
                         ".bat / .cmd のパスに % は使えません(cmd.exe が環境変数として展開します)",
                     ));
                 }
+                if item.target.starts_with(r"\\?\") || item.target.starts_with("//?/") {
+                    return Err(invalid(
+                        ".bat / .cmd では \\\\?\\ 形式のパスは使えません。通常のドライブ文字付きのパスを指定してください",
+                    ));
+                }
                 if is_unc(&item.target) {
                     return Err(invalid(
                         ".bat / .cmd はネットワークパス(UNC)では使えません。ドライブ文字付きのパスを指定してください",
@@ -158,7 +163,7 @@ fn is_unc(target: &str) -> bool {
 }
 
 /// cmd.exe /e:ON /v:OFF /d /c 経由で起動した時のコマンドライン長の見積もり(UTF-16 単位)。
-/// `%` は 8、`"` は 2 に数える。
+/// `%` は 8、`"` と `\`(Rust が倍化して引用する)は 2 に数える。
 fn batch_command_line_estimate(item: &LaunchItem) -> usize {
     let utf16 = |text: &str| text.encode_utf16().count();
     let args: usize = item
@@ -169,7 +174,7 @@ fn batch_command_line_estimate(item: &LaunchItem) -> usize {
                 .chars()
                 .map(|ch| match ch {
                     '%' => 8,
-                    '"' => 2,
+                    '"' | '\\' => 2,
                     _ => ch.len_utf16(),
                 })
                 .sum::<usize>()
@@ -621,6 +626,8 @@ mod tests {
             r"\\server\share\a.bat",
             r"\\server\share\a.cmd",
             r"\\?\UNC\server\share\a.bat",
+            r"\\?\C:\work\example.\a.cmd",
+            r"\\?\C:\Tools\a.bat",
             "//server/share/a.cmd",
         ] {
             assert!(validate_items(&app(path, false)).is_err(), "{path}");
@@ -628,7 +635,7 @@ mod tests {
         for path in [
             r"\\server\share\a.exe",
             r"\\?\UNC\server\share\a.exe",
-            r"\\?\C:\Tools\a.bat",
+            r"\\?\C:\Tools\a.exe",
         ] {
             assert!(validate_items(&app(path, false)).is_ok(), "{path}");
         }
@@ -654,6 +661,13 @@ mod tests {
             batch_command_line_estimate(&weighted[0]),
             42 + 3 + 8 + 2 + 2
         );
+        // `\` は倍化されるので 2 に数える。
+        let backslashes = batch_app(vec!["\\".repeat(1024); 5]);
+        assert_eq!(
+            batch_command_line_estimate(&backslashes[0]),
+            42 + 5 * (3 + 2048)
+        );
+        assert!(validate_items(&backslashes).is_err());
         // .exe は対象外。
         let mut exe = batch_app(args_of(8000 - 42 + 1));
         exe[0].target = r"C:\a.exe".into();
