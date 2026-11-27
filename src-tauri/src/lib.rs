@@ -390,7 +390,9 @@ fn resolve_license_doc(app: &AppHandle, doc: LicenseDoc) -> Option<PathBuf> {
     if let Ok(dir) = app.path().resource_dir() {
         candidates.push(dir.join(doc.file_name()));
     }
-    // 開発時フォールバック(cwd はリポジトリ直下か src-tauri/)。
+    // 開発時フォールバック(cwd はリポジトリ直下か src-tauri/)。リリースビルドでは
+    // 起動時の作業フォルダーに置かれた同名ファイルを開かないよう、デバッグビルドに限る。
+    #[cfg(debug_assertions)]
     if let Ok(cwd) = std::env::current_dir() {
         candidates.push(cwd.join(doc.repo_file_name()));
         candidates.push(cwd.join("..").join(doc.repo_file_name()));
