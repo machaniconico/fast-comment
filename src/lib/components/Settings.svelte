@@ -10,7 +10,7 @@
     setTtsPaused, clearTtsQueue, skipCurrentTts, testTts, probeTtsEngine, getYoutubeOauthStatus,
     connectYoutubeOauth, disconnectYoutubeOauth, getTwitchOauthStatus, beginTwitchLogin,
     awaitTwitchLogin, cancelTwitchLogin, disconnectTwitchOauth, getGoalSkinInfo, openUrl,
-    getCommentLogDir, openCommentLogDir, listListeners, deleteListener, resetAllListenerDonations
+    getCommentLogDir, openCommentLogDir, openLicenseDoc, listListeners, deleteListener, resetAllListenerDonations
   } from '../ipc';
   import {
     urlForEngineChange, buildVoicevoxParams, buildAutoSpeed, buildQueueLimits, kindTemplate, allTemplate,
@@ -1059,6 +1059,16 @@
       await openCommentLogDir();
     } catch (e) {
       logMsg = `フォルダを開けませんでした: ${String(e)}`;
+    }
+  }
+
+  let licenseMsg: string = $state('');
+  async function onOpenLicenseDoc(doc: 'thirdParty' | 'appLicense') {
+    licenseMsg = '';
+    try {
+      await openLicenseDoc(doc);
+    } catch (e) {
+      licenseMsg = `ライセンス文書を開けませんでした: ${String(e)}`;
     }
   }
 
@@ -3381,6 +3391,11 @@
       </p>
     {/if}
     <p class="hint">起動時に自動で確認します（失敗しても通知しません）。更新すると接続中の配信は一度切れます。</p>
+    <div class="field-row">
+      <button class="export-btn" onclick={() => void onOpenLicenseDoc('thirdParty')}>第三者ライセンス</button>
+      <button class="export-btn" onclick={() => void onOpenLicenseDoc('appLicense')}>本体のライセンス (MIT)</button>
+      {#if licenseMsg}<span class="hint-inline" role="status">{licenseMsg}</span>{/if}
+    </div>
   </SettingsSection>
 
   <!-- ── Export ── -->

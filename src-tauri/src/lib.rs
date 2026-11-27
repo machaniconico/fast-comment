@@ -50,7 +50,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -357,6 +357,55 @@ async fn open_backup_dir(state: State<'_, AppState>) -> Result<(), String> {
     .await
     .map_err(|_| MESSAGE.to_owned())?
     .map_err(str::to_owned)
+}
+
+/// 同梱ライセンス文書の種別。ファイル名はここで固定し、パスは呼び出し側から受け取らない。
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum LicenseDoc {
+    ThirdParty,
+    AppLicense,
+}
+
+impl LicenseDoc {
+    /// 配布物のリソース直下 (tauri.conf.json の bundle.resources) に置くファイル名。
+    fn file_name(self) -> &'static str {
+        match self {
+            LicenseDoc::ThirdParty => "THIRD_PARTY_NOTICES.txt",
+            LicenseDoc::AppLicense => "LICENSE.txt",
+        }
+    }
+
+    /// 開発時のフォールバック(リポジトリ直下)での名前。
+    fn repo_file_name(self) -> &'static str {
+        match self {
+            LicenseDoc::ThirdParty => "THIRD_PARTY_NOTICES.txt",
+            LicenseDoc::AppLicense => "LICENSE",
+        }
+    }
+}
+
+fn resolve_license_doc(app: &AppHandle, doc: LicenseDoc) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(dir) = app.path().resource_dir() {
+        candidates.push(dir.join(doc.file_name()));
+    }
+    // 開発時フォールバック(cwd はリポジトリ直下か src-tauri/)。
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join(doc.repo_file_name()));
+        candidates.push(cwd.join("..").join(doc.repo_file_name()));
+    }
+    candidates.into_iter().find(|path| path.is_file())
+}
+
+#[tauri::command]
+async fn open_license_doc(app: AppHandle, doc: LicenseDoc) -> Result<(), String> {
+    const MESSAGE: &str = "ライセンス文書を開けませんでした";
+    let path = resolve_license_doc(&app, doc).ok_or(MESSAGE)?;
+    tauri::async_runtime::spawn_blocking(move || open_directory(&path))
+        .await
+        .map_err(|_| MESSAGE.to_owned())?
+        .map_err(|_| MESSAGE.to_owned())
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -4751,6 +4800,7 @@ pub fn run() {
             create_backup_now,
             restore_backup,
             open_backup_dir,
+            open_license_doc,
             take_startup_restore_failure,
             list_achievements,
             achievement_schema,
@@ -4899,6 +4949,16 @@ mod sound_command_tests {
 mod tests {
     use super::*;
     use achievements::store::AchievementDefs;
+
+    #[test]
+    fn license_doc_names_are_fixed_files() {
+        assert_eq!(LicenseDoc::ThirdParty.file_name(), "THIRD_PARTY_NOTICES.txt");
+        assert_eq!(LicenseDoc::AppLicense.file_name(), "LICENSE.txt");
+        assert_eq!(LicenseDoc::AppLicense.repo_file_name(), "LICENSE");
+        let parsed: LicenseDoc = serde_json::from_str("\"thirdParty\"").unwrap();
+        assert_eq!(parsed.file_name(), "THIRD_PARTY_NOTICES.txt");
+        assert!(serde_json::from_str::<LicenseDoc>("\"../secret\"").is_err());
+    }
 
     #[test]
     fn deleting_listener_from_disabled_engine_preserves_future_unlocks() {

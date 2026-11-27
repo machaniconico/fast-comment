@@ -229,3 +229,7 @@ def verify(secret: str, headers: dict, raw_body: bytes) -> bool:
 ## ライセンス
 
 [MIT](./LICENSE)
+
+配布物には第三者ライセンス表記 `THIRD_PARTY_NOTICES.txt`(Windows 向けに配布されるバイナリに入る Rust / npm 依存)を同梱し、設定画面の「アプリの更新」から開けます。
+依存を更新したら `pnpm licenses` で再生成し、差分をコミットしてください(`cargo` と `pnpm install` 済みの `node_modules` が必要)。
+ライセンス文が見つからない依存やコピーレフト系の依存は、実行時に標準エラーへ一覧が出ます。

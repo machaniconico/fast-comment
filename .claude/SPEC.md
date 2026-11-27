@@ -549,6 +549,7 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
 - X 自動告知(Intent)は投稿の成否が分からない(状態は `opened` まで)。同一文面の繰り返しは X の規約に触れうる。Twitch の配信検知は Helix 認証(Client ID)が前提。YouTube は videoId 直接指定の行だと対象外。
 - X 自動告知(API)は従量課金で無料枠が無い(2026-11 時点の目安で 1 件 $0.015、URL 入りは $0.20。正は Developer Console)。X の許可はアプリ×ユーザーで 1 つで、同じ Client ID を別 PC・別ツールでログインすると先の接続は切れる。refresh token は約 6 か月で失効し、その後は再ログインが要る。同一文面は X が 403 で拒否する。
 - Tauri build にはアイコン(`src-tauri/icons/`)が必要。
+- 第三者ライセンス表記: `THIRD_PARTY_NOTICES.txt`(リポジトリ直下・生成物)と `LICENSE` を `tauri.conf.json` の `bundle.resources` でインストーラーに同梱する(`LICENSE` は `LICENSE.txt` として)。生成は `pnpm licenses`(`scripts/licenses/generate.mjs`)。対象は Windows ターゲットの Rust normal 依存(dev / build 依存は除外、proc-macro は含める)と npm の本番 dependencies の実行時依存。同一本文は 1 回にまとめ、ライセンス文が見つからないものは同ファイル冒頭と標準エラーに列挙し、コピーレフト系は標準エラーで警告する。設定画面「アプリの更新」のボタンは IPC `open_license_doc`(`thirdParty` / `appLicense` の列挙だけ受け取り、ファイル名はバックエンドで固定)で開く。依存を更新したら再生成してコミットする(CI での鮮度チェックは無い)。
 
 ## 13. X 自動告知 (`autopost/`)
 
