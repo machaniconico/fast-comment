@@ -27,6 +27,8 @@
     { key: 'reactions', label: 'REACTIONS', className: 'reactions' },
     { key: 'comments', label: 'COMMENTS', className: 'comments' },
     { key: 'viewers', label: 'VIEWERS', className: 'viewers' },
+    { key: 'donation', label: 'DONATION', className: 'donation' },
+    { key: 'commenters', label: 'COMMENTERS', className: 'commenters' },
   ];
 
   const DEFAULT_WS_URL = 'ws://127.0.0.1:11180/stats';
@@ -41,12 +43,21 @@
   const cards = $derived.by((): GoalCard[] => {
     if (!snapshot) return [];
 
-    const goals = snapshot.goals ?? { comments: 0, viewers: 0, likes: 0, reactions: 0 };
+    const goals = snapshot.goals ?? {
+      comments: 0,
+      viewers: 0,
+      likes: 0,
+      reactions: 0,
+      donation: 0,
+      commenters: 0,
+    };
     const visible = snapshot.goalsVisible ?? {
       comments: true,
       viewers: true,
       likes: true,
       reactions: true,
+      donation: true,
+      commenters: true,
     };
     const nextCards: GoalCard[] = [];
 
@@ -147,6 +158,11 @@
   function formatCount(value: number): string {
     return nf.format(value);
   }
+
+  // 投げ銭は円の整数なので ¥ を付ける。
+  function formatValue(key: MetricKey, value: number): string {
+    return key === 'donation' ? `¥${formatCount(value)}` : formatCount(value);
+  }
 </script>
 
 {#if cards.length > 0}
@@ -158,8 +174,8 @@
           <div class="goal-percent">{card.percent}%</div>
         </div>
         <div class="goal-value">
-          <span class="goal-current">{formatCount(card.current)}</span>
-          <span class="goal-target">/ {formatCount(card.target)}</span>
+          <span class="goal-current">{formatValue(card.key, card.current)}</span>
+          <span class="goal-target">/ {formatValue(card.key, card.target)}</span>
         </div>
         <div class="goal-track">
           <div class="goal-fill" style={`width: ${card.width}%`}></div>
@@ -252,6 +268,8 @@
   .reactions .goal-fill { background: #ff8a8a; }
   .comments .goal-fill { background: #58a6ff; }
   .viewers .goal-fill { background: #56d364; }
+  .donation .goal-fill { background: #e3b341; }
+  .commenters .goal-fill { background: #bc8cff; }
 
   .goal-card.reached {
     border-color: rgba(255,255,255,0.2);

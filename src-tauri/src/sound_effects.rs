@@ -172,8 +172,8 @@ pub fn is_valid_sound_ref(sound: &str) -> bool {
     }
 }
 
-/// 円換算(ミリ円)。レート表に無い通貨・壊れたレートは None。
-fn jpy_milli(msg: &ChatMessage, rates: &RateTable, symbols: &BTreeMap<String, String>) -> Option<i64> {
+/// 円換算(ミリ円)。レート表に無い通貨・壊れたレートは None。目標(Goals)の投げ銭合計でも使う。
+pub(crate) fn jpy_milli(msg: &ChatMessage, rates: &RateTable, symbols: &BTreeMap<String, String>) -> Option<i64> {
     let amount = msg.amount.as_ref()?;
     let code = normalize_currency(&amount.currency, symbols);
     if !rates.get(&code).is_some_and(|r| r.is_finite() && *r > 0.0) {

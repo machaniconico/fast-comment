@@ -519,6 +519,10 @@ pub struct GoalsConfig {
     pub show_likes: Option<bool>,
     #[serde(default)]
     pub show_reactions: Option<bool>,
+    #[serde(default)]
+    pub show_donation: Option<bool>,
+    #[serde(default)]
+    pub show_commenters: Option<bool>,
     /// コメント数目標。0 は 0% として表示。
     pub comments: u32,
     /// 視聴者数目標。0 は 0% として表示。
@@ -528,6 +532,12 @@ pub struct GoalsConfig {
     /// YouTube 絵文字リアクション数目標。0 は 0% として表示。
     #[serde(default)]
     pub reactions: u32,
+    /// 投げ銭の円換算合計の目標(円)。0 は 0% として表示。
+    #[serde(default)]
+    pub donation: u32,
+    /// コメントした人数(ユニーク発言者)の目標。0 は 0% として表示。
+    #[serde(default)]
+    pub commenters: u32,
 }
 
 impl Default for GoalsConfig {
@@ -542,10 +552,14 @@ impl Default for GoalsConfig {
             show_viewers: Some(true),
             show_likes: Some(true),
             show_reactions: Some(true),
+            show_donation: Some(true),
+            show_commenters: Some(true),
             comments: 0,
             viewers: 0,
             likes: 0,
             reactions: 0,
+            donation: 0,
+            commenters: 0,
         }
     }
 }
@@ -2163,10 +2177,14 @@ mod tests {
                 show_viewers: Some(false),
                 show_likes: Some(true),
                 show_reactions: Some(false),
+                show_donation: Some(true),
+                show_commenters: Some(false),
                 comments: 100,
                 viewers: 50,
                 likes: 25,
                 reactions: 0,
+                donation: 5000,
+                commenters: 30,
             },
             timer: TimerConfig {
                 enabled: true,
@@ -2894,6 +2912,10 @@ mod tests {
         assert_eq!(legacy_goals.viewers, 20);
         assert_eq!(legacy_goals.likes, 30);
         assert_eq!(legacy_goals.reactions, 0);
+        assert_eq!(legacy_goals.show_donation, None);
+        assert_eq!(legacy_goals.show_commenters, None);
+        assert_eq!(legacy_goals.donation, 0);
+        assert_eq!(legacy_goals.commenters, 0);
 
         let cfg = GoalsConfig {
             enabled: true,
@@ -2905,10 +2927,14 @@ mod tests {
             show_viewers: Some(true),
             show_likes: Some(false),
             show_reactions: Some(true),
+            show_donation: Some(false),
+            show_commenters: Some(true),
             comments: 100,
             viewers: 50,
             likes: 25,
             reactions: 12,
+            donation: 10000,
+            commenters: 40,
         };
         let text = serde_json::to_string(&cfg).expect("serialize goals config");
         let json: serde_json::Value = serde_json::from_str(&text).expect("parse goals json");
@@ -2918,6 +2944,10 @@ mod tests {
         assert_eq!(json["template"].as_str(), Some("custom:my-goals"));
         assert_eq!(json["showComments"].as_bool(), Some(false));
         assert_eq!(json["reactions"].as_u64(), Some(12));
+        assert_eq!(json["showDonation"].as_bool(), Some(false));
+        assert_eq!(json["showCommenters"].as_bool(), Some(true));
+        assert_eq!(json["donation"].as_u64(), Some(10000));
+        assert_eq!(json["commenters"].as_u64(), Some(40));
 
         let decoded: GoalsConfig = serde_json::from_str(&text).expect("deserialize goals config");
         assert_eq!(decoded, cfg);

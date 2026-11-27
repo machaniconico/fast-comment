@@ -119,6 +119,8 @@ test('enabled goals render cards even when every target is zero', () => {
     viewers: 0,
     likes: 0,
     reactions: 0,
+    donation: 0,
+    commenters: 0,
     likesAvailable: true,
     reactionsAvailable: true,
     goalsEnabled: true,
@@ -127,19 +129,24 @@ test('enabled goals render cards even when every target is zero', () => {
       viewers: true,
       likes: true,
       reactions: true,
+      donation: true,
+      commenters: true,
     },
     goals: {
       comments: 0,
       viewers: 0,
       likes: 0,
       reactions: 0,
+      donation: 0,
+      commenters: 0,
     },
   });
 
-  assert.equal(harness.goals.children.length, 4);
+  assert.equal(harness.goals.children.length, 6);
   for (const card of harness.goals.children) {
     assert.equal(card.children[0].children[1].textContent, '0%');
-    assert.equal(card.children[1].children[1].textContent, '/ 0');
+    const zero = card.className.split(' ').includes('donation') ? '/ ¥0' : '/ 0';
+    assert.equal(card.children[1].children[1].textContent, zero);
     assert.equal(card.children[2].children[0].style.width, '0%');
   }
 });
@@ -152,6 +159,8 @@ test('disabled goals remain hidden when every target is zero', () => {
     viewers: 0,
     likes: 0,
     reactions: 0,
+    donation: 0,
+    commenters: 0,
     likesAvailable: true,
     reactionsAvailable: true,
     goalsEnabled: false,
@@ -160,12 +169,16 @@ test('disabled goals remain hidden when every target is zero', () => {
       viewers: true,
       likes: true,
       reactions: true,
+      donation: true,
+      commenters: true,
     },
     goals: {
       comments: 0,
       viewers: 0,
       likes: 0,
       reactions: 0,
+      donation: 0,
+      commenters: 0,
     },
   });
 
@@ -180,6 +193,8 @@ test('individual goal visibility hides only unchecked metrics', () => {
     viewers: 0,
     likes: 0,
     reactions: 0,
+    donation: 0,
+    commenters: 0,
     likesAvailable: true,
     reactionsAvailable: true,
     goalsEnabled: true,
@@ -188,18 +203,92 @@ test('individual goal visibility hides only unchecked metrics', () => {
       viewers: false,
       likes: true,
       reactions: false,
+      donation: true,
+      commenters: false,
     },
     goals: {
       comments: 0,
       viewers: 0,
       likes: 0,
       reactions: 0,
+      donation: 0,
+      commenters: 0,
     },
   });
 
-  assert.equal(harness.goals.children.length, 2);
+  assert.equal(harness.goals.children.length, 3);
   assert.equal(harness.goals.children[0].children[0].children[0].textContent, 'LIKES');
   assert.equal(harness.goals.children[1].children[0].children[0].textContent, 'COMMENTS');
+  assert.equal(harness.goals.children[2].children[0].children[0].textContent, 'DONATION');
+});
+
+function donationSnapshot() {
+  return {
+    comments: 12,
+    viewers: 0,
+    likes: 0,
+    reactions: 0,
+    donation: 1500,
+    commenters: 7,
+    likesAvailable: true,
+    reactionsAvailable: true,
+    goalsEnabled: true,
+    goalsVisible: {
+      comments: true,
+      viewers: true,
+      likes: true,
+      reactions: true,
+      donation: true,
+      commenters: true,
+    },
+    goals: {
+      comments: 100,
+      viewers: 0,
+      likes: 0,
+      reactions: 0,
+      donation: 3000,
+      commenters: 10,
+    },
+  };
+}
+
+function cardByLabel(harness, label) {
+  return harness.goals.children.find((card) => card.children[0].children[0].textContent === label);
+}
+
+test('donation shows yen sign on current and target values', () => {
+  const harness = createHarness();
+  harness.render(donationSnapshot());
+
+  const card = cardByLabel(harness, 'DONATION');
+  assert.ok(card);
+  assert.ok(card.className.split(' ').includes('donation'));
+  assert.equal(card.children[0].children[1].textContent, '50%');
+  assert.equal(card.children[1].children[0].textContent, `¥${new Intl.NumberFormat().format(1500)}`);
+  assert.equal(card.children[1].children[1].textContent, `/ ¥${new Intl.NumberFormat().format(3000)}`);
+  assert.equal(card.children[2].children[0].style.width, '50%');
+});
+
+test('commenters shows plain count and progress', () => {
+  const harness = createHarness();
+  harness.render(donationSnapshot());
+
+  const card = cardByLabel(harness, 'COMMENTERS');
+  assert.ok(card);
+  assert.ok(card.className.split(' ').includes('commenters'));
+  assert.equal(card.children[0].children[1].textContent, '70%');
+  assert.equal(card.children[1].children[0].textContent, '7');
+  assert.equal(card.children[1].children[1].textContent, '/ 10');
+});
+
+test('only query filters to the new donation and commenters keys', () => {
+  const harness = createHarness('?only=donation,COMMENTERS');
+  harness.render(donationSnapshot());
+
+  assert.deepEqual(
+    harness.goals.children.map((card) => card.children[0].children[0].textContent),
+    ['DONATION', 'COMMENTERS'],
+  );
 });
 
 test('goals-neon / goals-retro use the same app.js as goals', () => {

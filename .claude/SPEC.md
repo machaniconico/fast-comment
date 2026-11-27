@@ -333,7 +333,10 @@ MVP(§8)に加えて以下が出荷済み。いずれも `config.ui` 等で ON/O
 - **アンケート** (`Poll.svelte`): 「ツール ▾」からコメント投票を開始・終了し、5 種類のグラフで結果を表示。OBS に同じ結果を配信する(§19)。
 - **配信振り返りダッシュボード** (`Dashboard.svelte`, `Sparkline.svelte`): コメント数・視聴者推移などの集計表示。
 - **タイマー/ゴール/エフェクト/マイルストーン** (`Timer.svelte`, `GoalsBar.svelte`, `Effects.svelte`, `Milestone.svelte`): 配信演出系。OBS テンプレ `timer`/`goals` と連動。
-  - Goals はコメント、視聴者、高評価、リアクションを表示できる。リアクションは YouTube 絵文字リアクション累計で、YouTube のみ有効(`reactionsAvailable=false` で自動非表示)。
+  - Goals はコメント、視聴者、高評価、リアクション、投げ銭、コメントした人数を表示できる。リアクションは YouTube 絵文字リアクション累計で、YouTube のみ有効(`reactionsAvailable=false` で自動非表示)。
+  - 投げ銭(`donation`、目標 `goals.donation`・表示 `goals.showDonation`)は受信した投げ銭の円換算合計。数える対象はリスナー記録の投げ銭累計と同じ `listeners::counts_as_donation`(SuperChat / Bits / Gift で金額が正・有限、SUBGIFT・システム・テスト注入・集計対象外を除く)、換算は効果音と同じ `sound_effects::jpy_milli`(実績定義のレート表と通貨記号の上書き。受信ごとに最新の定義を読むので再読込が反映される)。換算できない通貨は数えない。ミリ円で累計し、表示・目標値は円の整数(切り捨て)。アプリ起動中の累計でコメント数と同じくリセットしない。OBS・アプリ内とも現在値・目標値に `¥` を付ける。
+  - コメントした人数(`commenters`、目標 `goals.commenters`・表示 `goals.showCommenters`)は、プラットフォーム+チャンネル単位のユニーク発言者(視聴者キーと同じ)の和。設定変更時に無効になったチャンネルの分は外す。
+  - 各ゲージの表示 `show*` が未設定(旧設定)の時は目標値が 1 以上なら表示。新項目はすべて省略可能で、旧設定 JSON もそのまま読める。OBS テンプレの `only=` には `donation` / `commenters` も指定できる。
   - キーワードエフェクトは §9.2。アプリ内エフェクト有効時は、YouTube匿名リアクションの絵文字別増分を専用16msバッチIPCで受け、右端寄りに浮上・フェード表示する。初回pollはrolling windowの再送分なので、再接続時の重複を避けるため統計・演出とも更新しない。描画数は画面幅別の上限を設け、`prefers-reduced-motion` では演出を省略する。コメント/TTS/OBSには混ぜない。
 - **マルチカラム表示** (`MultiColumnView.svelte`): チャンネル/種別ごとの複数列ビュー。
 - **設定/モデレーションのポータビリティ** (`ConfigPortability.svelte`, `ModerationPortability.svelte`): 設定・NG/ハイライトのエクスポート/インポート。
