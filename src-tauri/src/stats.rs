@@ -79,6 +79,9 @@ pub struct StatsSnapshot {
     /// コメントした人数(有効なチャンネルごとのユニーク発言者の和)。
     #[serde(default)]
     pub commenters: u32,
+    /// 初見コメント数(リスナー記録で初めてのコメント)。アプリ起動中の累計。
+    #[serde(default)]
+    pub first_comments: u32,
     pub goals_enabled: bool,
     pub goals_visible: GoalsVisibilitySnapshot,
     #[serde(default)]
@@ -179,6 +182,8 @@ pub struct GoalsSnapshot {
     pub donation: u32,
     #[serde(default)]
     pub commenters: u32,
+    #[serde(default)]
+    pub first_comments: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -192,6 +197,8 @@ pub struct GoalsVisibilitySnapshot {
     pub donation: bool,
     #[serde(default)]
     pub commenters: bool,
+    #[serde(default)]
+    pub first_comments: bool,
 }
 
 /// メタデータ poller から集約タスクへ渡す更新。
@@ -270,6 +277,7 @@ pub fn spawn_stats_aggregator(
         let mut reactions = 0u32;
         // 投げ銭はミリ円で累計し、表示時に円へ切り捨てる(1 件ごとの丸め誤差を溜めない)。
         let mut donation_milli = 0i64;
+        let mut first_comments = 0u32;
         let mut viewers_max = 0u32;
         let mut viewer_scopes: HashMap<String, HashSet<String>> = HashMap::new();
         let mut metadata: HashMap<String, MetadataState> = HashMap::new();
@@ -283,6 +291,7 @@ pub fn spawn_stats_aggregator(
             viewers_max,
             reactions,
             donation_milli,
+            first_comments,
             &viewer_scopes,
             &metadata,
             &config,
@@ -297,6 +306,9 @@ pub fn spawn_stats_aggregator(
                         Ok(chat) => {
                             comments = comments.saturating_add(1);
                             record_unique_viewer(&mut viewer_scopes, &chat.message);
+                            if is_first_comment(&chat.message) {
+                                first_comments = first_comments.saturating_add(1);
+                            }
                             if counts_as_donation(&chat.message) {
                                 let defs = achievement_defs.current();
                                 donation_milli = donation_milli.saturating_add(donation_milli_of(
@@ -310,6 +322,7 @@ pub fn spawn_stats_aggregator(
                                 viewers_max,
                                 reactions,
                                 donation_milli,
+                                first_comments,
                                 &viewer_scopes,
                                 &metadata,
                                 &config,
@@ -334,6 +347,7 @@ pub fn spawn_stats_aggregator(
                         viewers_max,
                         reactions,
                         donation_milli,
+                        first_comments,
                         &viewer_scopes,
                         &metadata,
                         &config,
@@ -354,6 +368,7 @@ pub fn spawn_stats_aggregator(
                         viewers_max,
                         reactions,
                         donation_milli,
+                        first_comments,
                         &viewer_scopes,
                         &metadata,
                         &config,
@@ -368,6 +383,7 @@ pub fn spawn_stats_aggregator(
                         viewers_max,
                         reactions,
                         donation_milli,
+                        first_comments,
                         &viewer_scopes,
                         &metadata,
                         &config,
@@ -395,11 +411,13 @@ fn publish_snapshot(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_snapshot(
     comments: u32,
     viewers_max: u32,
     reactions: u32,
     donation_milli: i64,
+    first_comments: u32,
     viewer_scopes: &HashMap<String, HashSet<String>>,
     metadata: &HashMap<String, MetadataState>,
     config: &AppConfig,
@@ -466,6 +484,7 @@ fn build_snapshot(
         reactions_available: has_enabled_youtube(config),
         donation: donation_yen(donation_milli),
         commenters: unique_count,
+        first_comments,
         goals_enabled: config.goals.enabled,
         goals_visible: goals_visibility_from_config(config),
         channel_titles,
@@ -550,6 +569,15 @@ fn commenters_count(viewer_scopes: &HashMap<String, HashSet<String>>) -> u32 {
         .values()
         .map(|set| u32::try_from(set.len()).unwrap_or(u32::MAX))
         .fold(0u32, u32::saturating_add)
+}
+
+/// 初見コメントか。判定は効果音の初コメと同じ `listener.is_first_ever`(リスナー記録が無ければ数えない)。
+/// システム通知・テスト注入・集計対象外はコメントした人数・投げ銭と同じく除く。
+fn is_first_comment(msg: &ChatMessage) -> bool {
+    msg.kind != MessageKind::System
+        && !msg.is_injected_test_comment()
+        && !msg.route.uncounted
+        && msg.listener.as_ref().is_some_and(|l| l.is_first_ever)
 }
 
 fn record_unique_viewer(
@@ -695,6 +723,7 @@ fn goals_from_config(config: &AppConfig) -> GoalsSnapshot {
         reactions: config.goals.reactions,
         donation: config.goals.donation,
         commenters: config.goals.commenters,
+        first_comments: config.goals.first_comments,
     }
 }
 
@@ -721,6 +750,10 @@ fn goals_visibility_from_config(config: &AppConfig) -> GoalsVisibilitySnapshot {
             .goals
             .show_commenters
             .unwrap_or(config.goals.commenters > 0),
+        first_comments: config
+            .goals
+            .show_first_comments
+            .unwrap_or(config.goals.first_comments > 0),
     }
 }
 
@@ -844,7 +877,7 @@ mod tests {
             &config,
         );
 
-        let snapshot = build_snapshot(0, 0, 0, 0, &HashMap::new(), &metadata, &config);
+        let snapshot = build_snapshot(0, 0, 0, 0, 0, &HashMap::new(), &metadata, &config);
 
         assert_eq!(snapshot.viewers, 0);
         assert_eq!(snapshot.channel_status[0].viewers, None);
@@ -934,7 +967,7 @@ mod tests {
         record_unique_viewer(&mut scopes, &msg(Platform::Twitch, "gone", "c", "C"));
 
         retain_enabled_scopes(&mut scopes, &config);
-        let snapshot = build_snapshot(0, 0, 0, 0, &scopes, &HashMap::new(), &config);
+        let snapshot = build_snapshot(0, 0, 0, 0, 0, &scopes, &HashMap::new(), &config);
         assert_eq!(snapshot.commenters, 3);
     }
 
@@ -947,7 +980,7 @@ mod tests {
         config.goals.show_donation = None;
         config.goals.show_commenters = None;
 
-        let snapshot = build_snapshot(0, 0, 0, 1_234_999, &HashMap::new(), &HashMap::new(), &config);
+        let snapshot = build_snapshot(0, 0, 0, 1_234_999, 0, &HashMap::new(), &HashMap::new(), &config);
         assert_eq!(snapshot.donation, 1234);
         assert_eq!(snapshot.goals.donation, 5000);
         assert_eq!(snapshot.goals.commenters, 0);
@@ -959,6 +992,71 @@ mod tests {
         assert_eq!(json["commenters"].as_u64(), Some(0));
         assert_eq!(json["goals"]["donation"].as_u64(), Some(5000));
         assert_eq!(json["goalsVisible"]["commenters"].as_bool(), Some(false));
+    }
+
+    fn listener(is_first_ever: bool) -> crate::model::ListenerInfo {
+        crate::model::ListenerInfo {
+            comment_count: 1,
+            gift_count: 0,
+            first_seen_ms: 0,
+            prev_seen_ms: None,
+            is_first_ever,
+            label: None,
+            tts_muted: false,
+            tts_voice: None,
+        }
+    }
+
+    #[test]
+    fn first_comment_counts_only_first_ever_listener() {
+        let mut first = msg(Platform::Twitch, "ch", "u1", "a");
+        first.listener = Some(listener(true));
+        let mut repeat = msg(Platform::Twitch, "ch", "u2", "b");
+        repeat.listener = Some(listener(false));
+        let no_listener = msg(Platform::Twitch, "ch", "u3", "c");
+        assert!(is_first_comment(&first));
+        assert!(!is_first_comment(&repeat));
+        assert!(!is_first_comment(&no_listener));
+    }
+
+    #[test]
+    fn first_comment_skips_system_injected_and_uncounted() {
+        let base = || {
+            let mut m = msg(Platform::Youtube, "video", "u1", "a");
+            m.listener = Some(listener(true));
+            m
+        };
+        let mut system = base();
+        system.kind = MessageKind::System;
+        let mut injected = base();
+        injected.injected_test = true;
+        let mut uncounted = base();
+        uncounted.route.uncounted = true;
+        assert!(is_first_comment(&base()));
+        assert!(!is_first_comment(&system));
+        assert!(!is_first_comment(&injected));
+        assert!(!is_first_comment(&uncounted));
+    }
+
+    #[test]
+    fn snapshot_exposes_first_comments_goal_and_visibility() {
+        let mut config = AppConfig::default();
+        config.goals.enabled = true;
+        config.goals.first_comments = 0;
+        config.goals.show_first_comments = None;
+
+        let snapshot = build_snapshot(0, 0, 0, 0, 4, &HashMap::new(), &HashMap::new(), &config);
+        assert_eq!(snapshot.first_comments, 4);
+        assert_eq!(snapshot.goals.first_comments, 0);
+        assert!(!snapshot.goals_visible.first_comments);
+
+        config.goals.first_comments = 20;
+        let snapshot = build_snapshot(0, 0, 0, 0, 4, &HashMap::new(), &HashMap::new(), &config);
+        assert!(snapshot.goals_visible.first_comments);
+        let json = serde_json::to_value(&snapshot).expect("serialize snapshot");
+        assert_eq!(json["firstComments"].as_u64(), Some(4));
+        assert_eq!(json["goals"]["firstComments"].as_u64(), Some(20));
+        assert_eq!(json["goalsVisible"]["firstComments"].as_bool(), Some(true));
     }
 
     #[test]
@@ -983,7 +1081,7 @@ mod tests {
         let mut config = AppConfig::default();
         config.goals.enabled = true;
 
-        let snapshot = build_snapshot(0, 0, 0, 0, &HashMap::new(), &HashMap::new(), &config);
+        let snapshot = build_snapshot(0, 0, 0, 0, 0, &HashMap::new(), &HashMap::new(), &config);
 
         assert!(snapshot.goals_enabled);
         assert_eq!(snapshot.goals.comments, 0);
@@ -1075,7 +1173,7 @@ mod tests {
             },
         );
 
-        let snapshot = build_snapshot(0, 0, 0, 0, &HashMap::new(), &metadata, &config);
+        let snapshot = build_snapshot(0, 0, 0, 0, 0, &HashMap::new(), &metadata, &config);
 
         assert_eq!(snapshot.viewers, 17);
         assert_eq!(snapshot.likes, 3);
@@ -1130,7 +1228,7 @@ mod tests {
             },
         );
 
-        let snapshot = build_snapshot(0, 0, 0, 0, &HashMap::new(), &metadata, &config);
+        let snapshot = build_snapshot(0, 0, 0, 0, 0, &HashMap::new(), &metadata, &config);
 
         assert_eq!(snapshot.viewers, 10);
         let niconico = snapshot
@@ -1156,7 +1254,7 @@ mod tests {
             },
         );
 
-        let snapshot = build_snapshot(0, 0, 0, 0, &HashMap::new(), &metadata, &config);
+        let snapshot = build_snapshot(0, 0, 0, 0, 0, &HashMap::new(), &metadata, &config);
 
         assert_eq!(snapshot.channel_status.len(), 1);
         assert_eq!(snapshot.channel_status[0].identifier, "@example");
@@ -1192,7 +1290,7 @@ mod tests {
             },
         );
 
-        let snapshot = build_snapshot(0, 0, 0, 0, &HashMap::new(), &metadata, &config);
+        let snapshot = build_snapshot(0, 0, 0, 0, 0, &HashMap::new(), &metadata, &config);
 
         assert_eq!(snapshot.viewers, 0);
         assert_eq!(snapshot.likes, 0);
@@ -1228,7 +1326,7 @@ mod tests {
             },
         );
 
-        let snapshot = build_snapshot(0, 0, 0, 0, &HashMap::new(), &metadata, &config);
+        let snapshot = build_snapshot(0, 0, 0, 0, 0, &HashMap::new(), &metadata, &config);
 
         assert_eq!(snapshot.channel_status.len(), 1);
         assert_eq!(snapshot.channel_status[0].title.as_deref(), Some("Updated title"));
@@ -1271,7 +1369,7 @@ mod tests {
             &config,
         );
 
-        let snapshot = build_snapshot(0, 0, reactions, 0, &HashMap::new(), &metadata, &config);
+        let snapshot = build_snapshot(0, 0, reactions, 0, 0, &HashMap::new(), &metadata, &config);
 
         assert_eq!(reactions, 7);
         assert_eq!(metadata.len(), 1);

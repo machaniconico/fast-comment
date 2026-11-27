@@ -121,6 +121,7 @@ test('enabled goals render cards even when every target is zero', () => {
     reactions: 0,
     donation: 0,
     commenters: 0,
+    firstComments: 0,
     likesAvailable: true,
     reactionsAvailable: true,
     goalsEnabled: true,
@@ -131,6 +132,7 @@ test('enabled goals render cards even when every target is zero', () => {
       reactions: true,
       donation: true,
       commenters: true,
+      firstComments: true,
     },
     goals: {
       comments: 0,
@@ -139,10 +141,11 @@ test('enabled goals render cards even when every target is zero', () => {
       reactions: 0,
       donation: 0,
       commenters: 0,
+      firstComments: 0,
     },
   });
 
-  assert.equal(harness.goals.children.length, 6);
+  assert.equal(harness.goals.children.length, 7);
   for (const card of harness.goals.children) {
     assert.equal(card.children[0].children[1].textContent, '0%');
     const zero = card.className.split(' ').includes('donation') ? '/ ¥0' : '/ 0';
@@ -161,6 +164,7 @@ test('disabled goals remain hidden when every target is zero', () => {
     reactions: 0,
     donation: 0,
     commenters: 0,
+    firstComments: 0,
     likesAvailable: true,
     reactionsAvailable: true,
     goalsEnabled: false,
@@ -171,6 +175,7 @@ test('disabled goals remain hidden when every target is zero', () => {
       reactions: true,
       donation: true,
       commenters: true,
+      firstComments: true,
     },
     goals: {
       comments: 0,
@@ -179,6 +184,7 @@ test('disabled goals remain hidden when every target is zero', () => {
       reactions: 0,
       donation: 0,
       commenters: 0,
+      firstComments: 0,
     },
   });
 
@@ -195,6 +201,7 @@ test('individual goal visibility hides only unchecked metrics', () => {
     reactions: 0,
     donation: 0,
     commenters: 0,
+    firstComments: 0,
     likesAvailable: true,
     reactionsAvailable: true,
     goalsEnabled: true,
@@ -205,6 +212,7 @@ test('individual goal visibility hides only unchecked metrics', () => {
       reactions: false,
       donation: true,
       commenters: false,
+      firstComments: false,
     },
     goals: {
       comments: 0,
@@ -213,6 +221,7 @@ test('individual goal visibility hides only unchecked metrics', () => {
       reactions: 0,
       donation: 0,
       commenters: 0,
+      firstComments: 0,
     },
   });
 
@@ -230,6 +239,7 @@ function donationSnapshot() {
     reactions: 0,
     donation: 1500,
     commenters: 7,
+    firstComments: 3,
     likesAvailable: true,
     reactionsAvailable: true,
     goalsEnabled: true,
@@ -240,6 +250,7 @@ function donationSnapshot() {
       reactions: true,
       donation: true,
       commenters: true,
+      firstComments: true,
     },
     goals: {
       comments: 100,
@@ -248,6 +259,7 @@ function donationSnapshot() {
       reactions: 0,
       donation: 3000,
       commenters: 10,
+      firstComments: 12,
     },
   };
 }
@@ -289,6 +301,38 @@ test('only query filters to the new donation and commenters keys', () => {
     harness.goals.children.map((card) => card.children[0].children[0].textContent),
     ['DONATION', 'COMMENTERS'],
   );
+});
+
+test('first comments shows FIRST TIMERS card with plain count', () => {
+  const harness = createHarness();
+  harness.render(donationSnapshot());
+
+  const card = cardByLabel(harness, 'FIRST TIMERS');
+  assert.ok(card);
+  assert.ok(card.className.split(' ').includes('first-comments'));
+  assert.equal(card.children[0].children[1].textContent, '25%');
+  assert.equal(card.children[1].children[0].textContent, '3');
+  assert.equal(card.children[1].children[1].textContent, '/ 12');
+  assert.equal(card.children[2].children[0].style.width, '25%');
+});
+
+test('only query accepts firstComments case-insensitively', () => {
+  for (const query of ['?only=firstComments', '?only=firstcomments']) {
+    const harness = createHarness(query);
+    harness.render(donationSnapshot());
+    assert.deepEqual(
+      harness.goals.children.map((card) => card.children[0].children[0].textContent),
+      ['FIRST TIMERS'],
+    );
+  }
+});
+
+test('first comments card hides when its visibility is off', () => {
+  const harness = createHarness();
+  const snapshot = donationSnapshot();
+  snapshot.goalsVisible.firstComments = false;
+  harness.render(snapshot);
+  assert.equal(cardByLabel(harness, 'FIRST TIMERS'), undefined);
 });
 
 test('goals-neon / goals-retro use the same app.js as goals', () => {

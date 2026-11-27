@@ -255,6 +255,12 @@ body {
   --glow: rgba(94, 224, 204, 0.48);
 }
 
+.first-comments {
+  --accent: #ff9bd2;
+  --accent-2: #f472b6;
+  --glow: rgba(255, 155, 210, 0.48);
+}
+
 @media (max-width: 620px) {
   .overlay {
     padding: 12px;

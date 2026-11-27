@@ -29,6 +29,7 @@
     { key: 'viewers', label: 'VIEWERS', className: 'viewers' },
     { key: 'donation', label: 'DONATION', className: 'donation' },
     { key: 'commenters', label: 'COMMENTERS', className: 'commenters' },
+    { key: 'firstComments', label: 'FIRST TIMERS', className: 'first-comments' },
   ];
 
   const DEFAULT_WS_URL = 'ws://127.0.0.1:11180/stats';
@@ -50,6 +51,7 @@
       reactions: 0,
       donation: 0,
       commenters: 0,
+      firstComments: 0,
     };
     const visible = snapshot.goalsVisible ?? {
       comments: true,
@@ -58,6 +60,7 @@
       reactions: true,
       donation: true,
       commenters: true,
+      firstComments: true,
     };
     const nextCards: GoalCard[] = [];
 
@@ -270,6 +273,7 @@
   .viewers .goal-fill { background: #56d364; }
   .donation .goal-fill { background: #e3b341; }
   .commenters .goal-fill { background: #bc8cff; }
+  .first-comments .goal-fill { background: #ff9bd2; }
 
   .goal-card.reached {
     border-color: rgba(255,255,255,0.2);

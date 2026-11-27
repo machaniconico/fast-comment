@@ -605,6 +605,7 @@ export interface GoalsConfig {
   showReactions: boolean;
   showDonation: boolean;
   showCommenters: boolean;
+  showFirstComments: boolean;
   comments: number;
   viewers: number;
   likes: number;
@@ -613,6 +614,8 @@ export interface GoalsConfig {
   donation: number;
   /** コメントした人数の目標。 */
   commenters: number;
+  /** 初見コメント数の目標。 */
+  firstComments: number;
 }
 
 export interface TimerConfig {
@@ -671,6 +674,7 @@ export interface GoalsSnapshot {
   reactions: number;
   donation: number;
   commenters: number;
+  firstComments: number;
 }
 
 export interface GoalsVisibilitySnapshot {
@@ -680,6 +684,7 @@ export interface GoalsVisibilitySnapshot {
   reactions: boolean;
   donation: boolean;
   commenters: boolean;
+  firstComments: boolean;
 }
 
 export interface ChannelTitle {
@@ -710,6 +715,8 @@ export interface StatsSnapshot {
   donation: number;
   /** コメントした人数(有効なチャンネルごとのユニーク発言者の和)。 */
   commenters: number;
+  /** 初見コメント数(リスナー記録で初めてのコメント)。 */
+  firstComments: number;
   goalsEnabled: boolean;
   goalsVisible: GoalsVisibilitySnapshot;
   goals: GoalsSnapshot;
